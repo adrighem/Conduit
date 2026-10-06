@@ -1,17 +1,10 @@
 use std::collections::HashMap;
-use std::fs::{File, Metadata};
-use std::io::{self, Read, Seek, SeekFrom};
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
 
-use crate::config;
 use crate::message_html::CachedAssetSource;
 use crate::runtime::CachedAssetDescriptor;
 
 pub const CONDUIT_ASSET_REGISTRY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const CONDUIT_ASSET_REGISTRY_MAX_ENTRIES: usize = 2_048;
-pub const CONDUIT_ASSET_VALIDATION_PREFIX_BYTES: u64 = 64;
 pub const IMAGE_ASSET_SOURCE_MAX_BYTES: usize = 8 * 1024;
 pub const IMAGE_ASSET_KEY_SET_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const IMAGE_ASSET_KEY_SET_MAX_ENTRIES: usize = 2_048;
@@ -94,34 +87,6 @@ impl BoundedImageAssetKeys {
 
     pub fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImageAssetRecoveryAction {
-    Retry,
-    AlreadyPending,
-    Fail,
-}
-
-pub fn image_asset_recovery_action(
-    recovering: &mut BoundedImageAssetKeys,
-    pending: &mut BoundedImageAssetKeys,
-    key: &str,
-) -> ImageAssetRecoveryAction {
-    if !recovering.try_insert(key.to_string()) {
-        return ImageAssetRecoveryAction::Fail;
-    }
-    if pending.try_insert(key.to_string()) {
-        ImageAssetRecoveryAction::Retry
-    } else if pending.contains(key) {
-        ImageAssetRecoveryAction::AlreadyPending
-    } else {
-        ImageAssetRecoveryAction::Fail
     }
 }
 
@@ -216,6 +181,7 @@ impl BoundedConduitAssets {
         Some(evicted)
     }
 
+    #[cfg(test)]
     pub fn get(&mut self, cache_key: &str) -> Option<CachedAssetDescriptor> {
         let workspace_key = self.workspace_key.as_deref()?;
         let entry = self.entries.get_mut(cache_key)?;
@@ -274,155 +240,9 @@ pub fn conduit_asset_request_key(uri: &str) -> Option<String> {
     (valid_key && uri == format!("conduit-asset://{key}")).then(|| key.to_string())
 }
 
-pub fn conduit_asset_for_request(
-    uri: &str,
-    assets: &mut BoundedConduitAssets,
-) -> Option<CachedAssetDescriptor> {
-    let key = conduit_asset_request_key(uri)?;
-    assets.get(&key)
-}
-
 pub fn cached_asset_source_is_registered(
     source: &CachedAssetSource,
     assets: &BoundedConduitAssets,
 ) -> bool {
     conduit_asset_request_key(source.uri()).is_some_and(|key| assets.contains_key(&key))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConduitAssetResponsePlan {
-    Full,
-    Partial { start: u64, end: u64 },
-    NotSatisfiable,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConduitAssetServeOutcome {
-    Rejected,
-    Served(String),
-    Invalidated(String),
-}
-
-pub fn conduit_asset_request_method(method: Option<&str>) -> Option<&str> {
-    match method {
-        Some(method @ ("GET" | "HEAD")) => Some(method),
-        _ => None,
-    }
-}
-
-pub fn conduit_asset_response_plan(range: Option<&str>, size: u64) -> ConduitAssetResponsePlan {
-    let Some(range) = range else {
-        return ConduitAssetResponsePlan::Full;
-    };
-    let Some(specification) = range.trim().strip_prefix("bytes=") else {
-        return ConduitAssetResponsePlan::NotSatisfiable;
-    };
-    if specification.contains(',') || size == 0 {
-        return ConduitAssetResponsePlan::NotSatisfiable;
-    }
-    let Some((start, end)) = specification.split_once('-') else {
-        return ConduitAssetResponsePlan::NotSatisfiable;
-    };
-    let start = start.trim();
-    let end = end.trim();
-    if start.is_empty() {
-        let Ok(suffix_length) = end.parse::<u64>() else {
-            return ConduitAssetResponsePlan::NotSatisfiable;
-        };
-        if suffix_length == 0 {
-            return ConduitAssetResponsePlan::NotSatisfiable;
-        }
-        let suffix_length = suffix_length.min(size);
-        return ConduitAssetResponsePlan::Partial {
-            start: size - suffix_length,
-            end: size - 1,
-        };
-    }
-
-    let Ok(start) = start.parse::<u64>() else {
-        return ConduitAssetResponsePlan::NotSatisfiable;
-    };
-    if start >= size {
-        return ConduitAssetResponsePlan::NotSatisfiable;
-    }
-    let end = if end.is_empty() {
-        size - 1
-    } else {
-        let Ok(end) = end.parse::<u64>() else {
-            return ConduitAssetResponsePlan::NotSatisfiable;
-        };
-        if end < start {
-            return ConduitAssetResponsePlan::NotSatisfiable;
-        }
-        end.min(size - 1)
-    };
-    ConduitAssetResponsePlan::Partial { start, end }
-}
-
-#[cfg(unix)]
-fn same_opened_file(left: &Metadata, right: &Metadata) -> bool {
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_opened_file(left: &Metadata, right: &Metadata) -> bool {
-    left.len() == right.len()
-        && left.modified().ok().is_some()
-        && left.modified().ok() == right.modified().ok()
-}
-
-pub fn open_conduit_asset(descriptor: &CachedAssetDescriptor) -> io::Result<File> {
-    open_conduit_asset_at(descriptor, &config::image_asset_cache_dir())
-}
-
-pub fn open_conduit_asset_at(
-    descriptor: &CachedAssetDescriptor,
-    cache_root: &Path,
-) -> io::Result<File> {
-    let path = descriptor.path_in(cache_root);
-    let before = std::fs::symlink_metadata(&path)?;
-    if !before.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid cached asset",
-        ));
-    }
-    #[cfg(unix)]
-    if before.nlink() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid cached asset",
-        ));
-    }
-
-    let mut file = File::open(&path)?;
-    let opened = file.metadata()?;
-    let after = std::fs::symlink_metadata(&path)?;
-    if !opened.is_file()
-        || !after.file_type().is_file()
-        || !same_opened_file(&before, &opened)
-        || !same_opened_file(&opened, &after)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid cached asset",
-        ));
-    }
-
-    let mut prefix =
-        Vec::with_capacity(opened.len().min(CONDUIT_ASSET_VALIDATION_PREFIX_BYTES) as usize);
-    file.by_ref()
-        .take(CONDUIT_ASSET_VALIDATION_PREFIX_BYTES)
-        .read_to_end(&mut prefix)?;
-    let validated = file.metadata()?;
-    if !same_opened_file(&opened, &validated)
-        || !descriptor.validates_opened_content(validated.len(), &prefix)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid cached asset",
-        ));
-    }
-    file.seek(SeekFrom::Start(0))?;
-    Ok(file)
 }

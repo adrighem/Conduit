@@ -98,13 +98,31 @@ pub fn sidebar_row_widget(
     let emphasized = model.unread || model.has_mention;
     let title = gtk::Label::new(Some(&model.title));
     title.set_xalign(0.0);
-    title.set_hexpand(true);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     title.set_attributes(Some(&sidebar_title_attributes(emphasized)));
     if emphasized {
         title.add_css_class("heading");
     }
-    content.append(&title);
+
+    // `title` deliberately does NOT hexpand here: a mention pill rendered
+    // immediately after it (inside this same row) needs to sit right next
+    // to the visible text, not get stranded at the far edge of an expanded
+    // label's allocation. Hexpand instead applies to this wrapping row, so
+    // the unused space still ends up before the trailing indicators.
+    let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    title_row.set_hexpand(true);
+    title_row.append(&title);
+
+    if let Some(mention_label) = model.mention_badge_label() {
+        let mention = gtk::Label::new(Some(&mention_label));
+        mention.add_css_class("caption");
+        mention.add_css_class("heading");
+        mention.add_css_class("accent");
+        mention.set_tooltip_text(Some("Mentioned"));
+        title_row.append(&mention);
+    }
+
+    content.append(&title_row);
 
     if let Some(status) = model.status.as_ref() {
         let text = status.accessible_text();
@@ -147,15 +165,6 @@ pub fn sidebar_row_widget(
         unread.add_css_class("caption");
         unread.add_css_class("heading");
         content.append(&unread);
-    }
-
-    if let Some(mention_label) = model.mention_badge_label() {
-        let mention = gtk::Label::new(Some(&mention_label));
-        mention.add_css_class("caption");
-        mention.add_css_class("heading");
-        mention.add_css_class("accent");
-        mention.set_tooltip_text(Some("Mentioned"));
-        content.append(&mention);
     }
 
     if model.muted {

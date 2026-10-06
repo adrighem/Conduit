@@ -8,7 +8,7 @@ use anyhow::Context;
 use reqwest::header::{CONTENT_TYPE, COOKIE, RETRY_AFTER, USER_AGENT};
 use reqwest::multipart::Form;
 use reqwest::{Client, Method, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -388,8 +388,8 @@ impl std::fmt::Debug for SlackMessageActionRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SidebarTheme {
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SidebarTheme {
     pub column_bg: String,
     pub menu_bg_hover: String,
     pub active_item: String,
@@ -402,32 +402,184 @@ pub(crate) struct SidebarTheme {
     pub top_nav_text: Option<String>,
 }
 
-fn is_valid_sidebar_theme_hex(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 7 && bytes[0] == b'#' && bytes[1..].iter().all(u8::is_ascii_hexdigit)
+impl SidebarTheme {
+    pub fn default_aubergine() -> Self {
+        preset_sidebar_theme("aubergine").expect("default aubergine theme must be valid")
+    }
+}
+
+fn normalize_sidebar_theme_hex(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('#')
+        && trimmed.len() == 7
+        && trimmed[1..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Some(trimmed.to_string());
+    }
+    if trimmed.len() == 6 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(format!("#{trimmed}"));
+    }
+    None
+}
+
+
+pub fn preset_sidebar_theme(name: &str) -> Option<SidebarTheme> {
+    let normalized = name.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "default" | "aubergine" => Some(SidebarTheme {
+            column_bg: "#3F0E40".to_string(),
+            menu_bg_hover: "#350d36".to_string(),
+            active_item: "#1164A3".to_string(),
+            active_item_text: "#FFFFFF".to_string(),
+            hover_item: "#350D36".to_string(),
+            text_color: "#FFFFFF".to_string(),
+            active_presence: "#2BAC76".to_string(),
+            mention_badge: Some("#CD2553".to_string()),
+            top_nav_bg: Some("#350d36".to_string()),
+            top_nav_text: Some("#FFFFFF".to_string()),
+        }),
+        "aubergine_classic" => parse_sidebar_theme_csv(
+            "#4D394B,#3E313C,#4C9689,#FFFFFF,#3E313C,#FFFFFF,#38978D,#EB4D5C,#3E313C,#FFFFFF",
+        ),
+        "hoth" => parse_sidebar_theme_csv(
+            "#F8F8FA,#FFFFFF,#2D9EE0,#FFFFFF,#FFFFFF,#383F45,#60D156,#FF4743,#FFFFFF,#383F45",
+        ),
+        "monument" => parse_sidebar_theme_csv(
+            "#0D7E83,#076569,#F78640,#FFFFFF,#0B6C70,#FFFFFF,#F78640,#F78640,#076569,#FFFFFF",
+        ),
+        "chocolate" | "choco_mint" => parse_sidebar_theme_csv(
+            "#54453B,#42362E,#5DB09D,#FFFFFF,#4A3D34,#FFFFFF,#5DB09D,#FFFFFF,#42362E,#FFFFFF",
+        ),
+        "ochin" => parse_sidebar_theme_csv(
+            "#303E4D,#2C3846,#6698C8,#FFFFFF,#2A3542,#FFFFFF,#94E864,#783653,#2C3846,#FFFFFF",
+        ),
+        "goth" | "dark" => parse_sidebar_theme_csv(
+            "#1A1D21,#222529,#1264A3,#FFFFFF,#222529,#D1D2D3,#007A5A,#E01E5A,#1A1D21,#D1D2D3",
+        ),
+        "solaris" => parse_sidebar_theme_csv(
+            "#FCF8E3,#F3ECD0,#C55F37,#FFFFFF,#EDE4BE,#383F45,#60D156,#FF4743,#F3ECD0,#383F45",
+        ),
+        "brin" => parse_sidebar_theme_csv(
+            "#203E5F,#1A324C,#569F8B,#FFFFFF,#1D3856,#FFFFFF,#60D156,#CD2553,#1A324C,#FFFFFF",
+        ),
+        "sweet_treat" => parse_sidebar_theme_csv(
+            "#F2D388,#E8C97E,#C98474,#FFFFFF,#DFC075,#383F45,#874C62,#C98474,#E8C97E,#383F45",
+        ),
+        "mood_indigo" => parse_sidebar_theme_csv(
+            "#333456,#2C2D4A,#595B83,#FFFFFF,#2C2D4A,#FFFFFF,#595B83,#F4ABC4,#2C2D4A,#FFFFFF",
+        ),
+        "dagobah" => parse_sidebar_theme_csv(
+            "#353F3E,#2C3534,#94A187,#FFFFFF,#2F3837,#FFFFFF,#94A187,#C1A87D,#2C3534,#FFFFFF",
+        ),
+        "pro_hunter" => parse_sidebar_theme_csv(
+            "#374046,#2F363C,#61605C,#FFFFFF,#2F363C,#FFFFFF,#61605C,#D24726,#2F363C,#FFFFFF",
+        ),
+        _ => None,
+    }
 }
 
 fn parse_sidebar_theme_csv(raw: &str) -> Option<SidebarTheme> {
-    let tokens: Vec<&str> = raw
+    let tokens: Vec<String> = raw
         .split(',')
-        .map(str::trim)
-        .filter(|token| is_valid_sidebar_theme_hex(token))
+        .filter_map(normalize_sidebar_theme_hex)
         .collect();
     if tokens.len() < 7 {
         return None;
     }
     Some(SidebarTheme {
-        column_bg: tokens[0].to_string(),
-        menu_bg_hover: tokens[1].to_string(),
-        active_item: tokens[2].to_string(),
-        active_item_text: tokens[3].to_string(),
-        hover_item: tokens[4].to_string(),
-        text_color: tokens[5].to_string(),
-        active_presence: tokens[6].to_string(),
-        mention_badge: tokens.get(7).map(|token| token.to_string()),
-        top_nav_bg: tokens.get(8).map(|token| token.to_string()),
-        top_nav_text: tokens.get(9).map(|token| token.to_string()),
+        column_bg: tokens[0].clone(),
+        menu_bg_hover: tokens[1].clone(),
+        active_item: tokens[2].clone(),
+        active_item_text: tokens[3].clone(),
+        hover_item: tokens[4].clone(),
+        text_color: tokens[5].clone(),
+        active_presence: tokens[6].clone(),
+        mention_badge: tokens.get(7).cloned(),
+        top_nav_bg: tokens.get(8).cloned(),
+        top_nav_text: tokens.get(9).cloned(),
     })
+}
+
+fn parse_sidebar_theme_str(raw: &str) -> Option<SidebarTheme> {
+    let trimmed = raw.trim();
+    if let Some(theme) = parse_sidebar_theme_csv(trimmed) {
+        return Some(theme);
+    }
+    if let Some(theme) = preset_sidebar_theme(trimmed) {
+        return Some(theme);
+    }
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+            return parse_sidebar_theme_value(&val);
+        }
+    }
+    None
+}
+
+fn parse_sidebar_theme_value(val: &Value) -> Option<SidebarTheme> {
+    match val {
+        Value::String(s) => parse_sidebar_theme_str(s),
+        Value::Object(map) => {
+            let column_bg = map
+                .get("column_bg")
+                .and_then(Value::as_str)
+                .and_then(normalize_sidebar_theme_hex)?;
+            let menu_bg_hover = map
+                .get("menu_bg_hover")
+                .or_else(|| map.get("menu_bg"))
+                .and_then(Value::as_str)
+                .and_then(normalize_sidebar_theme_hex)?;
+            let active_item = map
+                .get("active_item")
+                .and_then(Value::as_str)
+                .and_then(normalize_sidebar_theme_hex)?;
+            let active_item_text = map
+                .get("active_item_text")
+                .and_then(Value::as_str)
+                .and_then(normalize_sidebar_theme_hex)?;
+            let hover_item = map
+                .get("hover_item")
+                .and_then(Value::as_str)
+                .and_then(normalize_sidebar_theme_hex)?;
+            let text_color = map
+                .get("text_color")
+                .and_then(Value::as_str)
+                .and_then(normalize_sidebar_theme_hex)?;
+            let active_presence = map
+                .get("active_presence")
+                .or_else(|| map.get("presence"))
+                .and_then(Value::as_str)
+                .and_then(normalize_sidebar_theme_hex)?;
+            let mention_badge = map
+                .get("mention_badge")
+                .and_then(Value::as_str)
+                .and_then(normalize_sidebar_theme_hex);
+            let top_nav_bg = map
+                .get("top_nav_bg")
+                .or_else(|| map.get("nav_bg"))
+                .and_then(Value::as_str)
+                .and_then(normalize_sidebar_theme_hex);
+            let top_nav_text = map
+                .get("top_nav_text")
+                .or_else(|| map.get("nav_text"))
+                .and_then(Value::as_str)
+                .and_then(normalize_sidebar_theme_hex);
+
+            Some(SidebarTheme {
+                column_bg,
+                menu_bg_hover,
+                active_item,
+                active_item_text,
+                hover_item,
+                text_color,
+                active_presence,
+                mention_badge,
+                top_nav_bg,
+                top_nav_text,
+            })
+        }
+        _ => None,
+    }
 }
 
 impl SlackApi {
@@ -469,28 +621,44 @@ impl SlackApi {
     }
 
     pub(crate) async fn fetch_sidebar_theme(&self) -> Result<Option<SidebarTheme>> {
-        if self.browser_cookie_d.is_none() {
-            return Ok(None);
-        }
-        let response: ClientUserBootResponse = match self.post_form("client.userBoot", &[]).await
-        {
-            Ok(response) => response,
+        let mut prefs = None;
+        match self.post_form::<ClientUserBootResponse>("client.userBoot", &[]).await {
+            Ok(response) => {
+                prefs = response.self_data.and_then(|s| s.prefs);
+            }
             Err(error) => {
                 crate::debug::log(
                     "slack",
-                    &format!("SidebarThemeFetchFailed error={error:#}"),
+                    &format!("client.userBoot failed, trying users.prefs.get error={error:#}"),
                 );
-                return Ok(None);
             }
-        };
-        let Some(raw_theme) = response
-            .self_data
-            .and_then(|self_data| self_data.prefs)
-            .and_then(|prefs| prefs.sidebar_theme)
-        else {
-            return Ok(None);
-        };
-        Ok(parse_sidebar_theme_csv(&raw_theme))
+        }
+        if prefs.is_none() {
+            match self.post_form::<UsersPrefsGetResponse>("users.prefs.get", &[]).await {
+                Ok(response) => {
+                    prefs = response.prefs;
+                }
+                Err(error) => {
+                    crate::debug::log(
+                        "slack",
+                        &format!("users.prefs.get failed error={error:#}"),
+                    );
+                }
+            }
+        }
+
+        let theme = prefs.as_ref().and_then(|p| {
+            p.sidebar_theme_custom
+                .as_ref()
+                .and_then(parse_sidebar_theme_value)
+                .or_else(|| p.sidebar_theme.as_ref().and_then(parse_sidebar_theme_value))
+        });
+
+        if let Some(theme) = theme {
+            return Ok(Some(theme));
+        }
+
+        Ok(Some(SidebarTheme::default_aubergine()))
     }
 
     pub(crate) async fn execute_message_action(
@@ -2312,8 +2480,17 @@ struct ClientUserBootSelf {
 
 #[derive(Debug, Deserialize)]
 struct ClientUserBootPrefs {
-    sidebar_theme: Option<String>,
+    sidebar_theme: Option<Value>,
+    sidebar_theme_custom: Option<Value>,
 }
+
+#[derive(Debug, Deserialize)]
+struct UsersPrefsGetResponse {
+    ok: bool,
+    error: Option<String>,
+    prefs: Option<ClientUserBootPrefs>,
+}
+impl_slack_response!(UsersPrefsGetResponse);
 
 #[derive(Debug, Deserialize)]
 struct MessageActionResponse {
@@ -2640,6 +2817,53 @@ mod tests {
     fn parse_sidebar_theme_csv_rejects_too_short_theme() {
         let csv = "#350d36,#350d36,#1264a3,#ffffff,#350d36,#ffffff";
         assert_eq!(parse_sidebar_theme_csv(csv), None);
+    }
+
+    #[test]
+    fn preset_sidebar_theme_resolves_known_presets() {
+        let aubergine = preset_sidebar_theme("aubergine").expect("aubergine preset exists");
+        assert_eq!(aubergine.column_bg, "#3F0E40");
+        assert_eq!(preset_sidebar_theme("default"), Some(aubergine.clone()));
+
+        let goth = preset_sidebar_theme("goth").expect("goth preset exists");
+        assert_eq!(goth.column_bg, "#1A1D21");
+        assert_eq!(preset_sidebar_theme("dark"), Some(goth));
+
+        assert!(preset_sidebar_theme("nonexistent").is_none());
+    }
+
+    #[test]
+    fn parse_sidebar_theme_value_resolves_json_object() {
+        let json: serde_json::Value = serde_json::json!({
+            "column_bg": "#112233",
+            "menu_bg_hover": "#223344",
+            "active_item": "#334455",
+            "active_item_text": "#445566",
+            "hover_item": "#556677",
+            "text_color": "#667788",
+            "active_presence": "#778899",
+            "top_nav_bg": "#8899aa",
+            "top_nav_text": "#99aabb"
+        });
+        let theme = parse_sidebar_theme_value(&json).expect("valid json theme");
+        assert_eq!(theme.column_bg, "#112233");
+        assert_eq!(theme.top_nav_bg.as_deref(), Some("#8899aa"));
+    }
+
+    #[test]
+    fn parse_sidebar_theme_str_handles_preset_and_json_string() {
+        let theme = parse_sidebar_theme_str("chocolate").expect("chocolate preset");
+        assert_eq!(theme.column_bg, "#54453B");
+
+        let json_str = r##"{"column_bg":"#112233","menu_bg":"#223344","active_item":"#334455","active_item_text":"#445566","hover_item":"#556677","text_color":"#667788","presence":"#778899"}"##;
+        let theme2 = parse_sidebar_theme_str(json_str).expect("json string theme");
+        assert_eq!(theme2.column_bg, "#112233");
+    }
+
+    #[test]
+    fn default_aubergine_is_valid() {
+        let theme = SidebarTheme::default_aubergine();
+        assert_eq!(theme.column_bg, "#3F0E40");
     }
 
     fn browser_test_token(browser_cookie_d: Option<&str>) -> StoredToken {

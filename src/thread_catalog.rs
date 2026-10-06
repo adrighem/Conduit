@@ -29,6 +29,13 @@ pub struct ThreadRecord {
     pub(crate) latest_reply: Option<String>,
     #[serde(default)]
     pub(crate) last_read: Option<String>,
+    /// How many of `reply_count` replies have been marked read. Paired with
+    /// `last_read`: always set together via `mark_read()`. Deliberately NOT
+    /// derived from `seen_reply_ts` (a realtime-only dedup cache that is
+    /// empty for any thread whose replies were never streamed in this
+    /// session) so the unread count is correct immediately on cold start.
+    #[serde(default)]
+    pub(crate) read_reply_count: u64,
     /// `None` means Slack has not supplied subscription metadata yet.
     pub(crate) subscribed: Option<bool>,
     /// Reply authors are append-only: deleting a reply does not erase the
@@ -40,20 +47,20 @@ pub struct ThreadRecord {
 }
 
 impl ThreadRecord {
-    fn placeholder(key: ThreadKey) -> Self {
+    pub(crate) fn placeholder(key: ThreadKey) -> Self {
         Self {
             key,
             root: None,
             reply_count: 0,
             latest_reply: None,
             last_read: None,
+            read_reply_count: 0,
             subscribed: None,
             participant_user_ids: HashSet::new(),
             seen_reply_ts: HashSet::new(),
         }
     }
 
-    #[allow(dead_code)]
     pub fn has_unread_replies(&self) -> bool {
         let Some(latest_reply) = self
             .latest_reply
@@ -72,6 +79,21 @@ impl ThreadRecord {
             Some(last_read) => slack_timestamp_is_after(latest_reply, last_read),
             None => true,
         }
+    }
+
+    /// Replies not yet marked read. Derived from `reply_count`/`read_reply_count`
+    /// (not `seen_reply_ts`) so it's accurate even for a thread whose replies
+    /// were only ever seen via channel history, never streamed this session.
+    pub fn unread_reply_count(&self) -> u64 {
+        self.reply_count.saturating_sub(self.read_reply_count)
+    }
+
+    /// Marks every reply seen so far as read. Local-only: no Slack API backs
+    /// thread read-state. `last_read` and `read_reply_count` are always set
+    /// together; they're one "I've seen everything up to here" operation.
+    pub(crate) fn mark_read(&mut self) {
+        self.last_read = self.latest_reply.clone();
+        self.read_reply_count = self.reply_count;
     }
 
     #[cfg(test)]
@@ -123,6 +145,24 @@ impl ThreadCatalog {
         records
     }
 
+    pub(crate) fn unread_summaries_for_user<'a>(
+        &'a self,
+        user_id: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a str, u64, u64)> + 'a {
+        self.records.values().filter_map(move |record| {
+            if record.has_unread_replies() && record.participant_user_ids.contains(user_id) {
+                Some((
+                    record.key.channel_id.as_str(),
+                    record.key.root_ts.as_str(),
+                    record.reply_count,
+                    record.unread_reply_count(),
+                ))
+            } else {
+                None
+            }
+        })
+    }
+
     pub(crate) fn upsert_records(&mut self, records: impl IntoIterator<Item = ThreadRecord>) {
         for record in records {
             self.records.insert(record.key.clone(), record);
@@ -131,6 +171,18 @@ impl ThreadCatalog {
 
     pub(crate) fn get(&self, channel_id: &str, root_ts: &str) -> Option<&ThreadRecord> {
         ThreadKey::new(channel_id, root_ts).and_then(|key| self.records.get(&key))
+    }
+
+    pub(crate) fn mark_read(&mut self, channel_id: &str, root_ts: &str) -> bool {
+        let Some(key) = ThreadKey::new(channel_id, root_ts) else {
+            return false;
+        };
+        if let Some(record) = self.records.get_mut(&key) {
+            record.mark_read();
+            true
+        } else {
+            false
+        }
     }
 
     /// Build the thread-inbox projection from locally observed roots and persisted Slack
@@ -439,6 +491,63 @@ mod tests {
             true,
         );
         assert_eq!(catalog.get("C1", "1.0").unwrap().reply_count, 3);
+    }
+
+    #[test]
+    fn unread_reply_count_is_accurate_on_cold_start_even_though_seen_reply_ts_is_empty() {
+        // A thread seen only via channel history (never streamed over realtime
+        // this session) has an empty `seen_reply_ts`: deriving unread count
+        // from that set would wrongly report 0 unread here. reply_count minus
+        // read_reply_count must still report all 20 as unread.
+        let mut catalog = ThreadCatalog::default();
+        catalog.observe_history("C1", &[root("1.0", 20)]);
+        let record = catalog.get("C1", "1.0").unwrap();
+        assert!(!record.has_seen_reply("x"));
+        assert_eq!(record.unread_reply_count(), 20);
+    }
+
+    #[test]
+    fn mark_read_zeroes_unread_count_and_a_later_reply_shows_one_unread() {
+        let mut record = ThreadRecord::placeholder(ThreadKey::new("C1", "1.0").unwrap());
+        record.reply_count = 5;
+        record.latest_reply = Some("5.0".into());
+        assert_eq!(record.unread_reply_count(), 5);
+
+        record.mark_read();
+        assert_eq!(record.unread_reply_count(), 0);
+        assert_eq!(record.last_read.as_deref(), Some("5.0"));
+        assert_eq!(record.read_reply_count, 5);
+
+        // A new reply arrives without another mark_read() call.
+        record.reply_count = 6;
+        record.latest_reply = Some("6.0".into());
+        assert_eq!(record.unread_reply_count(), 1);
+    }
+
+    #[test]
+    fn unread_summaries_for_user_filters_correctly() {
+        let mut catalog = ThreadCatalog::default();
+        let mut rec1 = ThreadRecord::placeholder(ThreadKey::new("C1", "1.0").unwrap());
+        rec1.reply_count = 2;
+        rec1.latest_reply = Some("2.0".into());
+        rec1.participant_user_ids.insert("U1".into());
+
+        let mut rec2 = ThreadRecord::placeholder(ThreadKey::new("C1", "2.0").unwrap());
+        rec2.reply_count = 3;
+        rec2.latest_reply = Some("3.0".into());
+        rec2.participant_user_ids.insert("U2".into()); // not U1
+
+        let mut rec3 = ThreadRecord::placeholder(ThreadKey::new("C2", "3.0").unwrap());
+        rec3.reply_count = 4;
+        rec3.latest_reply = Some("4.0".into());
+        rec3.participant_user_ids.insert("U1".into());
+        rec3.mark_read(); // read
+
+        catalog.upsert_records([rec1, rec2, rec3]);
+
+        let summaries: Vec<_> = catalog.unread_summaries_for_user("U1").collect();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0], ("C1", "1.0", 2, 2));
     }
 
     #[test]

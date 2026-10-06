@@ -524,6 +524,7 @@ pub(crate) enum ConversationOpenPosition {
 pub(crate) enum ConversationOpenPhase {
     Positioning,
     Interactive,
+    #[cfg(test)]
     Cancelled,
 }
 
@@ -629,7 +630,11 @@ impl ConversationOpenCoordinator {
                 session.pending_reconciliation = true;
                 Some(ConversationOpenRenderAction::HoldReconciliation)
             }
-            ConversationOpenPhase::Interactive | ConversationOpenPhase::Cancelled => {
+            ConversationOpenPhase::Interactive => {
+                Some(ConversationOpenRenderAction::Reconcile)
+            }
+            #[cfg(test)]
+            ConversationOpenPhase::Cancelled => {
                 Some(ConversationOpenRenderAction::Reconcile)
             }
         }
@@ -691,6 +696,7 @@ impl ConversationOpenCoordinator {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn note_user_interaction(&mut self, generation: ConversationOpenGeneration) -> bool {
         let Some(session) = self
             .active
@@ -1156,6 +1162,7 @@ impl WorkspaceViewState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_thread_history_request(&mut self) -> bool {
         let Some(thread) = &mut self.thread else {
             return false;
@@ -1190,6 +1197,7 @@ impl WorkspaceViewState {
         self.thread.take().is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn focus_message(&mut self, location: &SearchMessageLocation) -> bool {
         if self.visible_channel_id() != Some(location.channel_id()) {
             return false;

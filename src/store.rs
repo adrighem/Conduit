@@ -19,6 +19,7 @@ use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
     slack_timestamp_is_after, SlackConversation, SlackMessage, SlackUser, SlackUserStatus,
 };
+use crate::slack::SidebarTheme;
 use crate::slack_message_wire::normalize_cached_messages;
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
 use crate::workspace_pipeline::{
@@ -639,6 +640,7 @@ pub(crate) struct WorkspaceBootstrap {
     pub(crate) user_statuses: HashMap<String, SlackUserStatus>,
     pub(crate) thread_catalog: Vec<ThreadRecord>,
     pub(crate) custom_emojis: HashMap<String, String>,
+    pub(crate) sidebar_theme: Option<SidebarTheme>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1004,6 +1006,30 @@ impl WorkspaceStore {
                         freshness.retry_after_ms
                     ],
                 )? > 0;
+                finish_sqlite_transaction(transaction, changed)?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub(crate) async fn store_sidebar_theme(&self, theme: &SidebarTheme) -> Result<()> {
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        let theme = theme.clone();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                changed |= upsert_sqlite_item(
+                    &transaction,
+                    &workspace_key,
+                    "sidebar_theme",
+                    "theme",
+                    &theme,
+                )?;
                 finish_sqlite_transaction(transaction, changed)?;
                 Ok(())
             })
@@ -1937,6 +1963,7 @@ fn load_sqlite_bootstrap(
         user_statuses: load_sqlite_kind_map(connection, workspace_key, "user_status")?,
         thread_catalog: load_sqlite_kind_values(connection, workspace_key, "thread_record")?,
         custom_emojis: load_sqlite_kind_map(connection, workspace_key, "custom_emoji")?,
+        sidebar_theme: load_sqlite_item(connection, workspace_key, "sidebar_theme", "theme")?,
     }))
 }
 
@@ -7478,6 +7505,38 @@ mod tests {
             assert_eq!(loaded_records.len(), 1);
             assert_eq!(loaded_records[0].last_read.as_deref(), Some("1710000250.000100"));
             assert!(loaded_records[0].has_unread_replies());
+        });
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn store_and_load_sidebar_theme() {
+        let directory = temp_cache_dir("workspace-store-sidebar-theme");
+        let store = WorkspaceStore::new(directory.clone(), "T123");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let theme = SidebarTheme {
+                column_bg: "#123456".into(),
+                menu_bg_hover: "#234567".into(),
+                active_item: "#345678".into(),
+                active_item_text: "#ffffff".into(),
+                hover_item: "#456789".into(),
+                text_color: "#dddddd".into(),
+                active_presence: "#00ff00".into(),
+                mention_badge: Some("#ff0000".into()),
+                top_nav_bg: Some("#112233".into()),
+                top_nav_text: Some("#eeeeee".into()),
+            };
+
+            store.store_sidebar_theme(&theme).await.unwrap();
+
+            let bootstrap = store.load_bootstrap().await.unwrap().expect("bootstrap exists");
+            assert_eq!(bootstrap.sidebar_theme, Some(theme));
         });
 
         let _ = std::fs::remove_dir_all(directory);

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
 
 use crate::search::{SearchField, SearchQuery, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT};
@@ -203,6 +204,7 @@ pub struct EmojiPickerModel {
     entries: Vec<EmojiEntry>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmojiPickerQuery {
@@ -216,6 +218,7 @@ pub struct EmojiPickerQuery {
     pub offset: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EmojiPickerResult {
     pub version: u8,
@@ -227,6 +230,7 @@ pub struct EmojiPickerResult {
     pub entries: Vec<EmojiPickerResultEntry>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EmojiPickerResultEntry {
     pub name: String,
@@ -237,6 +241,7 @@ pub struct EmojiPickerResultEntry {
     pub value: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EmojiPickerResultValueKind {
@@ -244,6 +249,7 @@ pub enum EmojiPickerResultValueKind {
     CustomImage,
 }
 
+#[cfg(test)]
 impl From<&EmojiEntry> for EmojiPickerResultEntry {
     fn from(entry: &EmojiEntry) -> Self {
         let (value_kind, value) = match &entry.value {
@@ -265,11 +271,13 @@ impl From<&EmojiEntry> for EmojiPickerResultEntry {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct EmojiPickerGenerationGate {
     latest: u64,
 }
 
+#[cfg(test)]
 impl EmojiPickerGenerationGate {
     pub fn accept(&mut self, generation: u64) -> bool {
         if generation == 0 || generation <= self.latest {
@@ -293,6 +301,7 @@ impl EmojiPickerModel {
         self.ranked_entries(query).into_iter().cloned().collect()
     }
 
+    #[cfg(test)]
     pub fn query(&self, request: &EmojiPickerQuery) -> Option<EmojiPickerResult> {
         if request.version != EMOJI_PICKER_PROTOCOL_VERSION
             || request.generation == 0
@@ -358,7 +367,7 @@ impl EmojiPickerModel {
 }
 
 pub fn emoji_picker_accessible_label(entry: &EmojiEntry) -> String {
-    format!(":{}: — {}", entry.name, entry.label)
+    format!(":{}: -- {}", entry.name, entry.label)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -606,7 +615,7 @@ mod tests {
         assert_eq!(matches[0].name, "parrot");
         assert_eq!(
             emoji_picker_accessible_label(&matches[0]),
-            ":parrot: — parrot"
+            ":parrot: -- parrot"
         );
     }
 

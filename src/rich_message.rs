@@ -114,12 +114,6 @@ impl MessageAuthor {
         }
     }
 
-    pub(crate) fn app_id(&self) -> Option<&str> {
-        match self {
-            Self::App { app_id, .. } => app_id.as_deref(),
-            Self::User { .. } | Self::Unknown { .. } => None,
-        }
-    }
 
     pub(crate) fn bot_id(&self) -> Option<&str> {
         match self {

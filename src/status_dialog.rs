@@ -19,18 +19,14 @@
  */
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gettextrs::gettext;
 use gtk::glib;
 
-use crate::emoji::{
-    EmojiCatalog, EmojiEntry, EmojiPickerModel, EmojiPickerQuery, EmojiPickerResult,
-    EmojiPickerResultEntry, EmojiPickerResultValueKind, EmojiValue,
-    EMOJI_PICKER_MAX_QUERY_CHARS, EMOJI_PICKER_PROTOCOL_VERSION, EMOJI_PICKER_RESULT_LIMIT,
-};
+use crate::emoji::{EmojiCatalog, EmojiValue};
 use crate::models::SlackUserStatus;
 
 #[derive(Debug, Clone)]
@@ -46,21 +42,6 @@ pub(crate) struct PendingStatusUpdate {
     pub(crate) requested: SlackUserStatus,
     pub(crate) dialog_draft: SlackUserStatus,
     pub(crate) clearing: bool,
-}
-
-impl PendingStatusUpdate {
-    #[allow(dead_code)]
-    pub(crate) fn new(
-        requested: SlackUserStatus,
-        dialog_draft: SlackUserStatus,
-        clearing: bool,
-    ) -> Self {
-        Self {
-            requested,
-            dialog_draft,
-            clearing,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,79 +61,6 @@ pub(crate) struct UserStatusPresentation {
     pub(crate) accessible_text: String,
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone)]
-pub(crate) struct StatusEmojiPickerModel {
-    emojis: EmojiPickerModel,
-}
-
-#[cfg(test)]
-impl StatusEmojiPickerModel {
-    pub(crate) fn new(custom_emojis: &HashMap<String, String>, selected_emoji: &str) -> Self {
-        let catalog = EmojiCatalog::new(custom_emojis);
-        let catalog_entries = catalog.entries();
-        let workspace_names = catalog_entries
-            .iter()
-            .filter(|entry| entry.category == "Workspace")
-            .map(|entry| entry.name.clone())
-            .collect::<HashSet<_>>();
-        let mut seen = HashSet::new();
-        let mut entries = catalog_entries
-            .into_iter()
-            .filter(|entry| entry.category == "Workspace" || !workspace_names.contains(&entry.name))
-            .filter(|entry| seen.insert(entry.name.clone()))
-            .collect::<Vec<_>>();
-
-        let selected_emoji = selected_emoji.trim().trim_matches(':');
-        if !selected_emoji.is_empty() && seen.insert(selected_emoji.to_string()) {
-            entries.push(EmojiEntry {
-                name: selected_emoji.to_string(),
-                label: selected_emoji.replace(['_', '-'], " "),
-                category: "Current status",
-                value: catalog
-                    .resolve(selected_emoji)
-                    .unwrap_or_else(|| EmojiValue::CustomImage(String::new())),
-            });
-        }
-
-        Self {
-            emojis: EmojiPickerModel::new(entries),
-        }
-    }
-
-    pub(crate) fn choice_count(&self) -> usize {
-        self.emojis.entries().len() + 1
-    }
-
-    pub(crate) fn contains(&self, name: &str) -> bool {
-        name.is_empty() || self.emojis.entries().iter().any(|entry| entry.name == name)
-    }
-
-    pub(crate) fn selected_entry(&self, name: &str) -> Option<EmojiPickerResultEntry> {
-        self.emojis
-            .entries()
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(EmojiPickerResultEntry::from)
-    }
-
-    pub(crate) fn page(
-        &self,
-        query: &str,
-        category: Option<&str>,
-        offset: usize,
-    ) -> EmojiPickerResult {
-        self.emojis
-            .query(&EmojiPickerQuery {
-                version: EMOJI_PICKER_PROTOCOL_VERSION,
-                generation: 1,
-                query: query.chars().take(EMOJI_PICKER_MAX_QUERY_CHARS).collect(),
-                category: category.map(str::to_string),
-                offset,
-            })
-            .expect("status emoji picker creates valid bounded queries")
-    }
-}
 
 
 pub(crate) fn status_expiration_options(
@@ -329,20 +237,93 @@ pub(crate) fn user_status_presentation(
 }
 
 #[cfg(test)]
-pub(crate) fn status_emoji_result_label(entry: &EmojiPickerResultEntry) -> String {
-    match entry.value_kind {
-        EmojiPickerResultValueKind::Unicode => {
-            format!("{} :{}: - {}", entry.value, entry.name, entry.label)
-        }
-        EmojiPickerResultValueKind::CustomImage => {
-            format!(":{}: - {}", entry.name, entry.label)
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use crate::emoji::{
+        EmojiEntry, EmojiPickerModel, EmojiPickerQuery, EmojiPickerResult,
+        EmojiPickerResultEntry, EmojiPickerResultValueKind,
+        EMOJI_PICKER_MAX_QUERY_CHARS, EMOJI_PICKER_PROTOCOL_VERSION, EMOJI_PICKER_RESULT_LIMIT,
+    };
+
+    #[derive(Debug, Clone)]
+    struct StatusEmojiPickerModel {
+        emojis: EmojiPickerModel,
+    }
+
+    impl StatusEmojiPickerModel {
+        fn new(custom_emojis: &HashMap<String, String>, selected_emoji: &str) -> Self {
+            let catalog = EmojiCatalog::new(custom_emojis);
+            let catalog_entries = catalog.entries();
+            let workspace_names = catalog_entries
+                .iter()
+                .filter(|entry| entry.category == "Workspace")
+                .map(|entry| entry.name.clone())
+                .collect::<HashSet<_>>();
+            let mut seen = HashSet::new();
+            let mut entries = catalog_entries
+                .into_iter()
+                .filter(|entry| entry.category == "Workspace" || !workspace_names.contains(&entry.name))
+                .filter(|entry| seen.insert(entry.name.clone()))
+                .collect::<Vec<_>>();
+
+            let selected_emoji = selected_emoji.trim().trim_matches(':');
+            if !selected_emoji.is_empty() && seen.insert(selected_emoji.to_string()) {
+                entries.push(EmojiEntry {
+                    name: selected_emoji.to_string(),
+                    label: selected_emoji.replace(['_', '-'], " "),
+                    category: "Current status",
+                    value: catalog
+                        .resolve(selected_emoji)
+                        .unwrap_or_else(|| EmojiValue::CustomImage(String::new())),
+                });
+            }
+
+            Self {
+                emojis: EmojiPickerModel::new(entries),
+            }
+        }
+
+        fn contains(&self, name: &str) -> bool {
+            name.is_empty() || self.emojis.entries().iter().any(|entry| entry.name == name)
+        }
+
+        fn selected_entry(&self, name: &str) -> Option<EmojiPickerResultEntry> {
+            self.emojis
+                .entries()
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(EmojiPickerResultEntry::from)
+        }
+
+        fn page(
+            &self,
+            query: &str,
+            category: Option<&str>,
+            offset: usize,
+        ) -> EmojiPickerResult {
+            self.emojis
+                .query(&EmojiPickerQuery {
+                    version: EMOJI_PICKER_PROTOCOL_VERSION,
+                    generation: 1,
+                    query: query.chars().take(EMOJI_PICKER_MAX_QUERY_CHARS).collect(),
+                    category: category.map(str::to_string),
+                    offset,
+                })
+                .expect("status emoji picker creates valid bounded queries")
+        }
+    }
+
+    fn status_emoji_result_label(entry: &EmojiPickerResultEntry) -> String {
+        match entry.value_kind {
+            EmojiPickerResultValueKind::Unicode => {
+                format!("{} :{}: - {}", entry.value, entry.name, entry.label)
+            }
+            EmojiPickerResultValueKind::CustomImage => {
+                format!(":{}: - {}", entry.name, entry.label)
+            }
+        }
+    }
 
     #[test]
     fn status_expiration_choices_resolve_to_absolute_slack_timestamps() {

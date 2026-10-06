@@ -580,6 +580,20 @@ impl RuntimeCommand {
                 RuntimeTaskLane::Interactive,
                 RuntimeAdmissionPolicy::durable_action(),
             ),
+            Self::MarkThreadRead {
+                channel_id,
+                thread_ts,
+            } => RuntimeCommandDescriptor::mutation(
+                OperationContext::new(
+                    RuntimeOperation::MarkThreadRead,
+                    RuntimeTarget::Thread {
+                        channel_id: channel_id.clone(),
+                        thread_ts: thread_ts.clone(),
+                    },
+                ),
+                RuntimeTaskLane::Interactive,
+                RuntimeAdmissionPolicy::durable_action(),
+            ),
             Self::Huddle(command) => RuntimeCommandDescriptor::mutation(
                 OperationContext::new(
                     RuntimeOperation::Huddle,
@@ -3134,6 +3148,7 @@ impl CachedAssetDescriptor {
         &self.cache_key
     }
 
+    #[cfg(test)]
     pub(crate) fn content_type(&self) -> &'static str {
         self.mime_type.as_str()
     }
@@ -3160,10 +3175,6 @@ impl CachedAssetDescriptor {
             self.cache_key,
             self.mime_type.extension()
         ))
-    }
-
-    pub(crate) fn validates_opened_content(&self, size: u64, prefix: &[u8]) -> bool {
-        size == self.size && self.mime_type.validate_cached_content(size, prefix)
     }
 }
 
@@ -4586,9 +4597,18 @@ fn spawn_authentication_task<F>(
                     events.send_event(RuntimeEventKind::Authenticated(auth));
                     let theme_api = connection.slack.clone();
                     let theme_events = events.clone();
+                    let theme_store = connection.workspace_store.clone();
                     tokio::spawn(async move {
                         match theme_api.fetch_sidebar_theme().await {
                             Ok(Some(theme)) => {
+                                if let Some(store) = theme_store.as_ref() {
+                                    if let Err(error) = store.store_sidebar_theme(&theme).await {
+                                        crate::debug::log(
+                                            "store",
+                                            &format!("SidebarThemePersistFailed error={error:#}"),
+                                        );
+                                    }
+                                }
                                 theme_events.send_event(RuntimeEventKind::WorkspaceThemeLoaded(
                                     theme,
                                 ));
@@ -5167,6 +5187,7 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
         user_statuses,
         thread_catalog,
         custom_emojis,
+        sidebar_theme,
         ..
     } = bootstrap;
     crate::debug::log(
@@ -5179,6 +5200,9 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
             thread_catalog.len()
         ),
     );
+    if let Some(theme) = sidebar_theme {
+        events.send_event(RuntimeEventKind::WorkspaceThemeLoaded(theme));
+    }
     let users = users_from_cached_projections(
         &user_names,
         &user_full_names,
@@ -6544,6 +6568,23 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     }
                 }
             }
+        }
+        RuntimeCommand::MarkThreadRead {
+            channel_id,
+            thread_ts,
+        } => {
+            let _ = context
+                .workspace
+                .apply_persisted_and_publish(
+                    context.workspace_store.as_ref(),
+                    context.events,
+                    MutationOrigin::Local,
+                    WorkspaceMutation::ThreadRead {
+                        channel_id,
+                        root_ts: thread_ts,
+                    },
+                )
+                .await;
         }
     }
 
@@ -16403,6 +16444,7 @@ mod tests {
             | RuntimeCommand::SetCurrentUserStatus { .. }
             | RuntimeCommand::MarkConversationRead { .. }
             | RuntimeCommand::MarkConversationUnread { .. }
+            | RuntimeCommand::MarkThreadRead { .. }
             | RuntimeCommand::UploadFiles { .. }
             | RuntimeCommand::Huddle(_) => RuntimeAdmissionPolicy::durable_action(),
         }
@@ -16470,6 +16512,7 @@ mod tests {
             | RuntimeCommand::SetCurrentUserStatus { .. }
             | RuntimeCommand::MarkConversationRead { .. }
             | RuntimeCommand::MarkConversationUnread { .. }
+            | RuntimeCommand::MarkThreadRead { .. }
             | RuntimeCommand::Huddle(_) => (false, None, RuntimeTaskLane::Interactive),
         }
     }
@@ -16626,6 +16669,10 @@ mod tests {
                 channel_id: "C1".to_string(),
                 ts: "1.0".to_string(),
             },
+            RuntimeCommand::MarkThreadRead {
+                channel_id: "C1".to_string(),
+                thread_ts: "1.0".to_string(),
+            },
             RuntimeCommand::UploadFiles {
                 channel_id: "C1".to_string(),
                 thread_ts: None,
@@ -16642,7 +16689,7 @@ mod tests {
     #[test]
     fn runtime_command_admission_metadata_is_exhaustive_and_behavior_neutral() {
         let commands = runtime_command_fixtures();
-        assert_eq!(commands.len(), 42);
+        assert_eq!(commands.len(), 43);
 
         for command in commands {
             let descriptor = command.descriptor();

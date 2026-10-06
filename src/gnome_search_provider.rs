@@ -362,6 +362,7 @@ fn add_virtual_direct_messages(state: &mut CachedSearchState) {
             last_read: None,
             unread_count: None,
             unread_count_display: None,
+            unread_mentions: Default::default(),
             extra: HashMap::new(),
         });
     }

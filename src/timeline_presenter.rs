@@ -9,7 +9,9 @@ pub enum TimelineSurface {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineDocument {
+    #[allow(dead_code)]
     Conversation(String),
+    #[allow(dead_code)]
     Thread { channel_id: String, ts: String },
 }
 

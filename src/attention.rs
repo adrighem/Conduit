@@ -430,7 +430,7 @@ fn is_word_character(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
 }
 
-fn contains_direct_mention(text: &str, current_user_id: Option<&str>) -> bool {
+pub(crate) fn contains_direct_mention(text: &str, current_user_id: Option<&str>) -> bool {
     let Some(current_user_id) = current_user_id
         .map(str::trim)
         .filter(|user_id| !user_id.is_empty())

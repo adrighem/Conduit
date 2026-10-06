@@ -8,7 +8,7 @@ use gtk::glib::subclass::prelude::*;
 use gtk::{
     gio, glib, pango, Box, Button, CssProvider, Grid, Image, Label,
     ListView, NoSelection, Orientation, Picture, ScrolledWindow, Separator,
-    SignalListItemFactory, ToggleButton, Widget,
+    SignalListItemFactory, TextView, ToggleButton, Widget,
 };
 
 use crate::message_html::MessageHtmlContext;
@@ -407,6 +407,17 @@ pub(crate) fn register_timeline_css() {
             }
             .thread-reply-active { font-weight: bold; }
             .reaction-pill-active { background-color: #D6ECFF; color: #1264A3; }
+            .unread-separator-line { background-color: #1264A3; min-height: 2px; }
+            .unread-separator-label { color: #1264A3; font-weight: bold; }
+            .timeline-text-view,
+            .timeline-text-view:focus,
+            .timeline-text-view text {
+                background-color: transparent;
+                outline: none;
+                box-shadow: none;
+                padding: 0;
+                margin: 0;
+            }
             "#,
         );
         gtk::style_context_add_provider_for_display(
@@ -440,6 +451,16 @@ pub(crate) enum TimelineAction {
     MarkUnread(String),
     CopyMessageLink(String),
     CopyMessageText(String),
+    /// Fired by the visibility-based auto-read-marking mechanism once a
+    /// message has dwelled sufficiently on screen. Carries its own
+    /// channel_id/thread_ts explicitly rather than relying on the handler
+    /// to infer "whichever conversation is currently visible", since the
+    /// dwell timer can fire slightly after the user has navigated away.
+    AutoMarkRead {
+        channel_id: String,
+        thread_ts: Option<String>,
+        ts: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -468,6 +489,11 @@ pub struct NativeTimelineView {
     context: Rc<RefCell<Option<MessageHtmlContext>>>,
     on_action: Rc<RefCell<Option<Rc<dyn Fn(TimelineAction)>>>>,
     asset_update_pending: Rc<Cell<bool>>,
+    read_mark_target: Rc<RefCell<Option<(String, Option<String>)>>>,
+    latest_message_ts: Rc<RefCell<Option<String>>>,
+    read_candidate: Rc<RefCell<Option<String>>>,
+    read_generation: Rc<Cell<u64>>,
+    recheck_read_visibility: Rc<dyn Fn()>,
 }
 
 impl std::fmt::Debug for NativeTimelineView {
@@ -740,6 +766,142 @@ impl NativeTimelineView {
             });
         }
 
+        // --- Visibility-based automatic read-marking ---
+        // Purely event-driven: re-evaluated on scroll, on viewport resize,
+        // and once after new content loads - never on a per-frame tick
+        // callback, which would keep the compositor/display pipeline from
+        // idling for a check that's a no-op nearly all the time.
+        let read_mark_target: Rc<RefCell<Option<(String, Option<String>)>>> =
+            Rc::new(RefCell::new(None));
+        let latest_message_ts: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let read_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let read_candidate: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+        let recheck_read_visibility: Rc<dyn Fn()> = {
+            let list_view = list_view.clone();
+            let scrolled_window = scrolled_window.clone();
+            let read_mark_target = read_mark_target.clone();
+            let latest_message_ts = latest_message_ts.clone();
+            let read_generation = read_generation.clone();
+            let read_candidate = read_candidate.clone();
+            let on_action = on_action.clone();
+            Rc::new(move || {
+                let viewport_height = f64::from(scrolled_window.height());
+                if viewport_height <= 0.0 {
+                    return;
+                }
+                let mut best: Option<String> = None;
+                let mut child = list_view.first_child();
+                while let Some(widget) = child {
+                    if let Some(bounds) = widget.compute_bounds(&scrolled_window) {
+                        let row_height = f64::from(bounds.height());
+                        if row_height > 0.0 {
+                            let top = f64::from(bounds.y());
+                            let bottom = top + row_height;
+                            if row_qualifies_for_read(top, bottom, viewport_height) {
+                                // `list_view.first_child()` walks GTK's own
+                                // internal row wrapper widgets, not the
+                                // content widget we tagged via
+                                // `set_widget_name` in
+                                // `wrap_with_unread_separator_if_needed` -
+                                // the tag lives one or more levels further
+                                // down the tree, so descend to find it
+                                // rather than reading the wrapper's (always
+                                // empty) name directly.
+                                if let Some(ts) = row_message_ts(&widget) {
+                                    best = match best {
+                                        Some(current)
+                                            if crate::models::slack_timestamp_is_after(
+                                                &ts, &current,
+                                            ) =>
+                                        {
+                                            Some(ts)
+                                        }
+                                        Some(current) => Some(current),
+                                        None => Some(ts),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    child = widget.next_sibling();
+                }
+
+                if *read_candidate.borrow() == best {
+                    return;
+                }
+                *read_candidate.borrow_mut() = best.clone();
+                // Invalidate any in-flight dwell timer for the previous
+                // candidate - a changed or vanished candidate resets the
+                // dwell clock rather than pausing it.
+                read_generation.set(read_generation.get().wrapping_add(1));
+                let expected = read_generation.get();
+
+                let Some(candidate_ts) = best else {
+                    return;
+                };
+                let Some((channel_id, thread_ts)) = read_mark_target.borrow().clone() else {
+                    return;
+                };
+                // Thread read-state is all-or-nothing (`ThreadRecord::mark_read`
+                // jumps straight to `latest_reply`) - only fire for a thread
+                // surface once the dwelling candidate IS the actual latest
+                // message, never for partial progress through older replies.
+                if thread_ts.is_some()
+                    && latest_message_ts.borrow().as_deref() != Some(candidate_ts.as_str())
+                {
+                    return;
+                }
+                let read_generation = read_generation.clone();
+                let on_action = on_action.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+                    if read_generation.get() != expected {
+                        return;
+                    }
+                    if let Some(handler) = on_action.borrow().as_ref() {
+                        handler(TimelineAction::AutoMarkRead {
+                            channel_id,
+                            thread_ts,
+                            ts: candidate_ts,
+                        });
+                    }
+                });
+            })
+        };
+
+        let scroll_check_pending = Rc::new(Cell::new(false));
+        {
+            let recheck = recheck_read_visibility.clone();
+            let pending = scroll_check_pending.clone();
+            scrolled_window.vadjustment().connect_value_changed(move |_| {
+                if !pending.get() {
+                    pending.set(true);
+                    let recheck = recheck.clone();
+                    let pending = pending.clone();
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
+                        pending.set(false);
+                        recheck();
+                    });
+                }
+            });
+        }
+        {
+            let recheck = recheck_read_visibility.clone();
+            scrolled_window
+                .vadjustment()
+                .connect_notify_local(Some("page-size"), move |_, _| {
+                    recheck();
+                });
+        }
+        {
+            let recheck = recheck_read_visibility.clone();
+            scrolled_window
+                .vadjustment()
+                .connect_notify_local(Some("upper"), move |_, _| {
+                    recheck();
+                });
+        }
+
         overlay.set_child(Some(&scrolled_window));
 
         {
@@ -794,7 +956,25 @@ impl NativeTimelineView {
             context,
             on_action,
             asset_update_pending: Rc::new(Cell::new(false)),
+            read_mark_target,
+            latest_message_ts,
+            read_candidate,
+            read_generation,
+            recheck_read_visibility,
         }
+    }
+
+    /// Sets which conversation/thread this view's visibility-based
+    /// auto-read-marking should advance. `thread_ts` is `None` for the main
+    /// timeline surface (advances the conversation's `last_read` via
+    /// `conversations.mark`) and `Some` for a thread pane surface (advances
+    /// the thread's local-only read state instead).
+    pub(crate) fn set_read_mark_target(&self, channel_id: &str, thread_ts: Option<&str>) {
+        *self.read_mark_target.borrow_mut() =
+            Some((channel_id.to_string(), thread_ts.map(ToString::to_string)));
+        *self.read_candidate.borrow_mut() = None;
+        self.read_generation.set(self.read_generation.get().wrapping_add(1));
+        (self.recheck_read_visibility)();
     }
 
     pub(crate) fn set_on_action<F: Fn(TimelineAction) + 'static>(&self, f: F) {
@@ -832,6 +1012,9 @@ impl NativeTimelineView {
         self.placeholder_label.set_visible(false);
         self.scrolled_window.set_visible(true);
         *self.context.borrow_mut() = Some(context.clone());
+        *self.latest_message_ts.borrow_mut() = messages.first().map(|msg| msg.ts.clone());
+        *self.read_candidate.borrow_mut() = None;
+        self.read_generation.set(self.read_generation.get().wrapping_add(1));
         self.store.remove_all();
         for msg in messages.iter().rev() {
             let obj = TimelineMessageObject::new(msg.clone());
@@ -848,12 +1031,18 @@ impl NativeTimelineView {
 
         let list_view = self.list_view.clone();
         let vadj = self.scrolled_window.vadjustment();
+        let recheck_read_visibility = self.recheck_read_visibility.clone();
         glib::idle_add_local_once(move || {
             if let Some(index) = focus_index {
                 list_view.scroll_to(index, gtk::ListScrollFlags::empty(), None);
             } else {
                 vadj.set_value(vadj.upper() - vadj.page_size());
             }
+            recheck_read_visibility();
+        });
+        let recheck_delayed = self.recheck_read_visibility.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+            recheck_delayed();
         });
     }
 
@@ -950,6 +1139,216 @@ impl Default for NativeTimelineView {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InlineCustomEmoji {
+    name: String,
+    url: String,
+}
+
+fn extract_custom_emojis_and_prepare_markup(
+    pango: &str,
+) -> (String, Vec<InlineCustomEmoji>) {
+    let mut result = String::with_capacity(pango.len());
+    let mut emojis = Vec::new();
+    let mut rest = pango;
+
+    while let Some(start) = rest.find("<conduit-custom-emoji ") {
+        result.push_str(&rest[..start]);
+        let tag_rest = &rest[start..];
+        if let Some(end) = tag_rest.find("/>") {
+            let tag_content = &tag_rest[..end + 2];
+            let name = extract_attr_value(tag_content, "name").unwrap_or_default();
+            let url = extract_attr_value(tag_content, "url").unwrap_or_default();
+            emojis.push(InlineCustomEmoji { name, url });
+            result.push('\u{FFFC}');
+            rest = &tag_rest[end + 2..];
+        } else {
+            result.push_str(&rest[..start + 22]);
+            rest = &rest[start + 22..];
+        }
+    }
+    result.push_str(rest);
+    (result, emojis)
+}
+
+fn unescape_xml_attribute(val: &str) -> String {
+    val.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')? + start;
+    Some(unescape_xml_attribute(&tag[start..end]))
+}
+
+fn create_inline_emoji_widget(
+    emoji: &InlineCustomEmoji,
+    context: &MessageHtmlContext,
+) -> Widget {
+    let local_path = resolve_cached_asset_path(&emoji.url, context)
+        .or_else(|| Path::new(&emoji.url).exists().then(|| PathBuf::from(&emoji.url)));
+
+    let widget = if let Some(path) = local_path {
+        load_animated_or_static_picture(&path, 18, 18, gtk::ContentFit::Contain)
+    } else {
+        let label = Label::new(Some(&format!(":{}:", emoji.name)));
+        label.set_selectable(false);
+        label.upcast::<Widget>()
+    };
+    widget.set_valign(gtk::Align::Center);
+    widget.set_tooltip_text(Some(&format!(":{}:", emoji.name)));
+    widget
+}
+
+/// A link extracted from Pango markup, as a char range of the visible text.
+#[derive(Debug, PartialEq)]
+struct MarkupLink {
+    start: i32,
+    end: i32,
+    href: String,
+}
+
+/// Removes `<a href>` tags, which are only valid in GtkLabel markup, and returns the
+/// links as char ranges into the text that results from parsing the stripped markup.
+fn strip_anchor_tags(markup: &str) -> (String, Vec<MarkupLink>) {
+    let mut out = String::with_capacity(markup.len());
+    let mut links = Vec::new();
+    let mut offset = 0i32;
+    let mut open: Option<(i32, String)> = None;
+    let mut rest = markup;
+
+    while let Some(pos) = rest.find(|c| c == '<' || c == '&') {
+        let (text, tail) = rest.split_at(pos);
+        out.push_str(text);
+        offset += text.chars().count() as i32;
+        if tail.starts_with('&') {
+            let len = tail.find(';').map_or(1, |i| i + 1);
+            out.push_str(&tail[..len]);
+            offset += 1;
+            rest = &tail[len..];
+            continue;
+        }
+        let Some(close) = tail.find('>') else {
+            out.push_str(tail);
+            rest = "";
+            break;
+        };
+        let tag = &tail[..=close];
+        if tag.starts_with("<a ") || tag == "<a>" {
+            let href = extract_attr_value(tag, "href").unwrap_or_default();
+            open = Some((offset, href));
+        } else if tag == "</a>" {
+            if let Some((start, href)) = open.take() {
+                if !href.is_empty() && offset > start {
+                    links.push(MarkupLink { start, end: offset, href });
+                }
+            }
+        } else {
+            out.push_str(tag);
+        }
+        rest = &tail[close + 1..];
+    }
+    out.push_str(rest);
+    (out, links)
+}
+
+/// Underlines link ranges in a TextView buffer and opens them on click.
+fn attach_text_view_links(view: &TextView, links: Vec<MarkupLink>) {
+    if links.is_empty() {
+        return;
+    }
+    let buffer = view.buffer();
+    let mut hrefs = Vec::with_capacity(links.len());
+    for (index, link) in links.into_iter().enumerate() {
+        let name = format!("conduit-link-{index}");
+        let tag = gtk::TextTag::builder()
+            .name(name.as_str())
+            .underline(pango::Underline::Single)
+            .build();
+        buffer.tag_table().add(&tag);
+        buffer.apply_tag(
+            &tag,
+            &buffer.iter_at_offset(link.start),
+            &buffer.iter_at_offset(link.end),
+        );
+        hrefs.push((name, link.href));
+    }
+    let click = gtk::GestureClick::new();
+    let click_view = view.clone();
+    click.connect_released(move |_, _, x, y| {
+        let (bx, by) =
+            click_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+        let Some(iter) = click_view.iter_at_location(bx, by) else {
+            return;
+        };
+        for tag in iter.tags() {
+            let Some(tag_name) = tag.name() else { continue };
+            if let Some((_, href)) = hrefs.iter().find(|(n, _)| n.as_str() == tag_name.as_str()) {
+                let _ = gtk::gio::AppInfo::launch_default_for_uri(
+                    href,
+                    None::<&gtk::gio::AppLaunchContext>,
+                );
+                break;
+            }
+        }
+    });
+    view.add_controller(click);
+}
+
+fn create_message_text_widget(
+    pango: &str,
+    context: &MessageHtmlContext,
+) -> Widget {
+    if !pango.contains("<conduit-custom-emoji ") {
+        let label = Label::new(None);
+        label.set_wrap(true);
+        label.set_wrap_mode(pango::WrapMode::WordChar);
+        label.set_selectable(true);
+        label.set_focus_on_click(false);
+        label.set_xalign(0.0);
+        label.set_markup(pango);
+        return label.upcast::<Widget>();
+    }
+
+    let (markup_clean, emojis) = extract_custom_emojis_and_prepare_markup(pango);
+    let (markup_clean, links) = strip_anchor_tags(&markup_clean);
+    let view = TextView::new();
+    view.set_editable(false);
+    view.set_cursor_visible(false);
+    view.set_wrap_mode(gtk::WrapMode::WordChar);
+    view.add_css_class("timeline-text-view");
+    register_timeline_css();
+
+    let buffer = view.buffer();
+    let mut iter = buffer.start_iter();
+    buffer.insert_markup(&mut iter, &markup_clean);
+    attach_text_view_links(&view, links);
+
+    let mut search_iter = buffer.start_iter();
+    for emoji in &emojis {
+        if let Some((start_match, end_match)) =
+            search_iter.forward_search("\u{FFFC}", gtk::TextSearchFlags::empty(), None)
+        {
+            let mut del_start = start_match.clone();
+            let mut del_end = end_match.clone();
+            buffer.delete(&mut del_start, &mut del_end);
+            let anchor = buffer.create_child_anchor(&mut del_start);
+            let emoji_widget = create_inline_emoji_widget(emoji, context);
+            view.add_child_at_anchor(&emoji_widget, &anchor);
+            search_iter = del_start;
+        } else {
+            break;
+        }
+    }
+
+    view.upcast::<Widget>()
 }
 
 #[derive(Debug, PartialEq)]
@@ -1088,27 +1487,15 @@ fn render_text_content(
                 let quote_box = Box::new(Orientation::Vertical, 0);
                 quote_box.add_css_class("blockquote");
                 let pango = crate::message_html::mrkdwn_to_pango(&quote_text, context);
-                let label = Label::new(None);
-                label.set_wrap(true);
-                label.set_wrap_mode(pango::WrapMode::WordChar);
-                label.set_selectable(true);
-                label.set_focus_on_click(false);
-                label.set_xalign(0.0);
-                label.set_markup(&format!("<i>{}</i>", pango));
-                quote_box.append(&label);
+                let text_widget = create_message_text_widget(&format!("<i>{}</i>", pango), context);
+                quote_box.append(&text_widget);
                 target_box.append(&quote_box);
             }
             TextSegment::Normal(normal_text) => {
                 if !normal_text.trim().is_empty() {
                     let pango = crate::message_html::mrkdwn_to_pango(&normal_text, context);
-                    let label = Label::new(None);
-                    label.set_wrap(true);
-                    label.set_wrap_mode(pango::WrapMode::WordChar);
-                    label.set_selectable(true);
-                    label.set_focus_on_click(false);
-                    label.set_xalign(0.0);
-                    label.set_markup(&pango);
-                    target_box.append(&label);
+                    let text_widget = create_message_text_widget(&pango, context);
+                    target_box.append(&text_widget);
                 }
             }
         }
@@ -1253,16 +1640,10 @@ fn render_blocks(
                             if let Some(field_text) = extract_block_text(field) {
                                 if !field_text.trim().is_empty() {
                                     let pango = crate::message_html::mrkdwn_to_pango(&field_text, context);
-                                    let field_label = Label::new(None);
-                                    field_label.set_wrap(true);
-                                    field_label.set_wrap_mode(pango::WrapMode::WordChar);
-                                    field_label.set_selectable(true);
-                                    field_label.set_focus_on_click(false);
-                                    field_label.set_xalign(0.0);
-                                    field_label.set_markup(&pango);
+                                    let field_widget = create_message_text_widget(&pango, context);
                                     let col = (idx % 2) as i32;
                                     let row = (idx / 2) as i32;
-                                    grid.attach(&field_label, col, row, 1, 1);
+                                    grid.attach(&field_widget, col, row, 1, 1);
                                 }
                             }
                         }
@@ -1305,14 +1686,8 @@ fn render_blocks(
                                         let full_text = format!("{prefix}{item_text}");
                                         let pango =
                                             crate::message_html::mrkdwn_to_pango(&full_text, context);
-                                        let label = Label::new(None);
-                                        label.set_wrap(true);
-                                        label.set_wrap_mode(pango::WrapMode::WordChar);
-                                        label.set_selectable(true);
-                                        label.set_focus_on_click(false);
-                                        label.set_xalign(0.0);
-                                        label.set_markup(&pango);
-                                        list_box.append(&label);
+                                        let item_widget = create_message_text_widget(&pango, context);
+                                        list_box.append(&item_widget);
                                     }
                                 }
                                 target_box.append(&list_box);
@@ -1341,14 +1716,8 @@ fn render_blocks(
                                 quote_box.add_css_class("blockquote");
                                 let pango =
                                     crate::message_html::mrkdwn_to_pango(&quote_text, context);
-                                let label = Label::new(None);
-                                label.set_wrap(true);
-                                label.set_wrap_mode(pango::WrapMode::WordChar);
-                                label.set_selectable(true);
-                                label.set_focus_on_click(false);
-                                label.set_xalign(0.0);
-                                label.set_markup(&format!("<i>{}</i>", pango));
-                                quote_box.append(&label);
+                                let quote_widget = create_message_text_widget(&format!("<i>{}</i>", pango), context);
+                                quote_box.append(&quote_widget);
                                 target_box.append(&quote_box);
                             }
                             _ => {}
@@ -1409,15 +1778,9 @@ fn render_blocks(
                         } else if let Some(text) = extract_block_text(elem) {
                             if !text.trim().is_empty() {
                                 let pango = crate::message_html::mrkdwn_to_pango(&text, context);
-                                let label = Label::new(None);
-                                label.set_wrap(true);
-                                label.set_wrap_mode(pango::WrapMode::WordChar);
-                                label.set_selectable(true);
-                                label.set_focus_on_click(false);
-                                label.set_xalign(0.0);
-                                label.add_css_class("dim-label");
-                                label.set_markup(&format!("<span size=\"small\">{}</span>", pango));
-                                context_box.append(&label);
+                                let text_widget = create_message_text_widget(&format!("<span size=\"small\">{}</span>", pango), context);
+                                text_widget.add_css_class("dim-label");
+                                context_box.append(&text_widget);
                             }
                         }
                     }
@@ -1685,14 +2048,8 @@ fn render_attachments(
     for (index, attachment) in attachments.iter().enumerate() {
         if let Some(pretext) = attachment.pretext.as_deref().filter(|s| !s.trim().is_empty()) {
             let pango = crate::message_html::mrkdwn_to_pango(pretext, context);
-            let label = Label::new(None);
-            label.set_wrap(true);
-            label.set_wrap_mode(pango::WrapMode::WordChar);
-            label.set_selectable(true);
-            label.set_focus_on_click(false);
-            label.set_xalign(0.0);
-            label.set_markup(&pango);
-            root_box.append(&label);
+            let pretext_widget = create_message_text_widget(&pango, context);
+            root_box.append(&pretext_widget);
         }
 
         let attach_box = Box::new(Orientation::Vertical, 4);
@@ -1723,14 +2080,8 @@ fn render_attachments(
 
         if let Some(text) = attachment.text.as_deref().filter(|s| !s.trim().is_empty()) {
             let pango = crate::message_html::mrkdwn_to_pango(text, context);
-            let label = Label::new(None);
-            label.set_wrap(true);
-            label.set_wrap_mode(pango::WrapMode::WordChar);
-            label.set_selectable(true);
-            label.set_focus_on_click(false);
-            label.set_xalign(0.0);
-            label.set_markup(&pango);
-            attach_box.append(&label);
+            let text_widget = create_message_text_widget(&pango, context);
+            attach_box.append(&text_widget);
         }
 
         if let Some(fields) = attachment.fields.as_deref().filter(|f| !f.is_empty()) {
@@ -1751,16 +2102,10 @@ fn render_attachments(
                     (false, false) => String::new(),
                 };
                 if !markup.is_empty() {
-                    let field_label = Label::new(None);
-                    field_label.set_wrap(true);
-                    field_label.set_wrap_mode(pango::WrapMode::WordChar);
-                    field_label.set_selectable(true);
-                    field_label.set_focus_on_click(false);
-                    field_label.set_xalign(0.0);
-                    field_label.set_markup(&markup);
+                    let field_widget = create_message_text_widget(&markup, context);
                     let col = (idx % 2) as i32;
                     let row = (idx / 2) as i32;
-                    grid.attach(&field_label, col, row, 1, 1);
+                    grid.attach(&field_widget, col, row, 1, 1);
                 }
             }
             attach_box.append(&grid);
@@ -2220,6 +2565,86 @@ fn rebuild_quick_bar(
     quick_bar.append(&overflow_btn);
 }
 
+/// A row qualifies as "read" for auto-mark-read purposes once at least 80%
+/// of either its own height or the viewport's height is within the visible
+/// range `[0, viewport_height]` (`row_top`/`row_bottom` in the same
+/// coordinate space, i.e. relative to the viewport's own origin).
+fn row_qualifies_for_read(row_top: f64, row_bottom: f64, viewport_height: f64) -> bool {
+    let row_height = row_bottom - row_top;
+    if row_height <= 0.0 || viewport_height <= 0.0 {
+        return false;
+    }
+    let overlap = (row_bottom.min(viewport_height) - row_top.max(0.0)).max(0.0);
+    overlap / row_height >= 0.8 || overlap / viewport_height >= 0.8
+}
+
+/// Recovers the message-ts tag set via `set_widget_name` in
+/// `wrap_with_unread_separator_if_needed`. `GtkListView` realizes each row
+/// behind its own internal wrapper widget, so the tagged content widget is
+/// one or more levels below whatever `list_view.first_child()`/`next_sibling()`
+/// yields, not the wrapper itself (which always has an empty name).
+fn row_message_ts(widget: &Widget) -> Option<String> {
+    let name = widget.widget_name();
+    if crate::models::is_slack_timestamp(&name) {
+        return Some(name.to_string());
+    }
+    // GtkListView row items wrap message box inside internal wrapper widget.
+    // Inspect direct children rather than recursing deeply into message components.
+    let mut child = widget.first_child();
+    while let Some(candidate) = child {
+        let name = candidate.widget_name();
+        if crate::models::is_slack_timestamp(&name) {
+            return Some(name.to_string());
+        }
+        child = candidate.next_sibling();
+    }
+    None
+}
+
+fn unread_separator_widget() -> Box {
+    let separator_row = Box::new(Orientation::Horizontal, 6);
+    separator_row.set_margin_top(4);
+    separator_row.set_margin_bottom(4);
+
+    let line = Separator::new(Orientation::Horizontal);
+    line.add_css_class("unread-separator-line");
+    line.set_valign(gtk::Align::Center);
+    line.set_hexpand(true);
+    separator_row.append(&line);
+
+    let label = Label::new(Some("New"));
+    label.add_css_class("caption");
+    label.add_css_class("unread-separator-label");
+    separator_row.append(&label);
+
+    separator_row
+}
+
+/// Wraps `content` with the unread separator above it when `message_ts`
+/// matches the frozen anchor in `context`. Must wrap in an outer VERTICAL
+/// container regardless of `content`'s own orientation (e.g. the
+/// horizontal system-message row), otherwise the separator would be laid
+/// out side-by-side with the row instead of above it.
+fn wrap_with_unread_separator_if_needed(
+    content: Box,
+    message_ts: &str,
+    context: &MessageHtmlContext,
+) -> Box {
+    // Tag the row with its message ts (repurposing the CSS/accessible widget
+    // name as a plain string tag, not used for CSS selection anywhere in this
+    // app) so the visibility-based read-marking walk can recover which
+    // message a given realized row widget corresponds to.
+    content.set_widget_name(message_ts);
+    if context.unread_separator_ts.as_deref() != Some(message_ts) {
+        return content;
+    }
+    let outer = Box::new(Orientation::Vertical, 0);
+    outer.append(&unread_separator_widget());
+    outer.append(&content);
+    outer.set_widget_name(message_ts);
+    outer
+}
+
 pub(crate) fn build_timeline_message_widget(
     message: &SlackMessage,
     context: &MessageHtmlContext,
@@ -2254,17 +2679,11 @@ pub(crate) fn build_timeline_message_widget(
             });
 
             let pango = crate::message_html::mrkdwn_to_pango(sys_text, context);
-            let label = Label::new(None);
-            label.set_wrap(true);
-            label.set_wrap_mode(pango::WrapMode::WordChar);
-            label.set_selectable(true);
-            label.set_focus_on_click(false);
-            label.set_xalign(0.0);
-            label.add_css_class("dim-label");
-            label.set_markup(&format!("<i>{}</i>", pango));
-            root_box.append(&label);
+            let text_widget = create_message_text_widget(&format!("<i>{}</i>", pango), context);
+            text_widget.add_css_class("dim-label");
+            root_box.append(&text_widget);
 
-            return root_box;
+            return wrap_with_unread_separator_if_needed(root_box, &message.ts, context);
         }
     }
 
@@ -2523,7 +2942,7 @@ pub(crate) fn build_timeline_message_widget(
         root_box.add_controller(motion);
     }
 
-    root_box
+    wrap_with_unread_separator_if_needed(root_box, &message.ts, context)
 }
 
 #[cfg(test)]
@@ -2534,6 +2953,17 @@ mod tests {
 
     use crate::message_html::MessageHtmlContext;
     use crate::models::{SlackAttachmentField, SlackFile, SlackMessage, SlackReaction};
+
+    #[test]
+    fn strip_anchor_tags_returns_link_ranges_of_visible_text() {
+        let (clean, links) =
+            strip_anchor_tags("a &amp; <b>b</b> <a href=\"https://x.io/?a=1&amp;b=2\">link</a> z");
+        assert_eq!(clean, "a &amp; <b>b</b> link z");
+        assert_eq!(
+            links,
+            vec![MarkupLink { start: 6, end: 10, href: "https://x.io/?a=1&b=2".into() }]
+        );
+    }
 
     fn test_context() -> MessageHtmlContext {
         MessageHtmlContext {
@@ -2555,23 +2985,58 @@ mod tests {
             custom_emojis: Arc::default(),
             timeline_generation: None,
             last_read: None,
+            unread_separator_ts: None,
             message_control_handles: HashMap::default(),
             message_control_action_handles: HashMap::default(),
         }
     }
 
-    fn ensure_gtk() -> bool {
-        if gtk::is_initialized() {
-            return true;
-        }
-        std::panic::catch_unwind(|| gtk::init()).ok().and_then(|r| r.ok()).is_some()
-    }
+    static GTK_TEST_RUNNER: std::sync::OnceLock<
+        Option<std::sync::mpsc::Sender<std::boxed::Box<dyn FnOnce() + Send>>>,
+    > = std::sync::OnceLock::new();
 
-    fn run_gtk_test<F: FnOnce()>(f: F) {
-        if !ensure_gtk() {
+    fn run_gtk_test<F: FnOnce() + Send + 'static>(f: F) {
+        let sender = GTK_TEST_RUNNER.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<std::boxed::Box<dyn FnOnce() + Send>>();
+            let (init_tx, init_rx) = std::sync::mpsc::channel::<bool>();
+            std::thread::Builder::new()
+                .name("gtk-test-worker".into())
+                .spawn(move || {
+                    let ok = std::panic::catch_unwind(gtk::init)
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .is_some();
+                    let _ = init_tx.send(ok);
+                    if !ok {
+                        return;
+                    }
+                    while let Ok(job) = rx.recv() {
+                        job();
+                    }
+                })
+                .ok()?;
+            if init_rx.recv().unwrap_or(false) {
+                Some(tx)
+            } else {
+                None
+            }
+        });
+
+        let Some(tx) = sender.as_ref() else {
             return;
+        };
+
+        let (done_tx, done_rx) =
+            std::sync::mpsc::channel::<Result<(), std::boxed::Box<dyn std::any::Any + Send>>>();
+        let job = std::boxed::Box::new(move || {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = done_tx.send(res);
+        });
+        if tx.send(job).is_ok() {
+            if let Ok(Err(panic_payload)) = done_rx.recv() {
+                std::panic::resume_unwind(panic_payload);
+            }
         }
-        f();
     }
 
     #[test]
@@ -2607,56 +3072,54 @@ mod tests {
 
     #[test]
     fn giphy_attachment_image_renders_instead_of_nothing() {
-        if !ensure_gtk() {
-            return;
-        }
+        run_gtk_test(|| {
+            let cache_dir = crate::config::image_asset_cache_dir();
+            let ws_dir = cache_dir.join("test_ws_giphy");
+            let _ = std::fs::create_dir_all(&ws_dir);
 
-        let cache_dir = crate::config::image_asset_cache_dir();
-        let ws_dir = cache_dir.join("test_ws_giphy");
-        let _ = std::fs::create_dir_all(&ws_dir);
+            let test_url = "https://media.giphy.com/media/test123/giphy.gif";
+            let hash = {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update("test_ws_giphy".as_bytes());
+                hasher.update([0]);
+                hasher.update(test_url.as_bytes());
+                format!("{:x}", hasher.finalize())
+            };
+            let dummy_file = ws_dir.join(format!("{hash}.png"));
+            // Not a real image - this only exercises the "fails to parse as an
+            // animation" fallback to a static texture/picture, which is enough to
+            // prove the attachment renders an image widget instead of nothing.
+            std::fs::write(&dummy_file, b"not a real image").unwrap();
 
-        let test_url = "https://media.giphy.com/media/test123/giphy.gif";
-        let hash = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update("test_ws_giphy".as_bytes());
-            hasher.update([0]);
-            hasher.update(test_url.as_bytes());
-            format!("{:x}", hasher.finalize())
-        };
-        let dummy_file = ws_dir.join(format!("{hash}.png"));
-        // Not a real image - this only exercises the "fails to parse as an
-        // animation" fallback to a static texture/picture, which is enough to
-        // prove the attachment renders an image widget instead of nothing.
-        std::fs::write(&dummy_file, b"not a real image").unwrap();
+            let ctx = test_context();
+            let root_box = Box::new(Orientation::Vertical, 0);
+            let attachment = SlackAttachment {
+                image_url: Some(test_url.to_string()),
+                is_animated: Some(true),
+                ..Default::default()
+            };
+            render_attachments(&[attachment], &root_box, &ctx, "1710000000.000100");
 
-        let ctx = test_context();
-        let root_box = Box::new(Orientation::Vertical, 0);
-        let attachment = SlackAttachment {
-            image_url: Some(test_url.to_string()),
-            is_animated: Some(true),
-            ..Default::default()
-        };
-        render_attachments(&[attachment], &root_box, &ctx, "1710000000.000100");
+            let attach_box = root_box
+                .first_child()
+                .and_then(|w| w.downcast::<Box>().ok())
+                .expect("attach_box should be appended to root_box");
+            let media_wrapper = attach_box
+                .first_child()
+                .and_then(|w| w.downcast::<Box>().ok())
+                .expect("collapsible media wrapper should be the only attach_box child");
+            let toggle = media_wrapper
+                .first_child()
+                .and_then(|w| w.downcast::<ToggleButton>().ok());
+            assert!(
+                toggle.is_some(),
+                "expected a collapse/expand toggle button, i.e. an image widget was built"
+            );
 
-        let attach_box = root_box
-            .first_child()
-            .and_then(|w| w.downcast::<Box>().ok())
-            .expect("attach_box should be appended to root_box");
-        let media_wrapper = attach_box
-            .first_child()
-            .and_then(|w| w.downcast::<Box>().ok())
-            .expect("collapsible media wrapper should be the only attach_box child");
-        let toggle = media_wrapper
-            .first_child()
-            .and_then(|w| w.downcast::<ToggleButton>().ok());
-        assert!(
-            toggle.is_some(),
-            "expected a collapse/expand toggle button, i.e. an image widget was built"
-        );
-
-        let _ = std::fs::remove_file(dummy_file);
-        let _ = std::fs::remove_dir(ws_dir);
+            let _ = std::fs::remove_file(dummy_file);
+            let _ = std::fs::remove_dir(ws_dir);
+        });
     }
 
     #[test]
@@ -2686,11 +3149,8 @@ mod tests {
 
     #[test]
     fn test_timeline_message_widget_all_gtk() {
-        if !ensure_gtk() {
-            return;
-        }
-
-        let ctx = test_context();
+        run_gtk_test(|| {
+            let ctx = test_context();
 
         // 1. Basic message
         let mut msg1 = SlackMessage::default();
@@ -2953,29 +3413,87 @@ mod tests {
 
         let _ = std::fs::remove_file(dummy_file);
         let _ = std::fs::remove_dir(ws_dir);
+        });
     }
 
     #[test]
     fn test_reaction_wrap_box() {
-        if !ensure_gtk() {
-            return;
-        }
+        run_gtk_test(|| {
+            let wrap_box = ReactionWrapBox::new();
 
-        let wrap_box = ReactionWrapBox::new();
+            let btn1 = Button::with_label("👍 1");
+            let btn2 = Button::with_label("❤️ 2");
+            wrap_box.append(&btn1);
+            wrap_box.append(&btn2);
 
-        let btn1 = Button::with_label("👍 1");
-        let btn2 = Button::with_label("❤️ 2");
-        wrap_box.append(&btn1);
-        wrap_box.append(&btn2);
+            let (min_w, nat_w, _, _) = wrap_box.measure(Orientation::Horizontal, -1);
+            assert!(min_w >= 0);
+            assert!(nat_w >= min_w);
 
-        let (min_w, nat_w, _, _) = wrap_box.measure(Orientation::Horizontal, -1);
-        assert!(min_w >= 0);
-        assert!(nat_w >= min_w);
+            let (min_h, nat_h, _, _) = wrap_box.measure(Orientation::Vertical, 100);
+            assert!(min_h >= 0);
+            assert_eq!(min_h, nat_h);
 
-        let (min_h, nat_h, _, _) = wrap_box.measure(Orientation::Vertical, 100);
-        assert!(min_h >= 0);
-        assert_eq!(min_h, nat_h);
+            wrap_box.allocate(200, 100, -1, None);
+        });
+    }
 
-        wrap_box.allocate(200, 100, -1, None);
+    #[test]
+    fn row_qualifies_when_fully_visible() {
+        assert!(row_qualifies_for_read(0.0, 100.0, 500.0));
+    }
+
+    #[test]
+    fn row_qualifies_via_own_height_even_if_small_viewport_fraction() {
+        // A short row (40px) fully on-screen inside a tall viewport (2000px)
+        // satisfies the row-height condition even though it's a tiny sliver
+        // of the viewport.
+        assert!(row_qualifies_for_read(10.0, 50.0, 2000.0));
+    }
+
+    #[test]
+    fn row_qualifies_via_viewport_height_for_a_row_taller_than_the_viewport() {
+        // A row taller than the viewport can never show 80% of itself, but
+        // qualifies once it covers 80% of the viewport instead.
+        assert!(row_qualifies_for_read(-500.0, 1000.0, 400.0));
+    }
+
+    #[test]
+    fn row_does_not_qualify_when_mostly_scrolled_past() {
+        // Only the top 20px of a 100px row is visible in a tall viewport.
+        assert!(!row_qualifies_for_read(-80.0, 20.0, 2000.0));
+    }
+
+    #[test]
+    fn row_does_not_qualify_when_fully_offscreen() {
+        assert!(!row_qualifies_for_read(600.0, 700.0, 500.0));
+        assert!(!row_qualifies_for_read(-200.0, -100.0, 500.0));
+    }
+
+    #[test]
+    fn row_does_not_qualify_for_degenerate_sizes() {
+        assert!(!row_qualifies_for_read(0.0, 0.0, 500.0));
+        assert!(!row_qualifies_for_read(0.0, 100.0, 0.0));
+    }
+
+    #[test]
+    fn test_extract_custom_emojis_and_prepare_markup() {
+        let pango = "Hello <b><conduit-custom-emoji name=\"heart-sparkle\" url=\"https://example.com/heart.gif\"/></b> world";
+        let (clean, emojis) = extract_custom_emojis_and_prepare_markup(pango);
+        assert_eq!(clean, "Hello <b>\u{FFFC}</b> world");
+        assert_eq!(emojis.len(), 1);
+        assert_eq!(emojis[0].name, "heart-sparkle");
+        assert_eq!(emojis[0].url, "https://example.com/heart.gif");
+    }
+
+    #[test]
+    fn test_create_message_text_widget_with_custom_emoji() {
+        run_gtk_test(|| {
+            let context = test_context();
+            let pango = "Hi <b><conduit-custom-emoji name=\"heart-sparkle\" url=\"https://example.com/heart.gif\"/></b> there";
+            let widget = create_message_text_widget(pango, &context);
+            let view = widget.downcast::<TextView>().ok();
+            assert!(view.is_some(), "expected TextView for custom emoji markup");
+        });
     }
 }

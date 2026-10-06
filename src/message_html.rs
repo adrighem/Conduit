@@ -23,7 +23,7 @@ mod rich_plan;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 
-const MESSAGE_BASE_URI: &str = "app://conduit/messages/";
+
 const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
 pub(crate) const MESSAGE_BASE_FONT_SIZE_CSS_PX: f64 = 14.0;
 const CACHED_ASSET_URI_PREFIX: &str = "conduit-asset://";
@@ -52,6 +52,10 @@ pub struct MessageHtmlContext {
     pub custom_emojis: Arc<HashMap<String, String>>,
     pub timeline_generation: Option<u64>,
     pub last_read: Option<String>,
+    /// Frozen "first unread message" anchor for the unread separator line.
+    /// Computed once per conversation/thread-open and held fixed across
+    /// re-renders - see `ConduitWindow::unread_separator_anchor_ts`.
+    pub unread_separator_ts: Option<String>,
     pub(crate) message_control_handles: HashMap<MessageRef, MessageControlHandle>,
     pub(crate) message_control_action_handles:
         HashMap<(MessageRef, MessageControlKey), MessageControlHandle>,
@@ -364,6 +368,7 @@ pub fn timeline_dom_patch_call(patch: &TimelineDomPatch) -> String {
 }
 
 /// JavaScript suitable for applying one frame's timeline patches.
+#[cfg(test)]
 pub fn timeline_dom_delta_call(patches: &[TimelineDomPatch]) -> String {
     let payload = timeline_dom_payload(patches);
     let mut script = String::with_capacity(payload.len() + 75);
@@ -411,10 +416,6 @@ impl TimelineScrollBehavior {
             Self::StickToBottom => "stick-to-bottom",
         }
     }
-}
-
-pub fn base_uri() -> &'static str {
-    MESSAGE_BASE_URI
 }
 
 fn normalize_language_tag(locale: &str) -> Option<String> {
@@ -787,6 +788,7 @@ pub fn conversation_document(
     conversation_document_with_focus(channel_id, messages, context, None)
 }
 
+#[cfg(test)]
 pub fn conversation_document_with_focus(
     channel_id: &str,
     messages: &[SlackMessage],
@@ -1949,6 +1951,7 @@ fn timeline_scroll_identity(channel_id: &str, thread_ts: Option<&str>) -> String
     }
 }
 
+#[cfg(test)]
 fn timeline_dom_runtime_script() -> &'static str {
     include_str!("timeline_dom_runtime.js")
 }
@@ -3521,21 +3524,7 @@ fn thread_response_html(
     )
 }
 
-pub fn mark_unread_action_url(channel_id: &str, message: &SlackMessage) -> String {
-    format!(
-        "conduit://mark-unread?channel={}&ts={}",
-        encode_query(channel_id),
-        encode_query(&message.ts)
-    )
-}
 
-pub fn forward_action_url(channel_id: &str, message: &SlackMessage) -> String {
-    format!(
-        "conduit://forward?channel={}&ts={}",
-        encode_query(channel_id),
-        encode_query(&message.ts)
-    )
-}
 
 pub fn thread_action_url(channel_id: &str, ts: &str) -> String {
     format!(
@@ -3565,38 +3554,7 @@ pub fn reaction_action_url(
     url
 }
 
-pub fn save_action_url(
-    channel_id: &str,
-    message: &SlackMessage,
-    add: bool,
-    thread_ts: Option<&str>,
-) -> String {
-    let mut url = format!(
-        "conduit://save?channel={}&ts={}&add={}",
-        encode_query(channel_id),
-        encode_query(&message.ts),
-        add
-    );
 
-    append_thread_ts_query(&mut url, thread_ts);
-    url
-}
-
-pub fn copy_message_action_url(channel_id: &str, message: &SlackMessage) -> String {
-    format!(
-        "conduit://copy-message?channel={}&ts={}",
-        encode_query(channel_id),
-        encode_query(&message.ts)
-    )
-}
-
-pub fn copy_link_action_url(channel_id: &str, message: &SlackMessage) -> String {
-    format!(
-        "conduit://copy-link?channel={}&ts={}",
-        encode_query(channel_id),
-        encode_query(&message.ts)
-    )
-}
 
 pub fn load_more_action_url(channel_id: &str, cursor: &str, thread_ts: Option<&str>) -> String {
     let mut url = format!(
@@ -3980,6 +3938,13 @@ fn render_emoji_shortcode_pango(
 
     let rendered = match emoji {
         Some(EmojiValue::Unicode(val)) => escape_pango(val),
+        Some(EmojiValue::CustomImage(ref url)) => {
+            format!(
+                "<conduit-custom-emoji name=\"{}\" url=\"{}\"/>",
+                escape_pango(&resolved_code),
+                escape_pango(url)
+            )
+        }
         _ => escape_pango(shortcode),
     };
 
@@ -7065,10 +7030,26 @@ mod tests {
 
     #[test]
     fn test_mrkdwn_to_pango_emoji() {
-        let context = MessageHtmlContext::default();
+        let mut context = MessageHtmlContext::default();
         let input = ":smile: and :unknown_emoji:";
         let output = mrkdwn_to_pango(input, &context);
         assert_eq!(output, "😄 and :unknown_emoji:");
+
+        let mut emojis = HashMap::new();
+        emojis.insert(
+            "heart-sparkle".to_string(),
+            "https://emoji.slack-edge.com/heart-sparkle.gif".to_string(),
+        );
+        let custom_context = MessageHtmlContext {
+            custom_emojis: std::sync::Arc::new(emojis),
+            ..MessageHtmlContext::default()
+        };
+        let custom_input = "Hello :heart-sparkle: world";
+        let custom_output = mrkdwn_to_pango(custom_input, &custom_context);
+        assert_eq!(
+            custom_output,
+            "Hello <conduit-custom-emoji name=\"heart-sparkle\" url=\"https://emoji.slack-edge.com/heart-sparkle.gif\"/> world"
+        );
     }
 
     #[test]

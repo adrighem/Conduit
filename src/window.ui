@@ -203,6 +203,9 @@
                     <property name="tag">conversations</property>
                     <property name="child">
                       <object class="AdwToolbarView">
+                        <style>
+                          <class name="conduit-themed-sidebar"/>
+                        </style>
                         <child type="top">
                           <object class="AdwHeaderBar">
                             <property name="title-widget">
@@ -278,9 +281,9 @@
                                   </object>
                                 </child>
                                 <child>
-                                  <object class="GtkToggleButton" id="sidebar_all_filter_button">
-                                    <property name="icon-name">view-list-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Show All Conversations</property>
+                                  <object class="GtkToggleButton" id="sidebar_unread_filter_button">
+                                    <property name="label" translatable="yes">Unread</property>
+                                    <property name="tooltip-text" translatable="yes">Show Only Unread Conversations</property>
                                   </object>
                                 </child>
                               </object>
@@ -546,16 +549,6 @@
                                     <property name="spacing">4</property>
                                     <property name="visible">False</property>
                                     <child>
-                                      <object class="GtkLabel">
-                                        <property name="label" translatable="yes">Message</property>
-                                        <property name="xalign">0</property>
-                                        <property name="mnemonic-widget">message_entry</property>
-                                        <style>
-                                          <class name="caption"/>
-                                        </style>
-                                      </object>
-                                    </child>
-                                    <child>
                                       <object class="AdwBreakpointBin" id="message_format_breakpoint">
                                         <property name="child">
                                           <object class="GtkBox" id="message_format_toolbar">
@@ -598,6 +591,9 @@
                                             <property name="max-content-height">132</property>
                                             <property name="child">
                                               <object class="GtkTextView" id="message_entry">
+                                                <accessibility>
+                                                  <property name="label" translatable="yes">Message</property>
+                                                </accessibility>
                                                 <property name="wrap-mode">word-char</property>
                                                 <property name="accepts-tab">False</property>
                                                 <property name="top-margin">7</property>
@@ -678,16 +674,6 @@
                                     <property name="orientation">vertical</property>
                                     <property name="spacing">4</property>
                                     <child>
-                                      <object class="GtkLabel">
-                                        <property name="label" translatable="yes">Reply</property>
-                                        <property name="xalign">0</property>
-                                        <property name="mnemonic-widget">thread_entry</property>
-                                        <style>
-                                          <class name="caption"/>
-                                        </style>
-                                      </object>
-                                    </child>
-                                    <child>
                                       <object class="AdwBreakpointBin" id="thread_format_breakpoint">
                                         <property name="child">
                                           <object class="GtkBox" id="thread_format_toolbar">
@@ -730,6 +716,9 @@
                                             <property name="max-content-height">132</property>
                                             <property name="child">
                                               <object class="GtkTextView" id="thread_entry">
+                                                <accessibility>
+                                                  <property name="label" translatable="yes">Reply</property>
+                                                </accessibility>
                                                 <property name="wrap-mode">word-char</property>
                                                 <property name="accepts-tab">False</property>
                                                 <property name="top-margin">7</property>

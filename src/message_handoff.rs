@@ -168,8 +168,10 @@ impl PresentationRevision {
 
 #[derive(Clone, Debug)]
 struct HandleEntry {
+    #[cfg(test)]
     session_epoch: u64,
     target: MessageControlTarget,
+    #[cfg(test)]
     revision: PresentationRevision,
 }
 
@@ -366,6 +368,7 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
             .map(|(_, handle)| handle.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve(
         &self,
         handle: &MessageControlHandle,
@@ -389,6 +392,7 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         Ok(entry.target.message.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_target(
         &self,
         handle: &MessageControlHandle,
@@ -421,6 +425,7 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         Ok(target)
     }
 
+    #[cfg(test)]
     pub(crate) fn claim_token(
         &mut self,
         token: &str,
@@ -457,8 +462,10 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
             })
             .ok_or(HandleRegistrationError::TokenSourceExhausted)?;
         let entry = HandleEntry {
+            #[cfg(test)]
             session_epoch: self.session_epoch,
             target: target.clone(),
+            #[cfg(test)]
             revision,
         };
         self.entries.insert(handle.clone(), entry);
@@ -483,8 +490,11 @@ impl std::error::Error for HandleRegistrationError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HandleResolutionError {
     Malformed,
+    #[cfg(test)]
     Unknown,
+    #[cfg(test)]
     Stale,
+    #[cfg(test)]
     Claimed,
 }
 
@@ -492,8 +502,11 @@ impl fmt::Display for HandleResolutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Malformed => formatter.write_str("malformed message-control handle"),
+            #[cfg(test)]
             Self::Unknown => formatter.write_str("unknown message-control handle"),
+            #[cfg(test)]
             Self::Stale => formatter.write_str("stale message-control handle"),
+            #[cfg(test)]
             Self::Claimed => formatter.write_str("message-control handle is already in use"),
         }
     }

@@ -67,6 +67,7 @@ pub enum RuntimeCommand {
     LoadHistory {
         channel_id: String,
     },
+    #[allow(dead_code)]
     LoadOlderHistory {
         channel_id: String,
         cursor: String,
@@ -75,11 +76,13 @@ pub enum RuntimeCommand {
         channel_id: String,
         ts: String,
     },
+    #[allow(dead_code)]
     LoadOlderThread {
         channel_id: String,
         ts: String,
         cursor: String,
     },
+    #[allow(dead_code)]
     LoadMessageContext(SearchMessageLocation),
     SearchMessages {
         query: String,
@@ -104,14 +107,17 @@ pub enum RuntimeCommand {
         url: String,
         name: String,
     },
+    #[allow(dead_code)]
     DownloadAttachment {
         url: String,
         name: String,
     },
+    #[allow(dead_code)]
     ResolveMessagePermalink {
         channel_id: String,
         ts: String,
     },
+    #[allow(dead_code)]
     ExecuteMessageAction {
         request: SlackMessageActionRequest,
         control_handle: MessageControlHandle,
@@ -142,6 +148,7 @@ pub enum RuntimeCommand {
         add: bool,
         thread_ts: Option<String>,
     },
+    #[allow(dead_code)]
     SetSaved {
         channel_id: String,
         ts: String,
@@ -162,6 +169,12 @@ pub enum RuntimeCommand {
     MarkConversationUnread {
         channel_id: String,
         ts: String,
+    },
+    /// Local-only: no Slack API backs thread-level read state. Marks the
+    /// given thread fully read up to its latest known reply.
+    MarkThreadRead {
+        channel_id: String,
+        thread_ts: String,
     },
     UploadFiles {
         channel_id: String,
@@ -231,6 +244,7 @@ pub enum RuntimeOperation {
     SocketMode,
     MarkRead,
     MarkUnread,
+    MarkThreadRead,
     Huddle,
 }
 

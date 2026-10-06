@@ -77,10 +77,12 @@ impl PipelineCounters {
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn record_document_load(&self) {
         saturating_add(&self.document_loads, 1);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_timeline_delta(&self) {
         saturating_add(&self.timeline_deltas, 1);
     }
