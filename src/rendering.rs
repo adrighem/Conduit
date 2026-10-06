@@ -5,7 +5,12 @@ use std::collections::HashMap;
 
 pub fn extract_user_ids(message: &SlackMessage) -> Vec<String> {
     let mut ids = Vec::new();
-    if let Some(user) = message.author_user_id() {
+    // App messages also load their invoking user so the directory can tell
+    // a slash-command person from a bot user (see `display_user_id`).
+    for user in [message.author_user_id(), message.app_invoking_user_id()]
+        .into_iter()
+        .flatten()
+    {
         ids.push(user.to_string());
     }
     if message.content_version == crate::rich_message::MESSAGE_CONTENT_VERSION {

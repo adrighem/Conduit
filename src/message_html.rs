@@ -37,6 +37,8 @@ pub struct MessageHtmlContext {
     pub user_names: Arc<HashMap<String, String>>,
     pub user_full_names: Arc<HashMap<String, String>>,
     pub user_avatar_urls: Arc<HashMap<String, String>>,
+    /// Directory users flagged `is_bot`; see [`Self::display_user_id`].
+    pub bot_user_ids: Arc<HashSet<String>>,
     pub conversation_titles: HashMap<String, String>,
     pub private_conversation_ids: HashSet<String>,
     pub user_statuses: Arc<HashMap<String, SlackUserStatus>>,
@@ -62,6 +64,23 @@ pub struct MessageHtmlContext {
 }
 
 impl MessageHtmlContext {
+    /// The user whose name and avatar head `message`: its author, or for an
+    /// app-posted message the invoking person (e.g. `/giphy`), provided the
+    /// directory knows that user and does not flag them as a bot. Anything
+    /// else keeps the app identity.
+    pub(crate) fn display_user_id<'message>(
+        &self,
+        message: &'message SlackMessage,
+    ) -> Option<&'message str> {
+        message.author_user_id().or_else(|| {
+            message.app_invoking_user_id().filter(|user_id| {
+                !self.bot_user_ids.contains(*user_id)
+                    && (self.user_full_names.contains_key(*user_id)
+                        || self.user_names.contains_key(*user_id))
+            })
+        })
+    }
+
     fn message_control_handle(
         &self,
         channel_id: Option<&str>,
@@ -3022,25 +3041,7 @@ fn attachments_html(
 }
 
 fn file_is_rendered_in_document(message: &SlackMessage, file: &SlackFile) -> bool {
-    message.document.image_urls().any(|document_url| {
-        [
-            file.url_private.as_deref(),
-            file.url_private_download.as_deref(),
-            file.url_static_preview.as_deref(),
-            file.thumb_480_gif.as_deref(),
-            file.thumb_360_gif.as_deref(),
-            file.thumb_480.as_deref(),
-            file.thumb_360.as_deref(),
-            file.thumb_720.as_deref(),
-            file.thumb_1024.as_deref(),
-            file.thumb_160.as_deref(),
-            file.thumb_80.as_deref(),
-            file.thumb_64.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|file_url| file_url == document_url)
-    })
+    SlackMessage::document_renders_file(&message.document, file)
 }
 
 #[allow(dead_code)]

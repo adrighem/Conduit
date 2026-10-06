@@ -319,6 +319,7 @@ mod imp {
         pub user_names: RefCell<Arc<HashMap<String, String>>>,
         pub user_full_names: RefCell<Arc<HashMap<String, String>>>,
         pub user_avatar_urls: RefCell<Arc<HashMap<String, String>>>,
+        pub bot_user_ids: RefCell<Arc<HashSet<String>>>,
         pub user_search_aliases: RefCell<sidebar::UserSearchAliases>,
         pub user_statuses: RefCell<Arc<sidebar::UserStatuses>>,
         pub status_expiry_generation: Cell<u64>,
@@ -2412,10 +2413,7 @@ fn attachment_image_asset_request(
         .image_url
         .as_deref()
         .or(attachment.thumb_url.as_deref())?;
-    if !crate::slack::supports_unfurl_attachment_preview_url(url) {
-        return None;
-    }
-    bounded_image_asset_request(url)
+    native_preview_asset_request(url)
 }
 
 fn native_preview_asset_request(url: &str) -> Option<(String, String)> {
@@ -8057,6 +8055,7 @@ impl ConduitWindow {
         *imp.user_names.borrow_mut() = Arc::default();
         *imp.user_full_names.borrow_mut() = Arc::default();
         *imp.user_avatar_urls.borrow_mut() = Arc::default();
+        *imp.bot_user_ids.borrow_mut() = Arc::default();
         imp.user_search_aliases.borrow_mut().clear();
         *imp.user_statuses.borrow_mut() = Arc::default();
         imp.status_expiry_generation
@@ -8605,6 +8604,7 @@ impl ConduitWindow {
             *imp.user_names.borrow_mut() = Arc::new(HashMap::new());
             *imp.user_full_names.borrow_mut() = Arc::new(HashMap::new());
             *imp.user_avatar_urls.borrow_mut() = Arc::new(HashMap::new());
+            *imp.bot_user_ids.borrow_mut() = Arc::default();
             *imp.user_search_aliases.borrow_mut() = HashMap::new();
             *imp.user_statuses.borrow_mut() = Arc::new(HashMap::new());
         }
@@ -8612,6 +8612,7 @@ impl ConduitWindow {
         let mut names = HashMap::new();
         let mut full_names = HashMap::new();
         let mut avatar_urls = HashMap::new();
+        let mut bot_flags = Vec::new();
         let mut aliases = HashMap::new();
         let mut statuses = HashMap::new();
         let mut cleared_statuses = Vec::new();
@@ -8620,6 +8621,7 @@ impl ConduitWindow {
                 continue;
             };
             affected_user_ids.insert(user_id.clone());
+            bot_flags.push((user_id.clone(), user.is_bot.unwrap_or(false)));
             if let Some(name) = user.display_name() {
                 names.insert(user_id.clone(), name);
             }
@@ -8649,6 +8651,17 @@ impl ConduitWindow {
             Arc::make_mut(&mut imp.user_names.borrow_mut()).extend(names);
             Arc::make_mut(&mut imp.user_full_names.borrow_mut()).extend(full_names);
             Arc::make_mut(&mut imp.user_avatar_urls.borrow_mut()).extend(avatar_urls);
+            {
+                let mut bot_user_ids = imp.bot_user_ids.borrow_mut();
+                let bot_user_ids = Arc::make_mut(&mut bot_user_ids);
+                for (user_id, is_bot) in bot_flags {
+                    if is_bot {
+                        bot_user_ids.insert(user_id);
+                    } else {
+                        bot_user_ids.remove(&user_id);
+                    }
+                }
+            }
             imp.user_search_aliases.borrow_mut().extend(aliases);
             let mut known_statuses = imp.user_statuses.borrow_mut();
             let known_statuses = Arc::make_mut(&mut known_statuses);
@@ -12357,6 +12370,7 @@ impl ConduitWindow {
             user_names,
             user_full_names: imp.user_full_names.borrow().clone(),
             user_avatar_urls: imp.user_avatar_urls.borrow().clone(),
+            bot_user_ids: imp.bot_user_ids.borrow().clone(),
             conversation_titles,
             private_conversation_ids,
             user_statuses: imp.user_statuses.borrow().clone(),

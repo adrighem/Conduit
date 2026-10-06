@@ -4,7 +4,7 @@ use crate::models::{SlackAttachment, SlackFile};
 
 use crate::rich_message::{
     MessageAccessory as RichAccessory, MessageAttachment as RichAttachment,
-    MessageControl as RichControl, MessageControlConfirmation, MessageDocument as RichDocument,
+    MessageContextElement as RichContextElement, MessageControl as RichControl, MessageControlConfirmation, MessageDocument as RichDocument,
     MessageField as RichField, MessageImage as RichImage, MessageLinkedText as RichLinkedText,
     MessageNode as RichNode, MessageQuote as RichQuote, RichInline, RichInlineStyle, RichTextNode,
     SensitiveValue, SlackControlAction,
@@ -91,7 +91,7 @@ fn normalize_block(
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(block_text)
+                .filter_map(|element| normalize_context_element(element, files))
                 .collect::<Vec<_>>();
             (!elements.is_empty()).then_some(RichNode::Context(elements))
         }
@@ -181,7 +181,27 @@ fn normalize_image(value: &Value, files: &[SlackFile]) -> Option<RichImage> {
         .get("title")
         .and_then(block_text)
         .filter(|title| !title.trim().is_empty());
-    (url.is_some() || !alt.trim().is_empty()).then_some(RichImage { url, alt, title })
+    (url.is_some() || !alt.trim().is_empty()).then(|| {
+        RichImage::new(url, alt, title).with_size(
+            dimension(value.get("image_width")),
+            dimension(value.get("image_height")),
+        )
+    })
+}
+
+fn normalize_context_element(value: &Value, files: &[SlackFile]) -> Option<RichContextElement> {
+    if value.get("type").and_then(Value::as_str) == Some("image") {
+        return normalize_image(value, files).map(RichContextElement::Image);
+    }
+    block_text(value)
+        .filter(|text| !text.trim().is_empty())
+        .map(RichContextElement::Text)
+}
+
+fn dimension(value: Option<&Value>) -> Option<u32> {
+    value
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
 }
 
 fn is_call_url(value: &str) -> bool {
@@ -621,13 +641,15 @@ fn normalize_attachment(
     let image_url = non_empty(attachment.image_url.as_deref())
         .or_else(|| non_empty(attachment.thumb_url.as_deref()))
         .map(ToString::to_string);
-    let image = image_url.map(|url| RichImage {
-        url: Some(url),
-        alt: non_empty(attachment.title.as_deref())
-            .or_else(|| non_empty(attachment.fallback.as_deref()))
-            .unwrap_or("Attachment image")
-            .to_string(),
-        title: attachment.title.clone(),
+    let image = image_url.map(|url| {
+        RichImage::new(
+            Some(url),
+            non_empty(attachment.title.as_deref())
+                .or_else(|| non_empty(attachment.fallback.as_deref()))
+                .unwrap_or("Attachment image"),
+            attachment.title.clone(),
+        )
+        .with_size(attachment.image_width, attachment.image_height)
     });
     let actions = attachment
         .actions
@@ -693,6 +715,7 @@ fn normalize_attachment(
         image,
         actions,
         footer: non_empty(attachment.footer.as_deref()).map(ToString::to_string),
+        footer_icon: non_empty(attachment.footer_icon.as_deref()).map(ToString::to_string),
     })
 }
 

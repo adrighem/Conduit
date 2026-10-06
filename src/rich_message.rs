@@ -235,7 +235,7 @@ pub enum MessageNode {
         fields: Vec<String>,
         accessory: Option<MessageAccessory>,
     },
-    Context(Vec<String>),
+    Context(Vec<MessageContextElement>),
     Divider,
     Actions(Vec<MessageControl>),
     RichText(Vec<RichTextNode>),
@@ -272,6 +272,43 @@ pub struct MessageImage {
     pub(crate) url: Option<String>,
     pub(crate) alt: String,
     pub(crate) title: Option<String>,
+    /// Pixel dimensions declared by Slack (`image_width`/`image_height`), used
+    /// to reserve the right space before the asset has downloaded. Absent in
+    /// documents cached before these fields existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) height: Option<u32>,
+}
+
+impl MessageImage {
+    pub(crate) fn new(url: Option<String>, alt: impl Into<String>, title: Option<String>) -> Self {
+        Self {
+            url,
+            alt: alt.into(),
+            title,
+            width: None,
+            height: None,
+        }
+    }
+
+    pub(crate) fn with_size(mut self, width: Option<u32>, height: Option<u32>) -> Self {
+        self.width = width.filter(|value| *value > 0);
+        self.height = height.filter(|value| *value > 0);
+        self
+    }
+}
+
+/// One element of a Block Kit `context` block: either mrkdwn/plain text or a
+/// small inline image (e.g. the giphy logo in "Posted using /giphy").
+///
+/// Untagged so documents cached when context elements were plain strings
+/// still deserialize as [`MessageContextElement::Text`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContextElement {
+    Text(String),
+    Image(MessageImage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +360,8 @@ pub struct MessageAttachment {
     pub(crate) image: Option<MessageImage>,
     pub(crate) actions: Vec<MessageControl>,
     pub(crate) footer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) footer_icon: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,6 +478,15 @@ fn collect_image_urls<'a>(node: &'a MessageNode, urls: &mut Vec<&'a str>) {
                 urls.push(url);
             }
         }
+        MessageNode::Context(elements) => {
+            for element in elements {
+                if let MessageContextElement::Image(image) = element {
+                    if let Some(url) = image.url.as_deref().and_then(non_empty) {
+                        urls.push(url);
+                    }
+                }
+            }
+        }
         MessageNode::Attachment(attachment) => {
             if let Some(url) = attachment
                 .image
@@ -446,6 +494,9 @@ fn collect_image_urls<'a>(node: &'a MessageNode, urls: &mut Vec<&'a str>) {
                 .and_then(|img| img.url.as_deref())
                 .and_then(non_empty)
             {
+                urls.push(url);
+            }
+            if let Some(url) = attachment.footer_icon.as_deref().and_then(non_empty) {
                 urls.push(url);
             }
         }
@@ -523,7 +574,9 @@ fn project_node_text(node: &MessageNode, include_controls: bool, parts: &mut Vec
         }
         MessageNode::Context(elements) => {
             for element in elements {
-                push_text(parts, element);
+                if let MessageContextElement::Text(text) = element {
+                    push_text(parts, text);
+                }
             }
         }
         MessageNode::Image(image) => push_text(parts, &image.alt),
@@ -728,11 +781,7 @@ mod tests {
 
     #[test]
     fn image_urls_cover_blocks_accessories_and_attachments() {
-        let image = |url: &str| MessageImage {
-            url: Some(url.to_string()),
-            alt: "Preview".to_string(),
-            title: None,
-        };
+        let image = |url: &str| MessageImage::new(Some(url.to_string()), "Preview", None);
         let document = MessageDocument::new(
             vec![
                 MessageNode::Image(image("https://files.slack.com/block.png")),
@@ -754,7 +803,12 @@ mod tests {
                     image: Some(image("https://files.slack.com/attachment.png")),
                     actions: Vec::new(),
                     footer: None,
+                    footer_icon: Some("https://a.slack-edge.com/footer.png".to_string()),
                 })),
+                MessageNode::Context(vec![
+                    MessageContextElement::Image(image("https://a.slack-edge.com/giphy.png")),
+                    MessageContextElement::Text("Posted using /giphy".to_string()),
+                ]),
             ],
             None,
         );
@@ -765,17 +819,63 @@ mod tests {
                 "https://files.slack.com/block.png",
                 "https://files.slack.com/accessory.png",
                 "https://files.slack.com/attachment.png",
+                "https://a.slack-edge.com/footer.png",
+                "https://a.slack-edge.com/giphy.png",
             ]
         );
     }
 
     #[test]
+    fn cached_documents_with_string_context_and_sizeless_images_still_load() {
+        let cached = serde_json::json!({
+            "nodes": [
+                {"Image": {"url": "https://media1.giphy.com/a.gif", "alt": "GIF", "title": "GIF"}},
+                {"Context": ["Posted using /giphy"]}
+            ],
+            "accessible_fallback": null
+        });
+
+        let document: MessageDocument =
+            serde_json::from_value(cached).expect("cached document deserializes");
+
+        assert_eq!(
+            document.nodes(),
+            &[
+                MessageNode::Image(MessageImage::new(
+                    Some("https://media1.giphy.com/a.gif".to_string()),
+                    "GIF",
+                    Some("GIF".to_string()),
+                )),
+                MessageNode::Context(vec![MessageContextElement::Text(
+                    "Posted using /giphy".to_string()
+                )]),
+            ]
+        );
+    }
+
+    #[test]
+    fn context_images_round_trip_through_serde() {
+        let document = MessageDocument::new(
+            vec![MessageNode::Context(vec![
+                MessageContextElement::Image(
+                    MessageImage::new(Some("https://a.slack-edge.com/g.png".to_string()), "giphy", None)
+                        .with_size(Some(16), Some(16)),
+                ),
+                MessageContextElement::Text("by fuzzyghost".to_string()),
+            ])],
+            None,
+        );
+
+        let json = serde_json::to_value(&document).expect("document serializes");
+        let restored: MessageDocument = serde_json::from_value(json).expect("document restores");
+
+        assert_eq!(restored, document);
+        assert_eq!(restored.visible_text(), "by fuzzyghost");
+    }
+
+    #[test]
     fn quote_node_yields_author_icon_and_body_images_and_text() {
-        let image = |url: &str| MessageImage {
-            url: Some(url.to_string()),
-            alt: "Preview".to_string(),
-            title: None,
-        };
+        let image = |url: &str| MessageImage::new(Some(url.to_string()), "Preview", None);
         let document = MessageDocument::new(
             vec![MessageNode::Quote(Box::new(MessageQuote {
                 author_name: Some("Alice".to_string()),

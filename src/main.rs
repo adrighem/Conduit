@@ -60,6 +60,8 @@ mod sync_scheduler;
 mod thread_catalog;
 mod thread_pane;
 pub mod timeline_message_widget;
+mod timeline_document_widget;
+mod timeline_media;
 mod timeline_presenter;
 mod unread_ledger;
 mod window;

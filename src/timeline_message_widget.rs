@@ -6,13 +6,13 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib::subclass::prelude::*;
 use gtk::{
-    gio, glib, pango, Box, Button, CssProvider, Grid, Image, Label,
+    gio, glib, pango, Box, Button, CssProvider, Image, Label,
     ListView, NoSelection, Orientation, Picture, ScrolledWindow, Separator,
     SignalListItemFactory, TextView, ToggleButton, Widget,
 };
 
 use crate::message_html::MessageHtmlContext;
-use crate::models::{SlackAttachment, SlackFile, SlackMessage};
+use crate::models::{SlackFile, SlackMessage};
 
 mod imp {
     use super::*;
@@ -272,21 +272,43 @@ fn set_media_collapsed(ts: &str, slot: &str, collapsed: bool) {
 /// `slot` must be stable and unique per message (e.g. `"file:{index}"` vs
 /// `"attachment:{index}"`) so the collapsed state survives row rebuilds and
 /// files/attachments at the same index don't collide in the same key space.
-fn wrap_collapsible_media(media: Widget, ts: &str, slot: &str) -> Box {
+pub(crate) fn wrap_collapsible_media(
+    media: Widget,
+    ts: &str,
+    slot: &str,
+    title: Option<&str>,
+) -> Box {
     let container = Box::new(Orientation::Vertical, 2);
     container.set_halign(gtk::Align::Start);
 
     let collapsed = is_media_collapsed(ts, slot);
 
+    let icon_for = |expanded: bool| {
+        if expanded {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        }
+    };
     let toggle = ToggleButton::new();
     toggle.set_focus_on_click(false);
-    toggle.set_icon_name(if collapsed {
-        "pan-end-symbolic"
+    // Titled media ("GIF ▾") shows dim title text followed by the caret, like
+    // Slack; untitled media keeps the compact icon-only circular toggle.
+    let caret = Image::from_icon_name(icon_for(!collapsed));
+    if let Some(title) = title {
+        let title_row = Box::new(Orientation::Horizontal, 2);
+        let label = Label::new(Some(title));
+        label.set_ellipsize(pango::EllipsizeMode::End);
+        title_row.append(&label);
+        title_row.append(&caret);
+        toggle.set_child(Some(&title_row));
+        toggle.add_css_class("timeline-media-title");
+        toggle.add_css_class("dim-label");
     } else {
-        "pan-down-symbolic"
-    });
+        toggle.set_child(Some(&caret));
+        toggle.add_css_class("circular");
+    }
     toggle.add_css_class("flat");
-    toggle.add_css_class("circular");
     toggle.set_halign(gtk::Align::Start);
     toggle.set_tooltip_text(Some("Show or hide image"));
     toggle.set_active(!collapsed);
@@ -298,11 +320,7 @@ fn wrap_collapsible_media(media: Widget, ts: &str, slot: &str) -> Box {
     let media_weak = media.downgrade();
     toggle.connect_toggled(move |btn| {
         let expanded = btn.is_active();
-        btn.set_icon_name(if expanded {
-            "pan-down-symbolic"
-        } else {
-            "pan-end-symbolic"
-        });
+        caret.set_icon_name(Some(icon_for(expanded)));
         if let Some(media) = media_weak.upgrade() {
             media.set_visible(expanded);
         }
@@ -318,7 +336,7 @@ fn wrap_collapsible_media(media: Widget, ts: &str, slot: &str) -> Box {
 /// animated WebP), falling back to the shared static-texture cache otherwise.
 /// Generalizes the animation driver already used for custom emoji reactions
 /// (see `load_custom_emoji_picture`) to arbitrary message/attachment images.
-fn load_animated_or_static_picture(
+pub(crate) fn load_animated_or_static_picture(
     path: &Path,
     width: i32,
     height: i32,
@@ -393,6 +411,12 @@ pub(crate) fn register_timeline_css() {
             .reaction-emoji-unicode { font-size: 32px; line-height: 1; }
             .reaction-emoji-image { margin-top: 3px; margin-bottom: 3px; }
             .timeline-attachment { border-left: 3px solid #e0e0e0; padding-left: 8px; margin-left: 4px; }
+            .timeline-media-image { border-radius: 8px; }
+            .timeline-media-placeholder {
+                border-radius: 8px;
+                background-color: alpha(currentColor, 0.08);
+            }
+            .timeline-media-title { padding: 0 4px; min-height: 0; font-size: smaller; }
             .timeline-video-play-icon {
                 background-color: rgba(0, 0, 0, 0.55);
                 border-radius: 9999px;
@@ -1302,7 +1326,7 @@ fn attach_text_view_links(view: &TextView, links: Vec<MarkupLink>) {
     view.add_controller(click);
 }
 
-fn create_message_text_widget(
+pub(crate) fn create_message_text_widget(
     pango: &str,
     context: &MessageHtmlContext,
 ) -> Widget {
@@ -1461,7 +1485,7 @@ fn parse_line_by_line_quotes(text: &str, segments: &mut Vec<TextSegment>) {
     }
 }
 
-fn render_text_content(
+pub(crate) fn render_text_content(
     text: &str,
     target_box: &Box,
     context: &MessageHtmlContext,
@@ -1498,296 +1522,6 @@ fn render_text_content(
                     target_box.append(&text_widget);
                 }
             }
-        }
-    }
-}
-
-fn extract_block_text(value: &serde_json::Value) -> Option<String> {
-    if let Some(text) = value.as_str() {
-        return Some(text.to_string());
-    }
-    if let Some(text) = value.get("text") {
-        if let Some(t) = text.as_str() {
-            return Some(t.to_string());
-        }
-        if let Some(t) = text.get("text").and_then(|v| v.as_str()) {
-            return Some(t.to_string());
-        }
-    }
-    None
-}
-
-fn extract_rich_text_string(section_or_elem: &serde_json::Value) -> String {
-    let mut out = String::new();
-    if let Some(elements) = section_or_elem.get("elements").and_then(|e| e.as_array()) {
-        for sub in elements {
-            let sub_type = sub.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            match sub_type {
-                "text" => {
-                    if let Some(t) = sub.get("text").and_then(|v| v.as_str()) {
-                        let style = sub.get("style");
-                        let is_bold = style
-                            .and_then(|s| s.get("bold"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let is_italic = style
-                            .and_then(|s| s.get("italic"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let is_strike = style
-                            .and_then(|s| s.get("strike"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let is_code = style
-                            .and_then(|s| s.get("code"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-
-                        let mut text = t.to_string();
-                        if is_code {
-                            text = format!("`{text}`");
-                        }
-                        if is_bold {
-                            text = format!("*{text}*");
-                        }
-                        if is_italic {
-                            text = format!("_{text}_");
-                        }
-                        if is_strike {
-                            text = format!("~{text}~");
-                        }
-                        out.push_str(&text);
-                    }
-                }
-                "link" => {
-                    let url = sub.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                    let text = sub.get("text").and_then(|v| v.as_str());
-                    if let Some(t) = text {
-                        out.push_str(&format!("<{url}|{t}>"));
-                    } else {
-                        out.push_str(&format!("<{url}>"));
-                    }
-                }
-                "user" => {
-                    if let Some(uid) = sub.get("user_id").and_then(|v| v.as_str()) {
-                        out.push_str(&format!("<@{uid}>"));
-                    }
-                }
-                "emoji" => {
-                    if let Some(name) = sub.get("name").and_then(|v| v.as_str()) {
-                        out.push_str(&format!(":{name}:"));
-                    }
-                }
-                "channel" => {
-                    if let Some(cid) = sub.get("channel_id").and_then(|v| v.as_str()) {
-                        out.push_str(&format!("<#{cid}>"));
-                    }
-                }
-                _ => {
-                    if let Some(t) = sub.get("text").and_then(|v| v.as_str()) {
-                        out.push_str(t);
-                    }
-                }
-            }
-        }
-    } else if let Some(t) = extract_block_text(section_or_elem) {
-        out.push_str(&t);
-    }
-    out
-}
-
-fn render_blocks(
-    blocks: &[serde_json::Value],
-    target_box: &Box,
-    context: &MessageHtmlContext,
-) {
-    for block in blocks {
-        let Some(kind) = block.get("type").and_then(|k| k.as_str()) else {
-            continue;
-        };
-
-        match kind {
-            "header" => {
-                if let Some(text) = extract_block_text(block) {
-                    if !text.trim().is_empty() {
-                        let label = Label::new(None);
-                        label.set_wrap(true);
-                        label.set_wrap_mode(pango::WrapMode::WordChar);
-                        label.set_selectable(true);
-                        label.set_focus_on_click(false);
-                        label.set_xalign(0.0);
-                        label.set_markup(&format!(
-                            "<span size=\"larger\" weight=\"bold\">{}</span>",
-                            glib::markup_escape_text(&text)
-                        ));
-                        target_box.append(&label);
-                    }
-                }
-            }
-            "section" => {
-                let section_box = Box::new(Orientation::Vertical, 4);
-                if let Some(text) = extract_block_text(block) {
-                    if !text.trim().is_empty() {
-                        render_text_content(&text, &section_box, context);
-                    }
-                }
-                if let Some(fields) = block.get("fields").and_then(|f| f.as_array()) {
-                    if !fields.is_empty() {
-                        let grid = Grid::new();
-                        grid.set_column_spacing(12);
-                        grid.set_row_spacing(4);
-                        for (idx, field) in fields.iter().enumerate() {
-                            if let Some(field_text) = extract_block_text(field) {
-                                if !field_text.trim().is_empty() {
-                                    let pango = crate::message_html::mrkdwn_to_pango(&field_text, context);
-                                    let field_widget = create_message_text_widget(&pango, context);
-                                    let col = (idx % 2) as i32;
-                                    let row = (idx / 2) as i32;
-                                    grid.attach(&field_widget, col, row, 1, 1);
-                                }
-                            }
-                        }
-                        section_box.append(&grid);
-                    }
-                }
-                target_box.append(&section_box);
-            }
-            "rich_text" => {
-                if let Some(elements) = block.get("elements").and_then(|e| e.as_array()) {
-                    for elem in elements {
-                        let elem_type = elem.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        match elem_type {
-                            "rich_text_section" => {
-                                let text = extract_rich_text_string(elem);
-                                if !text.trim().is_empty() {
-                                    render_text_content(&text, target_box, context);
-                                }
-                            }
-                            "rich_text_list" => {
-                                let style = elem
-                                    .get("style")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or("bullet");
-                                let indent_level =
-                                    elem.get("indent").and_then(|i| i.as_u64()).unwrap_or(0) as i32;
-                                let list_box = Box::new(Orientation::Vertical, 2);
-                                if indent_level > 0 {
-                                    list_box.set_margin_start(indent_level * 16);
-                                }
-                                if let Some(items) = elem.get("elements").and_then(|e| e.as_array())
-                                {
-                                    for (idx, item) in items.iter().enumerate() {
-                                        let prefix = if style == "ordered" {
-                                            format!("{}. ", idx + 1)
-                                        } else {
-                                            "• ".to_string()
-                                        };
-                                        let item_text = extract_rich_text_string(item);
-                                        let full_text = format!("{prefix}{item_text}");
-                                        let pango =
-                                            crate::message_html::mrkdwn_to_pango(&full_text, context);
-                                        let item_widget = create_message_text_widget(&pango, context);
-                                        list_box.append(&item_widget);
-                                    }
-                                }
-                                target_box.append(&list_box);
-                            }
-                            "rich_text_preformatted" => {
-                                let code_text = extract_rich_text_string(elem);
-                                let frame = Box::new(Orientation::Vertical, 0);
-                                frame.add_css_class("code-block");
-                                let label = Label::new(None);
-                                label.set_wrap(true);
-                                label.set_wrap_mode(pango::WrapMode::WordChar);
-                                label.set_selectable(true);
-                                label.set_focus_on_click(false);
-                                label.set_xalign(0.0);
-                                label.set_markup(&format!(
-                                    "<tt>{}</tt>",
-                                    glib::markup_escape_text(&code_text)
-                                ));
-                                frame.append(&label);
-                                target_box.append(&frame);
-                            }
-                            "rich_text_quote" => {
-                                register_timeline_css();
-                                let quote_text = extract_rich_text_string(elem);
-                                let quote_box = Box::new(Orientation::Vertical, 0);
-                                quote_box.add_css_class("blockquote");
-                                let pango =
-                                    crate::message_html::mrkdwn_to_pango(&quote_text, context);
-                                let quote_widget = create_message_text_widget(&format!("<i>{}</i>", pango), context);
-                                quote_box.append(&quote_widget);
-                                target_box.append(&quote_box);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            "divider" => {
-                let separator = Separator::new(Orientation::Horizontal);
-                target_box.append(&separator);
-            }
-            "actions" => {
-                let actions_box = Box::new(Orientation::Horizontal, 6);
-                if let Some(elements) = block.get("elements").and_then(|e| e.as_array()) {
-                    for elem in elements {
-                        let btn_text =
-                            extract_block_text(elem).unwrap_or_else(|| "Button".to_string());
-                        let btn = Button::with_label(&btn_text);
-                        btn.set_focus_on_click(false);
-                        actions_box.append(&btn);
-                    }
-                }
-                target_box.append(&actions_box);
-            }
-            "context" => {
-                let context_box = Box::new(Orientation::Horizontal, 6);
-                if let Some(elements) = block.get("elements").and_then(|e| e.as_array()) {
-                    for elem in elements {
-                        let elem_type = elem.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        if elem_type == "image" || elem.get("image_url").is_some() {
-                            let image_url = elem
-                                .get("image_url")
-                                .and_then(|u| u.as_str())
-                                .or_else(|| elem.get("url").and_then(|u| u.as_str()));
-                            let img_widget: Widget = if let Some(url) = image_url {
-                                let local_path = resolve_cached_asset_path(url, context)
-                                    .or_else(|| Path::new(url).exists().then(|| PathBuf::from(url)));
-                                if let Some(path) = local_path {
-                                    let pic = if let Some(tex) = get_or_load_texture(&path) {
-                                        Picture::for_paintable(&tex)
-                                    } else {
-                                        Picture::for_filename(&path)
-                                    };
-                                    pic.set_size_request(16, 16);
-                                    pic.set_content_fit(gtk::ContentFit::Cover);
-                                    pic.upcast::<Widget>()
-                                } else {
-                                    let img = Image::from_icon_name("image-x-generic-symbolic");
-                                    img.set_pixel_size(16);
-                                    img.upcast::<Widget>()
-                                }
-                            } else {
-                                let img = Image::from_icon_name("image-x-generic-symbolic");
-                                img.set_pixel_size(16);
-                                img.upcast::<Widget>()
-                            };
-                            context_box.append(&img_widget);
-                        } else if let Some(text) = extract_block_text(elem) {
-                            if !text.trim().is_empty() {
-                                let pango = crate::message_html::mrkdwn_to_pango(&text, context);
-                                let text_widget = create_message_text_widget(&format!("<span size=\"small\">{}</span>", pango), context);
-                                text_widget.add_css_class("dim-label");
-                                context_box.append(&text_widget);
-                            }
-                        }
-                    }
-                }
-                target_box.append(&context_box);
-            }
-            _ => {}
         }
     }
 }
@@ -1924,7 +1658,12 @@ fn render_files(
                 container.set_cursor_from_name(Some("pointer"));
             }
 
-            files_box.append(&wrap_collapsible_media(container.upcast::<Widget>(), ts, &format!("file:{index}")));
+            files_box.append(&wrap_collapsible_media(
+                container.upcast::<Widget>(),
+                ts,
+                &format!("file:{index}"),
+                None,
+            ));
         } else if is_image {
             let container = Box::new(Orientation::Vertical, 2);
             container.add_css_class("timeline-image-container");
@@ -1985,7 +1724,12 @@ fn render_files(
                 container.set_cursor_from_name(Some("pointer"));
             }
 
-            files_box.append(&wrap_collapsible_media(container.upcast::<Widget>(), ts, &format!("file:{index}")));
+            files_box.append(&wrap_collapsible_media(
+                container.upcast::<Widget>(),
+                ts,
+                &format!("file:{index}"),
+                None,
+            ));
         } else {
             let file_card = Box::new(Orientation::Horizontal, 8);
             file_card.add_css_class("file-card");
@@ -2038,126 +1782,9 @@ fn render_files(
     root_box.append(&files_box);
 }
 
-fn render_attachments(
-    attachments: &[SlackAttachment],
-    root_box: &Box,
-    context: &MessageHtmlContext,
-    ts: &str,
-) {
-    register_timeline_css();
-    for (index, attachment) in attachments.iter().enumerate() {
-        if let Some(pretext) = attachment.pretext.as_deref().filter(|s| !s.trim().is_empty()) {
-            let pango = crate::message_html::mrkdwn_to_pango(pretext, context);
-            let pretext_widget = create_message_text_widget(&pango, context);
-            root_box.append(&pretext_widget);
-        }
-
-        let attach_box = Box::new(Orientation::Vertical, 4);
-        attach_box.add_css_class("timeline-attachment");
-
-        if let Some(title) = attachment.title.as_deref().filter(|s| !s.trim().is_empty()) {
-            let label = Label::new(None);
-            label.set_wrap(true);
-            label.set_wrap_mode(pango::WrapMode::WordChar);
-            label.set_selectable(true);
-            label.set_focus_on_click(false);
-            label.set_xalign(0.0);
-            if let Some(title_link) = attachment
-                .title_link
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-            {
-                label.set_markup(&format!(
-                    "<a href=\"{}\"><b>{}</b></a>",
-                    glib::markup_escape_text(title_link),
-                    glib::markup_escape_text(title)
-                ));
-            } else {
-                label.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(title)));
-            }
-            attach_box.append(&label);
-        }
-
-        if let Some(text) = attachment.text.as_deref().filter(|s| !s.trim().is_empty()) {
-            let pango = crate::message_html::mrkdwn_to_pango(text, context);
-            let text_widget = create_message_text_widget(&pango, context);
-            attach_box.append(&text_widget);
-        }
-
-        if let Some(fields) = attachment.fields.as_deref().filter(|f| !f.is_empty()) {
-            let grid = Grid::new();
-            grid.set_column_spacing(12);
-            grid.set_row_spacing(4);
-            for (idx, field) in fields.iter().enumerate() {
-                let title = field.title.as_deref().unwrap_or("");
-                let val = field.value.as_deref().unwrap_or("");
-                let markup = match (!title.is_empty(), !val.is_empty()) {
-                    (true, true) => format!(
-                        "<b>{}</b>\n{}",
-                        glib::markup_escape_text(title),
-                        crate::message_html::mrkdwn_to_pango(val, context)
-                    ),
-                    (true, false) => format!("<b>{}</b>", glib::markup_escape_text(title)),
-                    (false, true) => crate::message_html::mrkdwn_to_pango(val, context),
-                    (false, false) => String::new(),
-                };
-                if !markup.is_empty() {
-                    let field_widget = create_message_text_widget(&markup, context);
-                    let col = (idx % 2) as i32;
-                    let row = (idx / 2) as i32;
-                    grid.attach(&field_widget, col, row, 1, 1);
-                }
-            }
-            attach_box.append(&grid);
-        }
-
-        if let Some(image_url) = attachment
-            .image_url
-            .as_deref()
-            .or(attachment.thumb_url.as_deref())
-            .filter(|s| !s.trim().is_empty())
-        {
-            let local_path = resolve_cached_asset_path(image_url, context).or_else(|| {
-                std::path::Path::new(image_url)
-                    .exists()
-                    .then(|| std::path::PathBuf::from(image_url))
-            });
-
-            if let Some(path) = local_path {
-                let pic = load_animated_or_static_picture(&path, 400, 300, gtk::ContentFit::ScaleDown);
-                pic.add_css_class("rounded");
-                let title = attachment
-                    .title
-                    .as_deref()
-                    .or(attachment.fallback.as_deref())
-                    .unwrap_or("");
-                if !title.is_empty() {
-                    pic.set_tooltip_text(Some(title));
-                }
-                attach_box.append(&wrap_collapsible_media(
-                    pic,
-                    ts,
-                    &format!("attachment:{index}"),
-                ));
-            }
-        }
-
-        if let Some(attach_blocks) = attachment
-            .blocks
-            .as_ref()
-            .and_then(|b| b.as_array())
-            .filter(|b| !b.is_empty())
-        {
-            render_blocks(attach_blocks, &attach_box, context);
-        }
-
-        root_box.append(&attach_box);
-    }
-}
-
 fn build_avatar_widget(message: &SlackMessage, context: &MessageHtmlContext) -> Widget {
-    let user_avatar_url = message
-        .author_user_id()
+    let user_avatar_url = context
+        .display_user_id(message)
         .and_then(|user_id| context.user_avatar_urls.get(user_id));
     let avatar_source_url = user_avatar_url
         .map(String::as_str)
@@ -2645,6 +2272,45 @@ fn wrap_with_unread_separator_if_needed(
     outer
 }
 
+/// Body, document nodes and files, all driven by the canonical
+/// [`crate::rich_message::MessageDocument`] so cached and freshly fetched
+/// messages render identically.
+fn render_message_content(
+    message: &SlackMessage,
+    context: &MessageHtmlContext,
+    on_open_media: Option<&OpenMediaCallback>,
+    root_box: &Box,
+) {
+    let document = message.rendered_document();
+    if !crate::timeline_document_widget::document_replaces_text(&document) {
+        let content_text = message.text.as_deref().unwrap_or("");
+        if !content_text.trim().is_empty() {
+            render_text_content(content_text, root_box, context);
+        }
+    }
+
+    let resolve = |url: &str| resolve_cached_asset_path(url, context);
+    let is_failed = |url: &str| context.failed_image_urls.contains(url);
+    let sources = crate::timeline_media::MediaSources {
+        resolve: &resolve,
+        is_failed: &is_failed,
+    };
+    crate::timeline_document_widget::DocumentRenderer::new(context, sources, &message.ts)
+        .render(document.nodes(), root_box);
+
+    let files = message
+        .files
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|file| !SlackMessage::document_renders_file(&document, file))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !files.is_empty() {
+        render_files(&files, root_box, context, on_open_media, &message.ts);
+    }
+}
+
 pub(crate) fn build_timeline_message_widget(
     message: &SlackMessage,
     context: &MessageHtmlContext,
@@ -2707,8 +2373,8 @@ pub(crate) fn build_timeline_message_widget(
     let avatar_widget = build_avatar_widget(message, context);
     header_box.append(&avatar_widget);
 
-    let author_name = message
-        .author_user_id()
+    let author_name = context
+        .display_user_id(message)
         .and_then(|user_id| {
             context
                 .user_full_names
@@ -2738,39 +2404,7 @@ pub(crate) fn build_timeline_message_widget(
 
     root_box.append(&header_box);
 
-    // Content: Blocks or Text
-    let has_rendered_blocks = if let Some(blocks) = message
-        .blocks
-        .as_ref()
-        .and_then(|b| b.as_array())
-        .filter(|b| !b.is_empty())
-    {
-        render_blocks(blocks, &root_box, context);
-        true
-    } else {
-        false
-    };
-
-    if !has_rendered_blocks {
-        let content_text = message.text.as_deref().unwrap_or("");
-        if !content_text.is_empty() {
-            render_text_content(content_text, &root_box, context);
-        }
-    }
-
-    // Files
-    if let Some(files) = message.files.as_deref().filter(|f| !f.is_empty()) {
-        render_files(files, &root_box, context, on_open_media, &message.ts);
-    }
-
-    // Attachments
-    if let Some(attachments) = message
-        .attachments
-        .as_deref()
-        .filter(|a| !a.is_empty())
-    {
-        render_attachments(attachments, &root_box, context, &message.ts);
-    }
+    render_message_content(message, context, on_open_media, &root_box);
 
     // Reactions
     if let Some(reactions) = message.reactions.as_deref().filter(|r| !r.is_empty()) {
@@ -2952,7 +2586,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::message_html::MessageHtmlContext;
-    use crate::models::{SlackAttachmentField, SlackFile, SlackMessage, SlackReaction};
+    use crate::models::{SlackAttachment, SlackAttachmentField, SlackFile, SlackMessage, SlackReaction};
 
     #[test]
     fn strip_anchor_tags_returns_link_ranges_of_visible_text() {
@@ -2970,6 +2604,7 @@ mod tests {
             user_names: Arc::new(HashMap::from([("U123".to_string(), "Alice".to_string())])),
             user_full_names: Arc::default(),
             user_avatar_urls: Arc::default(),
+            bot_user_ids: Arc::default(),
             conversation_titles: HashMap::default(),
             private_conversation_ids: std::collections::HashSet::default(),
             user_statuses: Arc::default(),
@@ -3041,11 +2676,9 @@ mod tests {
 
     #[test]
     fn rich_text_channel_element_renders_as_pill_instead_of_vanishing() {
-        let elem = serde_json::json!({
-            "type": "rich_text_section",
-            "elements": [{"type": "channel", "channel_id": "C123"}]
-        });
-        let token = extract_rich_text_string(&elem);
+        let token = crate::timeline_document_widget::inlines_to_mrkdwn(&[
+            crate::rich_message::RichInline::Channel("C123".to_string()),
+        ]);
         assert_eq!(token, "<#C123>");
 
         let mut context = test_context();
@@ -3070,55 +2703,263 @@ mod tests {
         );
     }
 
+    fn descendants(root: &Widget) -> Vec<Widget> {
+        let mut found = Vec::new();
+        let mut child = root.first_child();
+        while let Some(widget) = child {
+            found.push(widget.clone());
+            found.extend(descendants(&widget));
+            child = widget.next_sibling();
+        }
+        found
+    }
+
+    fn label_texts(root: &Widget) -> Vec<String> {
+        descendants(root)
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<Label>().ok())
+            .map(|label| label.text().to_string())
+            .collect()
+    }
+
+    fn cached_roundtrip(message: SlackMessage) -> SlackMessage {
+        let stored = serde_json::to_value(crate::slack_message_wire::normalize_cached_message(
+            message,
+        ))
+        .expect("message serializes for the cache");
+        crate::slack_message_wire::normalize_cached_message(
+            serde_json::from_value(stored).expect("cached message deserializes"),
+        )
+    }
+
+    fn giphy_command_message() -> SlackMessage {
+        crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+            "type": "message",
+            "user": "U04R5M67EBV",
+            "bot_id": "B8D9J9E80",
+            "app_id": "A0F827J2C",
+            "text": "plumber",
+            "ts": "1789462599.765779",
+            "bot_profile": {
+                "id": "B8D9J9E80",
+                "app_id": "A0F827J2C",
+                "name": "giphy",
+                "icons": {"image_72": "https://a.slack-edge.com/dc483/img/plugins/giphy/service_72.png"}
+            },
+            "blocks": [
+                {
+                    "type": "image",
+                    "block_id": "giphy",
+                    "title": {"type": "plain_text", "text": "plumber", "emoji": true},
+                    "image_url": "https://media4.giphy.com/media/9TbgGqK1KhpnNORo9a/giphy.gif?cid=1&rid=giphy.gif&ct=g",
+                    "alt_text": "plumber",
+                    "image_width": 480,
+                    "image_height": 270,
+                    "image_bytes": 1234567,
+                    "is_animated": true
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "image",
+                            "image_url": "https://a.slack-edge.com/dc483/img/plugins/giphy/service_32.png",
+                            "alt_text": "giphy logo"
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": "Posted using /giphy | GIF by <https://giphy.com/channel/fuzzyghost/|fuzzyghost>"
+                        }
+                    ]
+                }
+            ]
+        }))
+        .into_message()
+        .expect("giphy message parses")
+    }
+
     #[test]
-    fn giphy_attachment_image_renders_instead_of_nothing() {
+    fn giphy_command_message_keeps_title_image_context_and_user_through_cache() {
+        let message = cached_roundtrip(giphy_command_message());
+
+        assert_eq!(message.app_invoking_user_id(), Some("U04R5M67EBV"));
+        let crate::rich_message::MessageNode::Image(image) = &message.document.nodes()[0] else {
+            panic!("first node should be the GIF image: {:?}", message.document.nodes());
+        };
+        assert_eq!(image.title.as_deref(), Some("plumber"));
+        assert_eq!((image.width, image.height), (Some(480), Some(270)));
+        let crate::rich_message::MessageNode::Context(elements) = &message.document.nodes()[1] else {
+            panic!("second node should be the context line");
+        };
+        assert!(matches!(
+            &elements[0],
+            crate::rich_message::MessageContextElement::Image(icon)
+                if icon.url.as_deref()
+                    == Some("https://a.slack-edge.com/dc483/img/plugins/giphy/service_32.png")
+        ));
+        assert_eq!(
+            message.document.image_urls().collect::<Vec<_>>(),
+            vec![
+                "https://media4.giphy.com/media/9TbgGqK1KhpnNORo9a/giphy.gif?cid=1&rid=giphy.gif&ct=g",
+                "https://a.slack-edge.com/dc483/img/plugins/giphy/service_32.png",
+            ]
+        );
+    }
+
+    #[test]
+    fn app_message_author_prefers_known_invoking_person_only() {
+        let message = cached_roundtrip(giphy_command_message());
+        let mut ctx = test_context();
+        assert_eq!(ctx.display_user_id(&message), None, "unknown user keeps the app");
+
+        Arc::make_mut(&mut ctx.user_full_names)
+            .insert("U04R5M67EBV".to_string(), "Robey Groeneweg".to_string());
+        assert_eq!(ctx.display_user_id(&message), Some("U04R5M67EBV"));
+
+        Arc::make_mut(&mut ctx.bot_user_ids).insert("U04R5M67EBV".to_string());
+        assert_eq!(ctx.display_user_id(&message), None, "bot users keep the app");
+    }
+
+    #[test]
+    fn giphy_command_message_renders_user_title_image_and_context() {
         run_gtk_test(|| {
-            let cache_dir = crate::config::image_asset_cache_dir();
-            let ws_dir = cache_dir.join("test_ws_giphy");
-            let _ = std::fs::create_dir_all(&ws_dir);
+            let message = cached_roundtrip(giphy_command_message());
+            let mut ctx = test_context();
+            Arc::make_mut(&mut ctx.user_full_names)
+                .insert("U04R5M67EBV".to_string(), "Robey Groeneweg".to_string());
 
-            let test_url = "https://media.giphy.com/media/test123/giphy.gif";
-            let hash = {
-                use sha2::{Digest, Sha256};
-                let mut hasher = Sha256::new();
-                hasher.update("test_ws_giphy".as_bytes());
-                hasher.update([0]);
-                hasher.update(test_url.as_bytes());
-                format!("{:x}", hasher.finalize())
-            };
-            let dummy_file = ws_dir.join(format!("{hash}.png"));
-            // Not a real image - this only exercises the "fails to parse as an
-            // animation" fallback to a static texture/picture, which is enough to
-            // prove the attachment renders an image widget instead of nothing.
-            std::fs::write(&dummy_file, b"not a real image").unwrap();
+            let widget = build_timeline_message_widget(&message, &ctx, None, None, None, None)
+                .upcast::<Widget>();
+            let texts = label_texts(&widget);
 
-            let ctx = test_context();
-            let root_box = Box::new(Orientation::Vertical, 0);
-            let attachment = SlackAttachment {
-                image_url: Some(test_url.to_string()),
-                is_animated: Some(true),
+            assert!(texts.iter().any(|text| text == "Robey Groeneweg"), "{texts:?}");
+            assert!(!texts.iter().any(|text| text == "giphy"), "{texts:?}");
+            assert!(texts.iter().any(|text| text == "plumber"), "{texts:?}");
+            assert!(
+                texts.iter().any(|text| text.starts_with("Posted using /giphy | GIF by")),
+                "{texts:?}"
+            );
+            assert!(descendants(&widget)
+                .iter()
+                .any(|widget| widget.has_css_class("timeline-media-title")));
+            assert!(descendants(&widget)
+                .iter()
+                .any(|widget| widget.has_css_class("timeline-media-placeholder")));
+        });
+    }
+
+    #[test]
+    fn cached_gif_picker_message_renders_titled_placeholder() {
+        run_gtk_test(|| {
+            let cached: SlackMessage = serde_json::from_value(serde_json::json!({
+                "type": "message",
+                "user": "U015HMNHYES",
+                "text": "",
+                "ts": "1789462245.306079",
+                "files": null,
+                "blocks": null,
+                "attachments": null,
+                "author": {"User": {"user_id": "U015HMNHYES"}},
+                "document": {
+                    "nodes": [{"Image": {
+                        "url": "https://media1.giphy.com/media/VF4jocEMAWVAVYRIQu/200w.gif?cid=b7&rid=200w.gif&ct=g",
+                        "alt": "Oh Yeah Yes GIF by FILMRISE",
+                        "title": "GIF"
+                    }}],
+                    "accessible_fallback": null
+                },
+                "content_version": 1
+            }))
+            .expect("cached GIF picker message deserializes");
+            let message = crate::slack_message_wire::normalize_cached_message(cached);
+
+            let widget = build_timeline_message_widget(&message, &test_context(), None, None, None, None)
+                .upcast::<Widget>();
+
+            assert!(label_texts(&widget).iter().any(|text| text == "GIF"));
+            let placeholder = descendants(&widget)
+                .into_iter()
+                .find(|widget| widget.has_css_class("timeline-media-placeholder"))
+                .expect("pending GIF reserves a placeholder");
+            assert_eq!(placeholder.tooltip_text().as_deref(), Some("Oh Yeah Yes GIF by FILMRISE"));
+        });
+    }
+
+    #[test]
+    fn downloaded_document_image_renders_picture_fitted_to_media_box() {
+        run_gtk_test(|| {
+            let dir = std::env::temp_dir().join(format!("conduit-media-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let path = dir.join("wide.png");
+            gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 960, 540)
+                .expect("pixbuf")
+                .savev(&path, "png", &[])
+                .expect("png written");
+
+            let image = crate::rich_message::MessageImage::new(
+                Some("https://media1.giphy.com/media/x/giphy.gif".to_string()),
+                "wide",
+                Some("GIF".to_string()),
+            );
+            let resolved = path.clone();
+            let resolve = move |_: &str| Some(resolved.clone());
+            let is_failed = |_: &str| false;
+            let target = Box::new(Orientation::Vertical, 0);
+            crate::timeline_document_widget::DocumentRenderer::new(
+                &test_context(),
+                crate::timeline_media::MediaSources {
+                    resolve: &resolve,
+                    is_failed: &is_failed,
+                },
+                "1789462245.306079",
+            )
+            .render(&[crate::rich_message::MessageNode::Image(image)], &target);
+
+            let picture = descendants(target.upcast_ref())
+                .into_iter()
+                .find_map(|widget| widget.downcast::<Picture>().ok())
+                .expect("downloaded image renders a picture");
+            assert_eq!(picture.size_request(), (480, 270));
+            assert!(picture.has_css_class("timeline-media-image"));
+
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn file_shown_as_document_image_is_not_rendered_twice() {
+        run_gtk_test(|| {
+            let url = "https://files.slack.com/files-pri/T1-F1/photo.png";
+            let mut message = SlackMessage {
+                ts: "1700000000.000500".to_string(),
+                user: Some("U123".to_string()),
+                files: Some(vec![SlackFile {
+                    id: Some("F1".to_string()),
+                    mimetype: Some("image/png".to_string()),
+                    url_private: Some(url.to_string()),
+                    thumb_360: Some(url.to_string()),
+                    ..Default::default()
+                }]),
+                blocks: Some(serde_json::json!([{
+                    "type": "image",
+                    "alt_text": "photo",
+                    "slack_file": {"url": url}
+                }])),
                 ..Default::default()
             };
-            render_attachments(&[attachment], &root_box, &ctx, "1710000000.000100");
+            message.refresh_canonical_content();
 
-            let attach_box = root_box
-                .first_child()
-                .and_then(|w| w.downcast::<Box>().ok())
-                .expect("attach_box should be appended to root_box");
-            let media_wrapper = attach_box
-                .first_child()
-                .and_then(|w| w.downcast::<Box>().ok())
-                .expect("collapsible media wrapper should be the only attach_box child");
-            let toggle = media_wrapper
-                .first_child()
-                .and_then(|w| w.downcast::<ToggleButton>().ok());
-            assert!(
-                toggle.is_some(),
-                "expected a collapse/expand toggle button, i.e. an image widget was built"
+            let widget = build_timeline_message_widget(&message, &test_context(), None, None, None, None)
+                .upcast::<Widget>();
+            let all = descendants(&widget);
+
+            assert!(!all.iter().any(|widget| widget.has_css_class("timeline-image-container")));
+            assert_eq!(
+                all.iter()
+                    .filter(|widget| widget.downcast_ref::<ToggleButton>().is_some())
+                    .count(),
+                1
             );
-
-            let _ = std::fs::remove_file(dummy_file);
-            let _ = std::fs::remove_dir(ws_dir);
         });
     }
 

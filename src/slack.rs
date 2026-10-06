@@ -2286,28 +2286,32 @@ fn is_trusted_avatar_url(url: &str) -> bool {
     })
 }
 
+/// The single allowlist for images the timeline fetches on its own:
+/// message documents (image blocks, context icons, unfurls), attachments and
+/// avatars. Slack hosts plus the GIF services Slack itself integrates with
+/// (`/giphy`, the GIF picker). Arbitrary user-pasted hosts are never fetched.
 pub(crate) fn supports_native_preview_asset_url(url: &str) -> bool {
-    is_trusted_slack_download_url(url) || is_trusted_avatar_url(url)
+    is_trusted_slack_download_url(url)
+        || is_trusted_avatar_url(url)
+        || is_trusted_gif_service_url(url)
 }
 
-/// Trusted sources for `SlackAttachment` unfurl preview images specifically
-/// (e.g. a `/giphy` share), in addition to Slack's own CDN. These are
-/// Slack-recognized unfurl integrations, not arbitrary user-pasted URLs, so
-/// this is a narrower, separate allowlist from [`supports_native_preview_asset_url`]
-/// rather than a general loosening of what gets auto-fetched.
-pub(crate) fn supports_unfurl_attachment_preview_url(url: &str) -> bool {
-    if supports_native_preview_asset_url(url) {
-        return true;
-    }
-    let Ok(parsed) = url::Url::parse(url) else {
+fn is_trusted_gif_service_url(url: &str) -> bool {
+    const GIF_SERVICE_HOSTS: [&str; 2] = ["giphy.com", "tenor.com"];
+    let Ok(url) = url::Url::parse(url) else {
         return false;
     };
-    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         return false;
     }
-    parsed.host_str().is_some_and(|host| {
+    url.host_str().is_some_and(|host| {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
-        host == "giphy.com" || host.ends_with(".giphy.com")
+        GIF_SERVICE_HOSTS.iter().any(|trusted| {
+            host == *trusted
+                || host
+                    .strip_suffix(trusted)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
     })
 }
 
@@ -3764,6 +3768,30 @@ mod tests {
         assert!(supports_native_preview_asset_url(
             "https://avatars.slack-edge.com/2026-01-01/avatar_72.png"
         ));
+    }
+
+    #[test]
+    fn preview_allowlist_accepts_gif_services_and_rejects_other_hosts() {
+        for trusted in [
+            "https://media1.giphy.com/media/abc/200w.gif?cid=1&rid=200w.gif",
+            "https://i.giphy.com/abc.gif",
+            "https://giphy.com/abc.gif",
+            "https://media.tenor.com/abc/tenor.gif",
+            "https://a.slack-edge.com/dc483/img/plugins/giphy/service_32.png",
+            "https://files.slack.com/files-pri/T1-F1/image.png",
+        ] {
+            assert!(supports_native_preview_asset_url(trusted), "{trusted}");
+        }
+        for untrusted in [
+            "https://images.example.test/card.gif",
+            "https://evilgiphy.com/abc.gif",
+            "https://media1.giphy.com.evil.example/abc.gif",
+            "http://media1.giphy.com/abc.gif",
+            "https://user@media1.giphy.com/abc.gif",
+            "not a URL",
+        ] {
+            assert!(!supports_native_preview_asset_url(untrusted), "{untrusted}");
+        }
     }
 
     #[test]

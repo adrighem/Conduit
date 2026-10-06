@@ -1,8 +1,8 @@
 use gettextrs::gettext;
 
 use super::rich_model::{
-    RichAccessory, RichAttachment, RichControl, RichField, RichImage, RichInline, RichInlineStyle,
-    RichLinkedText, RichNode, RichQuote, RichTextNode,
+    RichAccessory, RichAttachment, RichContextElement, RichControl, RichField, RichImage,
+    RichInline, RichInlineStyle, RichLinkedText, RichNode, RichQuote, RichTextNode,
 };
 use super::rich_plan::{plan_control, ControlPlan, RichRenderPlan};
 use super::MessageHtmlContext;
@@ -49,7 +49,15 @@ fn render_node(node: &RichNode, plan: &RichRenderPlan, context: &MessageHtmlCont
             html
         }
         RichNode::Context(elements) => {
-            super::text_block_html(&elements.join("  "), Some("context-block"), context)
+            let text = elements
+                .iter()
+                .filter_map(|element| match element {
+                    RichContextElement::Text(text) => Some(text.as_str()),
+                    RichContextElement::Image(_) => None,
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            super::text_block_html(&text, Some("context-block"), context)
         }
         RichNode::Divider => "<hr class=\"divider\">".to_string(),
         RichNode::Image(image) => render_image(image, context),

@@ -717,6 +717,10 @@ pub struct SlackAttachment {
     pub image_url: Option<String>,
     pub thumb_url: Option<String>,
     #[serde(default)]
+    pub image_width: Option<u32>,
+    #[serde(default)]
+    pub image_height: Option<u32>,
+    #[serde(default)]
     pub is_animated: Option<bool>,
     pub footer: Option<String>,
     pub footer_icon: Option<String>,
@@ -1083,6 +1087,57 @@ impl SlackMessage {
             return None;
         }
         non_empty(self.user.as_deref())
+    }
+
+    /// The `user` carried by an app-authored message.
+    ///
+    /// Slash-command integrations such as `/giphy` post through a bot but
+    /// keep the invoking person in `user`, and Slack heads those messages
+    /// with that person. Modern bots put their own bot user there instead,
+    /// so only a renderer that knows which users are people may promote this
+    /// id to the displayed author.
+    pub fn app_invoking_user_id(&self) -> Option<&str> {
+        match self.author {
+            MessageAuthor::App { .. } => non_empty(self.user.as_deref()),
+            MessageAuthor::User { .. } | MessageAuthor::Unknown { .. } => None,
+        }
+    }
+
+    /// The canonical content document for rendering.
+    ///
+    /// Current messages carry it already; legacy-version messages (built
+    /// in-process from raw wire fields) are normalized on demand.
+    pub(crate) fn rendered_document(&self) -> std::borrow::Cow<'_, MessageDocument> {
+        if self.content_version == MESSAGE_CONTENT_VERSION {
+            return std::borrow::Cow::Borrowed(&self.document);
+        }
+        let mut normalized = self.clone();
+        normalized.refresh_canonical_content();
+        std::borrow::Cow::Owned(normalized.document)
+    }
+
+    /// True when `file` is already shown as an image node of `document`, so
+    /// renderers can skip the duplicate file card.
+    pub(crate) fn document_renders_file(document: &MessageDocument, file: &SlackFile) -> bool {
+        document.image_urls().any(|document_url| {
+            [
+                file.url_private.as_deref(),
+                file.url_private_download.as_deref(),
+                file.url_static_preview.as_deref(),
+                file.thumb_480_gif.as_deref(),
+                file.thumb_360_gif.as_deref(),
+                file.thumb_480.as_deref(),
+                file.thumb_360.as_deref(),
+                file.thumb_720.as_deref(),
+                file.thumb_1024.as_deref(),
+                file.thumb_160.as_deref(),
+                file.thumb_80.as_deref(),
+                file.thumb_64.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|file_url| file_url == document_url)
+        })
     }
 
     pub fn author_key(&self) -> String {
