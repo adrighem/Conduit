@@ -843,17 +843,14 @@ impl WorkspaceViewState {
         &self.saved_items
     }
 
-    #[cfg(test)]
     pub(crate) fn search_loading(&self) -> bool {
         self.search_loading
     }
 
-    #[cfg(test)]
     pub(crate) fn files_loading(&self) -> bool {
         self.files_loading
     }
 
-    #[cfg(test)]
     pub(crate) fn saved_loading(&self) -> bool {
         self.saved_loading
     }
@@ -1212,7 +1209,6 @@ impl WorkspaceViewState {
         self.thread.take().is_some()
     }
 
-    #[cfg(test)]
     pub(crate) fn focus_message(&mut self, location: &SearchMessageLocation) -> bool {
         if self.visible_channel_id() != Some(location.channel_id()) {
             return false;

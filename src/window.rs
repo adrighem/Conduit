@@ -380,6 +380,9 @@ mod imp {
         pub(super) navigation_history: RefCell<Vec<MainNavigationTarget>>,
         pub(super) restoring_navigation: Cell<bool>,
         pub(super) profile_visible: Cell<bool>,
+        pub(super) secondary_view: RefCell<Option<crate::secondary_views::SecondaryView>>,
+        /// Query of the search currently shown, for result highlighting.
+        pub(super) search_query: RefCell<String>,
     }
 
     #[glib::object_subclass]
@@ -861,6 +864,8 @@ label.mention-badge-pill {
 }
 "#;
 const MAX_COMPOSER_ATTACHMENTS: usize = 10;
+/// Typing pause before an open search refines its results.
+const SEARCH_REFINE_DELAY_MS: u32 = 500;
 
 fn composer_format_toolbar_width(control_count: usize) -> i32 {
     let control_count = i32::try_from(control_count).expect("composer control count fits i32");
@@ -873,19 +878,6 @@ fn composer_format_toolbar_width(control_count: usize) -> i32 {
 use crate::timeline_presenter::*;
 
 use crate::asset_server::*;
-
-fn generate_html(label: &str, render: impl FnOnce() -> String) -> String {
-    let started = Instant::now();
-    let html = render();
-    log_performance(started, |elapsed_ms| {
-        format!(
-            "html_generation surface={label} bytes={} elapsed_ms={:.2}",
-            html.len(),
-            elapsed_ms
-        )
-    });
-    html
-}
 
 fn log_performance(started: Instant, message: impl FnOnce(f64) -> String) {
     if crate::debug::enabled() {
@@ -1346,9 +1338,18 @@ fn valid_channel_name(name: &str) -> bool {
 }
 
 fn media_gallery_items(messages: &[SlackMessage]) -> Vec<MediaGalleryItem> {
-    messages
-        .iter()
-        .flat_map(|message| message.files.as_deref().unwrap_or_default())
+    file_media_gallery_items(
+        messages
+            .iter()
+            .flat_map(|message| message.files.as_deref().unwrap_or_default()),
+    )
+}
+
+fn file_media_gallery_items<'a>(
+    files: impl IntoIterator<Item = &'a SlackFile>,
+) -> Vec<MediaGalleryItem> {
+    files
+        .into_iter()
         .filter_map(|file| {
             let kind = match file.supported_media_kind()? {
                 "image" => MediaKind::Image,
@@ -1461,6 +1462,18 @@ fn workspace_navigation_selection(
 
 fn workspace_composer_visible(main_view: MainMessageView) -> bool {
     main_view == MainMessageView::Conversation
+}
+
+/// The native secondary view that renders `main_view`, if any.
+fn secondary_kind(main_view: MainMessageView) -> Option<crate::secondary_views::SecondaryKind> {
+    use crate::secondary_views::SecondaryKind;
+    match main_view {
+        MainMessageView::Threads => Some(SecondaryKind::Threads),
+        MainMessageView::Search => Some(SecondaryKind::Search),
+        MainMessageView::Files => Some(SecondaryKind::Files),
+        MainMessageView::Saved => Some(SecondaryKind::Saved),
+        MainMessageView::Conversation | MainMessageView::Placeholder => None,
+    }
 }
 
 fn sidebar_conversation_can_leave(conversation: &SlackConversation) -> bool {
@@ -2366,6 +2379,16 @@ impl PlaceholderSurface {
         };
         template.replace("{error}", error)
     }
+
+    fn secondary_kind(self) -> Option<crate::secondary_views::SecondaryKind> {
+        use crate::secondary_views::SecondaryKind;
+        match self {
+            Self::Messages => None,
+            Self::SearchResults => Some(SecondaryKind::Search),
+            Self::Files => Some(SecondaryKind::Files),
+            Self::SavedItems => Some(SecondaryKind::Saved),
+        }
+    }
 }
 
 fn localized_replies_error(error: &str) -> String {
@@ -3147,6 +3170,17 @@ impl ConduitWindow {
             }
         });
         let viewer = self.create_media_viewer(&native_timeline);
+        let secondary_view = crate::secondary_views::SecondaryView::new();
+        let window_weak = self.downgrade();
+        secondary_view.set_on_action(move |action| {
+            if let Some(window) = window_weak.upgrade() {
+                window.handle_secondary_action(action);
+            }
+        });
+        viewer
+            .surface_stack
+            .add_named(secondary_view.widget(), Some("secondary"));
+        *self.imp().secondary_view.borrow_mut() = Some(secondary_view);
         self.imp().message_view_box.append(&viewer.surface_stack);
         *self.imp().native_timeline_view.borrow_mut() = Some(native_timeline);
         *self.imp().media_viewer.borrow_mut() = Some(viewer);
@@ -3385,13 +3419,16 @@ impl ConduitWindow {
     }
 
     pub(crate) fn open_media_viewer(&self, item: MediaGalleryItem) {
-        let messages = {
+        let mut gallery = {
             let view = self.imp().workspace.view.borrow();
-            view.last_channel_id()
-                .map(|channel_id| view.channel_messages(channel_id).to_vec())
-                .unwrap_or_default()
+            if view.main_view() == MainMessageView::Files {
+                file_media_gallery_items(view.files())
+            } else {
+                view.last_channel_id()
+                    .map(|channel_id| media_gallery_items(view.channel_messages(channel_id)))
+                    .unwrap_or_default()
+            }
         };
-        let mut gallery = media_gallery_items(&messages);
         if !gallery.iter().any(|candidate| candidate.url == item.url) {
             gallery.push(item.clone());
         }
@@ -3487,7 +3524,11 @@ impl ConduitWindow {
     }
 
     fn active_surface_name(&self) -> &'static str {
-        "native_timeline"
+        if secondary_kind(self.current_main_view()).is_some() {
+            "secondary"
+        } else {
+            "native_timeline"
+        }
     }
 
     fn close_media_viewer(&self) {
@@ -3922,6 +3963,24 @@ impl ConduitWindow {
                 window.search_messages();
             }
         });
+        // Enter starts a search; once results are showing, edits refine them
+        // after the entry's debounce delay.
+        imp.message_search_entry
+            .set_search_delay(SEARCH_REFINE_DELAY_MS);
+        let weak_window = self.downgrade();
+        imp.message_search_entry
+            .connect_search_changed(move |entry| {
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                let query = entry.text().trim().to_string();
+                if window.current_main_view() == MainMessageView::Search
+                    && !query.is_empty()
+                    && *window.imp().search_query.borrow() != query
+                {
+                    window.search_messages();
+                }
+            });
 
         imp.message_search_bar
             .connect_entry(&imp.message_search_entry.get());
@@ -6713,14 +6772,6 @@ impl ConduitWindow {
                     &user_id,
                 ) {
                     imp.pending_profile_user_id.borrow_mut().take();
-                    if let Some(user) = imp.workspace.users.borrow().get(&user_id).cloned() {
-                        imp.message_title
-                            .set_title(&user.display_name().unwrap_or_else(|| gettext("Profile")));
-                        let context = self.message_html_context(None);
-                        self.load_secondary_html(&message_html::user_profile_document(
-                            &user, &context,
-                        ));
-                    }
                 }
             }
             RuntimeEventKind::EmojiCatalogLoaded(emojis) => self.replace_custom_emojis(emojis),
@@ -7357,7 +7408,10 @@ impl ConduitWindow {
         self.render_closed_thread();
         self.imp().message_title.set_title(&title);
         self.render_conversations();
-        self.show_secondary_text_placeholder(&title, loading_message);
+        self.show_secondary_loading(
+            crate::secondary_views::SecondaryKind::Files,
+            loading_message,
+        );
         self.imp().workspace_split.set_show_content(true);
         true
     }
@@ -7372,7 +7426,10 @@ impl ConduitWindow {
         self.imp().message_title.set_title(&title);
         self.render_closed_thread();
         self.render_conversations();
-        self.show_secondary_text_placeholder(&title, &gettext("Loading saved items"));
+        self.show_secondary_loading(
+            crate::secondary_views::SecondaryKind::Saved,
+            &gettext("Loading saved items"),
+        );
         self.send_command(RuntimeCommand::LoadSavedItems);
         self.imp().workspace_split.set_show_content(true);
     }
@@ -7392,7 +7449,11 @@ impl ConduitWindow {
         self.render_closed_thread();
         self.render_conversations();
         self.imp().message_title.set_title(&title);
-        self.show_secondary_text_placeholder(&title, &gettext("Searching"));
+        self.show_secondary_loading(
+            crate::secondary_views::SecondaryKind::Search,
+            &gettext("Searching"),
+        );
+        self.imp().search_query.replace(query.clone());
         self.send_command(RuntimeCommand::SearchMessages { query });
         self.imp().workspace_split.set_show_content(true);
     }
@@ -8723,14 +8784,13 @@ impl ConduitWindow {
     fn show_main_surface_error(&self, surface: PlaceholderSurface, error: &str) {
         let title = surface.title();
         let message = surface.error_message(error);
-        match surface {
-            PlaceholderSurface::Messages => {
-                self.show_message_text_placeholder(&title, &message);
-            }
-            PlaceholderSurface::SearchResults
-            | PlaceholderSurface::Files
-            | PlaceholderSurface::SavedItems => {
-                self.show_secondary_text_placeholder(&title, &message);
+        match surface.secondary_kind() {
+            None => self.show_message_text_placeholder(&title, &message),
+            Some(kind) => {
+                if let Some(view) = self.secondary_view() {
+                    view.show_error(kind, &title, &message);
+                }
+                self.show_secondary_surface();
             }
         }
     }
@@ -9422,6 +9482,11 @@ impl ConduitWindow {
                 observed.iter().any(|(_, message)| {
                     messages_use_user(std::slice::from_ref(message), user_id)
                         || messages_use_user_in_reactions(std::slice::from_ref(message), user_id)
+                        || message
+                            .reply_users
+                            .iter()
+                            .flatten()
+                            .any(|candidate| candidate == user_id)
                 }) || {
                     let conversations = self.imp().workspace.conversations.borrow();
                     observed.iter().any(|(channel_id, _)| {
@@ -9447,7 +9512,11 @@ impl ConduitWindow {
                         || messages_use_user_in_reactions(std::slice::from_ref(message), user_id)
                 })
             }),
-            MainMessageView::Files | MainMessageView::Placeholder => false,
+            MainMessageView::Files => state
+                .files()
+                .iter()
+                .any(|file| file.user.as_deref() == Some(user_id)),
+            MainMessageView::Placeholder => false,
         }
     }
 
@@ -9469,9 +9538,12 @@ impl ConduitWindow {
                     messages_use_image_asset(std::slice::from_ref(message), custom_emojis, key)
                 })
             }),
-            MainMessageView::Search | MainMessageView::Files | MainMessageView::Placeholder => {
-                false
-            }
+            MainMessageView::Files => state
+                .files()
+                .iter()
+                .filter_map(image_asset_request)
+                .any(|(candidate, _)| candidate == key),
+            MainMessageView::Search | MainMessageView::Placeholder => false,
         }
     }
 
@@ -11348,24 +11420,69 @@ impl ConduitWindow {
             .collect::<Vec<_>>();
         self.request_user_names(&roots);
         self.request_image_assets(roots.iter());
-        let items = observed
-            .into_iter()
-            .map(|(channel_id, root)| message_html::ThreadInboxItem {
-                channel_title: self.conversation_title(&channel_id),
-                channel_id,
-                root,
-            })
-            .collect::<Vec<_>>();
-        self.imp().message_title.set_title(&gettext("Threads"));
+        let states = {
+            let catalog = self.imp().workspace.threads.borrow();
+            observed
+                .iter()
+                .map(|(channel_id, root)| {
+                    let state = catalog
+                        .get(channel_id, &root.ts)
+                        .map(|record| {
+                            let mut participant_ids = record
+                                .participant_user_ids
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            participant_ids.sort();
+                            crate::secondary_views::ThreadState {
+                                has_unread: record.has_unread_replies(),
+                                unread_count: record.unread_reply_count(),
+                                participant_ids,
+                            }
+                        })
+                        .unwrap_or_default();
+                    ((channel_id.clone(), root.ts.clone()), state)
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        self.request_user_ids(
+            states
+                .values()
+                .flat_map(|state| state.participant_ids.iter().cloned())
+                .chain(
+                    roots
+                        .iter()
+                        .flat_map(|root| root.reply_users.iter().flatten().cloned()),
+                )
+                .collect(),
+        );
         let context = self.message_html_context(None);
-        self.load_secondary_html(&generate_html("threads", || {
-            message_html::threads_document(&items, &context)
-        }));
+        let rows = crate::secondary_views::thread_rows(
+            observed,
+            &|channel_id, ts| {
+                states
+                    .get(&(channel_id.to_string(), ts.to_string()))
+                    .cloned()
+                    .unwrap_or_default()
+            },
+            &|channel_id| self.conversation_title(channel_id),
+            &context,
+        );
+        self.show_secondary_rows(
+            crate::secondary_views::SecondaryKind::Threads,
+            rows.into_iter()
+                .map(crate::secondary_views::SecondaryRow::Thread)
+                .collect(),
+            &context,
+        );
     }
 
     fn populate_search_results(&self, results: Vec<SearchMatch>) {
-        let imp = self.imp();
-        imp.message_title.set_title(&gettext("Search results"));
+        let kind = crate::secondary_views::SecondaryKind::Search;
+        if self.imp().workspace.view.borrow().search_loading() {
+            self.show_secondary_loading(kind, &gettext("Searching"));
+            return;
+        }
         self.request_user_ids(
             results
                 .iter()
@@ -11373,37 +11490,133 @@ impl ConduitWindow {
                 .collect(),
         );
         let context = self.message_html_context(None);
-        self.load_secondary_html(&generate_html("search", || {
-            message_html::search_results_document(&results, &context)
-        }));
+        let query = self.imp().search_query.borrow().clone();
+        let rows = crate::secondary_views::search_rows(
+            &results,
+            &query,
+            &|channel_id| self.known_conversation_title(channel_id),
+            &context,
+        );
+        self.show_secondary_rows(
+            kind,
+            rows.into_iter()
+                .map(crate::secondary_views::SecondaryRow::Search)
+                .collect(),
+            &context,
+        );
     }
 
     fn populate_files(&self, files: Vec<SlackFile>) {
-        let imp = self.imp();
-        imp.message_title.set_title(&gettext("Files"));
+        let kind = crate::secondary_views::SecondaryKind::Files;
         self.render_conversations();
-        self.load_secondary_html(&generate_html("files", || {
-            message_html::files_document(&files)
-        }));
+        if self.imp().workspace.view.borrow().files_loading() {
+            self.show_secondary_loading(kind, &gettext("Loading files"));
+            return;
+        }
+        self.request_user_ids(files.iter().filter_map(|file| file.user.clone()).collect());
+        self.send_image_asset_requests(files.iter().filter_map(image_asset_request).collect());
+        let context = self.message_html_context(None);
+        let rows = crate::secondary_views::file_rows(
+            &files,
+            &|channel_id| self.conversation_title(channel_id),
+            &context,
+        );
+        self.show_secondary_rows(
+            kind,
+            rows.into_iter()
+                .map(crate::secondary_views::SecondaryRow::File)
+                .collect(),
+            &context,
+        );
     }
 
     fn populate_saved_items(&self, items: Vec<SavedItem>) {
-        let imp = self.imp();
-        imp.message_title.set_title(&gettext("Later"));
+        let kind = crate::secondary_views::SecondaryKind::Saved;
+        if self.imp().workspace.view.borrow().saved_loading() {
+            self.show_secondary_loading(kind, &gettext("Loading saved items"));
+            return;
+        }
         let saved_messages = items
             .iter()
-            .filter_map(|item| item.message.as_ref())
+            .filter_map(|item| item.message.clone())
             .collect::<Vec<_>>();
-        let messages_for_names = saved_messages
-            .iter()
-            .map(|message| (*message).clone())
-            .collect::<Vec<_>>();
-        self.request_user_names(&messages_for_names);
-        self.request_image_assets(saved_messages);
+        self.request_user_names(&saved_messages);
+        self.request_image_assets(saved_messages.iter());
         let context = self.message_html_context(None);
-        self.load_secondary_html(&generate_html("saved_items", || {
-            message_html::saved_items_document(&items, &context)
-        }));
+        let rows = crate::secondary_views::saved_rows(&items, &|channel_id| {
+            self.conversation_title(channel_id)
+        });
+        self.show_secondary_rows(
+            kind,
+            rows.into_iter()
+                .map(crate::secondary_views::SecondaryRow::Saved)
+                .collect(),
+            &context,
+        );
+    }
+
+    /// Routes an action raised in the Threads, Search, Files or Later view.
+    fn handle_secondary_action(&self, action: crate::secondary_views::SecondaryAction) {
+        use crate::secondary_views::SecondaryAction;
+        match action {
+            SecondaryAction::OpenThread {
+                channel_id,
+                thread_ts,
+            } => self.open_thread(&channel_id, &thread_ts),
+            SecondaryAction::OpenMessage(location) => self.open_message_context(location),
+            SecondaryAction::OpenExternal(url) => self.open_external_link(&url),
+            SecondaryAction::OpenMedia { url, name, video } => {
+                self.open_media_viewer(MediaGalleryItem {
+                    url,
+                    name,
+                    kind: if video {
+                        MediaKind::Video
+                    } else {
+                        MediaKind::Image
+                    },
+                });
+            }
+            SecondaryAction::RemoveSaved {
+                channel_id,
+                ts,
+                thread_ts,
+            } => {
+                if self.send_command(RuntimeCommand::SetSaved {
+                    channel_id,
+                    ts,
+                    add: false,
+                    thread_ts,
+                }) {
+                    self.set_status(&gettext("Removing saved message"));
+                }
+            }
+            SecondaryAction::Author(action) => self.handle_timeline_action(action),
+        }
+    }
+
+    /// Opens a message in its conversation (and thread), loading the
+    /// surrounding history when it is not cached.
+    fn open_message_context(&self, location: crate::models::SearchMessageLocation) {
+        let channel_id = location.channel_id().to_string();
+        let thread_ts = location.thread_ts().map(ToString::to_string);
+        let title = self.conversation_title(&channel_id);
+        if !self.select_conversation_target(&channel_id, &title, Some(location.message_ts())) {
+            return;
+        }
+        if let Some(thread_ts) = thread_ts.as_deref() {
+            self.open_thread(&channel_id, thread_ts);
+        }
+        if !self
+            .imp()
+            .workspace
+            .view
+            .borrow_mut()
+            .focus_message(&location)
+        {
+            return;
+        }
+        self.set_status(&gettext("Loading message context"));
+        self.send_command(RuntimeCommand::LoadMessageContext(location));
     }
 
     fn handle_huddle_event(&self, event: HuddleEvent) {
@@ -12183,6 +12396,11 @@ impl ConduitWindow {
     }
 
     fn conversation_title(&self, channel_id: &str) -> String {
+        self.known_conversation_title(channel_id)
+            .unwrap_or_else(|| "Slack".to_string())
+    }
+
+    fn known_conversation_title(&self, channel_id: &str) -> Option<String> {
         let imp = self.imp();
         let user_names = imp.user_names.borrow().clone();
         let current_user_id = imp.current_user_id.borrow().clone();
@@ -12193,7 +12411,6 @@ impl ConduitWindow {
             .map(|conversation| {
                 conversation.display_name_with_users(&user_names, current_user_id.as_deref())
             })
-            .unwrap_or_else(|| "Slack".to_string())
     }
 
     fn open_channel_reference(&self, channel_id: &str) -> bool {
@@ -12253,32 +12470,48 @@ impl ConduitWindow {
         self.show_message_placeholder(&format!("{title}\n\n{message}"));
     }
 
-    /// Shows a titled text placeholder in the secondary surface. See
-    /// `show_message_text_placeholder` for the main-surface equivalent.
-    fn show_secondary_text_placeholder(&self, title: &str, message: &str) {
-        if let Some(native_timeline) = self.imp().native_timeline_view.borrow().as_ref() {
-            native_timeline.show_placeholder(&format!("{title}\n\n{message}"));
+    /// Cloned handle, so no `RefCell` borrow is held while the view runs.
+    fn secondary_view(&self) -> Option<crate::secondary_views::SecondaryView> {
+        self.imp().secondary_view.borrow().clone()
+    }
+
+    /// Shows the loading state of a native secondary view.
+    fn show_secondary_loading(&self, kind: crate::secondary_views::SecondaryKind, message: &str) {
+        if let Some(view) = self.secondary_view() {
+            view.show_loading(kind, message);
         }
         self.show_secondary_surface();
     }
 
-    fn show_timeline_surface(&self) {
+    /// Renders `rows` in the secondary view, or its empty state.
+    fn show_secondary_rows(
+        &self,
+        kind: crate::secondary_views::SecondaryKind,
+        rows: Vec<crate::secondary_views::SecondaryRow>,
+        context: &MessageHtmlContext,
+    ) {
+        self.imp().message_title.set_title(&kind.title());
+        if let Some(view) = self.secondary_view() {
+            view.show_rows(kind, rows, context);
+        }
+        self.show_secondary_surface();
+    }
+
+    fn show_surface(&self, name: &str) {
         if let Some(viewer) = self.imp().media_viewer.borrow().as_ref() {
             if viewer.surface_stack.visible_child_name().as_deref() == Some("media") {
                 self.close_media_viewer();
             }
-            viewer
-                .surface_stack
-                .set_visible_child_name("native_timeline");
+            viewer.surface_stack.set_visible_child_name(name);
         }
     }
 
-    fn show_secondary_surface(&self) {
-        self.show_timeline_surface();
+    fn show_timeline_surface(&self) {
+        self.show_surface("native_timeline");
     }
 
-    fn load_secondary_html(&self, _html: &str) {
-        self.show_secondary_surface();
+    fn show_secondary_surface(&self) {
+        self.show_surface("secondary");
     }
 
     fn close_thread_pane(&self) {
@@ -12435,6 +12668,12 @@ impl ConduitWindow {
         let requests = message_image_asset_requests(messages, &avatar_urls, &custom_emojis);
         drop(custom_emojis);
         drop(avatar_urls);
+        self.send_image_asset_requests(requests);
+    }
+
+    /// Requests the `(key, url)` image assets that are not cached, pending or
+    /// known to have failed.
+    fn send_image_asset_requests(&self, requests: Vec<(String, String)>) {
         if requests.is_empty() {
             return;
         }

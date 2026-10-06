@@ -7,14 +7,15 @@ use serde::Serialize;
 use crate::config;
 use crate::day_label::{capitalize_first_letter, date_text};
 use crate::debug;
+use crate::emoji::{EmojiCatalog, EmojiEntry, EmojiValue};
+#[cfg(test)]
 use crate::emoji::{
-    EmojiCatalog, EmojiEntry, EmojiValue, EMOJI_PICKER_CATEGORIES, EMOJI_PICKER_MAX_QUERY_CHARS,
-    EMOJI_PICKER_PROTOCOL_VERSION, EMOJI_PICKER_RESULT_LIMIT,
+    EMOJI_PICKER_CATEGORIES, EMOJI_PICKER_MAX_QUERY_CHARS, EMOJI_PICKER_PROTOCOL_VERSION,
+    EMOJI_PICKER_RESULT_LIMIT,
 };
 use crate::message_handoff::{MessageControlHandle, MessageRef};
 use crate::models::{
-    SavedItem, SearchMatch, SearchMessageLocation, SlackAttachment, SlackAttachmentAction,
-    SlackFile, SlackMessage, SlackUser, SlackUserStatus,
+    SlackAttachment, SlackAttachmentAction, SlackFile, SlackMessage, SlackUserStatus,
 };
 use crate::rich_message::MessageControlKey;
 
@@ -25,10 +26,14 @@ mod rich_plan;
 pub(crate) mod test_fixtures;
 
 
+#[cfg(test)]
 const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
+#[cfg(test)]
 pub(crate) const MESSAGE_BASE_FONT_SIZE_CSS_PX: f64 = 14.0;
 const CACHED_ASSET_URI_PREFIX: &str = "conduit-asset://";
+#[cfg(test)]
 const TIMESTAMP_LOCALIZATION_SCRIPT: &str = include_str!("timestamp_localization.js");
+#[cfg(test)]
 const RICH_MESSAGE_CSS: &str = include_str!("message_html/message.css");
 const QUICK_REACTION_LIMIT: usize = 4;
 static TIME_FORMAT_LOCALE: OnceLock<Option<String>> = OnceLock::new();
@@ -537,6 +542,7 @@ fn normalize_language_tag(locale: &str) -> Option<String> {
     Some(normalized.join("-"))
 }
 
+#[cfg(test)]
 fn document_language() -> String {
     gtk::glib::language_names()
         .iter()
@@ -554,12 +560,14 @@ fn normalize_time_format_locale(locale: Option<&[u8]>) -> Option<String> {
         .and_then(normalize_language_tag)
 }
 
+#[cfg(test)]
 fn configured_time_locale() -> Option<&'static str> {
     TIME_FORMAT_LOCALE
         .get_or_init(time_format_locale_from_environment)
         .as_deref()
 }
 
+#[cfg(test)]
 fn time_format_locale_from_environment() -> Option<String> {
     let lc_all = std::env::var("LC_ALL").ok();
     let lc_time = std::env::var("LC_TIME").ok();
@@ -567,6 +575,7 @@ fn time_format_locale_from_environment() -> Option<String> {
     preferred_time_locale([lc_all.as_deref(), lc_time.as_deref(), lang.as_deref()])
 }
 
+#[cfg(test)]
 fn preferred_time_locale<'a>(locales: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
     for locale in locales.into_iter().flatten() {
         if !locale.trim().is_empty() {
@@ -576,6 +585,7 @@ fn preferred_time_locale<'a>(locales: impl IntoIterator<Item = Option<&'a str>>)
     None
 }
 
+#[cfg(test)]
 fn document_heading(title: &str) -> String {
     format!(
         "<h1 id=\"document-title\" class=\"visually-hidden\">{}</h1>",
@@ -583,6 +593,7 @@ fn document_heading(title: &str) -> String {
     )
 }
 
+#[cfg(test)]
 fn emoji_picker_html(_context: &MessageHtmlContext) -> String {
     let category_buttons = EMOJI_PICKER_CATEGORIES
         .iter()
@@ -610,10 +621,12 @@ fn emoji_picker_html(_context: &MessageHtmlContext) -> String {
     )
 }
 
+#[cfg(test)]
 fn emoji_picker_script() -> &'static str {
     include_str!("emoji_picker.js")
 }
 
+#[cfg(test)]
 fn author_actions_script() -> &'static str {
     r#"(function () {
   function closeAuthorMenus(except) {
@@ -651,152 +664,6 @@ fn emoji_value_html(value: &EmojiValue, lazy: bool) -> String {
             escape_html(url)
         ),
     }
-}
-
-pub fn placeholder_document(title: &str, message: &str) -> String {
-    html_document(
-        title,
-        &format!(
-            "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<p class=\"placeholder\">{}</p></main>",
-            document_heading(title),
-            escape_html(message)
-        ),
-    )
-}
-
-pub fn user_profile_document(user: &SlackUser, context: &MessageHtmlContext) -> String {
-    let profile = user.profile.as_ref();
-    let display_name = user
-        .display_name()
-        .unwrap_or_else(|| gettext("Unknown person"));
-    let full_name = profile
-        .and_then(|profile| profile.real_name.as_deref())
-        .or(user.real_name.as_deref())
-        .unwrap_or(&display_name);
-    let image = profile.and_then(|profile| {
-        profile
-            .image_original
-            .as_deref()
-            .or(profile.image_512.as_deref())
-            .or(profile.image_192.as_deref())
-            .or(profile.image_72.as_deref())
-    });
-    let mut body = format!(
-        "<main class=\"profile-page\" aria-labelledby=\"document-title\"><nav><a href=\"conduit://profile-close\">← {}</a></nav><header class=\"profile-header\">",
-        profile_plain_text_html(&gettext("Back to conversation"))
-    );
-    if let Some(image) = image.filter(|url| is_http_url(url)) {
-        body.push_str(&format!(
-            "<img class=\"profile-picture\" src=\"{}\" alt=\"{}\">",
-            escape_html(image),
-            escape_html(&format!("{} profile picture", full_name))
-        ));
-    }
-    body.push_str(&format!(
-        "<div><h1 id=\"document-title\">{}</h1><p class=\"profile-full-name\">{}</p></div></header><dl class=\"profile-details\">",
-        profile_plain_text_html(&display_name),
-        profile_plain_text_html(full_name)
-    ));
-    if let Some(status) = user.status() {
-        let status_value = [status.emoji.as_str(), status.text.as_str()]
-            .into_iter()
-            .filter(|value| !value.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        body.push_str(&format!(
-            "<div><dt>{}</dt><dd dir=\"auto\">{}</dd></div>",
-            profile_plain_text_html(&gettext("Status")),
-            profile_status_text_html(&status_value, context)
-        ));
-        if status.expiration > 0 {
-            let expiration = gtk::glib::DateTime::from_unix_local(status.expiration)
-                .ok()
-                .and_then(|datetime| localized_full_timestamp(&datetime))
-                .unwrap_or_else(|| status.expiration.to_string());
-            body.push_str(&format!(
-                "<div><dt>{}</dt><dd dir=\"auto\">{}</dd></div>",
-                profile_plain_text_html(&gettext("Status expiration")),
-                profile_plain_text_html(&expiration)
-            ));
-        }
-    }
-    let mut detail = |label: &str, value: Option<&str>| {
-        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
-            body.push_str(&format!(
-                "<div><dt>{}</dt><dd dir=\"auto\">{}</dd></div>",
-                profile_plain_text_html(label),
-                profile_plain_text_html(value)
-            ));
-        }
-    };
-    detail(
-        &gettext("Job title"),
-        profile.and_then(|p| p.title.as_deref()),
-    );
-    detail(
-        &gettext("Pronouns"),
-        profile.and_then(|p| p.pronouns.as_deref()),
-    );
-    detail(&gettext("Email"), profile.and_then(|p| p.email.as_deref()));
-    detail(&gettext("Phone"), profile.and_then(|p| p.phone.as_deref()));
-    detail(&gettext("Skype"), profile.and_then(|p| p.skype.as_deref()));
-    detail(&gettext("About"), profile.and_then(|p| p.about.as_deref()));
-    detail(
-        &gettext("Location"),
-        profile
-            .and_then(|p| p.location.as_deref())
-            .or(user.tz_label.as_deref()),
-    );
-    detail(&gettext("Time zone"), user.tz.as_deref());
-    if let Some(profile) = profile {
-        let mut fields = profile.fields.iter().collect::<Vec<_>>();
-        fields.sort_by(|(left_id, left), (right_id, right)| {
-            left.label
-                .as_deref()
-                .unwrap_or(left_id)
-                .cmp(right.label.as_deref().unwrap_or(right_id))
-        });
-        for (field_id, field) in fields {
-            detail(
-                field.label.as_deref().unwrap_or(field_id),
-                field.display_value(),
-            );
-        }
-    }
-    body.push_str("</dl></main>");
-    html_document(&display_name, &body)
-}
-
-fn profile_plain_text_html(text: &str) -> String {
-    escape_html(text).replace('\n', "<br>")
-}
-
-fn profile_status_text_html(text: &str, context: &MessageHtmlContext) -> String {
-    let mut output = String::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        if let Some((_, consumed)) = decode_html_entity_prefix(rest) {
-            output.push_str(&escape_html(&rest[..consumed]));
-            rest = &rest[consumed..];
-            continue;
-        }
-        if let Some((html, consumed)) = render_emoji_shortcode(rest, context) {
-            output.push_str(&html);
-            rest = &rest[consumed..];
-            continue;
-        }
-        let next = rest
-            .chars()
-            .next()
-            .expect("non-empty string has a character");
-        if next == '\n' {
-            output.push_str("<br>");
-        } else {
-            output.push_str(&escape_html(&next.to_string()));
-        }
-        rest = &rest[next.len_utf8()..];
-    }
-    output
 }
 
 #[cfg(test)]
@@ -905,119 +772,7 @@ fn conversation_list_items_html(
     html
 }
 
-pub fn saved_items_document(items: &[SavedItem], context: &MessageHtmlContext) -> String {
-    let title = gettext("Saved items");
-    let mut rendered = 0;
-    let mut body = String::with_capacity(items.len() * 1536 + 2048);
-    body.push_str(&format!(
-        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ol class=\"message-list\">",
-        document_heading(&title)
-    ));
-
-    for item in items {
-        if let (Some(channel_id), Some(message)) = (item.channel.as_deref(), item.message.as_ref())
-        {
-            body.push_str("<li class=\"message-list-item\">");
-            body.push_str(&message_article(Some(channel_id), message, context));
-            body.push_str("</li>");
-            rendered += 1;
-        }
-    }
-
-    body.push_str("</ol>");
-    if rendered == 0 {
-        body.push_str(&format!(
-            "<p class=\"placeholder\">{}</p>",
-            escape_html(&gettext("No saved items"))
-        ));
-    }
-    body.push_str("</main>");
-    if rendered > 0 {
-        body.push_str(&emoji_picker_html(context));
-    }
-
-    html_document(&title, &body)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadInboxItem {
-    pub channel_id: String,
-    pub channel_title: String,
-    pub root: SlackMessage,
-}
-
-pub fn threads_document(items: &[ThreadInboxItem], context: &MessageHtmlContext) -> String {
-    if items.is_empty() {
-        return placeholder_document(
-            &gettext("Threads"),
-            &gettext("No threads have been discovered yet"),
-        );
-    }
-
-    let title = gettext("Threads");
-    let mut body = String::with_capacity(items.len() * 1536 + 2048);
-    body.push_str(&format!(
-        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ol class=\"message-list\">",
-        document_heading(&title)
-    ));
-    for item in items {
-        let reply_count = item.root.reply_count.unwrap_or_default();
-        let label = gettext("{channel} · {count} replies")
-            .replace("{channel}", &item.channel_title)
-            .replace("{count}", &reply_count.to_string());
-        body.push_str(&format!(
-            "<li class=\"message-list-item\"><a class=\"activity-row\" href=\"{}\">{}</a>{}</li>",
-            escape_html(&thread_action_url(&item.channel_id, &item.root.ts)),
-            escape_html(&label),
-            message_article(Some(&item.channel_id), &item.root, context),
-        ));
-    }
-    body.push_str("</ol></main>");
-    body.push_str(&emoji_picker_html(context));
-    html_document(&title, &body)
-}
-
-pub fn files_document(files: &[SlackFile]) -> String {
-    if files.is_empty() {
-        return placeholder_document(&gettext("Files"), &gettext("No files"));
-    }
-
-    let title = gettext("Files");
-    let mut body = String::with_capacity(files.len() * 512 + 1024);
-    body.push_str(&format!(
-        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ul class=\"file-list\">",
-        document_heading(&title)
-    ));
-    for file in files {
-        body.push_str(&file_item_html(file));
-    }
-    body.push_str("</ul></main>");
-
-    html_document(&title, &body)
-}
-
-pub fn search_results_document(results: &[SearchMatch], context: &MessageHtmlContext) -> String {
-    if results.is_empty() {
-        return placeholder_document(&gettext("Search results"), &gettext("No results"));
-    }
-
-    let title = gettext("Search results");
-    let mut body = String::with_capacity(results.len() * 1536 + 2048);
-    body.push_str(&format!(
-        "<main class=\"timeline\" aria-labelledby=\"document-title\">{}<ol class=\"message-list\">",
-        document_heading(&title)
-    ));
-    for result in results {
-        body.push_str("<li class=\"message-list-item\">");
-        body.push_str(&search_result_article(result, context));
-        body.push_str("</li>");
-    }
-    body.push_str("</ol></main>");
-    body.push_str(&emoji_picker_html(context));
-
-    html_document(&title, &body)
-}
-
+#[cfg(test)]
 fn document_direction(language: &str) -> &'static str {
     if let Some(script) = language.split('-').skip(1).find(|subtag| {
         subtag.len() == 4
@@ -1042,10 +797,7 @@ fn document_direction(language: &str) -> &'static str {
     }
 }
 
-fn html_document(title: &str, body: &str) -> String {
-    html_document_with_script(title, body, None)
-}
-
+#[cfg(test)]
 fn html_document_with_script(title: &str, body: &str, script: Option<&str>) -> String {
     html_document_with_locales(
         title,
@@ -1056,6 +808,7 @@ fn html_document_with_script(title: &str, body: &str, script: Option<&str>) -> S
     )
 }
 
+#[cfg(test)]
 fn html_document_with_locales(
     title: &str,
     body: &str,
@@ -2011,26 +1764,6 @@ fn load_more_action_html(url: &str, label: &str) -> String {
     )
 }
 
-fn file_item_html(file: &SlackFile) -> String {
-    let title = escape_html(file.display_title());
-    let detail = file.detail_label();
-    let detail = if detail.is_empty() {
-        String::new()
-    } else {
-        format!("<span class=\"file-meta\">{}</span>", escape_html(&detail))
-    };
-    let content = format!("<span class=\"file-title\" dir=\"auto\">{title}</span>{detail}");
-
-    if let Some(url) = file.link_url().filter(|url| is_http_url(url)) {
-        format!(
-            "<li><a class=\"file-row\" href=\"{}\" rel=\"noreferrer noopener\">{content}</a></li>",
-            escape_html(url)
-        )
-    } else {
-        format!("<li><div class=\"file-row\">{content}</div></li>")
-    }
-}
-
 fn message_group_article(
     channel_id: Option<&str>,
     messages: &[&SlackMessage],
@@ -2255,64 +1988,6 @@ fn same_author(previous: &SlackMessage, current: &SlackMessage) -> bool {
 
 fn slack_ts_seconds(ts: &str) -> Option<f64> {
     ts.parse::<f64>().ok()
-}
-
-fn search_result_article(result: &SearchMatch, context: &MessageHtmlContext) -> String {
-    let channel = result
-        .channel
-        .as_ref()
-        .and_then(|channel| {
-            channel
-                .id
-                .as_deref()
-                .and_then(|id| context.conversation_titles.get(id).cloned())
-                .or_else(|| channel.name.as_deref().map(|name| format!("#{name}")))
-        })
-        .unwrap_or_else(|| "Slack".to_string());
-    let author = result
-        .user
-        .as_deref()
-        .and_then(|user_id| context.user_names.get(user_id).map(String::as_str))
-        .or(result.username.as_deref())
-        .or(result.user.as_deref())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| gettext("Unknown"));
-    let text = result.text.as_deref().unwrap_or_default();
-
-    let timestamp = result.ts.as_deref().map(timestamp_html).unwrap_or_default();
-    let mut article = format!(
-        "<article class=\"message\"{}><header class=\"message-header\"><span class=\"author\" dir=\"auto\">{}</span><span class=\"metadata\">{}</span>{}</header><div class=\"body\" dir=\"auto\"><p>{}</p></div>",
-        message_target_attributes(result.ts.as_deref()),
-        escape_html(&author),
-        escape_html(&channel),
-        timestamp,
-        mrkdwn_to_html(text, context)
-    );
-
-    let mut actions = String::new();
-    if let Some(location) = result.message_location() {
-        actions.push_str(&format!(
-            "<a class=\"external-action\" href=\"{}\">{}</a>",
-            escape_html(&message_context_action_url(&location)),
-            escape_html(&gettext("Open in Conduit"))
-        ));
-    }
-    if let Some(permalink) = result.permalink.as_deref().filter(|url| is_http_url(url)) {
-        actions.push_str(&format!(
-            "<a class=\"external-action\" href=\"{}\" rel=\"noreferrer noopener\">{}</a>",
-            escape_html(permalink),
-            escape_html(&gettext("Open in Slack"))
-        ));
-    }
-    if !actions.is_empty() {
-        article.push_str(&format!(
-            "<nav class=\"external-actions\" aria-label=\"{}\">{actions}</nav>",
-            escape_html(&gettext("Message actions")),
-        ));
-    }
-
-    article.push_str("</article>");
-    article
 }
 
 fn metadata_html(message: &SlackMessage) -> String {
@@ -3541,14 +3216,6 @@ pub fn user_profile_action_url(user_id: &str) -> String {
     format!("conduit://user-profile?user={}", encode_query(user_id))
 }
 
-pub fn message_context_action_url(location: &SearchMessageLocation) -> String {
-    message_target_action_url(
-        location.channel_id(),
-        location.message_ts(),
-        location.thread_ts(),
-    )
-}
-
 pub fn message_target_action_url(channel_id: &str, ts: &str, thread_ts: Option<&str>) -> String {
     let mut url = format!(
         "conduit://message?channel={}&ts={}",
@@ -4351,7 +4018,7 @@ fn push_escaped_html_character(output: &mut String, character: char) {
 mod tests {
     use super::*;
     use crate::message_handoff::{MessageControlRegistry, TimelineSurfaceId};
-    use crate::models::{SavedItem, SlackFile, SlackReaction};
+    use crate::models::{SlackFile, SlackReaction};
     use std::time::Instant;
 
     fn message(text: &str) -> SlackMessage {
@@ -4448,32 +4115,6 @@ mod tests {
         )
     }
 
-    fn contrast_ratio(foreground: &str, background: &str) -> f64 {
-        fn luminance(color: &str) -> f64 {
-            let channel = |offset| {
-                let value =
-                    u8::from_str_radix(&color[offset..offset + 2], 16).unwrap() as f64 / 255.0;
-                if value <= 0.04045 {
-                    value / 12.92
-                } else {
-                    ((value + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5)
-        }
-
-        let foreground = luminance(foreground);
-        let background = luminance(background);
-        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
-    }
-
-    fn document_css(html: &str) -> &str {
-        html.split_once("<style>")
-            .and_then(|(_, rest)| rest.split_once("</style>"))
-            .map(|(css, _)| css)
-            .expect("generated document should contain CSS")
-    }
-
     #[test]
     #[ignore = "release measurement fixture; run explicitly with --ignored --nocapture"]
     fn measure_credential_free_emoji_picker_document_cost() {
@@ -4504,29 +4145,6 @@ mod tests {
             html.matches("class=\"emoji-choice\"").count(),
             context.custom_emojis.len(),
         );
-    }
-
-    fn root_css_variables(css: &str) -> Vec<HashMap<String, String>> {
-        let mut remaining = css;
-        let mut themes = Vec::new();
-
-        while let Some((_, after_root)) = remaining.split_once(":root {") {
-            let (block, rest) = after_root
-                .split_once('}')
-                .expect("CSS root block should be closed");
-            let variables = block
-                .lines()
-                .filter_map(|line| {
-                    let (name, value) = line.trim().strip_suffix(';')?.split_once(':')?;
-                    name.starts_with("--")
-                        .then(|| (name.to_string(), value.trim().to_string()))
-                })
-                .collect();
-            themes.push(variables);
-            remaining = rest;
-        }
-
-        themes
     }
 
     #[test]
@@ -4630,14 +4248,6 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_document_preserves_and_escapes_prelocalized_inputs() {
-        let html = placeholder_document("Titel & meer", "Runtime <error> & details");
-
-        assert!(html.contains("<title>Titel &amp; meer</title>"));
-        assert!(html.contains("Runtime &lt;error&gt; &amp; details"));
-    }
-
-    #[test]
     fn html_documents_decode_entities_once_before_safe_rendering() {
         assert_eq!(
             escape_html("&gt; &lt; &amp; &quot; &apos; &#62; &#x1F642;"),
@@ -4648,11 +4258,6 @@ mod tests {
             "&amp;lt;script&amp;gt;"
         );
 
-        let placeholder = placeholder_document("A &gt; B", "C &lt; D &amp; E");
-        assert!(placeholder.contains("<title>A &gt; B</title>"));
-        assert!(placeholder.contains("C &lt; D &amp; E"));
-        assert!(!placeholder.contains("&amp;gt;"));
-
         let conversation = conversation_document(
             "C123",
             &[message("A &gt; B &amp; &lt;script&gt;")],
@@ -4660,102 +4265,6 @@ mod tests {
         );
         assert!(conversation.contains("A &gt; B &amp; &lt;script&gt;"));
         assert!(!conversation.contains("A &amp;gt; B"));
-
-        let search = search_results_document(
-            &[SearchMatch {
-                text: Some("Result &gt; threshold".into()),
-                ..Default::default()
-            }],
-            &MessageHtmlContext::default(),
-        );
-        assert!(search.contains("Result &gt; threshold"));
-        assert!(!search.contains("Result &amp;gt; threshold"));
-
-        let profile = user_profile_document(
-            &SlackUser {
-                real_name: Some("Ada &gt; Grace".into()),
-                ..Default::default()
-            },
-            &MessageHtmlContext::default(),
-        );
-        assert!(profile.contains("Ada &gt; Grace"));
-        assert!(!profile.contains("Ada &amp;gt; Grace"));
-
-        let files = files_document(&[SlackFile {
-            title: Some("Report &gt; draft".into()),
-            ..Default::default()
-        }]);
-        assert!(files.contains("Report &gt; draft"));
-        assert!(!files.contains("Report &amp;gt; draft"));
-    }
-
-    #[test]
-    fn document_css_preserves_keyboard_motion_and_bidirectional_accessibility() {
-        let html = placeholder_document("Messages", "No messages");
-        let css = document_css(&html);
-
-        assert!(css.contains(":focus-visible"));
-        assert!(css.contains(".quick-actions:has(:focus-visible)"));
-        assert!(css.contains("@keyframes sent-message-arrival"));
-        assert!(css.contains(".sent-message-arrival"));
-        assert!(css.contains("@media (prefers-reduced-motion: reduce)"));
-        assert!(css.contains("padding-inline:"));
-        assert!(css.contains("inset-inline-end:"));
-
-        for line in css.lines().map(str::trim) {
-            let Some((property, _)) = line.split_once(':') else {
-                continue;
-            };
-            assert!(
-                !matches!(
-                    property,
-                    "left"
-                        | "right"
-                        | "padding-left"
-                        | "padding-right"
-                        | "margin-left"
-                        | "margin-right"
-                ),
-                "physical directional property in generated CSS: {property}"
-            );
-        }
-    }
-
-    #[test]
-    fn document_includes_the_rich_message_css_asset() {
-        let html = placeholder_document("Messages", "No messages");
-        let css = document_css(&html);
-
-        assert!(RICH_MESSAGE_CSS.contains(".legacy-attachment"));
-        assert!(RICH_MESSAGE_CSS.contains(".slack-handoff"));
-        assert!(css.contains(RICH_MESSAGE_CSS));
-    }
-
-    #[test]
-    fn document_color_variables_meet_wcag_aa_for_normal_text() {
-        let html = placeholder_document("Messages", "No messages");
-        let themes = root_css_variables(document_css(&html));
-        assert_eq!(themes.len(), 2, "expected light and dark CSS variable sets");
-
-        for variables in themes {
-            for (foreground_name, background_name) in [
-                ("--text", "--page"),
-                ("--muted", "--page"),
-                ("--accent", "--page"),
-                ("--accent", "--accent-soft"),
-            ] {
-                let foreground = variables
-                    .get(foreground_name)
-                    .expect("foreground CSS variable should exist");
-                let background = variables
-                    .get(background_name)
-                    .expect("background CSS variable should exist");
-                assert!(
-                    contrast_ratio(foreground, background) >= 4.5,
-                    "{foreground_name} ({foreground}) on {background_name} ({background})"
-                );
-            }
-        }
     }
 
     #[test]
@@ -6134,170 +5643,6 @@ mod tests {
     }
 
     #[test]
-    fn saved_items_ignore_non_message_entries() {
-        let items = vec![
-            SavedItem {
-                kind: Some("file".to_string()),
-                ..Default::default()
-            },
-            SavedItem {
-                channel: Some("C123".to_string()),
-                message: Some(message("saved")),
-                ..Default::default()
-            },
-        ];
-
-        let html = saved_items_document(&items, &MessageHtmlContext::default());
-
-        assert!(html.contains("saved"));
-        assert!(!html.contains("No saved items"));
-    }
-
-    #[test]
-    fn files_document_renders_file_rows() {
-        let files = vec![SlackFile {
-            title: Some("Quarterly <plan>.pdf".to_string()),
-            pretty_type: Some("PDF".to_string()),
-            size: Some(1_048_576),
-            permalink: Some("https://slack.example/files/F123".to_string()),
-            ..Default::default()
-        }];
-
-        let html = files_document(&files);
-
-        assert!(html.contains("<main class=\"timeline\" aria-labelledby=\"document-title\">"));
-        assert!(html.contains("<ul class=\"file-list\"><li>"));
-        assert!(html.contains("class=\"file-title\" dir=\"auto\""));
-        assert!(html.contains("Quarterly &lt;plan&gt;.pdf"));
-        assert!(html.contains("PDF - 1.0 MB"));
-        assert!(html.contains("href=\"https://slack.example/files/F123\""));
-    }
-
-    #[test]
-    fn files_document_uses_empty_state_without_rows() {
-        let html = files_document(&[]);
-
-        assert!(html.contains("No files"));
-        assert!(!html.contains("<a class=\"file-row\""));
-        assert!(!html.contains("<section class=\"file-row\""));
-    }
-
-    #[test]
-    fn threads_document_links_roots_to_existing_thread_navigation() {
-        let mut root = message("A useful thread");
-        root.reply_count = Some(3);
-        let html = threads_document(
-            &[ThreadInboxItem {
-                channel_id: "C123".to_string(),
-                channel_title: "general".to_string(),
-                root,
-            }],
-            &MessageHtmlContext::default(),
-        );
-
-        assert!(html.contains("general · 3 replies"));
-        assert!(html.contains("conduit://thread?channel=C123&amp;ts=1710000000.000100"));
-        assert!(html.contains("A useful thread"));
-    }
-
-    #[test]
-    fn search_results_do_not_link_unsafe_permalink_schemes() {
-        let results = vec![SearchMatch {
-            username: Some("Ada".to_string()),
-            text: Some("result".to_string()),
-            permalink: Some("javascript:alert(1)".to_string()),
-            ..Default::default()
-        }];
-
-        let html = search_results_document(&results, &MessageHtmlContext::default());
-
-        assert!(html.contains("result"));
-        assert!(!html.contains("javascript:alert"));
-        assert!(!html.contains("Open in Slack"));
-    }
-
-    #[test]
-    fn search_results_link_to_valid_internal_message_locations() {
-        let results = vec![SearchMatch {
-            channel: Some(crate::models::SlackSearchChannel {
-                id: Some("C 123".to_string()),
-                name: Some("general".to_string()),
-            }),
-            ts: Some("1710000001.000100".to_string()),
-            thread_ts: Some("1710000000.000100".to_string()),
-            permalink: Some("https://example.slack.com/archives/C123/p1".to_string()),
-            ..Default::default()
-        }];
-
-        let html = search_results_document(&results, &MessageHtmlContext::default());
-
-        assert!(html.contains("Open in Conduit"));
-        assert!(html.contains(
-            "conduit://message?channel=C%20123&amp;ts=1710000001.000100&amp;thread_ts=1710000000.000100"
-        ));
-        assert!(html.contains("Open in Slack"));
-    }
-
-    #[test]
-    fn search_results_resolve_dm_group_dm_and_author_display_names() {
-        let results = vec![
-            SearchMatch {
-                channel: Some(crate::models::SlackSearchChannel {
-                    id: Some("D123".to_string()),
-                    name: Some("directmessage".to_string()),
-                }),
-                user: Some("U_AUTHOR".to_string()),
-                username: Some("legacy-name".to_string()),
-                text: Some("Direct result".to_string()),
-                ..Default::default()
-            },
-            SearchMatch {
-                channel: Some(crate::models::SlackSearchChannel {
-                    id: Some("G123".to_string()),
-                    name: Some("mpdm-ada-grace-1".to_string()),
-                }),
-                text: Some("Group result".to_string()),
-                ..Default::default()
-            },
-        ];
-        let context = MessageHtmlContext {
-            user_names: Arc::new(HashMap::from([(
-                "U_AUTHOR".to_string(),
-                "Linus Torvalds".to_string(),
-            )])),
-            conversation_titles: HashMap::from([
-                ("D123".to_string(), "Ada Lovelace".to_string()),
-                ("G123".to_string(), "Ada Lovelace, Grace Hopper".to_string()),
-            ]),
-            ..Default::default()
-        };
-
-        let html = search_results_document(&results, &context);
-
-        assert!(html.contains("Ada Lovelace"));
-        assert!(html.contains("Ada Lovelace, Grace Hopper"));
-        assert!(html.contains("Linus Torvalds"));
-        assert!(!html.contains("#directmessage"));
-        assert!(!html.contains("#mpdm-ada-grace-1"));
-        assert!(!html.contains("legacy-name"));
-    }
-
-    #[test]
-    fn search_results_omit_internal_link_without_a_complete_location() {
-        let html = search_results_document(
-            &[SearchMatch {
-                ts: Some("1710000001.000100".to_string()),
-                permalink: Some("https://example.slack.com/archives/C123/p1".to_string()),
-                ..Default::default()
-            }],
-            &MessageHtmlContext::default(),
-        );
-
-        assert!(!html.contains("Open in Conduit"));
-        assert!(html.contains("Open in Slack"));
-    }
-
-    #[test]
     fn focused_conversation_document_escapes_target_and_uses_static_script() {
         let target = "1710000000.000100\"</script><script>alert(1)</script>";
         let html = conversation_document_with_focus(
@@ -6317,33 +5662,6 @@ mod tests {
         assert!(html.contains("timeline.dataset.focusMessageTs"));
         assert!(html.contains("target.scrollIntoView"));
         assert!(!html.contains("target.focus"));
-    }
-
-    #[test]
-    fn search_and_saved_documents_use_semantic_message_lists_and_time() {
-        let results = vec![SearchMatch {
-            username: Some("Ada".to_string()),
-            text: Some("A result".to_string()),
-            ts: Some("1710000000.000100".to_string()),
-            ..Default::default()
-        }];
-        let search = search_results_document(&results, &MessageHtmlContext::default());
-        assert!(search.contains("<ol class=\"message-list\"><li class=\"message-list-item\">"));
-        assert_eq!(search.matches("<ol class=\"message-list\">").count(), 1);
-        assert!(!search.contains("<section"));
-        assert!(search.contains("<time class=\"metadata\""));
-        assert!(search.contains("id=\"message-1710000000.000100\" tabindex=\"-1\""));
-
-        let saved = saved_items_document(
-            &[SavedItem {
-                channel: Some("C123".to_string()),
-                message: Some(message("saved")),
-                ..Default::default()
-            }],
-            &MessageHtmlContext::default(),
-        );
-        assert!(saved.contains("<ol class=\"message-list\"><li class=\"message-list-item\">"));
-        assert!(saved.contains("<time class=\"metadata\""));
     }
 
     #[test]
@@ -6649,7 +5967,7 @@ mod tests {
     }
 
     #[test]
-    fn author_menu_and_profile_page_expose_person_actions_and_details() {
+    fn author_menu_exposes_person_actions() {
         let context = MessageHtmlContext {
             user_names: Arc::new(HashMap::from([("U123".into(), "Ada".into())])),
             ..Default::default()
@@ -6658,107 +5976,6 @@ mod tests {
         assert!(html.contains("conduit://user-message?user=U123"));
         assert!(html.contains("conduit://user-profile?user=U123"));
         assert!(!html.contains("document.addEventListener(\"contextmenu\""));
-
-        let profile = SlackUser {
-            id: Some("U123".into()),
-            real_name: Some("Ada Lovelace".into()),
-            tz_label: Some("Europe/Amsterdam".into()),
-            profile: Some(crate::models::SlackUserProfile {
-                display_name: Some("Ada :wave:".into()),
-                title: Some("Engineer :rocket:".into()),
-                email: Some("ada@example.test".into()),
-                about: Some("Builds useful things :coffee:".into()),
-                fields: HashMap::from([(
-                    "X123".into(),
-                    crate::models::SlackProfileField {
-                        label: Some("Office".into()),
-                        value: Some("Amsterdam".into()),
-                        ..Default::default()
-                    },
-                )]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let context = MessageHtmlContext {
-            custom_emojis: Arc::new(HashMap::from([(
-                "working".into(),
-                "https://emoji.slack-edge.com/T123/working.png".into(),
-            )])),
-            ..Default::default()
-        };
-        let mut profile = profile;
-        profile.profile.as_mut().unwrap().status_emoji = Some(":working:".into());
-        profile.profile.as_mut().unwrap().status_text = Some("Focused :coffee:".into());
-        let profile_html = user_profile_document(&profile, &context);
-        assert!(profile_html.contains("Ada Lovelace"));
-        assert!(profile_html.contains("Engineer"));
-        assert!(profile_html.contains("ada@example.test"));
-        assert!(profile_html.contains("Builds useful things"));
-        assert!(profile_html.contains("Europe/Amsterdam"));
-        assert!(profile_html.contains("Office"));
-        assert!(profile_html.contains("Amsterdam"));
-        assert!(profile_html.contains("title=\":working:\""));
-        assert!(profile_html.contains("https://emoji.slack-edge.com/T123/working.png"));
-        assert!(profile_html.contains("title=\":coffee:\""));
-        assert!(profile_html.contains("Ada :wave:"));
-        assert!(profile_html.contains("Engineer :rocket:"));
-        assert!(profile_html.contains("Builds useful things :coffee:"));
-        assert!(!profile_html.contains("title=\":wave:\""));
-        assert!(!profile_html.contains("title=\":rocket:\""));
-        assert!(!profile_html.contains(":working: Focused :coffee:"));
-    }
-
-    #[test]
-    fn profile_structured_fields_keep_date_and_emoji_shortcodes_literal() {
-        let user = SlackUser {
-            real_name: Some("Ada :calendar:".into()),
-            profile: Some(crate::models::SlackUserProfile {
-                status_text: Some("Focused :coffee:".into()),
-                status_emoji: Some(":working:".into()),
-                status_expiration: Some(1_784_635_200),
-                fields: HashMap::from([(
-                    "X123".into(),
-                    crate::models::SlackProfileField {
-                        label: Some("Availability :calendar:".into()),
-                        value: Some("di 21 jul 2026 12:00:00 CEST".into()),
-                        ..Default::default()
-                    },
-                )]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let context = MessageHtmlContext {
-            custom_emojis: Arc::new(HashMap::from([
-                ("00".into(), "https://emoji.example/clock-minute.png".into()),
-                (
-                    "calendar".into(),
-                    "https://emoji.example/calendar.png".into(),
-                ),
-                ("working".into(), "https://emoji.example/working.png".into()),
-            ])),
-            ..Default::default()
-        };
-
-        let html = user_profile_document(&user, &context);
-        let expiration_start = html
-            .find("<dt>Status expiration</dt>")
-            .expect("profile should include the status expiration");
-        let expiration_end = html[expiration_start..]
-            .find("</div>")
-            .map(|offset| expiration_start + offset)
-            .expect("status expiration detail should be closed");
-        let expiration_detail = &html[expiration_start..expiration_end];
-
-        assert!(html.contains("Ada :calendar:"));
-        assert!(html.contains("Availability :calendar:"));
-        assert!(html.contains("di 21 jul 2026 12:00:00 CEST"));
-        assert!(!html.contains("https://emoji.example/clock-minute.png"));
-        assert!(!html.contains("https://emoji.example/calendar.png"));
-        assert!(!expiration_detail.contains("class=\"emoji\""));
-        assert!(html.contains("title=\":working:\""));
-        assert!(html.contains("title=\":coffee:\""));
     }
 
     #[test]

@@ -19,9 +19,13 @@ static UNICODE_BY_CANONICAL_NAME: LazyLock<HashMap<String, Option<&'static emoji
         by_name
     });
 
+#[cfg(test)]
 pub const EMOJI_PICKER_PROTOCOL_VERSION: u8 = 1;
+#[cfg(test)]
 pub const EMOJI_PICKER_RESULT_LIMIT: usize = 64;
+#[cfg(test)]
 pub const EMOJI_PICKER_MAX_QUERY_CHARS: usize = 128;
+#[cfg(test)]
 pub const EMOJI_PICKER_CATEGORIES: &[&str] = &[
     "All",
     "Smileys",

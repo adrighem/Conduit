@@ -2591,7 +2591,7 @@ pub(crate) fn build_timeline_message_widget(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2628,7 +2628,7 @@ mod tests {
         );
     }
 
-    fn test_context() -> MessageHtmlContext {
+    pub(crate) fn test_context() -> MessageHtmlContext {
         MessageHtmlContext {
             user_names: Arc::new(HashMap::from([("U123".to_string(), "Alice".to_string())])),
             user_full_names: Arc::default(),
@@ -2659,7 +2659,7 @@ mod tests {
         Option<std::sync::mpsc::Sender<std::boxed::Box<dyn FnOnce() + Send>>>,
     > = std::sync::OnceLock::new();
 
-    fn run_gtk_test<F: FnOnce() + Send + 'static>(f: F) {
+    pub(crate) fn run_gtk_test<F: FnOnce() + Send + 'static>(f: F) {
         let sender = GTK_TEST_RUNNER.get_or_init(|| {
             let (tx, rx) = std::sync::mpsc::channel::<std::boxed::Box<dyn FnOnce() + Send>>();
             let (init_tx, init_rx) = std::sync::mpsc::channel::<bool>();

@@ -52,6 +52,7 @@ mod rich_message_normalize;
 mod runtime;
 mod runtime_mailbox;
 mod search;
+mod secondary_views;
 mod services;
 mod shortcuts;
 mod sidebar;
