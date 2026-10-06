@@ -247,6 +247,19 @@ thread_local! {
     static COLLAPSED_MEDIA: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
+/// Invokes the timeline action handler without holding the `RefCell` borrow:
+/// handlers may re-render the view, which replaces the handler via
+/// `set_on_action` and would otherwise panic with "already borrowed".
+fn dispatch_timeline_action(
+    on_action: &RefCell<Option<Rc<dyn Fn(TimelineAction)>>>,
+    action: TimelineAction,
+) {
+    let handler = on_action.borrow().clone();
+    if let Some(handler) = handler {
+        handler(action);
+    }
+}
+
 fn media_collapse_key(ts: &str, slot: &str) -> String {
     format!("{ts}:{slot}")
 }
@@ -640,9 +653,10 @@ impl NativeTimelineView {
                     Rc::new(move |media_item| {
                         let on_action = on_action.clone();
                         glib::idle_add_local_once(move || {
-                            if let Some(h) = on_action.borrow().as_ref() {
-                                h(TimelineAction::OpenMedia(media_item));
-                            }
+                            dispatch_timeline_action(
+                                &on_action,
+                                TimelineAction::OpenMedia(media_item),
+                            );
                         });
                     })
                 };
@@ -651,9 +665,10 @@ impl NativeTimelineView {
                     Rc::new(move |thread_ts| {
                         let on_action = on_action.clone();
                         glib::idle_add_local_once(move || {
-                            if let Some(h) = on_action.borrow().as_ref() {
-                                h(TimelineAction::OpenThread(thread_ts));
-                            }
+                            dispatch_timeline_action(
+                                &on_action,
+                                TimelineAction::OpenThread(thread_ts),
+                            );
                         });
                     })
                 };
@@ -662,9 +677,10 @@ impl NativeTimelineView {
                     Rc::new(move |ts, name, add| {
                         let on_action = on_action.clone();
                         glib::idle_add_local_once(move || {
-                            if let Some(h) = on_action.borrow().as_ref() {
-                                h(TimelineAction::ToggleReaction { ts, name, add });
-                            }
+                            dispatch_timeline_action(
+                                &on_action,
+                                TimelineAction::ToggleReaction { ts, name, add },
+                            );
                         });
                     })
                 };
@@ -882,13 +898,14 @@ impl NativeTimelineView {
                     if read_generation.get() != expected {
                         return;
                     }
-                    if let Some(handler) = on_action.borrow().as_ref() {
-                        handler(TimelineAction::AutoMarkRead {
+                    dispatch_timeline_action(
+                        &on_action,
+                        TimelineAction::AutoMarkRead {
                             channel_id,
                             thread_ts,
                             ts: candidate_ts,
-                        });
-                    }
+                        },
+                    );
                 });
             })
         };
@@ -1997,13 +2014,14 @@ fn rebuild_quick_bar(
         let name = entry.name.clone();
         let on_action = on_action.clone();
         btn.connect_clicked(move |_| {
-            if let Some(h) = on_action.borrow().as_ref() {
-                h(TimelineAction::ToggleReaction {
+            dispatch_timeline_action(
+                &on_action,
+                TimelineAction::ToggleReaction {
                     ts: ts.clone(),
                     name: name.clone(),
                     add: true,
-                });
-            }
+                },
+            );
         });
         quick_bar.append(&btn);
     }
@@ -2032,13 +2050,14 @@ fn rebuild_quick_bar(
                 move |selected_name| {
                     let clean = selected_name.trim().trim_matches(':');
                     if !clean.is_empty() {
-                        if let Some(h) = on_action.borrow().as_ref() {
-                            h(TimelineAction::ToggleReaction {
+                        dispatch_timeline_action(
+                            &on_action,
+                            TimelineAction::ToggleReaction {
                                 ts: ts.clone(),
                                 name: clean.to_string(),
                                 add: true,
-                            });
-                        }
+                            },
+                        );
                     }
                 },
             );
@@ -2058,9 +2077,7 @@ fn rebuild_quick_bar(
         let ts = ts.to_string();
         let on_action = on_action.clone();
         reply_btn.connect_clicked(move |_| {
-            if let Some(h) = on_action.borrow().as_ref() {
-                h(TimelineAction::OpenThread(ts.clone()));
-            }
+            dispatch_timeline_action(&on_action, TimelineAction::OpenThread(ts.clone()));
         });
     }
     quick_bar.append(&reply_btn);
@@ -2074,9 +2091,7 @@ fn rebuild_quick_bar(
         let ts = ts.to_string();
         let on_action = on_action.clone();
         forward_btn.connect_clicked(move |_| {
-            if let Some(h) = on_action.borrow().as_ref() {
-                h(TimelineAction::ForwardMessage(ts.clone()));
-            }
+            dispatch_timeline_action(&on_action, TimelineAction::ForwardMessage(ts.clone()));
         });
     }
     quick_bar.append(&forward_btn);
@@ -2090,9 +2105,7 @@ fn rebuild_quick_bar(
         let ts = ts.to_string();
         let on_action = on_action.clone();
         unread_btn.connect_clicked(move |_| {
-            if let Some(h) = on_action.borrow().as_ref() {
-                h(TimelineAction::MarkUnread(ts.clone()));
-            }
+            dispatch_timeline_action(&on_action, TimelineAction::MarkUnread(ts.clone()));
         });
     }
     quick_bar.append(&unread_btn);
@@ -2115,9 +2128,7 @@ fn rebuild_quick_bar(
         let on_action = on_action.clone();
         let popover_weak = popover.downgrade();
         copy_link_btn.connect_clicked(move |_| {
-            if let Some(h) = on_action.borrow().as_ref() {
-                h(TimelineAction::CopyMessageLink(ts.clone()));
-            }
+            dispatch_timeline_action(&on_action, TimelineAction::CopyMessageLink(ts.clone()));
             if let Some(p) = popover_weak.upgrade() {
                 p.popdown();
             }
@@ -2133,9 +2144,7 @@ fn rebuild_quick_bar(
         let on_action = on_action.clone();
         let popover_weak = popover.downgrade();
         copy_text_btn.connect_clicked(move |_| {
-            if let Some(h) = on_action.borrow().as_ref() {
-                h(TimelineAction::CopyMessageText(ts.clone()));
-            }
+            dispatch_timeline_action(&on_action, TimelineAction::CopyMessageText(ts.clone()));
             if let Some(p) = popover_weak.upgrade() {
                 p.popdown();
             }
@@ -2587,6 +2596,24 @@ mod tests {
 
     use crate::message_html::MessageHtmlContext;
     use crate::models::{SlackAttachment, SlackAttachmentField, SlackFile, SlackMessage, SlackReaction};
+
+    #[test]
+    fn dispatch_allows_handler_to_replace_itself() {
+        type Handler = Rc<dyn Fn(TimelineAction)>;
+        let on_action: Rc<RefCell<Option<Handler>>> = Rc::new(RefCell::new(None));
+        let replaced = Rc::new(Cell::new(false));
+        let slot = on_action.clone();
+        let flag = replaced.clone();
+        *on_action.borrow_mut() = Some(Rc::new(move |_| {
+            // Mirrors a re-render calling `set_on_action` from inside a handler.
+            *slot.borrow_mut() = Some(Rc::new(|_| {}));
+            flag.set(true);
+        }));
+
+        dispatch_timeline_action(&on_action, TimelineAction::OpenThread("1.0".to_string()));
+
+        assert!(replaced.get());
+    }
 
     #[test]
     fn strip_anchor_tags_returns_link_ranges_of_visible_text() {
