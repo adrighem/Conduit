@@ -4348,7 +4348,7 @@ fn escape_html(text: &str) -> String {
     escaped
 }
 
-fn decode_html_entity_prefix(text: &str) -> Option<(char, usize)> {
+pub(crate) fn decode_html_entity_prefix(text: &str) -> Option<(char, usize)> {
     if !text.starts_with('&') {
         return None;
     }

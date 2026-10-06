@@ -5,6 +5,7 @@ use crate::search::{
     MatchScore, SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT,
     SECONDARY_FIELD_WEIGHT,
 };
+use crate::unread_ledger::{ConversationReadState, UnreadLedger};
 use serde_json::Value;
 
 pub type UserSearchAliases = HashMap<String, Vec<String>>;
@@ -69,9 +70,9 @@ pub struct SidebarRowModel {
     pub id: String,
     pub title: String,
     pub kind: ConversationKind,
+    /// Bold title: the conversation has unread messages.
     pub unread: bool,
-    pub unread_count: u64,
-    pub has_mention: bool,
+    /// Red pill: every DM message, or channel @-mentions, since last read.
     pub mention_count: u64,
     pub selected: bool,
     pub starred: bool,
@@ -107,26 +108,9 @@ pub struct ConversationPickerSections {
 }
 
 impl SidebarRowModel {
-    pub fn unread_badge_label(&self) -> Option<String> {
-        if matches!(
-            self.kind,
-            ConversationKind::PublicChannel | ConversationKind::PrivateChannel
-        ) {
-            return None;
-        }
-        match self.unread_count {
-            0 => None,
-            1..=99 => Some(self.unread_count.to_string()),
-            _ => Some("99+".to_string()),
-        }
-    }
-
     pub fn mention_badge_label(&self) -> Option<String> {
-        if !self.has_mention && self.mention_count == 0 {
-            return None;
-        }
         match self.mention_count {
-            0 => Some("@".to_string()),
+            0 => None,
             1..=99 => Some(self.mention_count.to_string()),
             _ => Some("99+".to_string()),
         }
@@ -138,14 +122,8 @@ impl SidebarRowModel {
             label.push_str(", 1 mention");
         } else if self.mention_count > 1 {
             label.push_str(&format!(", {} mentions", self.mention_count));
-        } else if self.has_mention {
-            label.push_str(", mentioned");
         }
-        if self.unread_count == 1 {
-            label.push_str(", 1 unread");
-        } else if self.unread_count > 1 {
-            label.push_str(&format!(", {} unread", self.unread_count));
-        } else if self.unread {
+        if self.unread {
             label.push_str(", unread");
         }
         if self.selected {
@@ -558,6 +536,7 @@ pub struct SidebarBuildOptions<'a> {
     /// mentions or unread threads. The selected conversation always stays.
     pub unread_only: bool,
     pub unread_thread_channel_ids: Option<&'a HashSet<String>>,
+    pub read_states: Option<&'a UnreadLedger>,
     pub loading: bool,
     pub has_error: bool,
     pub user_search_aliases: Option<&'a UserSearchAliases>,
@@ -569,6 +548,7 @@ pub struct SidebarBuildOptions<'a> {
 #[derive(Debug, Clone, Copy, Default)]
 struct SidebarRowOptions<'a> {
     selected_channel: Option<&'a str>,
+    read_state: Option<&'a ConversationReadState>,
     current_user_id: Option<&'a str>,
     active_huddle_channel_id: Option<&'a str>,
     user_search_aliases: Option<&'a UserSearchAliases>,
@@ -610,12 +590,13 @@ impl SidebarRowModel {
             .cloned()
             .collect();
         let muted = conversation.is_muted_conversation();
-        let unread = conversation.has_unread_activity() && !muted;
-        let unread_count = if muted {
-            0
-        } else {
-            conversation.unread_activity_count()
-        };
+        let unread = !muted
+            && options
+                .read_state
+                .is_some_and(ConversationReadState::has_unreads);
+        let mention_count = options
+            .read_state
+            .map_or(0, ConversationReadState::badge_count);
         Self {
             id: conversation.id.clone(),
             title: conversation.navigation_name_with_users(
@@ -625,9 +606,7 @@ impl SidebarRowModel {
             ),
             kind,
             unread,
-            unread_count,
-            has_mention: conversation.has_mention_activity(),
-            mention_count: conversation.mention_activity_count(),
+            mention_count,
             selected: options.selected_channel == Some(conversation.id.as_str()),
             starred: conversation.is_starred(),
             private: conversation.is_private.unwrap_or(false)
@@ -675,6 +654,9 @@ pub(crate) fn sidebar_row_for_conversation(
         user_names,
         SidebarRowOptions {
             selected_channel: options.selected_channel,
+            read_state: options
+                .read_states
+                .and_then(|read_states| read_states.get(&conversation.id)),
             current_user_id: options.current_user_id,
             active_huddle_channel_id: options.active_huddle_channel_id,
             user_search_aliases: options.user_search_aliases,
@@ -767,6 +749,7 @@ where
                     conversation,
                     options.selected_channel,
                     recent_history_direct_messages.contains(&conversation.id),
+                    read_state_for(options, conversation),
                 )
             }
         })
@@ -1108,8 +1091,6 @@ pub fn conversation_picker_sections_with_statuses(
                 title,
                 kind: ConversationKind::DirectMessage,
                 unread: false,
-                unread_count: 0,
-                has_mention: false,
                 mention_count: 0,
                 selected: false,
                 starred: false,
@@ -1246,10 +1227,22 @@ pub fn conversation_kind(conversation: &SlackConversation) -> ConversationKind {
     }
 }
 
+fn read_state_for<'a>(
+    options: SidebarBuildOptions<'a>,
+    conversation: &SlackConversation,
+) -> Option<&'a ConversationReadState> {
+    options.read_states?.get(&conversation.id)
+}
+
+fn has_unread_activity(read_state: Option<&ConversationReadState>) -> bool {
+    read_state.is_some_and(ConversationReadState::has_unreads)
+}
+
 pub fn conversation_visible_in_default_sidebar(
     conversation: &SlackConversation,
     selected_channel: Option<&str>,
     recent_history_direct_message: bool,
+    read_state: Option<&ConversationReadState>,
 ) -> bool {
     if conversation.is_archived.unwrap_or(false) {
         return false;
@@ -1273,7 +1266,7 @@ pub fn conversation_visible_in_default_sidebar(
 
     match conversation_kind(conversation) {
         ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => {
-            if conversation.has_unread_activity() || conversation.has_mention_activity() {
+            if has_unread_activity(read_state) {
                 return !conversation.is_user_deleted();
             }
             !conversation.is_user_deleted()
@@ -1291,8 +1284,7 @@ fn conversation_visible_in_unread_sidebar(
     options: SidebarBuildOptions<'_>,
 ) -> bool {
     options.selected_channel == Some(conversation.id.as_str())
-        || conversation.has_unread_activity()
-        || conversation.has_mention_activity()
+        || has_unread_activity(read_state_for(options, conversation))
         || options
             .unread_thread_channel_ids
             .is_some_and(|channel_ids| channel_ids.contains(&conversation.id))
@@ -1616,8 +1608,6 @@ mod tests {
             title: title.to_string(),
             kind: ConversationKind::PublicChannel,
             unread: false,
-            unread_count: 0,
-            has_mention: false,
             mention_count: 0,
             selected,
             starred: false,
@@ -1636,14 +1626,16 @@ mod tests {
     fn dm_row_gets_avatar_url_from_options_but_channel_does_not() {
         let dm_conversation = dm("D1", "U1");
         let channel_conversation = channel("C1", "general");
-        let avatar_urls = HashMap::from([("U1".to_string(), "https://example.com/u1.png".to_string())]);
+        let avatar_urls =
+            HashMap::from([("U1".to_string(), "https://example.com/u1.png".to_string())]);
         let options = SidebarBuildOptions {
             user_avatar_urls: Some(&avatar_urls),
             ..Default::default()
         };
 
         let dm_row = sidebar_row_for_conversation(&dm_conversation, &HashMap::new(), options);
-        let channel_row = sidebar_row_for_conversation(&channel_conversation, &HashMap::new(), options);
+        let channel_row =
+            sidebar_row_for_conversation(&channel_conversation, &HashMap::new(), options);
 
         assert_eq!(
             dm_row.avatar_url.as_deref(),
@@ -1655,7 +1647,8 @@ mod tests {
     #[test]
     fn dm_row_has_no_avatar_when_user_missing_from_map() {
         let dm_conversation = dm("D1", "U_UNKNOWN");
-        let avatar_urls = HashMap::from([("U1".to_string(), "https://example.com/u1.png".to_string())]);
+        let avatar_urls =
+            HashMap::from([("U1".to_string(), "https://example.com/u1.png".to_string())]);
         let options = SidebarBuildOptions {
             user_avatar_urls: Some(&avatar_urls),
             ..Default::default()
@@ -1899,36 +1892,43 @@ mod tests {
             &active_channel,
             None,
             false,
+            None,
         ));
         assert!(conversation_visible_in_default_sidebar(
             &open_dm,
             None,
             recent_history_direct_messages.contains(&open_dm.id),
+            None,
         ));
         assert!(conversation_visible_in_default_sidebar(
             &priority_dm,
             None,
             recent_history_direct_messages.contains(&priority_dm.id),
+            None,
         ));
         assert!(conversation_visible_in_default_sidebar(
             &recent_group_dm,
             None,
             recent_history_direct_messages.contains(&recent_group_dm.id),
+            None,
         ));
         assert!(!conversation_visible_in_default_sidebar(
             &inactive_dm,
             None,
             recent_history_direct_messages.contains(&inactive_dm.id),
+            None,
         ));
         assert!(!conversation_visible_in_default_sidebar(
             &unopened_group_dm,
             None,
             recent_history_direct_messages.contains(&unopened_group_dm.id),
+            None,
         ));
         assert!(conversation_visible_in_default_sidebar(
             &inactive_dm,
             Some("D_INACTIVE"),
             false,
+            None,
         ));
     }
 
@@ -1961,27 +1961,31 @@ mod tests {
         archived.is_archived = Some(true);
 
         assert!(!conversation_visible_in_default_sidebar(
-            &dormant, None, false,
+            &dormant, None, false, None,
         ));
         assert!(conversation_visible_in_default_sidebar(
             &selected_deleted,
             Some("D2"),
             false,
+            None,
         ));
         assert!(!conversation_visible_in_default_sidebar(
             &selected_deleted,
             None,
             true,
+            None,
         ));
         assert!(!conversation_visible_in_default_sidebar(
             &read_dormant,
             None,
             true,
+            None,
         ));
         assert!(!conversation_visible_in_default_sidebar(
             &archived,
             Some("D4"),
             true,
+            None,
         ));
     }
 
@@ -2004,49 +2008,104 @@ mod tests {
         assert!(row.external);
     }
 
-    #[test]
-    fn category_1_channels_bold_when_unread_no_numeric_badge_muted_suppresses() {
-        let mut alpha = channel("C1", "alpha");
-        alpha.unread_count = Some(3);
-        let row = SidebarRowModel::from_conversation(&alpha, &HashMap::new(), None, None);
-        assert!(row.unread);
-        assert_eq!(row.unread_badge_label(), None);
+    fn read_states(entries: &[(&str, u64)]) -> UnreadLedger {
+        UnreadLedger::from_entries(entries.iter().map(|(channel_id, badge)| {
+            (
+                channel_id.to_string(),
+                ConversationReadState {
+                    server_has_unreads: true,
+                    server_mention_count: *badge,
+                    ..Default::default()
+                },
+            )
+        }))
+    }
 
-        let mut muted_alpha = channel("C2", "alpha-muted");
-        muted_alpha.unread_count = Some(3);
-        muted_alpha.extra.insert("is_muted".to_string(), serde_json::json!(true));
-        let muted_row = SidebarRowModel::from_conversation(&muted_alpha, &HashMap::new(), None, None);
-        assert!(!muted_row.unread);
-        assert_eq!(muted_row.unread_badge_label(), None);
+    fn row_with_read_states(
+        conversation: &SlackConversation,
+        ledger: &UnreadLedger,
+    ) -> SidebarRowModel {
+        sidebar_row_for_conversation(
+            conversation,
+            &HashMap::new(),
+            SidebarBuildOptions {
+                read_states: Some(ledger),
+                ..Default::default()
+            },
+        )
     }
 
     #[test]
-    fn category_4_dms_bold_title_and_numeric_badge_and_unhide_dormant() {
-        let mut unread_dm = dm("D1", "U1");
-        unread_dm.unread_count = Some(5);
-        unread_dm.extra.insert("is_dormant".to_string(), serde_json::json!(true));
+    fn category_1_channels_bold_when_unread_no_badge_muted_suppresses() {
+        let alpha = channel("C1", "alpha");
+        let mut muted_alpha = channel("C2", "alpha-muted");
+        muted_alpha
+            .extra
+            .insert("is_muted".to_string(), serde_json::json!(true));
+        let ledger = read_states(&[("C1", 0), ("C2", 0)]);
 
-        let row = SidebarRowModel::from_conversation(&unread_dm, &HashMap::new(), None, None);
+        let row = row_with_read_states(&alpha, &ledger);
         assert!(row.unread);
-        assert_eq!(row.unread_count, 5);
-        assert_eq!(row.unread_badge_label().as_deref(), Some("5"));
-        assert!(conversation_visible_in_default_sidebar(&unread_dm, None, false));
+        assert_eq!(row.mention_badge_label(), None);
+
+        let muted_row = row_with_read_states(&muted_alpha, &ledger);
+        assert!(!muted_row.unread);
+        assert_eq!(muted_row.mention_badge_label(), None);
+    }
+
+    #[test]
+    fn category_4_dms_bold_title_and_badge_and_unhide_dormant() {
+        let mut unread_dm = dm("D1", "U1");
+        unread_dm
+            .extra
+            .insert("is_dormant".to_string(), serde_json::json!(true));
+        let ledger = read_states(&[("D1", 5)]);
+
+        let row = row_with_read_states(&unread_dm, &ledger);
+        assert!(row.unread);
+        assert_eq!(row.mention_count, 5);
+        assert_eq!(row.mention_badge_label().as_deref(), Some("5"));
+        assert!(!conversation_visible_in_default_sidebar(
+            &unread_dm, None, false, None
+        ));
+        assert!(conversation_visible_in_default_sidebar(
+            &unread_dm,
+            None,
+            false,
+            ledger.get("D1"),
+        ));
     }
 
     #[test]
     fn category_5_mentions_override_mute_status() {
         let mut muted_channel = channel("C1", "general");
-        muted_channel.extra.insert("is_muted".to_string(), serde_json::json!(true));
-        muted_channel.last_read = Some("1710000000.000100".to_string());
-        muted_channel.set_mention_unread("1710000000.000200", true);
-        muted_channel.set_mention_unread("1710000000.000300", true);
+        muted_channel
+            .extra
+            .insert("is_muted".to_string(), serde_json::json!(true));
+        let ledger = read_states(&[("C1", 2)]);
 
-        let row = SidebarRowModel::from_conversation(&muted_channel, &HashMap::new(), None, None);
+        let row = row_with_read_states(&muted_channel, &ledger);
         assert!(row.muted);
         assert!(!row.unread);
-        assert!(row.has_mention);
         assert_eq!(row.mention_count, 2);
         assert_eq!(row.mention_badge_label().as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn mention_badge_label_caps_at_ninety_nine_and_hides_zero() {
+        let mut row = row("general", false);
+        assert_eq!(row.mention_badge_label(), None);
+        row.mention_count = 99;
+        assert_eq!(row.mention_badge_label().as_deref(), Some("99"));
+        row.mention_count = 100;
+        assert_eq!(row.mention_badge_label().as_deref(), Some("99+"));
+    }
+
+    #[test]
+    fn rows_without_read_state_are_neither_bold_nor_badged() {
+        let row = row_with_read_states(&channel("C1", "general"), &UnreadLedger::default());
+        assert!(!row.unread);
+        assert_eq!(row.mention_badge_label(), None);
     }
 
     #[test]
@@ -2362,13 +2421,9 @@ mod tests {
             id: "C_UNREAD".to_string(),
             name: Some("unread".to_string()),
             is_channel: Some(true),
-            unread_count: Some(3),
             ..Default::default()
         };
-        let mut mentioned_dm = dm("D_MENTION", "U_MENTION");
-        mentioned_dm
-            .unread_mentions
-            .insert("1710000000.000100".to_string());
+        let mentioned_dm = dm("D_MENTION", "U_MENTION");
         let thread_channel = SlackConversation {
             id: "C_THREAD".to_string(),
             name: Some("thread".to_string()),
@@ -2385,19 +2440,27 @@ mod tests {
             id: "C_ARCHIVED".to_string(),
             name: Some("archived".to_string()),
             is_channel: Some(true),
-            unread_count: Some(1),
             ..Default::default()
         };
         archived.is_archived = Some(true);
         let unread_thread_channel_ids = HashSet::from(["C_THREAD".to_string()]);
+        let ledger = read_states(&[("C_UNREAD", 0), ("D_MENTION", 1), ("C_ARCHIVED", 0)]);
 
         let sections = list_sections(build_sidebar_list(
-            &[general, unread, mentioned_dm, thread_channel, selected, archived],
+            &[
+                general,
+                unread,
+                mentioned_dm,
+                thread_channel,
+                selected,
+                archived,
+            ],
             &HashMap::new(),
             SidebarBuildOptions {
                 selected_channel: Some("C_SELECTED"),
                 unread_only: true,
                 unread_thread_channel_ids: Some(&unread_thread_channel_ids),
+                read_states: Some(&ledger),
                 ..Default::default()
             },
         ));
@@ -2405,7 +2468,10 @@ mod tests {
             .iter()
             .flat_map(|section| section.rows.iter())
             .collect::<Vec<_>>();
-        let ids = rows.iter().map(|row| row.id.as_str()).collect::<HashSet<_>>();
+        let ids = rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<HashSet<_>>();
 
         assert_eq!(
             ids,
@@ -2415,6 +2481,10 @@ mod tests {
             .iter()
             .find(|row| row.id == "C_SELECTED")
             .is_some_and(|row| row.selected));
+        assert!(rows
+            .iter()
+            .find(|row| row.id == "D_MENTION")
+            .is_some_and(|row| row.unread && row.mention_badge_label().as_deref() == Some("1")));
     }
 
     #[test]
@@ -2423,16 +2493,15 @@ mod tests {
             id: "C_ALERTS".to_string(),
             name: Some("alerts".to_string()),
             is_channel: Some(true),
-            unread_count: Some(1),
             ..Default::default()
         };
         let builds = SlackConversation {
             id: "C_BUILDS".to_string(),
             name: Some("builds".to_string()),
             is_channel: Some(true),
-            unread_count: Some(1),
             ..Default::default()
         };
+        let ledger = read_states(&[("C_ALERTS", 0), ("C_BUILDS", 0)]);
 
         let rows = list_rows(build_sidebar_list(
             &[alerts, builds],
@@ -2440,6 +2509,7 @@ mod tests {
             SidebarBuildOptions {
                 query: "alerts",
                 unread_only: true,
+                read_states: Some(&ledger),
                 ..Default::default()
             },
         ));
@@ -2619,10 +2689,8 @@ mod tests {
             ("U_CSABA".to_string(), "Csaba Karpati".to_string()),
             ("U_ZOE".to_string(), "Zoe Adams".to_string()),
         ]);
-        let conversations = [csaba, active].map(|mut conversation| {
-            conversation.unread_count = Some(1);
-            conversation
-        });
+        let conversations = [csaba, active];
+        let ledger = read_states(&[("CONV_CSABA", 0), ("CONV_ZOE", 0)]);
 
         let sidebar_rows = list_rows(build_sidebar_list(
             &conversations,
@@ -2630,6 +2698,7 @@ mod tests {
             SidebarBuildOptions {
                 query: "conv",
                 unread_only: true,
+                read_states: Some(&ledger),
                 ..Default::default()
             },
         ));
@@ -3293,8 +3362,10 @@ mod tests {
             },
         ]);
 
-        let items = model
-            .keyed_items_with_collapsed_sections(&HashSet::from([SidebarSectionKind::Priority]), &[]);
+        let items = model.keyed_items_with_collapsed_sections(
+            &HashSet::from([SidebarSectionKind::Priority]),
+            &[],
+        );
 
         assert_eq!(items.len(), 3);
         assert_eq!(
@@ -3601,8 +3672,10 @@ mod tests {
                 rows: vec![starred.clone()],
             },
         ]);
-        let items = model
-            .keyed_items_with_collapsed_sections(&HashSet::from([SidebarSectionKind::Priority]), &[]);
+        let items = model.keyed_items_with_collapsed_sections(
+            &HashSet::from([SidebarSectionKind::Priority]),
+            &[],
+        );
         let mut projection = SidebarProjection::default();
         projection.reconcile(&items);
         starred.muted = true;

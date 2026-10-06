@@ -34,8 +34,8 @@ use crate::attention::AttentionDecision;
 use crate::attention_settings;
 use crate::auth;
 use crate::composer::{
-    completion_key_action, composer_draft_from_message, decode_rich_composer_draft,
-    channel_candidates, channel_token_at_caret, emoji_token_at_caret, encode_rich_composer_draft,
+    channel_candidates, channel_token_at_caret, completion_key_action, composer_draft_from_message,
+    decode_rich_composer_draft, emoji_token_at_caret, encode_rich_composer_draft,
     expand_composer_semantic_selection, hydrate_composer_mentions, mention_candidates,
     mention_token_at_caret, message_edit_key_action, replace_channel_token, replace_emoji_token,
     replace_mention_token, search_channel_candidates, search_mention_candidates,
@@ -58,16 +58,16 @@ use crate::huddles::state::{
     HuddleScreenShareState, HuddleSnapshot,
 };
 use crate::message_handoff::{
-    open_resolved_handoff, ExternalOpenError, ExternalOpener, HandoffProvenance, MessageControlRegistry,
-    MessageRef, SafeSlackPermalink, TimelineSurfaceId,
+    open_resolved_handoff, ExternalOpenError, ExternalOpener, HandoffProvenance,
+    MessageControlRegistry, MessageRef, SafeSlackPermalink, TimelineSurfaceId,
 };
 use crate::message_html::{
     self, CachedAssetKind, CachedAssetSource, MessageHtmlContext, TimelineDomPatch,
     TimelineInsertPosition, TimelineMessageArrival, TimelineScrollBehavior,
 };
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile,
-    SlackMessage, SlackUser, SlackUserStatus,
+    AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUser,
+    SlackUserStatus,
 };
 use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
 use crate::rendering;
@@ -376,7 +376,8 @@ mod imp {
         pub(super) pending_ui_invalidations: Cell<UiInvalidations>,
         pub(super) main_timeline_presenter: RefCell<TimelinePresenter>,
         pub(super) thread_timeline_presenter: RefCell<TimelinePresenter>,
-        pub(super) native_timeline_view: RefCell<Option<crate::timeline_message_widget::NativeTimelineView>>,
+        pub(super) native_timeline_view:
+            RefCell<Option<crate::timeline_message_widget::NativeTimelineView>>,
         pub(super) sidebar_projection: RefCell<SidebarProjection>,
         pub(super) sidebar_filter_generation: Cell<u64>,
         pub(super) picker_filter_generation: Cell<u64>,
@@ -839,6 +840,15 @@ listview.navigation-sidebar row:not(:selected) .sidebar-row-content.active-conve
 listview.navigation-sidebar label.status-emoji {
   line-height: 1;
 }
+label.mention-badge-pill {
+  background-color: #CD2553;
+  color: #ffffff;
+  border-radius: 9999px;
+  padding: 0 7px;
+  min-width: 10px;
+  font-weight: bold;
+  font-size: 0.8em;
+}
 "#;
 const MAX_COMPOSER_ATTACHMENTS: usize = 10;
 
@@ -1284,7 +1294,6 @@ fn apply_sidebar_store_operations(
     }
 }
 
-
 fn sidebar_selected_position(items: &[KeyedSidebarItem]) -> u32 {
     items
         .iter()
@@ -1595,11 +1604,16 @@ fn message_notification_body(
     user_names: &HashMap<String, String>,
 ) -> Option<String> {
     let visible_text = message.map(SlackMessage::visible_text).unwrap_or_default();
-    let text = visible_text.trim();
-    if text.is_empty() {
-        Some(gettext("New message"))
+    let text = rendering::notification_plain_text(&visible_text, user_names)?;
+    if !text.is_empty() {
+        Some(text)
+    } else if message
+        .and_then(|message| message.files.as_ref())
+        .is_some_and(|files| !files.is_empty())
+    {
+        Some(gettext("Shared a file"))
     } else {
-        rendering::resolve_user_mentions(text, user_names)
+        Some(gettext("New message"))
     }
 }
 
@@ -2372,7 +2386,10 @@ fn promoted_recent_reactions<'a>(
 
 fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
     let is_video = file.supported_media_kind() == Some("video")
-        || file.mimetype.as_deref().is_some_and(|m| m.starts_with("video/"))
+        || file
+            .mimetype
+            .as_deref()
+            .is_some_and(|m| m.starts_with("video/"))
         || file.thumb_video.is_some();
     let url = if is_video {
         file.thumb_video
@@ -2464,7 +2481,9 @@ fn message_image_asset_requests<'a>(
         for reaction in message.reactions.as_ref().into_iter().flatten() {
             if let Some(name) = reaction.name.as_deref() {
                 let clean_name = name.trim_matches(':');
-                if let Some(crate::emoji::EmojiValue::CustomImage(url)) = catalog.resolve(clean_name) {
+                if let Some(crate::emoji::EmojiValue::CustomImage(url)) =
+                    catalog.resolve(clean_name)
+                {
                     retain_image_asset_request(&mut requests, bounded_image_asset_request(&url));
                 }
             }
@@ -2477,10 +2496,17 @@ fn message_image_asset_requests<'a>(
                     let code = &rest[..end];
                     if !code.is_empty()
                         && code.len() <= 64
-                        && code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+                        && code
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
                     {
-                        if let Some(crate::emoji::EmojiValue::CustomImage(url)) = catalog.resolve(code) {
-                            retain_image_asset_request(&mut requests, bounded_image_asset_request(&url));
+                        if let Some(crate::emoji::EmojiValue::CustomImage(url)) =
+                            catalog.resolve(code)
+                        {
+                            retain_image_asset_request(
+                                &mut requests,
+                                bounded_image_asset_request(&url),
+                            );
                         }
                     }
                     rest = &rest[end + 1..];
@@ -2730,10 +2756,6 @@ fn timeline_scroll_behavior(behavior: WorkspaceScrollBehavior) -> TimelineScroll
         WorkspaceScrollBehavior::Bottom => TimelineScrollBehavior::Bottom,
     }
 }
-
-
-
-
 
 fn browser_session_input(
     xoxc_token: &str,
@@ -3038,7 +3060,8 @@ impl ConduitWindow {
                         name: canonical.clone(),
                         add,
                         thread_ts: None,
-                    }) && add {
+                    }) && add
+                    {
                         self.remember_recent_reaction(&canonical);
                     }
                 }
@@ -3602,21 +3625,27 @@ impl ConduitWindow {
         self.set_status("Video loaded");
     }
 
+    /// Applies the mark to the window's ledger copy for zero-latency UI; the
+    /// runtime routes the same mutation through the coordinator, which
+    /// persists it, publishes it to every window and then tells Slack.
     fn mark_conversation_read(&self, channel_id: &str, ts: &str) {
-        let mut convs = self.imp().workspace.conversations.borrow_mut();
-        let existing_last_read = convs.get(channel_id).and_then(|c| c.last_read.clone());
-        let advanced = convs.advance_last_read(channel_id, ts);
+        let mut read_states = self.imp().workspace.read_states.borrow_mut();
+        let existing_last_read = read_states
+            .get(channel_id)
+            .and_then(|state| state.last_read.clone());
+        let advanced = read_states
+            .update(channel_id, |state| state.mark_read(ts))
+            .is_some();
+        drop(read_states);
         crate::debug::log(
             "readstate",
             &format!(
-                "mark_conversation_read channel_id={channel_id} ts={ts} existing_last_read={existing_last_read:?} advanced={advanced} conv_present={}",
-                convs.get(channel_id).is_some()
+                "mark_conversation_read channel_id={channel_id} ts={ts} existing_last_read={existing_last_read:?} advanced={advanced}"
             ),
         );
         if !advanced {
             return;
         }
-        drop(convs);
         self.send_command(RuntimeCommand::MarkConversationRead {
             channel_id: channel_id.to_string(),
             ts: ts.to_string(),
@@ -3647,12 +3676,18 @@ impl ConduitWindow {
         self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
     }
 
+    /// Bold immediately; the coordinator derives the badge from history.
     fn mark_conversation_unread(&self, channel_id: &str, ts: &str) {
-        let mut convs = self.imp().workspace.conversations.borrow_mut();
-        if !convs.set_last_read(channel_id, ts.to_string()) {
+        let changed = self
+            .imp()
+            .workspace
+            .read_states
+            .borrow_mut()
+            .update(channel_id, |state| state.mark_unread(ts, Vec::new()))
+            .is_some();
+        if !changed {
             return;
         }
-        drop(convs);
         self.send_command(RuntimeCommand::MarkConversationUnread {
             channel_id: channel_id.to_string(),
             ts: ts.to_string(),
@@ -5005,8 +5040,8 @@ impl ConduitWindow {
         let top_nav_bg = theme.top_nav_bg.as_deref().unwrap_or(&theme.column_bg);
         let top_nav_text = theme.top_nav_text.as_deref().unwrap_or(&theme.text_color);
         let mention_badge = theme.mention_badge.as_deref().unwrap_or("#e01e5a");
-        let pill_bg = hex_to_rgba(&theme.active_item, 0.15)
-            .unwrap_or_else(|| "#D6ECFF".to_string());
+        let pill_bg =
+            hex_to_rgba(&theme.active_item, 0.15).unwrap_or_else(|| "#D6ECFF".to_string());
 
         let css = format!(
             "window {{\n\
@@ -5031,7 +5066,9 @@ impl ConduitWindow {
              .conduit-themed-sidebar row:selected {{ background-color: {}; color: {}; }}\n\
              .conduit-themed-sidebar row.active-conversation label,\n\
              .conduit-themed-sidebar row:selected label {{ color: {}; }}\n\
-             .conduit-themed-sidebar .mention {{ background-color: {mention_badge}; color: #ffffff; }}\n\
+             .mention-badge-pill {{ background-color: {mention_badge}; }}\n\
+             .conduit-themed-sidebar row label.mention-badge-pill,\n\
+             .conduit-themed-sidebar row:selected label.mention-badge-pill {{ color: #ffffff; }}\n\
              .unread-separator-line {{ background-color: {}; }}\n\
              .unread-separator-label {{ color: {}; }}\n\
              .thread-reply-pill {{ background-color: {pill_bg}; color: {}; }}\n\
@@ -5208,10 +5245,7 @@ impl ConduitWindow {
         breakpoint.add_setter(&overflow, "visible", Some(&true.to_value()));
         breakpoint_bin.add_breakpoint(breakpoint);
 
-        *self.composer_toolbar(target).borrow_mut() = Some(ComposerToolbar {
-            buttons,
-            updating,
-        });
+        *self.composer_toolbar(target).borrow_mut() = Some(ComposerToolbar { buttons, updating });
 
         let buffer = self.composer_text_view(target).buffer();
         let pending_format = Rc::new(RefCell::new(None::<(i32, i32, Vec<ComposerFormatAction>)>));
@@ -8531,6 +8565,12 @@ impl ConduitWindow {
                 );
             }
         }
+        if !application.read_state_changed_ids().is_empty()
+            && !application.conversation_reset()
+            && !self.render_changed_conversations(application.read_state_changed_ids())
+        {
+            self.render_conversations();
+        }
         if application.thread_catalog_changed() {
             // Sidebar thread sub-rows ("Thread (N responses) (M unread)")
             // are derived from the thread catalog independently of which
@@ -8909,6 +8949,7 @@ impl ConduitWindow {
             let user_statuses = imp.user_statuses.borrow();
             let user_avatar_urls = imp.user_avatar_urls.borrow();
             let current_user_id = imp.current_user_id.borrow();
+            let read_states = imp.workspace.read_states.borrow();
             let query = imp.sidebar_filter_entry.text();
             let selected_channel = self.visible_channel_id();
             let active_huddle_channel_id = imp
@@ -8924,6 +8965,7 @@ impl ConduitWindow {
                 query: query.as_str(),
                 unread_only: false,
                 unread_thread_channel_ids: None,
+                read_states: Some(&read_states),
                 loading: false,
                 has_error: imp.sidebar_error.borrow().is_some(),
                 user_search_aliases: Some(&user_search_aliases),
@@ -9085,16 +9127,19 @@ impl ConduitWindow {
         }
     }
 
-    fn main_view_uses_image_asset(&self, custom_emojis: &HashMap<String, String>, key: &str) -> bool {
+    fn main_view_uses_image_asset(
+        &self,
+        custom_emojis: &HashMap<String, String>,
+        key: &str,
+    ) -> bool {
         let state = self.imp().workspace.view.borrow();
         match state.main_view() {
             MainMessageView::Conversation => state.visible_channel_id().is_some_and(|channel_id| {
                 messages_use_image_asset(state.channel_messages(channel_id), custom_emojis, key)
             }),
-            MainMessageView::Threads => state
-                .observed_threads()
-                .iter()
-                .any(|(_, message)| messages_use_image_asset(std::slice::from_ref(message), custom_emojis, key)),
+            MainMessageView::Threads => state.observed_threads().iter().any(|(_, message)| {
+                messages_use_image_asset(std::slice::from_ref(message), custom_emojis, key)
+            }),
             MainMessageView::Saved => state.saved_items().iter().any(|item| {
                 item.message.as_ref().is_some_and(|message| {
                     messages_use_image_asset(std::slice::from_ref(message), custom_emojis, key)
@@ -9235,6 +9280,7 @@ impl ConduitWindow {
                     query: imp.sidebar_filter_entry.text().as_str(),
                     unread_only: imp.sidebar_unread_filter_button.is_active(),
                     unread_thread_channel_ids: Some(&unread_thread_channel_ids),
+                    read_states: Some(&imp.workspace.read_states.borrow()),
                     loading: false,
                     has_error: imp.sidebar_error.borrow().is_some(),
                     user_search_aliases: Some(&user_search_aliases),
@@ -9246,12 +9292,10 @@ impl ConduitWindow {
             (model, conversations.len())
         };
 
-        self.reconcile_sidebar(
-            model.keyed_items_with_collapsed_sections(
-                &self.imp().collapsed_sidebar_sections.borrow(),
-                &thread_summaries,
-            ),
-        );
+        self.reconcile_sidebar(model.keyed_items_with_collapsed_sections(
+            &self.imp().collapsed_sidebar_sections.borrow(),
+            &thread_summaries,
+        ));
         log_performance(started, |elapsed_ms| {
             format!(
                 "sidebar_render conversations={} elapsed_ms={:.2}",
@@ -10703,13 +10747,19 @@ impl ConduitWindow {
                 }
             }
             ConversationSelectionDecision::RequestFresh => {
-                self.show_message_text_placeholder(&gettext("Messages"), &gettext("Loading messages"));
+                self.show_message_text_placeholder(
+                    &gettext("Messages"),
+                    &gettext("Loading messages"),
+                );
                 self.send_command(RuntimeCommand::LoadHistory {
                     channel_id: channel_id.to_string(),
                 });
             }
             ConversationSelectionDecision::AwaitFresh => {
-                self.show_message_text_placeholder(&gettext("Messages"), &gettext("Loading messages"));
+                self.show_message_text_placeholder(
+                    &gettext("Messages"),
+                    &gettext("Loading messages"),
+                );
             }
         }
         self.imp().pending_last_conversation.borrow_mut().take();
@@ -10747,11 +10797,8 @@ impl ConduitWindow {
             context.load_more_url = self.channel_load_more_url(channel_id);
         }
         context.timeline_scroll = scroll_behavior;
-        context.unread_separator_ts = self.unread_separator_anchor_ts(
-            channel_id,
-            context.last_read.as_deref(),
-            &messages,
-        );
+        context.unread_separator_ts =
+            self.unread_separator_anchor_ts(channel_id, context.last_read.as_deref(), &messages);
         let active_open_generation = imp
             .conversation_opening
             .borrow()
@@ -10772,7 +10819,10 @@ impl ConduitWindow {
                 .borrow()
                 .active_waits_for_explicit_target(channel_id)
         {
-            self.show_message_text_placeholder(&gettext("Messages"), &gettext("Loading message context"));
+            self.show_message_text_placeholder(
+                &gettext("Messages"),
+                &gettext("Loading message context"),
+            );
             return;
         }
         let explicit_focus_ts = imp
@@ -11862,7 +11912,9 @@ impl ConduitWindow {
             if viewer.surface_stack.visible_child_name().as_deref() == Some("media") {
                 self.close_media_viewer();
             }
-            viewer.surface_stack.set_visible_child_name("native_timeline");
+            viewer
+                .surface_stack
+                .set_visible_child_name("native_timeline");
         }
     }
 
@@ -12296,10 +12348,10 @@ impl ConduitWindow {
             .collect();
         let last_read = self.visible_channel_id().and_then(|channel_id| {
             imp.workspace
-                .conversations
+                .read_states
                 .borrow()
                 .get(&channel_id)
-                .and_then(|c| c.last_read.clone())
+                .and_then(|state| state.last_read.clone())
         });
         MessageHtmlContext {
             user_names,
@@ -12741,8 +12793,6 @@ mod tests {
         assert!(!valid_channel_name(&"a".repeat(81)));
     }
 
-
-
     #[test]
     fn lifecycle_presentation_owns_connection_surface_and_status() {
         let cases = [
@@ -12893,7 +12943,6 @@ mod tests {
     use crate::runtime::{RuntimeOperation, RuntimeTarget};
     use crate::sidebar::ConversationKind;
 
-
     #[test]
     fn conduit_asset_requests_require_an_exact_known_cache_key() {
         let key = "a".repeat(64);
@@ -13002,7 +13051,6 @@ mod tests {
         assert_eq!(byte_bounded.len(), entries_by_bytes);
     }
 
-
     #[test]
     fn conduit_asset_registry_rejects_cross_workspace_descriptors() {
         let current_workspace = "a".repeat(64);
@@ -13016,15 +13064,12 @@ mod tests {
         assert_eq!(assets.total_bytes(), 0);
     }
 
-
     fn sidebar_row(id: &str, title: &str) -> SidebarRowModel {
         SidebarRowModel {
             id: id.to_string(),
             title: title.to_string(),
             kind: ConversationKind::DirectMessage,
             unread: false,
-            unread_count: 0,
-            has_mention: false,
             mention_count: 0,
             selected: false,
             starred: false,
@@ -13797,7 +13842,10 @@ mod tests {
     #[test]
     fn earliest_unread_ts_is_none_when_everything_is_read() {
         let messages = [message("1710000000.000100", "hi")];
-        assert_eq!(earliest_unread_ts(Some("1710000005.000100"), &messages), None);
+        assert_eq!(
+            earliest_unread_ts(Some("1710000005.000100"), &messages),
+            None
+        );
     }
 
     #[test]
@@ -14048,8 +14096,6 @@ mod tests {
             user_projection_invalidations(&conversations, &["U000".to_string()], None, None, true);
         assert_eq!(picker_flags, UiInvalidations::PICKER);
     }
-
-
 
     #[test]
     fn browser_session_input_requires_both_tokens() {
@@ -15322,7 +15368,9 @@ mod tests {
             ..Default::default()
         }];
 
-        assert!(message_image_asset_requests(&messages, &HashMap::new(), &HashMap::new()).is_empty());
+        assert!(
+            message_image_asset_requests(&messages, &HashMap::new(), &HashMap::new()).is_empty()
+        );
     }
 
     #[test]
@@ -15405,7 +15453,11 @@ mod tests {
             .expect("GIF block should normalize"),
         );
 
-        assert!(messages_use_image_asset(&[message], &HashMap::new(), image_url));
+        assert!(messages_use_image_asset(
+            &[message],
+            &HashMap::new(),
+            image_url
+        ));
     }
 
     #[test]
@@ -15516,8 +15568,14 @@ mod tests {
 
     #[test]
     fn test_hex_to_rgba_conversion() {
-        assert_eq!(hex_to_rgba("#1264A3", 0.15), Some("rgba(18, 100, 163, 0.15)".to_string()));
-        assert_eq!(hex_to_rgba("#ffffff", 0.5), Some("rgba(255, 255, 255, 0.50)".to_string()));
+        assert_eq!(
+            hex_to_rgba("#1264A3", 0.15),
+            Some("rgba(18, 100, 163, 0.15)".to_string())
+        );
+        assert_eq!(
+            hex_to_rgba("#ffffff", 0.5),
+            Some("rgba(255, 255, 255, 0.50)".to_string())
+        );
         assert_eq!(hex_to_rgba("invalid", 0.15), None);
         assert_eq!(hex_to_rgba("#123", 0.15), None);
     }

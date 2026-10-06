@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::huddles::model::{SlackHuddleRoom, SlackHuddleState};
@@ -66,18 +66,9 @@ pub struct SlackConversation {
     pub is_private: Option<bool>,
     pub is_archived: Option<bool>,
     pub is_starred: Option<bool>,
-    #[serde(default)]
-    pub last_read: Option<String>,
-    #[serde(default)]
-    pub unread_count: Option<u64>,
-    #[serde(default)]
-    pub unread_count_display: Option<u64>,
-    /// Timestamps of unread messages that directly @-mention the current
-    /// user. Tracked as a set (not a counter) so historical backfill,
-    /// message edits, and deletions can't cause it to drift: membership is
-    /// recomputed per-message rather than incremented/decremented.
-    #[serde(default)]
-    pub unread_mentions: BTreeSet<String>,
+    /// Unknown payload fields. Read state (`last_read`, unread counts and
+    /// legacy cached `unread_mentions`) lands here harmlessly; the
+    /// authoritative copy lives in `crate::unread_ledger`.
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -106,112 +97,8 @@ impl SlackConversation {
         self.is_starred = Some(starred);
     }
 
-    pub fn is_ts_unread(&self, ts: &str) -> bool {
-        let ts = ts.trim();
-        if ts.is_empty() || ts == "0" || ts == "0.000000" {
-            return false;
-        }
-        match self.last_read.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(last_read) => slack_timestamp_is_after(ts, last_read),
-            None => false,
-        }
-    }
-
-    pub fn is_ts_read(&self, ts: &str) -> bool {
-        let ts = ts.trim();
-        if ts.is_empty() {
-            return false;
-        }
-        !self.is_ts_unread(ts)
-    }
-
-    pub fn advance_last_read(&mut self, new_ts: &str) -> bool {
-        let new_ts = new_ts.trim();
-        if new_ts.is_empty() {
-            return false;
-        }
-        let should_update = match self.last_read.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(current) => slack_timestamp_is_after(new_ts, current),
-            None => true,
-        };
-        if should_update {
-            self.last_read = Some(new_ts.to_string());
-            self.retain_unread_mentions_after(new_ts);
-        }
-        should_update
-    }
-
-    /// Drops mention entries at or before `mark_ts`, called whenever
-    /// read-state advances (manual mark-read, visibility-based auto-read,
-    /// or a server-synced `last_read`) so the mention set self-corrects
-    /// regardless of which path moved the read boundary.
-    pub fn retain_unread_mentions_after(&mut self, mark_ts: &str) {
-        let mark_ts = mark_ts.trim();
-        if mark_ts.is_empty() {
-            return;
-        }
-        self.unread_mentions
-            .retain(|ts| slack_timestamp_is_after(ts, mark_ts));
-    }
-
-    /// Records (or clears) whether `ts` is an unread self-mention. Pass
-    /// `is_mention = false` to remove a timestamp whose edited content no
-    /// longer mentions the current user, or on delete.
-    pub fn set_mention_unread(&mut self, ts: &str, is_mention: bool) {
-        let ts = ts.trim();
-        if ts.is_empty() {
-            return;
-        }
-        if is_mention && self.is_ts_unread(ts) {
-            self.unread_mentions.insert(ts.to_string());
-        } else {
-            self.unread_mentions.remove(ts);
-        }
-    }
-
     pub fn is_dormant(&self) -> bool {
         self.extra_bool("is_dormant")
-    }
-
-    pub fn unread_activity_count(&self) -> u64 {
-        let extra_count = self
-            .extra
-            .get("unread_count_display")
-            .and_then(unread_count_value)
-            .or_else(|| {
-                self.extra
-                    .get("unread_count_string")
-                    .and_then(unread_count_value)
-            })
-            .unwrap_or_default();
-
-        self.unread_count_display
-            .or(self.unread_count)
-            .unwrap_or_default()
-            .max(extra_count)
-    }
-
-    pub fn has_unread_activity(&self) -> bool {
-        if self.unread_activity_count() > 0 {
-            return true;
-        }
-        if self.extra_bool("has_unreads") || self.extra_bool("has_unread") {
-            return true;
-        }
-        if let Some(latest) = self.latest_message_ts() {
-            if self.is_ts_unread(latest) {
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn mention_activity_count(&self) -> u64 {
-        self.unread_mentions.len() as u64
-    }
-
-    pub fn has_mention_activity(&self) -> bool {
-        !self.unread_mentions.is_empty()
     }
 
     pub fn priority_hint(&self) -> f64 {
@@ -440,19 +327,6 @@ fn user_id_from_value(value: &Value) -> Option<String> {
 fn non_empty_string(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
-}
-
-fn unread_count_value(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(number) => number.as_u64().or_else(|| {
-            number
-                .as_i64()
-                .filter(|value| *value > 0)
-                .map(|value| value as u64)
-        }),
-        Value::String(value) => value.parse::<u64>().ok(),
-        _ => None,
-    }
 }
 
 pub(crate) fn slack_timestamp_is_after(candidate: &str, current: &str) -> bool {
@@ -2485,104 +2359,17 @@ mod tests {
     }
 
     #[test]
-    fn conversation_read_state_tracking_and_watermark_advancement() {
-        let mut conversation: SlackConversation = serde_json::from_value(serde_json::json!({
+    fn cached_conversation_read_fields_are_tolerated_as_extra_payload() {
+        let conversation: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "C123",
             "last_read": "1710000000.000100",
             "unread_count": 5,
-            "unread_count_display": 2
+            "unread_mentions": ["1710000000.000200"]
         }))
-        .expect("conversation with read fields deserializes");
+        .expect("legacy cached conversation deserializes");
 
-        assert_eq!(conversation.last_read.as_deref(), Some("1710000000.000100"));
-        assert_eq!(conversation.unread_count, Some(5));
-        assert_eq!(conversation.unread_count_display, Some(2));
-
-        assert!(conversation.is_ts_unread("1710000000.000200"));
-        assert!(conversation.is_ts_read("1710000000.000100"));
-        assert!(conversation.is_ts_read("1710000000.000050"));
-
-        assert!(!conversation.advance_last_read("1710000000.000050"));
-        assert_eq!(conversation.last_read.as_deref(), Some("1710000000.000100"));
-
-        assert!(conversation.advance_last_read("1710000000.000300"));
-        assert_eq!(conversation.last_read.as_deref(), Some("1710000000.000300"));
-        assert!(conversation.is_ts_read("1710000000.000200"));
-    }
-
-    #[test]
-    fn unread_mentions_reflects_set_membership_not_a_naive_counter() {
-        let mut conversation = SlackConversation {
-            id: "C123".to_string(),
-            last_read: Some("1710000000.000100".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(conversation.mention_activity_count(), 0);
-        assert!(!conversation.has_mention_activity());
-
-        // Backfill re-applying an already-seen mention is a no-op (inserting
-        // the same ts twice doesn't double-count).
-        conversation.set_mention_unread("1710000000.000200", true);
-        conversation.set_mention_unread("1710000000.000200", true);
-        assert_eq!(conversation.mention_activity_count(), 1);
-
-        // A second, distinct unread mention is tracked independently.
-        conversation.set_mention_unread("1710000000.000300", true);
-        assert_eq!(conversation.mention_activity_count(), 2);
-
-        // Editing a message to remove its mention clears that entry only.
-        conversation.set_mention_unread("1710000000.000200", false);
-        assert_eq!(conversation.mention_activity_count(), 1);
-        assert!(conversation.has_mention_activity());
-
-        // Deleting a mentioning message removes it the same way (callers
-        // pass `is_mention = false` on delete).
-        conversation.set_mention_unread("1710000000.000300", false);
-        assert_eq!(conversation.mention_activity_count(), 0);
-        assert!(!conversation.has_mention_activity());
-    }
-
-    #[test]
-    fn marking_read_retains_only_mentions_after_the_mark_point() {
-        let mut conversation = SlackConversation {
-            id: "C123".to_string(),
-            last_read: Some("1710000000.000100".to_string()),
-            ..Default::default()
-        };
-        conversation.set_mention_unread("1710000000.000200", true);
-        conversation.set_mention_unread("1710000000.000300", true);
-        conversation.set_mention_unread("1710000000.000400", true);
-        assert_eq!(conversation.mention_activity_count(), 3);
-
-        // Advancing last_read past the first two mentions retains only the
-        // one still after the new watermark.
-        assert!(conversation.advance_last_read("1710000000.000300"));
-        assert_eq!(conversation.mention_activity_count(), 1);
-        assert!(conversation
-            .unread_mentions
-            .contains("1710000000.000400"));
-
-        // A direct retain call (the path used when read-state advances
-        // through some other route than `advance_last_read`) behaves the
-        // same way.
-        conversation.set_mention_unread("1710000000.000500", true);
-        conversation.retain_unread_mentions_after("1710000000.000400");
-        assert_eq!(conversation.mention_activity_count(), 1);
-        assert!(conversation
-            .unread_mentions
-            .contains("1710000000.000500"));
-    }
-
-    #[test]
-    fn set_mention_unread_ignores_messages_already_read() {
-        let mut conversation = SlackConversation {
-            id: "C123".to_string(),
-            last_read: Some("1710000000.000300".to_string()),
-            ..Default::default()
-        };
-        // A "mention" at or before the read watermark (e.g. historical
-        // backfill of already-read history) must not resurrect as unread.
-        conversation.set_mention_unread("1710000000.000100", true);
-        assert_eq!(conversation.mention_activity_count(), 0);
+        assert_eq!(conversation.id, "C123");
+        assert!(conversation.extra.contains_key("last_read"));
+        assert!(conversation.extra.contains_key("unread_mentions"));
     }
 }

@@ -22,13 +22,21 @@ use crate::models::{
 use crate::slack::SidebarTheme;
 use crate::slack_message_wire::normalize_cached_messages;
 use crate::thread_catalog::{ThreadCatalog, ThreadRecord};
+use crate::unread_ledger::{ConversationReadState, UnreadLedger};
 use crate::workspace_pipeline::{
     same_message_identity, MessageMutationKind, StoreBatch, StoreChange, WorkspaceRevision,
 };
 
 pub(crate) const CACHE_VERSION: u32 = 1;
-const DATABASE_SCHEMA_VERSION: u32 = 2;
+const DATABASE_SCHEMA_VERSION: u32 = 3;
 const DATABASE_FILENAME: &str = "state.sqlite3";
+const LEGACY_CONVERSATION_READ_KEYS: [&str; 5] = [
+    "last_read",
+    "unread_count",
+    "unread_count_display",
+    "unread_mentions",
+    "has_unreads",
+];
 const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
 const ATTENTION_DELIVERY_KIND: &str = "attention_delivery";
 const ATTENTION_DELIVERY_LEDGER_KEY: &str = "__ledger__";
@@ -641,6 +649,7 @@ pub(crate) struct WorkspaceBootstrap {
     pub(crate) thread_catalog: Vec<ThreadRecord>,
     pub(crate) custom_emojis: HashMap<String, String>,
     pub(crate) sidebar_theme: Option<SidebarTheme>,
+    pub(crate) read_states: UnreadLedger,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1049,6 +1058,7 @@ impl WorkspaceStore {
         .await
     }
 
+    #[cfg(test)]
     pub async fn load_conversations(&self) -> Result<Option<Vec<SlackConversation>>> {
         let workspace_key = self.workspace_key.clone();
         let conversations = self
@@ -1871,6 +1881,18 @@ fn open_database_once(directory: &Path) -> Result<Connection> {
              retry_after_ms INTEGER,
              PRIMARY KEY (workspace_key, operation, target)
          ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS conversation_read_state (
+             workspace_key TEXT NOT NULL REFERENCES workspaces(workspace_key) ON DELETE CASCADE,
+             channel_id TEXT NOT NULL,
+             last_read TEXT,
+             server_latest TEXT,
+             server_mention_count INTEGER NOT NULL DEFAULT 0,
+             server_unread_count INTEGER NOT NULL DEFAULT 0,
+             server_has_unreads INTEGER NOT NULL DEFAULT 0,
+             live_mentions_json TEXT NOT NULL DEFAULT '[]',
+             live_latest_unread TEXT,
+             PRIMARY KEY (workspace_key, channel_id)
+         ) WITHOUT ROWID;
          PRAGMA user_version = {DATABASE_SCHEMA_VERSION};"
     )) {
         if schema_version < DATABASE_SCHEMA_VERSION {
@@ -1964,7 +1986,96 @@ fn load_sqlite_bootstrap(
         thread_catalog: load_sqlite_kind_values(connection, workspace_key, "thread_record")?,
         custom_emojis: load_sqlite_kind_map(connection, workspace_key, "custom_emoji")?,
         sidebar_theme: load_sqlite_item(connection, workspace_key, "sidebar_theme", "theme")?,
+        read_states: load_sqlite_read_states(connection, workspace_key)?,
     }))
+}
+
+fn load_sqlite_read_states(connection: &Connection, workspace_key: &str) -> Result<UnreadLedger> {
+    let mut statement = connection.prepare(
+        "SELECT channel_id, last_read, server_latest, server_mention_count,
+                server_unread_count, server_has_unreads, live_mentions_json, live_latest_unread
+         FROM conversation_read_state WHERE workspace_key = ?1 ORDER BY channel_id",
+    )?;
+    let rows = statement.query_map([workspace_key], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, bool>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
+        ))
+    })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let (channel_id, last_read, server_latest, mentions, unreads, has_unreads, live, latest) =
+            row?;
+        let live_mentions = serde_json::from_str(&live).map_err(|error| {
+            StoreError::corrupt_item("conversation_read_state", &channel_id, error)
+        })?;
+        entries.push((
+            channel_id,
+            ConversationReadState {
+                last_read,
+                server_latest,
+                server_mention_count: u64::try_from(mentions).unwrap_or_default(),
+                server_unread_count: u64::try_from(unreads).unwrap_or_default(),
+                server_has_unreads: has_unreads,
+                live_mentions,
+                live_latest_unread: latest,
+            },
+        ));
+    }
+    Ok(UnreadLedger::from_entries(entries))
+}
+
+fn upsert_sqlite_read_states(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    workspace_id: &str,
+    states: &[(String, ConversationReadState)],
+) -> Result<bool> {
+    if states.is_empty() {
+        return Ok(false);
+    }
+    let mut changed = transaction.execute(
+        "INSERT INTO workspaces(workspace_key, workspace_id) VALUES (?1, ?2)
+         ON CONFLICT(workspace_key) DO NOTHING",
+        params![workspace_key, workspace_id],
+    )? > 0;
+    for (channel_id, state) in states {
+        require_store_key("conversation read state", channel_id)?;
+        let live_mentions = serde_json::to_string(&state.live_mentions)
+            .context("failed to serialize live mentions")?;
+        changed |= transaction.execute(
+            "INSERT INTO conversation_read_state(
+                 workspace_key, channel_id, last_read, server_latest, server_mention_count,
+                 server_unread_count, server_has_unreads, live_mentions_json, live_latest_unread)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(workspace_key, channel_id) DO UPDATE SET
+                 last_read = excluded.last_read,
+                 server_latest = excluded.server_latest,
+                 server_mention_count = excluded.server_mention_count,
+                 server_unread_count = excluded.server_unread_count,
+                 server_has_unreads = excluded.server_has_unreads,
+                 live_mentions_json = excluded.live_mentions_json,
+                 live_latest_unread = excluded.live_latest_unread",
+            params![
+                workspace_key,
+                channel_id,
+                state.last_read,
+                state.server_latest,
+                i64::try_from(state.server_mention_count).unwrap_or(i64::MAX),
+                i64::try_from(state.server_unread_count).unwrap_or(i64::MAX),
+                state.server_has_unreads,
+                live_mentions,
+                state.live_latest_unread,
+            ],
+        )? > 0;
+    }
+    Ok(changed)
 }
 
 fn load_sqlite_kind_map<T: DeserializeOwned>(
@@ -2176,6 +2287,16 @@ fn apply_store_change(
                     .collect::<Result<Vec<_>>>()?,
             )?;
             changed |= sync_thread_records(transaction, workspace_key, data.threads)?;
+            changed |= transaction.execute(
+                "DELETE FROM conversation_read_state WHERE workspace_key = ?1",
+                [workspace_key],
+            )? > 0;
+            changed |= upsert_sqlite_read_states(
+                transaction,
+                workspace_key,
+                workspace_id,
+                &data.read_states.entries(),
+            )?;
             Ok(changed)
         }
         StoreChange::ConversationsReplaced(conversations) => {
@@ -2335,6 +2456,9 @@ fn apply_store_change(
         }
         StoreChange::ThreadRecordsUpserted(records) => {
             upsert_thread_records(transaction, workspace_key, records)
+        }
+        StoreChange::ReadStatesUpserted(states) => {
+            upsert_sqlite_read_states(transaction, workspace_key, workspace_id, &states)
         }
     }
 }
@@ -3340,6 +3464,11 @@ fn conversation_for_cache(conversation: &SlackConversation) -> SlackConversation
         });
     if remove_empty_properties {
         cached.extra.remove("properties");
+    }
+    // Read state is owned by `conversation_read_state`; drop payload copies
+    // (including legacy cached fields) so they cannot go stale here.
+    for key in LEGACY_CONVERSATION_READ_KEYS {
+        cached.extra.remove(key);
     }
     cached
 }
@@ -5051,6 +5180,7 @@ mod tests {
                         }],
                     )]),
                     threads: thread_catalog.into_records(),
+                    ..Default::default()
                 })],
             )
             .unwrap();
@@ -5322,7 +5452,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
         let metadata_columns: Vec<String> = connection
             .prepare("PRAGMA table_info(sync_metadata)")
             .unwrap()
@@ -5359,7 +5489,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -5397,7 +5527,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -7458,14 +7588,17 @@ mod tests {
         let runtime = runtime();
 
         runtime.block_on(async {
-            let conversation = SlackConversation {
+            let mut conversation = SlackConversation {
                 id: "C123".into(),
                 name: Some("general".into()),
-                last_read: Some("1710000200.000100".into()),
-                unread_count: Some(4),
-                unread_count_display: Some(1),
                 ..Default::default()
             };
+            conversation
+                .extra
+                .insert("last_read".into(), serde_json::json!("1710000200.000100"));
+            conversation
+                .extra
+                .insert("unread_mentions".into(), serde_json::json!(["1.0"]));
             store
                 .store_conversations(&[conversation.clone()])
                 .await
@@ -7477,9 +7610,37 @@ mod tests {
                 .expect("load conversations failed")
                 .expect("conversations found");
             assert_eq!(loaded_convs.len(), 1);
-            assert_eq!(loaded_convs[0].last_read.as_deref(), Some("1710000200.000100"));
-            assert_eq!(loaded_convs[0].unread_count, Some(4));
-            assert_eq!(loaded_convs[0].unread_count_display, Some(1));
+            assert!(!loaded_convs[0].extra.contains_key("last_read"));
+            assert!(!loaded_convs[0].extra.contains_key("unread_mentions"));
+
+            let read_state = ConversationReadState {
+                last_read: Some("1710000200.000100".into()),
+                server_latest: Some("1710000300.000100".into()),
+                server_mention_count: 4,
+                server_unread_count: 1,
+                server_has_unreads: true,
+                live_mentions: BTreeSet::from(["1710000400.000100".to_string()]),
+                live_latest_unread: Some("1710000500.000100".into()),
+            };
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        WorkspaceRevision::INITIAL.successor(),
+                        vec![StoreChange::ReadStatesUpserted(vec![(
+                            "C123".into(),
+                            read_state.clone(),
+                        )])],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .expect("store read state failed");
+            let bootstrap = store
+                .load_bootstrap()
+                .await
+                .unwrap()
+                .expect("bootstrap exists");
+            assert_eq!(bootstrap.read_states.get("C123"), Some(&read_state));
 
             let mut catalog = ThreadCatalog::default();
             let root = SlackMessage {
@@ -7503,7 +7664,10 @@ mod tests {
                 .await
                 .expect("load thread catalog failed");
             assert_eq!(loaded_records.len(), 1);
-            assert_eq!(loaded_records[0].last_read.as_deref(), Some("1710000250.000100"));
+            assert_eq!(
+                loaded_records[0].last_read.as_deref(),
+                Some("1710000250.000100")
+            );
             assert!(loaded_records[0].has_unread_replies());
         });
 
@@ -7535,7 +7699,11 @@ mod tests {
 
             store.store_sidebar_theme(&theme).await.unwrap();
 
-            let bootstrap = store.load_bootstrap().await.unwrap().expect("bootstrap exists");
+            let bootstrap = store
+                .load_bootstrap()
+                .await
+                .unwrap()
+                .expect("bootstrap exists");
             assert_eq!(bootstrap.sidebar_theme, Some(theme));
         });
 

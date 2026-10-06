@@ -125,27 +125,6 @@ impl ConversationCatalog {
         true
     }
 
-    pub(crate) fn advance_last_read(&mut self, id: &str, ts: &str) -> bool {
-        let revision = self.next_revision();
-        if let Some(entry) = self.entries.get_mut(id) {
-            if entry.conversation.advance_last_read(ts) {
-                entry.metadata_revision = revision;
-                return true;
-            }
-        }
-        false
-    }
-
-    pub(crate) fn set_last_read(&mut self, id: &str, ts: String) -> bool {
-        let revision = self.next_revision();
-        if let Some(entry) = self.entries.get_mut(id) {
-            entry.conversation.last_read = Some(ts);
-            entry.metadata_revision = revision;
-            return true;
-        }
-        false
-    }
-
     /// Upserts a conversation opened while a membership refresh may be in flight.
     pub(crate) fn upsert_opened(&mut self, conversation: SlackConversation) {
         let revision = self.next_revision();
@@ -242,9 +221,6 @@ fn merge_metadata(current: &mut SlackConversation, incoming: &SlackConversation)
     merge_option(&mut current.is_private, &incoming.is_private);
     merge_option(&mut current.is_archived, &incoming.is_archived);
     merge_option(&mut current.is_starred, &incoming.is_starred);
-    merge_option(&mut current.last_read, &incoming.last_read);
-    merge_option(&mut current.unread_count, &incoming.unread_count);
-    merge_option(&mut current.unread_count_display, &incoming.unread_count_display);
 
     for (key, value) in &incoming.extra {
         current.extra.insert(key.clone(), value.clone());

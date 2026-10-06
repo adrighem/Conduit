@@ -95,7 +95,7 @@ pub fn sidebar_row_widget(
         content.append(&icon);
     }
 
-    let emphasized = model.unread || model.has_mention;
+    let emphasized = model.unread || model.mention_count > 0;
     let title = gtk::Label::new(Some(&model.title));
     title.set_xalign(0.0);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -104,23 +104,13 @@ pub fn sidebar_row_widget(
         title.add_css_class("heading");
     }
 
-    // `title` deliberately does NOT hexpand here: a mention pill rendered
-    // immediately after it (inside this same row) needs to sit right next
-    // to the visible text, not get stranded at the far edge of an expanded
-    // label's allocation. Hexpand instead applies to this wrapping row, so
-    // the unused space still ends up before the trailing indicators.
+    // `title` deliberately does NOT hexpand here: the status indicator sits
+    // right next to the visible text. Hexpand instead applies to this
+    // wrapping row, so the unused space ends up before trailing indicators
+    // and the mention pill stays right-aligned at the row end.
     let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     title_row.set_hexpand(true);
     title_row.append(&title);
-
-    if let Some(mention_label) = model.mention_badge_label() {
-        let mention = gtk::Label::new(Some(&mention_label));
-        mention.add_css_class("caption");
-        mention.add_css_class("heading");
-        mention.add_css_class("accent");
-        mention.set_tooltip_text(Some("Mentioned"));
-        title_row.append(&mention);
-    }
 
     content.append(&title_row);
 
@@ -160,13 +150,6 @@ pub fn sidebar_row_widget(
         content.append(&starred);
     }
 
-    if let Some(unread_label) = model.unread_badge_label() {
-        let unread = gtk::Label::new(Some(&unread_label));
-        unread.add_css_class("caption");
-        unread.add_css_class("heading");
-        content.append(&unread);
-    }
-
     if model.muted {
         let muted = gtk::Image::from_icon_name("notifications-disabled-symbolic");
         muted.set_tooltip_text(Some("Muted"));
@@ -184,6 +167,14 @@ pub fn sidebar_row_widget(
         huddle.set_tooltip_text(Some("Huddle active"));
         huddle.update_property(&[gtk::accessible::Property::Label("Huddle active")]);
         content.append(&huddle);
+    }
+
+    if let Some(mention_label) = model.mention_badge_label() {
+        let mention = gtk::Label::new(Some(&mention_label));
+        mention.add_css_class("mention-badge-pill");
+        mention.set_valign(gtk::Align::Center);
+        mention.set_tooltip_text(Some("Unread mentions"));
+        content.append(&mention);
     }
 
     row.set_child(Some(&content));

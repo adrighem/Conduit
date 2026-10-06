@@ -51,6 +51,17 @@ pub enum SocketModeEvent {
     UserChanged(Box<SlackUser>),
     UserHuddleChanged(Box<SlackUser>),
     RefreshConversations,
+    /// `channel_marked`, `group_marked`, `im_marked` or `mpim_marked`: the
+    /// read watermark moved, usually from another client.
+    ConversationMarked {
+        channel_id: String,
+        ts: String,
+    },
+    /// `thread_marked`: a thread was read from another client.
+    ThreadMarked {
+        channel_id: String,
+        thread_ts: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,6 +370,10 @@ fn socket_event_from_event(event: &Value) -> Option<SocketModeEvent> {
         event_type if conversation_refresh_event(event_type) => {
             Some(SocketModeEvent::RefreshConversations)
         }
+        "channel_marked" | "group_marked" | "im_marked" | "mpim_marked" => {
+            conversation_marked_event(event)
+        }
+        "thread_marked" => thread_marked_event(event),
         _ => None,
     }
 }
@@ -430,6 +445,29 @@ fn reaction_event(event: &Value, added: bool) -> Option<SocketModeReactionEvent>
         name: event.get("reaction").and_then(Value::as_str)?.to_string(),
         user_id: event.get("user").and_then(Value::as_str)?.to_string(),
         added,
+    })
+}
+
+fn non_empty_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn conversation_marked_event(event: &Value) -> Option<SocketModeEvent> {
+    Some(SocketModeEvent::ConversationMarked {
+        channel_id: non_empty_str(event, "channel")?.to_string(),
+        ts: non_empty_str(event, "ts")?.to_string(),
+    })
+}
+
+fn thread_marked_event(event: &Value) -> Option<SocketModeEvent> {
+    let subscription = event.get("subscription")?;
+    Some(SocketModeEvent::ThreadMarked {
+        channel_id: non_empty_str(subscription, "channel")?.to_string(),
+        thread_ts: non_empty_str(subscription, "thread_ts")?.to_string(),
     })
 }
 
@@ -606,6 +644,45 @@ mod tests {
     use std::task::{Context as TaskContext, Poll};
 
     use super::*;
+
+    #[test]
+    fn rtm_marked_events_parse_into_read_state_events() {
+        for event_type in ["channel_marked", "group_marked", "im_marked", "mpim_marked"] {
+            let event = serde_json::json!({
+                "type": event_type,
+                "channel": "D1",
+                "ts": "1710000000.000100",
+                "unread_count": 0
+            });
+            assert_eq!(
+                socket_event_from_rtm(&event),
+                Some(SocketModeEvent::ConversationMarked {
+                    channel_id: "D1".to_string(),
+                    ts: "1710000000.000100".to_string(),
+                }),
+                "{event_type}"
+            );
+        }
+        let missing_ts = serde_json::json!({"type": "im_marked", "channel": "D1"});
+        assert_eq!(socket_event_from_rtm(&missing_ts), None);
+
+        let thread = serde_json::json!({
+            "type": "thread_marked",
+            "subscription": {
+                "type": "thread",
+                "channel": "C1",
+                "thread_ts": "1710000000.000100",
+                "last_read": "1710000000.000300"
+            }
+        });
+        assert_eq!(
+            socket_event_from_rtm(&thread),
+            Some(SocketModeEvent::ThreadMarked {
+                channel_id: "C1".to_string(),
+                thread_ts: "1710000000.000100".to_string(),
+            })
+        );
+    }
 
     #[derive(Clone, Default)]
     struct RecordingSink {

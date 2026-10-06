@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::auth::browser_session_cookie_header;
+use crate::client_counts::ClientCountsPayload;
 use crate::http_client;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackAttachment, SlackConversation, SlackFile, SlackMessage,
@@ -24,6 +25,7 @@ use crate::search::{
     SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
 };
 use crate::slack_message_wire::{deserialize_message, deserialize_messages};
+use crate::unread_ledger::ServerReadCounts;
 
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MEDIA_DOWNLOAD_BYTES: u64 = MAX_UPLOAD_BYTES;
@@ -422,7 +424,6 @@ fn normalize_sidebar_theme_hex(value: &str) -> Option<String> {
     None
 }
 
-
 pub fn preset_sidebar_theme(name: &str) -> Option<SidebarTheme> {
     let normalized = name.trim().to_ascii_lowercase().replace('-', "_");
     match normalized.as_str() {
@@ -622,7 +623,10 @@ impl SlackApi {
 
     pub(crate) async fn fetch_sidebar_theme(&self) -> Result<Option<SidebarTheme>> {
         let mut prefs = None;
-        match self.post_form::<ClientUserBootResponse>("client.userBoot", &[]).await {
+        match self
+            .post_form::<ClientUserBootResponse>("client.userBoot", &[])
+            .await
+        {
             Ok(response) => {
                 prefs = response.self_data.and_then(|s| s.prefs);
             }
@@ -634,15 +638,15 @@ impl SlackApi {
             }
         }
         if prefs.is_none() {
-            match self.post_form::<UsersPrefsGetResponse>("users.prefs.get", &[]).await {
+            match self
+                .post_form::<UsersPrefsGetResponse>("users.prefs.get", &[])
+                .await
+            {
                 Ok(response) => {
                     prefs = response.prefs;
                 }
                 Err(error) => {
-                    crate::debug::log(
-                        "slack",
-                        &format!("users.prefs.get failed error={error:#}"),
-                    );
+                    crate::debug::log("slack", &format!("users.prefs.get failed error={error:#}"));
                 }
             }
         }
@@ -873,6 +877,21 @@ impl SlackApi {
             )
             .await?;
         Ok(())
+    }
+
+    /// Read-state baseline for every conversation (`client.counts`).
+    pub async fn client_counts(&self) -> Result<Vec<ServerReadCounts>> {
+        let response: ClientCountsResponse = self
+            .post_form(
+                "client.counts",
+                &[
+                    ("thread_counts_by_channel", "true".to_string()),
+                    ("org_wide_aware", "true".to_string()),
+                    ("include_file_channels", "true".to_string()),
+                ],
+            )
+            .await?;
+        Ok(response.payload.server_read_counts())
     }
 
     pub async fn open_direct_message(&self, user_id: &str) -> Result<SlackConversation> {
@@ -2738,6 +2757,15 @@ struct MessagePermalinkResponse {
     permalink: Option<String>,
 }
 impl_slack_response!(MessagePermalinkResponse);
+
+#[derive(Debug, Deserialize)]
+struct ClientCountsResponse {
+    ok: bool,
+    error: Option<String>,
+    #[serde(flatten)]
+    payload: ClientCountsPayload,
+}
+impl_slack_response!(ClientCountsResponse);
 
 #[derive(Debug, Deserialize)]
 struct BasicResponse {
@@ -4625,11 +4653,10 @@ mod tests {
                 .expect("mock Slack request body should be readable");
             request
                 .respond(
-                    Response::from_string(r#"{"ok":true}"#)
-                        .with_header(
-                            Header::from_bytes("Content-Type", "application/json")
-                                .expect("content type header should be valid"),
-                        ),
+                    Response::from_string(r#"{"ok":true}"#).with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
                 )
                 .expect("mock Slack response should be sent");
             (path, body)

@@ -19,6 +19,7 @@ use crate::models::{
     SlackFile, SlackMessage, SlackUser,
 };
 use crate::thread_catalog::ThreadCatalog;
+use crate::unread_ledger::UnreadLedger;
 use crate::workspace_pipeline::{
     MessageChange, TimelineTarget, WorkspaceChange, WorkspacePatch, WorkspaceRevision,
 };
@@ -93,6 +94,7 @@ pub(crate) struct WorkspaceSessionState {
     pub(crate) users: RefCell<HashMap<String, SlackUser>>,
     pub(crate) view: RefCell<WorkspaceViewState>,
     pub(crate) threads: RefCell<ThreadCatalog>,
+    pub(crate) read_states: RefCell<UnreadLedger>,
     workspace_patches: RefCell<WorkspacePatchConsumer>,
 }
 
@@ -129,6 +131,7 @@ pub(crate) struct WorkspacePatchApplication {
     conversation_structure_changed: bool,
     changed_conversation_ids: Vec<String>,
     thread_catalog_changed: bool,
+    read_state_changed_ids: Vec<String>,
     users_reset: bool,
     changed_user_ids: Vec<String>,
     timeline_changes: Vec<TimelineProjectionApplication>,
@@ -200,6 +203,11 @@ impl WorkspacePatchApplication {
         self.thread_catalog_changed
     }
 
+    /// Conversations whose read state changed without a conversation reset.
+    pub(crate) fn read_state_changed_ids(&self) -> &[String] {
+        &self.read_state_changed_ids
+    }
+
     pub(crate) fn users_reset(&self) -> bool {
         self.users_reset
     }
@@ -255,6 +263,7 @@ impl WorkspaceSessionState {
         self.users.borrow_mut().clear();
         self.view.borrow_mut().reset();
         *self.threads.borrow_mut() = ThreadCatalog::default();
+        *self.read_states.borrow_mut() = UnreadLedger::default();
         *self.workspace_patches.borrow_mut() = WorkspacePatchConsumer::default();
     }
 
@@ -276,6 +285,7 @@ impl WorkspaceSessionState {
         let mut users = self.users.borrow_mut();
         let mut view = self.view.borrow_mut();
         let mut threads = self.threads.borrow_mut();
+        let mut read_states = self.read_states.borrow_mut();
         let mut application = WorkspacePatchApplication::default();
         for change in patch.changes() {
             match change {
@@ -288,6 +298,7 @@ impl WorkspaceSessionState {
                     );
                     *threads = ThreadCatalog::from_records(data.threads.clone());
                     application.thread_catalog_changed = true;
+                    *read_states = data.read_states.clone();
                     replace_patch_users(&mut users, &data.users, &mut application);
                 }
                 WorkspaceChange::ConversationsReset(conversations) => {
@@ -322,6 +333,12 @@ impl WorkspaceSessionState {
                         threads.upsert_records(records.iter().cloned());
                     }
                     application.thread_catalog_changed = true;
+                }
+                WorkspaceChange::ReadStatesChanged(changed) => {
+                    for (channel_id, state) in changed {
+                        read_states.upsert(channel_id, state.clone());
+                        application.read_state_changed_ids.push(channel_id.clone());
+                    }
                 }
                 WorkspaceChange::UsersReset(updated) => {
                     replace_patch_users(&mut users, updated, &mut application);
@@ -359,6 +376,8 @@ impl WorkspaceSessionState {
         }
         application.changed_conversation_ids.sort_unstable();
         application.changed_conversation_ids.dedup();
+        application.read_state_changed_ids.sort_unstable();
+        application.read_state_changed_ids.dedup();
         consumer.revision = patch.revision();
         Some(application)
     }
@@ -630,13 +649,9 @@ impl ConversationOpenCoordinator {
                 session.pending_reconciliation = true;
                 Some(ConversationOpenRenderAction::HoldReconciliation)
             }
-            ConversationOpenPhase::Interactive => {
-                Some(ConversationOpenRenderAction::Reconcile)
-            }
+            ConversationOpenPhase::Interactive => Some(ConversationOpenRenderAction::Reconcile),
             #[cfg(test)]
-            ConversationOpenPhase::Cancelled => {
-                Some(ConversationOpenRenderAction::Reconcile)
-            }
+            ConversationOpenPhase::Cancelled => Some(ConversationOpenRenderAction::Reconcile),
         }
     }
 

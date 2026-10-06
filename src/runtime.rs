@@ -4609,9 +4609,8 @@ fn spawn_authentication_task<F>(
                                         );
                                     }
                                 }
-                                theme_events.send_event(RuntimeEventKind::WorkspaceThemeLoaded(
-                                    theme,
-                                ));
+                                theme_events
+                                    .send_event(RuntimeEventKind::WorkspaceThemeLoaded(theme));
                             }
                             Ok(None) => {}
                             Err(error) => {
@@ -5131,17 +5130,17 @@ async fn run_job_payload(
 /// since the catalog changes rarely and doesn't warrant a separate schedule.
 /// Never fails the caller: `emoji.list` errors are logged and swallowed so a
 /// transient failure here can't take down the rest of workspace sync.
-async fn sync_custom_emojis_best_effort(events: &RuntimeEventSender, connection: &RuntimeConnection) {
+async fn sync_custom_emojis_best_effort(
+    events: &RuntimeEventSender,
+    connection: &RuntimeConnection,
+) {
     let Some(store) = connection.workspace_store.as_ref() else {
         return;
     };
     match connection.slack.custom_emojis().await {
         Ok(emojis) => {
             if let Err(error) = store.store_custom_emojis(&emojis).await {
-                crate::debug::log(
-                    "store",
-                    &format!("CustomEmojiStoreFailed error={error:#}"),
-                );
+                crate::debug::log("store", &format!("CustomEmojiStoreFailed error={error:#}"));
             }
             if !emojis.is_empty() {
                 events.send_event(RuntimeEventKind::EmojiCatalogLoaded(emojis));
@@ -5188,6 +5187,7 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
         thread_catalog,
         custom_emojis,
         sidebar_theme,
+        read_states,
         ..
     } = bootstrap;
     crate::debug::log(
@@ -5230,6 +5230,7 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
                 conversations: conversations.clone(),
                 users,
                 threads: thread_catalog.clone(),
+                read_states,
                 ..Default::default()
             }),
             None,
@@ -6556,39 +6557,101 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .send_event(RuntimeEventKind::FileUploaded(label));
         }
         RuntimeCommand::MarkConversationRead { channel_id, ts } => {
+            apply_local_read_state(
+                context,
+                WorkspaceMutation::ConversationMarked {
+                    channel_id: channel_id.clone(),
+                    ts: ts.clone(),
+                },
+            )
+            .await;
             context.read_flusher.enqueue(&channel_id, &ts);
         }
         RuntimeCommand::MarkConversationUnread { channel_id, ts } => {
+            apply_local_read_state(
+                context,
+                WorkspaceMutation::ConversationMarkedUnread {
+                    channel_id: channel_id.clone(),
+                    ts: ts.clone(),
+                },
+            )
+            .await;
             context.read_flusher.enqueue_force(&channel_id, &ts);
-            if let Some(store) = context.workspace_store.as_mut() {
-                if let Ok(Some(mut convs)) = store.load_conversations().await {
-                    if let Some(conv) = convs.iter_mut().find(|c| c.id == channel_id) {
-                        conv.last_read = Some(ts.clone());
-                        let _ = store.store_conversations(&convs).await;
-                    }
-                }
-            }
         }
         RuntimeCommand::MarkThreadRead {
             channel_id,
             thread_ts,
         } => {
-            let _ = context
-                .workspace
-                .apply_persisted_and_publish(
-                    context.workspace_store.as_ref(),
-                    context.events,
-                    MutationOrigin::Local,
-                    WorkspaceMutation::ThreadRead {
-                        channel_id,
-                        root_ts: thread_ts,
-                    },
-                )
-                .await;
+            apply_local_read_state(
+                context,
+                WorkspaceMutation::ThreadRead {
+                    channel_id,
+                    root_ts: thread_ts,
+                },
+            )
+            .await;
         }
     }
 
     Ok(())
+}
+
+/// Applies a local read-state mutation through the coordinator so the
+/// ledger, store and every window agree before Slack is told.
+async fn apply_local_read_state(context: &RuntimeContext<'_>, mutation: WorkspaceMutation) {
+    if let Err(error) = context
+        .workspace
+        .apply_persisted_and_publish(
+            context.workspace_store.as_ref(),
+            context.events,
+            MutationOrigin::Local,
+            mutation,
+        )
+        .await
+    {
+        crate::debug::log(
+            "store",
+            &format!("LocalReadStateDeferred category={:?}", error.category()),
+        );
+    }
+}
+
+/// Fetches the `client.counts` baseline and feeds it to the coordinator.
+/// Best effort: a failure keeps the previous baseline and live tier.
+async fn sync_client_counts(
+    events: &RuntimeEventSender,
+    api: &SlackApi,
+    store: Option<&WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
+) {
+    let counts = match api.client_counts().await {
+        Ok(counts) => counts,
+        Err(error) => {
+            crate::debug::log(
+                "runtime",
+                &format!("ClientCountsLoadFailed category={:?}", error.category()),
+            );
+            return;
+        }
+    };
+    crate::debug::log(
+        "runtime",
+        &format!("ClientCountsLoaded conversations={}", counts.len()),
+    );
+    if let Err(error) = workspace
+        .apply_persisted_and_publish(
+            store,
+            events,
+            MutationOrigin::WebApi,
+            WorkspaceMutation::CountsSnapshot(counts),
+        )
+        .await
+    {
+        crate::debug::log(
+            "store",
+            &format!("ClientCountsDeferred category={:?}", error.category()),
+        );
+    }
 }
 
 async fn run_socket_mode(
@@ -6598,6 +6661,7 @@ async fn run_socket_mode(
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let RuntimeConnection {
+        slack,
         workspace_store,
         workspace,
         current_user_id,
@@ -6608,6 +6672,8 @@ async fn run_socket_mode(
     } = connection;
     let mut reconnect_delay = SOCKET_MODE_INITIAL_RECONNECT_DELAY;
     let transport = credentials.transport();
+    // Bootstrap already loads `client.counts`; only reconnects re-snapshot.
+    let connected_before = std::sync::atomic::AtomicBool::new(false);
 
     loop {
         if realtime_shutdown_requested(&mut shutdown) {
@@ -6635,12 +6701,27 @@ async fn run_socket_mode(
         let team_id_for_run = team_id.clone();
         let user_status_sync_for_run = user_status_sync.clone();
         let result = {
+            let connected_before = &connected_before;
+            let counts_api = slack.clone();
+            let counts_store = workspace_store.clone();
+            let counts_workspace = workspace.clone();
             let run_once = socket_mode::run_once(
                 &credentials,
                 move || {
                     connected_events.send_event(RuntimeEventKind::RealtimeStatusChanged(
                         RealtimeStatus::online(transport),
                     ));
+                    if connected_before.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        tokio::spawn(async move {
+                            sync_client_counts(
+                                &connected_events,
+                                &counts_api,
+                                counts_store.as_ref(),
+                                &counts_workspace,
+                            )
+                            .await;
+                        });
+                    }
                 },
                 move |event| {
                     let persistence_for_event = persistence_for_run.clone();
@@ -6663,6 +6744,8 @@ async fn run_socket_mode(
                                     | SocketModeEvent::Reaction(_)
                                     | SocketModeEvent::UserChanged(_)
                                     | SocketModeEvent::UserHuddleChanged(_)
+                                    | SocketModeEvent::ConversationMarked { .. }
+                                    | SocketModeEvent::ThreadMarked { .. }
                             );
                         let attention = (!defer_workspace_mutation)
                             .then(|| {
@@ -6705,7 +6788,9 @@ async fn run_socket_mode(
                                     event: message.clone(),
                                 })
                             }
-                            SocketModeEvent::Reaction(_) => {
+                            SocketModeEvent::Reaction(_)
+                            | SocketModeEvent::ConversationMarked { .. }
+                            | SocketModeEvent::ThreadMarked { .. } => {
                                 Some(RealtimePersistenceEvent::OrderedEvent {
                                     event: event.clone(),
                                 })
@@ -6890,6 +6975,19 @@ fn realtime_workspace_mutation(event: &SocketModeEvent) -> Option<WorkspaceMutat
             user_id: reaction.user_id.clone(),
             added: reaction.added,
         }),
+        SocketModeEvent::ConversationMarked { channel_id, ts } => {
+            Some(WorkspaceMutation::ConversationMarked {
+                channel_id: channel_id.clone(),
+                ts: ts.clone(),
+            })
+        }
+        SocketModeEvent::ThreadMarked {
+            channel_id,
+            thread_ts,
+        } => Some(WorkspaceMutation::ThreadRead {
+            channel_id: channel_id.clone(),
+            root_ts: thread_ts.clone(),
+        }),
         SocketModeEvent::RefreshConversations => None,
     }
 }
@@ -6994,7 +7092,9 @@ async fn observe_huddle_socket_event(
         }
         SocketModeEvent::UserChanged(_)
         | SocketModeEvent::Reaction(_)
-        | SocketModeEvent::RefreshConversations => Ok(()),
+        | SocketModeEvent::RefreshConversations
+        | SocketModeEvent::ConversationMarked { .. }
+        | SocketModeEvent::ThreadMarked { .. } => Ok(()),
     }
 }
 
@@ -7900,6 +8000,7 @@ async fn load_conversations_best_effort_with_api(
             events.send_event(RuntimeEventKind::WorkspaceLifecycle(
                 WorkspaceLifecycleEvent::SyncCompleted,
             ));
+            sync_client_counts(events, api, workspace.store.as_ref(), workspace.reducer).await;
             let current_huddle_channels = conversations
                 .iter()
                 .filter(|conversation| conversation.has_huddle_metadata())
@@ -8464,18 +8565,21 @@ impl ReadFlusherQueue {
                 return false;
             }
         }
-        self.pending.insert(channel_id.to_string(), target_ts.to_string());
+        self.pending
+            .insert(channel_id.to_string(), target_ts.to_string());
         true
     }
 
     pub fn enqueue_force(&mut self, channel_id: &str, target_ts: &str) {
-        self.pending.insert(channel_id.to_string(), target_ts.to_string());
+        self.pending
+            .insert(channel_id.to_string(), target_ts.to_string());
     }
 
     pub fn flush(&mut self) -> Vec<PendingReadMark> {
         let mut flushed = Vec::with_capacity(self.pending.len());
         for (channel_id, target_ts) in self.pending.drain() {
-            self.last_marked.insert(channel_id.clone(), target_ts.clone());
+            self.last_marked
+                .insert(channel_id.clone(), target_ts.clone());
             flushed.push(PendingReadMark {
                 channel_id,
                 target_ts,
@@ -8486,7 +8590,8 @@ impl ReadFlusherQueue {
 
     pub fn flush_channel(&mut self, channel_id: &str) -> Option<PendingReadMark> {
         if let Some(target_ts) = self.pending.remove(channel_id) {
-            self.last_marked.insert(channel_id.to_string(), target_ts.clone());
+            self.last_marked
+                .insert(channel_id.to_string(), target_ts.clone());
             Some(PendingReadMark {
                 channel_id: channel_id.to_string(),
                 target_ts,
@@ -8549,7 +8654,10 @@ impl ReadFlusherHandle {
 pub async fn execute_read_flusher_mark(api: &SlackApi, mark: &PendingReadMark) -> Result<()> {
     let mut retries = 0usize;
     loop {
-        match api.conversations_mark(&mark.channel_id, &mark.target_ts).await {
+        match api
+            .conversations_mark(&mark.channel_id, &mark.target_ts)
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(slack_err) => {
                 if slack_err.category() == SlackErrorCategory::RateLimited && retries < 3 {
