@@ -246,8 +246,7 @@ pub(crate) fn present(
         previous.dialog.force_close();
     }
 
-    let spinner = gtk::Spinner::new();
-    spinner.set_spinning(true);
+    let spinner = adw::Spinner::new();
     spinner.set_size_request(32, 32);
     spinner.set_halign(gtk::Align::Center);
     spinner.set_valign(gtk::Align::Center);
@@ -282,7 +281,7 @@ pub(crate) fn present(
     };
     CURRENT.with(|current| *current.borrow_mut() = Some(this.clone()));
     dialog.connect_closed(glib::clone!(
-        #[strong(rename_to = closed)]
+        #[weak(rename_to = closed)]
         dialog,
         move |_| {
             CURRENT.with(|current| {
@@ -456,11 +455,17 @@ impl ProfileDialog {
             });
             buttons.append(&message);
         }
-        let copy_id = gtk::Button::with_label(&gettext("Copy Member ID"));
-        copy_id.add_css_class("pill");
+        let copy_id = adw::ButtonRow::new();
+        copy_id.set_title(&gettext("Copy Member ID"));
+        copy_id.set_start_icon_name(Some("edit-copy-symbolic"));
         let this = self.clone();
-        copy_id.connect_clicked(move |_| this.copy(&this.user_id, &gettext("Member ID")));
-        buttons.append(&copy_id);
+        copy_id.connect_activated(move |_| this.copy(&this.user_id, &gettext("Member ID")));
+        let list = gtk::ListBox::new();
+        list.add_css_class("boxed-list");
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.set_size_request(260, -1);
+        list.append(&copy_id);
+        buttons.append(&list);
         buttons
     }
 }

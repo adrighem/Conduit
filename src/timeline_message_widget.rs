@@ -39,142 +39,12 @@ glib::wrapper! {
     pub struct TimelineMessageObject(ObjectSubclass<imp::TimelineMessageObject>);
 }
 
-mod wrap_box_imp {
-    use super::*;
-    use gtk::subclass::prelude::*;
-
-    #[derive(Default)]
-    pub struct ReactionWrapBox {
-        pub children: RefCell<Vec<Widget>>,
-    }
-
-    #[glib::object_subclass]
-    impl ObjectSubclass for ReactionWrapBox {
-        const NAME: &'static str = "ConduitReactionWrapBox";
-        type Type = super::ReactionWrapBox;
-        type ParentType = Widget;
-    }
-
-    impl ObjectImpl for ReactionWrapBox {
-        fn dispose(&self) {
-            while let Some(child) = self.children.borrow_mut().pop() {
-                child.unparent();
-            }
-        }
-    }
-
-    impl WidgetImpl for ReactionWrapBox {
-        fn request_mode(&self) -> gtk::SizeRequestMode {
-            gtk::SizeRequestMode::HeightForWidth
-        }
-
-        fn measure(&self, orientation: Orientation, for_size: i32) -> (i32, i32, i32, i32) {
-            let children = self.children.borrow();
-            if children.is_empty() {
-                return (0, 0, -1, -1);
-            }
-
-            let col_spacing = 4;
-            let row_spacing = 4;
-
-            match orientation {
-                Orientation::Horizontal => {
-                    let min_w = children
-                        .iter()
-                        .map(|c| c.measure(Orientation::Horizontal, -1).0)
-                        .max()
-                        .unwrap_or(0);
-                    let sum_nat: i32 = children
-                        .iter()
-                        .map(|c| c.measure(Orientation::Horizontal, -1).1)
-                        .sum();
-                    let total_spacing = (children.len() as i32 - 1) * col_spacing;
-                    let nat_w = sum_nat + total_spacing;
-                    let nat = if for_size > 0 {
-                        nat_w.min(for_size)
-                    } else {
-                        nat_w
-                    };
-                    (min_w, nat, -1, -1)
-                }
-                Orientation::Vertical => {
-                    let mut x = 0;
-                    let mut y = 0;
-                    let mut line_h = 0;
-
-                    for child in children.iter() {
-                        let (_, child_w, _, _) = child.measure(Orientation::Horizontal, -1);
-                        let (_, child_h, _, _) = child.measure(Orientation::Vertical, child_w);
-
-                        if for_size > 0 && x + child_w > for_size && x > 0 {
-                            x = 0;
-                            y += line_h + row_spacing;
-                            line_h = 0;
-                        }
-                        x += child_w + col_spacing;
-                        line_h = line_h.max(child_h);
-                    }
-                    let total_h = y + line_h;
-
-                    (total_h, total_h, -1, -1)
-                }
-                _ => (0, 0, -1, -1),
-            }
-        }
-
-        fn size_allocate(&self, width: i32, _height: i32, _baseline: i32) {
-            let children = self.children.borrow();
-            let col_spacing = 4;
-            let row_spacing = 4;
-
-            let mut x = 0;
-            let mut y = 0;
-            let mut line_h = 0;
-
-            for child in children.iter() {
-                let (_, child_w, _, _) = child.measure(Orientation::Horizontal, -1);
-                let (_, child_h, _, _) = child.measure(Orientation::Vertical, child_w);
-
-                if x + child_w > width && x > 0 {
-                    x = 0;
-                    y += line_h + row_spacing;
-                    line_h = 0;
-                }
-
-                let transform = gtk::gsk::Transform::new()
-                    .translate(&gtk::graphene::Point::new(x as f32, y as f32));
-                child.allocate(child_w, child_h, -1, Some(transform));
-
-                x += child_w + col_spacing;
-                line_h = line_h.max(child_h);
-            }
-        }
-    }
-}
-
-glib::wrapper! {
-    pub struct ReactionWrapBox(ObjectSubclass<wrap_box_imp::ReactionWrapBox>)
-        @extends Widget,
-        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
-}
-
-impl ReactionWrapBox {
-    pub fn new() -> Self {
-        glib::Object::builder().build()
-    }
-
-    pub fn append(&self, child: &impl IsA<Widget>) {
-        let child = child.as_ref();
-        child.set_parent(self);
-        self.imp().children.borrow_mut().push(child.clone());
-        self.queue_resize();
-    }
-}
-
-impl Default for ReactionWrapBox {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Wrapping row for chips and pills: natural-width children, 4px gaps.
+pub(crate) fn new_chip_wrap_box() -> adw::WrapBox {
+    adw::WrapBox::builder()
+        .child_spacing(4)
+        .line_spacing(4)
+        .build()
 }
 
 impl TimelineMessageObject {
@@ -1553,13 +1423,14 @@ pub(crate) fn render_text_content(
             TextSegment::CodeBlock { lang: _, code } => {
                 let frame = Box::new(Orientation::Vertical, 0);
                 frame.add_css_class("code-block");
+                frame.add_css_class("monospace");
                 let label = Label::new(None);
                 label.set_wrap(true);
                 label.set_wrap_mode(pango::WrapMode::WordChar);
                 label.set_selectable(true);
                 label.set_focus_on_click(false);
                 label.set_xalign(0.0);
-                label.set_markup(&format!("<tt>{}</tt>", glib::markup_escape_text(&code)));
+                label.set_text(&code);
                 frame.append(&label);
                 target_box.append(&frame);
             }
@@ -2545,7 +2416,8 @@ pub(crate) fn build_timeline_message_widget(
     // Reactions
     if let Some(reactions) = message.reactions.as_deref().filter(|r| !r.is_empty()) {
         register_timeline_css();
-        let wrap_box = ReactionWrapBox::new();
+        let wrap_box = new_chip_wrap_box();
+        wrap_box.add_css_class("reaction-row");
 
         let emoji_catalog = crate::emoji::EmojiCatalog::new(&context.custom_emojis);
 
@@ -3142,6 +3014,20 @@ mod tests {
         assert_eq!(format_file_size(10737418240), "10.0 GB");
     }
 
+    fn find_descendant(widget: &Widget, pred: &dyn Fn(&Widget) -> bool) -> Option<Widget> {
+        if pred(widget) {
+            return Some(widget.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = find_descendant(&current, pred) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
     fn find_menu_button(widget: &Widget) -> Option<gtk::MenuButton> {
         if let Some(button) = widget.downcast_ref::<gtk::MenuButton>() {
             return Some(button.clone());
@@ -3476,24 +3362,31 @@ mod tests {
     }
 
     #[test]
-    fn test_reaction_wrap_box() {
+    fn test_reaction_row_is_adw_wrap_box() {
         run_gtk_test(|| {
-            let wrap_box = ReactionWrapBox::new();
-
-            let btn1 = Button::with_label("👍 1");
-            let btn2 = Button::with_label("❤️ 2");
-            wrap_box.append(&btn1);
-            wrap_box.append(&btn2);
-
-            let (min_w, nat_w, _, _) = wrap_box.measure(Orientation::Horizontal, -1);
-            assert!(min_w >= 0);
-            assert!(nat_w >= min_w);
-
-            let (min_h, nat_h, _, _) = wrap_box.measure(Orientation::Vertical, 100);
-            assert!(min_h >= 0);
-            assert_eq!(min_h, nat_h);
-
-            wrap_box.allocate(200, 100, -1, None);
+            let ctx = test_context();
+            let mut msg = SlackMessage::default();
+            msg.ts = "1700000000.000900".to_string();
+            msg.user = Some("U123".to_string());
+            msg.text = Some("hi".to_string());
+            msg.reactions = Some(vec![
+                SlackReaction { name: Some("thumbsup".to_string()), count: Some(2), users: None },
+                SlackReaction { name: Some("smile".to_string()), count: Some(1), users: None },
+            ]);
+            let widget = build_timeline_message_widget(&msg, &ctx, None, None, None, None, None);
+            let row = find_descendant(&widget.clone().upcast(), &|w| w.has_css_class("reaction-row"))
+                .expect("reaction row");
+            let wrap = row.downcast::<adw::WrapBox>().expect("adw::WrapBox");
+            assert_eq!(wrap.child_spacing(), 4);
+            let mut pills = 0;
+            let mut child = wrap.first_child();
+            while let Some(c) = child {
+                assert!(c.is::<Button>());
+                assert!(c.has_css_class("reaction-pill"));
+                pills += 1;
+                child = c.next_sibling();
+            }
+            assert_eq!(pills, 3);
         });
     }
 

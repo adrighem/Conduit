@@ -218,17 +218,21 @@ fn build(input: &DetailsInput, callbacks: Callbacks) -> Rc<Inner> {
 
     let toolbar = adw::ToolbarView::new();
     let header_bar = adw::HeaderBar::new();
-    let switcher = adw::ViewSwitcher::new();
+    let switcher = adw::InlineViewSwitcher::new();
     switcher.set_stack(Some(&stack));
-    switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
-    if stack.pages().n_items() > 1 {
-        header_bar.set_title_widget(Some(&switcher));
-    } else {
+    switcher.set_homogeneous(true);
+    switcher.set_margin_start(18);
+    switcher.set_margin_end(18);
+    switcher.set_margin_bottom(6);
+    if stack.pages().n_items() <= 1 {
         header_bar.set_title_widget(Some(&adw::WindowTitle::new(&gettext("Members"), "")));
     }
     toolbar.add_top_bar(&header_bar);
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&header);
+    if stack.pages().n_items() > 1 {
+        content.append(&switcher);
+    }
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&stack);
     let toasts = adw::ToastOverlay::new();
@@ -413,11 +417,9 @@ fn build_settings(input: &DetailsInput, callbacks: &Callbacks) -> gtk::Widget {
     } else {
         gettext("You can rejoin this channel later.")
     }));
-    let leave = gtk::Button::with_label(&gettext("Leave channel"));
+    let leave = adw::ButtonRow::new();
+    leave.set_title(&gettext("Leave channel"));
     leave.add_css_class("destructive-action");
-    leave.add_css_class("pill");
-    leave.set_halign(gtk::Align::Center);
-    leave.set_margin_top(6);
     group.add(&leave);
     page.add(&group);
 
@@ -425,7 +427,7 @@ fn build_settings(input: &DetailsInput, callbacks: &Callbacks) -> gtk::Widget {
     let title = input.title.clone();
     let is_private = input.is_private;
     let callbacks = callbacks.clone();
-    leave.connect_clicked(move |button| {
+    leave.connect_activated(move |button| {
         let heading = gettext("Leave {name}?").replace("{name}", &title);
         let body = if is_private {
             gettext("You won't be able to rejoin this private channel unless someone invites you again.")
@@ -534,8 +536,7 @@ fn build_members(callbacks: &Callbacks) -> (gtk::Box, MembersWidgets) {
     scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
     scrolled.set_child(Some(&list));
 
-    let spinner = gtk::Spinner::new();
-    spinner.set_spinning(true);
+    let spinner = adw::Spinner::new();
     spinner.set_size_request(32, 32);
     spinner.set_halign(gtk::Align::Center);
     spinner.set_valign(gtk::Align::Center);

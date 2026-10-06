@@ -19,7 +19,7 @@ use crate::rich_message::{
 };
 use crate::timeline_media::{context_icon, fetchable_url, image_block, MediaSources};
 use crate::timeline_message_widget::{
-    create_message_text_widget, register_timeline_css, render_text_content,
+    create_message_text_widget, new_chip_wrap_box, register_timeline_css, render_text_content,
 };
 
 const ACCESSORY_IMAGE_SIZE: i32 = 72;
@@ -156,8 +156,8 @@ impl<'a> DocumentRenderer<'a> {
         target.append(&row);
     }
 
-    fn context_row(&self, elements: &[MessageContextElement]) -> Box {
-        let row = Box::new(Orientation::Horizontal, 4);
+    fn context_row(&self, elements: &[MessageContextElement]) -> adw::WrapBox {
+        let row = new_chip_wrap_box();
         for element in elements {
             match element {
                 MessageContextElement::Image(image) => {
@@ -186,9 +186,9 @@ impl<'a> DocumentRenderer<'a> {
             RichTextNode::Preformatted(inlines) => {
                 let frame = Box::new(Orientation::Vertical, 0);
                 frame.add_css_class("code-block");
-                frame.append(&markup_label(&format!(
-                    "<tt>{}</tt>",
-                    glib::markup_escape_text(&inlines_plain_text(inlines))
+                frame.add_css_class("monospace");
+                frame.append(&markup_label(&glib::markup_escape_text(
+                    &inlines_plain_text(inlines),
                 )));
                 target.append(&frame);
             }
@@ -471,8 +471,8 @@ fn two_column_grid(widgets: Vec<Widget>) -> Grid {
     grid
 }
 
-fn controls_row(controls: &[MessageControl]) -> Box {
-    let row = Box::new(Orientation::Horizontal, 6);
+fn controls_row(controls: &[MessageControl]) -> adw::WrapBox {
+    let row = adw::WrapBox::builder().child_spacing(6).line_spacing(6).build();
     for control in controls {
         row.append(&control_button(control));
     }

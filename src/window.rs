@@ -185,13 +185,7 @@ mod imp {
         #[template_child]
         pub workspace_split: TemplateChild<adw::NavigationSplitView>,
         #[template_child]
-        pub messages_button: TemplateChild<gtk::ToggleButton>,
-        #[template_child]
-        pub threads_button: TemplateChild<gtk::ToggleButton>,
-        #[template_child]
-        pub files_button: TemplateChild<gtk::ToggleButton>,
-        #[template_child]
-        pub saved_button: TemplateChild<gtk::ToggleButton>,
+        pub navigation_toggle_group: TemplateChild<adw::ToggleGroup>,
         #[template_child]
         pub refresh_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -807,6 +801,21 @@ const COMPOSER_ITALIC_TAG: &str = "composer-italic";
 const COMPOSER_UNDERLINE_TAG: &str = "composer-underline";
 const COMPOSER_STRIKE_TAG: &str = "composer-strike";
 const COMPOSER_CODE_TAG: &str = "composer-code";
+
+/// Family part of a Pango font description string such as "Monospace 10"
+/// or "JetBrains Mono Bold 11" (style and size words are dropped).
+fn font_family_from_description(description: &str) -> Option<String> {
+    gtk::pango::FontDescription::from_string(description)
+        .family()
+        .map(|family| family.to_string())
+        .filter(|family| !family.is_empty())
+}
+
+/// The desktop's monospace family (GNOME "Monospace Font" setting).
+fn system_monospace_family() -> String {
+    font_family_from_description(&adw::StyleManager::default().monospace_font_name())
+        .unwrap_or_else(|| "monospace".to_string())
+}
 const COMPOSER_BULLETED_LIST_TAG: &str = "composer-bulleted-list";
 const COMPOSER_NUMBERED_LIST_TAG: &str = "composer-numbered-list";
 const COMPOSER_QUOTE_TAG: &str = "composer-quote";
@@ -1414,6 +1423,27 @@ fn remember_navigation(
     history.push(current);
     if history.len() > MAX_NAVIGATION_HISTORY {
         history.remove(0);
+    }
+}
+
+impl WorkspaceNavigationSelection {
+    fn toggle_name(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::Threads => "threads",
+            Self::Files => "files",
+            Self::Saved => "saved",
+        }
+    }
+
+    fn from_toggle_name(name: &str) -> Option<Self> {
+        match name {
+            "messages" => Some(Self::Messages),
+            "threads" => Some(Self::Threads),
+            "files" => Some(Self::Files),
+            "saved" => Some(Self::Saved),
+            _ => None,
+        }
     }
 }
 
@@ -3005,26 +3035,8 @@ impl ConduitWindow {
             button.update_property(&[gtk::accessible::Property::Label(label)]);
         }
 
-        for (button, label) in [
-            (
-                imp.messages_button.get().upcast::<gtk::Widget>(),
-                gettext("Messages"),
-            ),
-            (
-                imp.threads_button.get().upcast::<gtk::Widget>(),
-                gettext("Threads"),
-            ),
-            (
-                imp.files_button.get().upcast::<gtk::Widget>(),
-                gettext("Files"),
-            ),
-            (
-                imp.saved_button.get().upcast::<gtk::Widget>(),
-                gettext("Later"),
-            ),
-        ] {
-            button.update_property(&[gtk::accessible::Property::Label(&label)]);
-        }
+        imp.navigation_toggle_group
+            .update_property(&[gtk::accessible::Property::Label(&gettext("Workspace views"))]);
     }
 
     fn setup_runtime(&self) {
@@ -3803,13 +3815,15 @@ impl ConduitWindow {
             glib::Propagation::Proceed
         });
         self.connect_widget(&imp.connect_button.get(), |window| window.start_auth());
-        self.connect_widget(&imp.messages_button.get(), |window| window.show_messages());
-        self.connect_widget(&imp.threads_button.get(), |window| window.show_threads());
-        self.connect_widget(&imp.files_button.get(), |window| window.show_files());
+        let weak_window = self.downgrade();
+        imp.navigation_toggle_group.connect_active_name_notify(move |group| {
+            if let Some(window) = weak_window.upgrade() {
+                window.navigation_toggle_changed(group);
+            }
+        });
         self.connect_widget(&imp.refresh_button.get(), |window| {
             window.refresh_conversations()
         });
-        self.connect_widget(&imp.saved_button.get(), |window| window.show_later());
         self.connect_widget(&imp.send_button.get(), |window| {
             window.post_current_message()
         });
@@ -5083,7 +5097,6 @@ impl ConduitWindow {
              .conduit-themed-sidebar {{\n\
                  background-color: {};\n\
                  color: {};\n\
-                 font-family: Cantarell, \"Helvetica Neue\", -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif;\n\
              }}\n\
              .conduit-themed-sidebar row {{ color: {}; }}\n\
              .conduit-themed-sidebar row:hover {{ background-color: {}; }}\n\
@@ -5098,10 +5111,7 @@ impl ConduitWindow {
              .unread-separator-label {{ color: {}; }}\n\
              .thread-reply-pill {{ background-color: {pill_bg}; color: {}; }}\n\
              .reaction-pill-active {{ background-color: {pill_bg}; color: {}; }}\n\
-             .presence-active {{ background-color: {}; color: {}; }}\n\
-             .code-block, code, pre {{\n\
-                 font-family: ui-monospace, \"Cascadia Mono\", \"SF Mono\", Menlo, Consolas, monospace;\n\
-             }}\n",
+             .presence-active {{ background-color: {}; color: {}; }}\n",
             theme.column_bg,
             theme.text_color,
             theme.text_color,
@@ -5772,7 +5782,7 @@ impl ConduitWindow {
                 .build(),
             gtk::TextTag::builder()
                 .name(COMPOSER_CODE_TAG)
-                .family("monospace")
+                .family(system_monospace_family())
                 .build(),
             gtk::TextTag::builder()
                 .name(COMPOSER_BULLETED_LIST_TAG)
@@ -5789,7 +5799,7 @@ impl ConduitWindow {
                 .build(),
             gtk::TextTag::builder()
                 .name(COMPOSER_PREFORMATTED_TAG)
-                .family("monospace")
+                .family(system_monospace_family())
                 .left_margin(18)
                 .right_margin(18)
                 .build(),
@@ -5801,6 +5811,17 @@ impl ConduitWindow {
                 table.add(&tag);
             }
         }
+        let weak_table = table.downgrade();
+        adw::StyleManager::default().connect_monospace_font_name_notify(move |_| {
+            let Some(table) = weak_table.upgrade() else {
+                return;
+            };
+            for name in [COMPOSER_CODE_TAG, COMPOSER_PREFORMATTED_TAG] {
+                if let Some(tag) = table.lookup(name) {
+                    tag.set_family(Some(&system_monospace_family()));
+                }
+            }
+        });
     }
 
     fn composer_style_at(iter: &gtk::TextIter) -> ComposerTextStyle {
@@ -10964,19 +10985,37 @@ impl ConduitWindow {
         }
     }
 
+    /// Handles a user (or programmatic) change of the navigation toggle group.
+    /// Programmatic syncs from `sync_workspace_chrome` already match the
+    /// authoritative view, so comparing against it breaks the feedback loop.
+    fn navigation_toggle_changed(&self, group: &adw::ToggleGroup) {
+        let main_view = self.imp().workspace.view.borrow().main_view();
+        let current = workspace_navigation_selection(main_view);
+        let requested = group
+            .active_name()
+            .and_then(|name| WorkspaceNavigationSelection::from_toggle_name(&name));
+        if requested == current {
+            return;
+        }
+        match requested {
+            Some(WorkspaceNavigationSelection::Messages) => self.show_messages(),
+            Some(WorkspaceNavigationSelection::Threads) => self.show_threads(),
+            Some(WorkspaceNavigationSelection::Files) => self.show_files(),
+            Some(WorkspaceNavigationSelection::Saved) => self.show_later(),
+            None => {}
+        }
+        // A refused switch (for example unsaved drafts) must not leave the
+        // toggle group out of step with the visible view.
+        self.sync_workspace_chrome();
+    }
+
     fn sync_workspace_chrome(&self) {
         let imp = self.imp();
         self.sync_back_button();
         let main_view = imp.workspace.view.borrow().main_view();
         let selection = workspace_navigation_selection(main_view);
-        imp.messages_button
-            .set_active(selection == Some(WorkspaceNavigationSelection::Messages));
-        imp.threads_button
-            .set_active(selection == Some(WorkspaceNavigationSelection::Threads));
-        imp.files_button
-            .set_active(selection == Some(WorkspaceNavigationSelection::Files));
-        imp.saved_button
-            .set_active(selection == Some(WorkspaceNavigationSelection::Saved));
+        imp.navigation_toggle_group
+            .set_active_name(selection.map(WorkspaceNavigationSelection::toggle_name));
         imp.message_composer
             .set_visible(workspace_composer_visible(main_view));
         if main_view != MainMessageView::Conversation {
@@ -13015,6 +13054,19 @@ mod tests {
     use super::*;
     use crate::runtime::CachedAssetDescriptor;
     use crate::slack::PreviewAssetMime;
+
+    #[test]
+    fn font_family_is_extracted_from_pango_descriptions() {
+        assert_eq!(
+            font_family_from_description("Monospace 10").as_deref(),
+            Some("Monospace")
+        );
+        assert_eq!(
+            font_family_from_description("JetBrains Mono Bold 11").as_deref(),
+            Some("JetBrains Mono")
+        );
+        assert_eq!(font_family_from_description("").as_deref(), None);
+    }
 
     #[test]
     fn executable_message_controls_require_fresh_callback_and_publisher_metadata() {
@@ -15293,6 +15345,11 @@ mod tests {
             "AdwOverlaySplitView\" id=\"thread_split",
             "AdwPasswordEntryRow\" id=\"xoxc_token_entry",
             "AdwPasswordEntryRow\" id=\"xoxd_token_entry",
+            "AdwToggleGroup\" id=\"navigation_toggle_group",
+            "<property name=\"name\">messages</property>",
+            "<property name=\"name\">threads</property>",
+            "<property name=\"name\">files</property>",
+            "<property name=\"name\">saved</property>",
             "GtkToggleButton\" id=\"sidebar_unread_filter_button",
             "Show Only Unread Conversations",
             "GtkLabel\" id=\"message_status_label",
