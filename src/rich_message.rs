@@ -120,6 +120,13 @@ impl MessageAuthor {
             Self::User { .. } | Self::Unknown { .. } => None,
         }
     }
+
+    pub(crate) fn app_id(&self) -> Option<&str> {
+        match self {
+            Self::App { app_id, .. } => app_id.as_deref(),
+            Self::User { .. } | Self::Unknown { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

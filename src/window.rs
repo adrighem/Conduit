@@ -3160,7 +3160,86 @@ impl ConduitWindow {
                     self.mark_conversation_read(&channel_id, &ts);
                 }
             },
+            TimelineAction::ExecuteControlAction { ts, key } => {
+                if let Some(channel_id) = self.visible_channel_id() {
+                    self.execute_control_action(&channel_id, &ts, key);
+                }
+            }
         }
+    }
+
+    fn execute_control_action(
+        &self,
+        channel_id: &str,
+        ts: &str,
+        key: crate::rich_message::MessageControlKey,
+    ) {
+        let Some(message) = self.find_message(channel_id, ts) else {
+            return;
+        };
+        let Some(control) = message.document.control(key) else {
+            return;
+        };
+        let Some(action) = control.action().cloned() else {
+            return;
+        };
+        let service_id = message
+            .author
+            .bot_id()
+            .or(message.bot_id.as_deref())
+            .or(message.bot_profile.as_ref().and_then(|p| p.id.as_deref()))
+            .unwrap_or_default()
+            .to_string();
+        let app_id = message
+            .author
+            .app_id()
+            .or(message.app_id.as_deref())
+            .or(message
+                .bot_profile
+                .as_ref()
+                .and_then(|p| p.app_id.as_deref()))
+            .map(str::to_string);
+        let bot_user_id = message
+            .bot_profile
+            .as_ref()
+            .and_then(|p| p.user_id.clone())
+            .or(message.user.clone());
+        let is_ephemeral = message.is_ephemeral.unwrap_or(false)
+            || message.subtype.as_deref() == Some("ephemeral");
+        let request = crate::slack::SlackMessageActionRequest {
+            channel_id: channel_id.to_string(),
+            message_ts: ts.to_string(),
+            thread_ts: message.thread_ts.clone(),
+            service_id,
+            app_id,
+            bot_user_id,
+            is_ephemeral,
+            action,
+        };
+        let target = MessageRef::new(channel_id, ts.to_string()).ok();
+        let control_handle = target.and_then(|t| {
+            if let Some(existing) = self
+                .imp()
+                .message_control_registry
+                .borrow()
+                .active_control_handle(TimelineSurfaceId::Main, &t, key)
+            {
+                return Some(existing);
+            }
+            let keys =
+                message_action_control_keys(&message, self.browser_message_actions_available());
+            let mut registry = self.imp().message_control_registry.borrow_mut();
+            let _ =
+                registry.replace_message_with_controls(TimelineSurfaceId::Main, t.clone(), keys);
+            registry.active_control_handle(TimelineSurfaceId::Main, &t, key)
+        });
+        let Some(control_handle) = control_handle else {
+            return;
+        };
+        self.send_command(RuntimeCommand::ExecuteMessageAction {
+            request,
+            control_handle,
+        });
     }
 
     fn setup_message_view(&self) {

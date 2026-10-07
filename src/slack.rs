@@ -369,6 +369,7 @@ pub struct SlackMessageActionRequest {
     pub(crate) service_id: String,
     pub(crate) app_id: Option<String>,
     pub(crate) bot_user_id: Option<String>,
+    pub(crate) is_ephemeral: bool,
     pub(crate) action: SlackControlAction,
 }
 
@@ -696,7 +697,7 @@ impl SlackApi {
                     "type": "message",
                     "message_ts": request.message_ts,
                     "channel_id": request.channel_id,
-                    "is_ephemeral": false,
+                    "is_ephemeral": request.is_ephemeral,
                 });
                 if let Some(thread_ts) = request.thread_ts.as_ref() {
                     container["thread_ts"] = Value::String(thread_ts.clone());
@@ -728,7 +729,7 @@ impl SlackApi {
                     "attachment_id": attachment_id,
                     "callback_id": callback_id.expose(),
                     "channel_id": request.channel_id,
-                    "is_ephemeral": false,
+                    "is_ephemeral": request.is_ephemeral,
                     "message_ts": request.message_ts,
                     "prompt_app_install": false,
                     "team_id": team_id,
@@ -3124,6 +3125,7 @@ mod tests {
             service_id: "B123".to_string(),
             app_id: Some("A123".to_string()),
             bot_user_id: Some("U123".to_string()),
+            is_ephemeral: false,
             action: SlackControlAction::Block {
                 action: SensitiveValue::new(
                     r#"{"type":"button","block_id":"block","action_id":"approve","value":"opaque","text":{"type":"plain_text","text":"Approve"}}"#,
@@ -3195,6 +3197,7 @@ mod tests {
             service_id: "B123".to_string(),
             app_id: None,
             bot_user_id: Some("U123".to_string()),
+            is_ephemeral: false,
             action: SlackControlAction::LegacyAttachment {
                 attachment_id: 2,
                 callback_id: SensitiveValue::new("callback"),
@@ -3226,6 +3229,61 @@ mod tests {
         assert_eq!(payload["actions"][0]["value"], "yes");
         assert_eq!(payload["thread_ts"], "1710000000.000000");
         assert_eq!(payload["prompt_app_install"], false);
+    }
+
+    #[test]
+    fn ephemeral_attachment_action_sets_is_ephemeral_flag() {
+        let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
+        let address = server.server_addr();
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(r#"{"ok":true,"replaced":true}"#).with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            (path, body)
+        });
+        let mut api = SlackApi::new(browser_test_token(Some("browser-cookie-value")));
+        api.api_base_url = format!("http://{address}/api");
+        let request = SlackMessageActionRequest {
+            channel_id: "C123".to_string(),
+            message_ts: "1710000000.000100".to_string(),
+            thread_ts: None,
+            service_id: "B123".to_string(),
+            app_id: None,
+            bot_user_id: Some("U123".to_string()),
+            is_ephemeral: true,
+            action: SlackControlAction::LegacyAttachment {
+                attachment_id: 1,
+                callback_id: SensitiveValue::new("giphy_send"),
+                action: SensitiveValue::new(
+                    r#"{"type":"button","name":"send","text":"Send","value":"send"}"#,
+                ),
+            },
+        };
+
+        tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.execute_message_action("https://example.slack.com/", "T123", &request))
+            .expect("message action should dispatch");
+        let (path, body) = received.join().expect("mock Slack server should finish");
+
+        assert_eq!(path, "/api/chat.attachmentAction");
+        let payload: Value = serde_json::from_str(
+            multipart_field_value(&body, "payload").expect("payload field should exist"),
+        )
+        .expect("payload should be JSON");
+        assert_eq!(payload["is_ephemeral"], true);
     }
 
     #[test]
@@ -3910,7 +3968,7 @@ mod tests {
 
     #[test]
     fn preview_allowlist_accepts_gif_services_and_rejects_other_hosts() {
-        for trusted in [
+        for valid_url in [
             "https://media1.giphy.com/media/abc/200w.gif?cid=1&rid=200w.gif",
             "https://i.giphy.com/abc.gif",
             "https://giphy.com/abc.gif",
@@ -3918,9 +3976,9 @@ mod tests {
             "https://a.slack-edge.com/dc483/img/plugins/giphy/service_32.png",
             "https://files.slack.com/files-pri/T1-F1/image.png",
         ] {
-            assert!(supports_native_preview_asset_url(trusted), "{trusted}");
+            assert!(supports_native_preview_asset_url(valid_url), "{valid_url}");
         }
-        for untrusted in [
+        for invalid_url in [
             "https://images.example.test/card.gif",
             "https://evilgiphy.com/abc.gif",
             "https://media1.giphy.com.evil.example/abc.gif",
@@ -3928,7 +3986,10 @@ mod tests {
             "https://user@media1.giphy.com/abc.gif",
             "not a URL",
         ] {
-            assert!(!supports_native_preview_asset_url(untrusted), "{untrusted}");
+            assert!(
+                !supports_native_preview_asset_url(invalid_url),
+                "{invalid_url}"
+            );
         }
     }
 

@@ -80,7 +80,7 @@ impl TimelineMessageObject {
 
 pub(crate) type OpenMediaCallback = Rc<dyn Fn(crate::window::MediaGalleryItem)>;
 
-type ActionHandler = Rc<dyn Fn(TimelineAction)>;
+pub(crate) type ActionHandler = Rc<dyn Fn(TimelineAction)>;
 type ActionSlot = Rc<RefCell<Option<ActionHandler>>>;
 type ReadMarkTarget = Rc<RefCell<Option<(String, Option<String>)>>>;
 type ToggleReactionCallback = Rc<dyn Fn(String, String, bool)>;
@@ -400,6 +400,10 @@ pub(crate) enum TimelineAction {
         channel_id: String,
         thread_ts: Option<String>,
         ts: String,
+    },
+    ExecuteControlAction {
+        ts: String,
+        key: crate::rich_message::MessageControlKey,
     },
 }
 
@@ -2332,6 +2336,7 @@ fn render_message_content(
     message: &SlackMessage,
     context: &MessageHtmlContext,
     on_open_media: Option<&OpenMediaCallback>,
+    on_action: Option<&ActionHandler>,
     root_box: &Box,
 ) {
     let document = message.rendered_document();
@@ -2348,8 +2353,13 @@ fn render_message_content(
         resolve: &resolve,
         is_failed: &is_failed,
     };
-    crate::timeline_document_widget::DocumentRenderer::new(context, sources, &message.ts)
-        .render(document.nodes(), root_box);
+    crate::timeline_document_widget::DocumentRenderer::new(
+        context,
+        sources,
+        &message.ts,
+        on_action,
+    )
+    .render(document.nodes(), root_box);
 
     let files = message
         .files
@@ -2482,7 +2492,7 @@ pub(crate) fn build_timeline_message_widget(
 
     root_box.append(&header_box);
 
-    render_message_content(message, context, on_open_media, &root_box);
+    render_message_content(message, context, on_open_media, on_author_action, &root_box);
 
     // Reactions
     if let Some(reactions) = message.reactions.as_deref().filter(|r| !r.is_empty()) {
@@ -3046,6 +3056,7 @@ pub(crate) mod tests {
                     is_failed: &is_failed,
                 },
                 "1789462245.306079",
+                None,
             )
             .render(&[crate::rich_message::MessageNode::Image(image)], &target);
 

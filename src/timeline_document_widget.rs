@@ -45,6 +45,7 @@ pub(crate) struct DocumentRenderer<'a> {
     context: &'a MessageHtmlContext,
     sources: MediaSources<'a>,
     ts: &'a str,
+    on_action: Option<&'a crate::timeline_message_widget::ActionHandler>,
     next_media_slot: Cell<usize>,
 }
 
@@ -53,11 +54,13 @@ impl<'a> DocumentRenderer<'a> {
         context: &'a MessageHtmlContext,
         sources: MediaSources<'a>,
         ts: &'a str,
+        on_action: Option<&'a crate::timeline_message_widget::ActionHandler>,
     ) -> Self {
         Self {
             context,
             sources,
             ts,
+            on_action,
             next_media_slot: Cell::new(0),
         }
     }
@@ -84,9 +87,9 @@ impl<'a> DocumentRenderer<'a> {
             MessageNode::Divider => target.append(&Separator::new(Orientation::Horizontal)),
             MessageNode::Image(image) => target.append(&self.image(image)),
             MessageNode::Control(control) => {
-                target.append(&controls_row(std::slice::from_ref(control)))
+                target.append(&self.controls_row(std::slice::from_ref(control)))
             }
-            MessageNode::Actions(controls) => target.append(&controls_row(controls)),
+            MessageNode::Actions(controls) => target.append(&self.controls_row(controls)),
             MessageNode::RichText(nodes) => {
                 for node in nodes {
                     self.render_rich_text(node, target);
@@ -147,7 +150,7 @@ impl<'a> DocumentRenderer<'a> {
                 row.append(&thumb);
             }
             Some(MessageAccessory::Control(control)) => {
-                let button = control_button(control);
+                let button = self.control_button(control);
                 button.set_valign(gtk::Align::Start);
                 row.append(&button);
             }
@@ -263,7 +266,7 @@ impl<'a> DocumentRenderer<'a> {
             card.append(&self.image(image));
         }
         if !attachment.actions.is_empty() {
-            card.append(&controls_row(&attachment.actions));
+            card.append(&self.controls_row(&attachment.actions));
         }
         if attachment.footer.is_some() || attachment.footer_icon.is_some() {
             card.append(&self.attachment_footer(attachment));
@@ -471,25 +474,22 @@ fn two_column_grid(widgets: Vec<Widget>) -> Grid {
     grid
 }
 
-fn controls_row(controls: &[MessageControl]) -> adw::WrapBox {
-    let row = adw::WrapBox::builder()
-        .child_spacing(6)
-        .line_spacing(6)
-        .build();
-    for control in controls {
-        row.append(&control_button(control));
+impl<'a> DocumentRenderer<'a> {
+    fn controls_row(&self, controls: &[MessageControl]) -> adw::WrapBox {
+        let row = adw::WrapBox::builder()
+            .child_spacing(6)
+            .line_spacing(6)
+            .build();
+        for control in controls {
+            row.append(&self.control_button(control));
+        }
+        row
     }
-    row
-}
 
-/// Link controls open their URL; callback controls need Slack's
-/// interactivity endpoint, which the native timeline does not drive yet, so
-/// they render disabled instead of pretending to work.
-fn control_button(control: &MessageControl) -> Button {
-    let button = Button::with_label(control.label());
-    button.set_focus_on_click(false);
-    match control.url().filter(|url| is_http_url(url)) {
-        Some(url) => {
+    fn control_button(&self, control: &MessageControl) -> Button {
+        let button = Button::with_label(control.label());
+        button.set_focus_on_click(false);
+        if let Some(url) = control.url().filter(|url| is_http_url(url)) {
             let url = url.to_string();
             button.set_tooltip_text(Some(&url));
             button.connect_clicked(move |_| {
@@ -506,13 +506,32 @@ fn control_button(control: &MessageControl) -> Button {
                     );
                 }
             });
-        }
-        None => {
+        } else if let Some(key) = control.key() {
+            if let Some(on_action) = self.on_action {
+                let on_action = on_action.clone();
+                let ts = self.ts.to_string();
+                button.set_sensitive(true);
+                button.connect_clicked(move |_| {
+                    let on_action = on_action.clone();
+                    let ts = ts.clone();
+                    glib::idle_add_local_once(move || {
+                        (on_action)(
+                            crate::timeline_message_widget::TimelineAction::ExecuteControlAction {
+                                ts,
+                                key,
+                            },
+                        );
+                    });
+                });
+            } else {
+                button.set_sensitive(false);
+            }
+        } else {
             button.set_sensitive(false);
             button.set_tooltip_text(Some("Open this message in Slack to use this action"));
         }
+        button
     }
-    button
 }
 
 /// A small square image (section accessory, quote avatar): the cached asset

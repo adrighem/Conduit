@@ -17086,6 +17086,7 @@ mod tests {
                     service_id: "B1".to_string(),
                     app_id: None,
                     bot_user_id: None,
+                    is_ephemeral: false,
                     action: crate::rich_message::SlackControlAction::Block {
                         action: crate::rich_message::SensitiveValue::new("action-canary"),
                     },
@@ -17453,6 +17454,7 @@ mod tests {
                 service_id: "B123".to_string(),
                 app_id: Some("A123".to_string()),
                 bot_user_id: Some("U123".to_string()),
+                is_ephemeral: false,
                 action: crate::rich_message::SlackControlAction::Block {
                     action: crate::rich_message::SensitiveValue::new(
                         r#"{"type":"button","block_id":"block","action_id":"approve"}"#,

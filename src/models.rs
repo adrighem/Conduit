@@ -834,6 +834,8 @@ pub struct SlackMessage {
     pub bot_profile: Option<SlackBotProfile>,
     pub icons: Option<SlackIcons>,
     #[serde(default)]
+    pub is_ephemeral: Option<bool>,
+    #[serde(default)]
     pub author: MessageAuthor,
     #[serde(default)]
     pub document: MessageDocument,
