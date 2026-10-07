@@ -8618,11 +8618,21 @@ pub struct PendingReadMark {
     pub target_ts: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct PendingThreadReadMark {
+    pub channel_id: String,
+    pub thread_ts: String,
+    pub target_ts: String,
+}
+
 #[derive(Clone, Debug, Default)]
 #[allow(dead_code)]
 pub struct ReadFlusherQueue {
     last_marked: HashMap<String, String>,
     pending: HashMap<String, String>,
+    last_marked_threads: HashMap<(String, String), String>,
+    pending_threads: HashMap<(String, String), String>,
 }
 
 #[allow(dead_code)]
@@ -8672,6 +8682,55 @@ impl ReadFlusherQueue {
             .insert(channel_id.to_string(), target_ts.to_string());
     }
 
+    pub fn set_last_marked_thread(
+        &mut self,
+        channel_id: impl Into<String>,
+        thread_ts: impl Into<String>,
+        ts: impl Into<String>,
+    ) {
+        let key = (channel_id.into(), thread_ts.into());
+        let ts = ts.into();
+        if let Some(current) = self.last_marked_threads.get(&key) {
+            if slack_timestamp_is_after(&ts, current) {
+                self.last_marked_threads.insert(key, ts);
+            }
+        } else {
+            self.last_marked_threads.insert(key, ts);
+        }
+    }
+
+    pub fn last_marked_thread(&self, channel_id: &str, thread_ts: &str) -> Option<&str> {
+        let key = (channel_id.to_string(), thread_ts.to_string());
+        self.last_marked_threads.get(&key).map(String::as_str)
+    }
+
+    pub fn pending_thread_mark(&self, channel_id: &str, thread_ts: &str) -> Option<&str> {
+        let key = (channel_id.to_string(), thread_ts.to_string());
+        self.pending_threads.get(&key).map(String::as_str)
+    }
+
+    pub fn enqueue_thread(&mut self, channel_id: &str, thread_ts: &str, target_ts: &str) -> bool {
+        let key = (channel_id.to_string(), thread_ts.to_string());
+        if let Some(marked_ts) = self.last_marked_threads.get(&key) {
+            if !slack_timestamp_is_after(target_ts, marked_ts) {
+                return false;
+            }
+        }
+        if let Some(p_ts) = self.pending_threads.get(&key) {
+            if !slack_timestamp_is_after(target_ts, p_ts) {
+                return false;
+            }
+        }
+        self.pending_threads
+            .insert(key, target_ts.to_string());
+        true
+    }
+
+    pub fn enqueue_thread_force(&mut self, channel_id: &str, thread_ts: &str, target_ts: &str) {
+        let key = (channel_id.to_string(), thread_ts.to_string());
+        self.pending_threads.insert(key, target_ts.to_string());
+    }
+
     pub fn flush(&mut self) -> Vec<PendingReadMark> {
         let mut flushed = Vec::with_capacity(self.pending.len());
         for (channel_id, target_ts) in self.pending.drain() {
@@ -8696,6 +8755,20 @@ impl ReadFlusherQueue {
         } else {
             None
         }
+    }
+
+    pub fn flush_threads(&mut self) -> Vec<PendingThreadReadMark> {
+        let mut flushed = Vec::with_capacity(self.pending_threads.len());
+        for ((channel_id, thread_ts), target_ts) in self.pending_threads.drain() {
+            self.last_marked_threads
+                .insert((channel_id.clone(), thread_ts.clone()), target_ts.clone());
+            flushed.push(PendingThreadReadMark {
+                channel_id,
+                thread_ts,
+                target_ts,
+            });
+        }
+        flushed
     }
 }
 
@@ -8736,6 +8809,30 @@ impl ReadFlusherHandle {
         self.notify.notify_one();
     }
 
+    pub fn set_last_marked_thread(&self, channel_id: &str, thread_ts: &str, ts: &str) {
+        let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
+        q.set_last_marked_thread(channel_id, thread_ts, ts);
+    }
+
+    pub fn enqueue_thread(&self, channel_id: &str, thread_ts: &str, target_ts: &str) -> bool {
+        let updated = {
+            let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
+            q.enqueue_thread(channel_id, thread_ts, target_ts)
+        };
+        if updated {
+            self.notify.notify_one();
+        }
+        updated
+    }
+
+    pub fn enqueue_thread_force(&self, channel_id: &str, thread_ts: &str, target_ts: &str) {
+        {
+            let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
+            q.enqueue_thread_force(channel_id, thread_ts, target_ts);
+        }
+        self.notify.notify_one();
+    }
+
     pub fn flush_channel(&self, channel_id: &str) -> Option<PendingReadMark> {
         let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
         q.flush_channel(channel_id)
@@ -8744,6 +8841,11 @@ impl ReadFlusherHandle {
     pub fn flush(&self) -> Vec<PendingReadMark> {
         let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
         q.flush()
+    }
+
+    pub fn flush_threads(&self) -> Vec<PendingThreadReadMark> {
+        let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
+        q.flush_threads()
     }
 }
 
@@ -19840,5 +19942,55 @@ mod tests {
         // Force enqueue allows backward mark for manual overrides
         queue.enqueue_force("C1", "100.000000");
         assert_eq!(queue.pending_mark("C1"), Some("100.000000"));
+    }
+
+    #[test]
+    fn read_flusher_queue_thread_monotonic_and_dedup() {
+        let mut queue = ReadFlusherQueue::new();
+        queue.set_last_marked_thread("C1", "100.000000", "110.000000");
+
+        // Forward thread target accepted
+        assert!(queue.enqueue_thread("C1", "100.000000", "120.000000"));
+        assert_eq!(
+            queue.pending_thread_mark("C1", "100.000000"),
+            Some("120.000000")
+        );
+
+        // Backward or equal candidate rejected
+        assert!(!queue.enqueue_thread("C1", "100.000000", "115.000000"));
+        assert!(!queue.enqueue_thread("C1", "100.000000", "120.000000"));
+
+        // Newer target accepted and replaces pending
+        assert!(queue.enqueue_thread("C1", "100.000000", "130.000000"));
+        assert_eq!(
+            queue.pending_thread_mark("C1", "100.000000"),
+            Some("130.000000")
+        );
+    }
+
+    #[test]
+    fn read_flusher_queue_thread_batching() {
+        let mut queue = ReadFlusherQueue::new();
+        queue.enqueue_thread("C1", "100.000000", "110.000000");
+        queue.enqueue_thread("C1", "200.000000", "210.000000");
+
+        let flushed = queue.flush_threads();
+        assert_eq!(flushed.len(), 2);
+        assert!(flushed.contains(&PendingThreadReadMark {
+            channel_id: "C1".to_string(),
+            thread_ts: "100.000000".to_string(),
+            target_ts: "110.000000".to_string(),
+        }));
+        assert!(flushed.contains(&PendingThreadReadMark {
+            channel_id: "C1".to_string(),
+            thread_ts: "200.000000".to_string(),
+            target_ts: "210.000000".to_string(),
+        }));
+
+        assert_eq!(
+            queue.last_marked_thread("C1", "100.000000"),
+            Some("110.000000")
+        );
+        assert!(queue.flush_threads().is_empty());
     }
 }
