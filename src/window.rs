@@ -298,7 +298,6 @@ mod imp {
         /// computed once when a conversation/thread becomes visible and kept
         /// fixed across re-renders so the unread separator doesn't vanish out
         /// from under the user as read-state advances live while they scroll.
-        pub(super) unread_separator_anchors: RefCell<HashMap<String, Option<String>>>,
         pub settings: RefCell<Option<gio::Settings>>,
         pub connect_requested: Cell<bool>,
         pub auth_debug: Cell<bool>,
@@ -3729,6 +3728,7 @@ impl ConduitWindow {
             ts: ts.to_string(),
         });
         self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+        self.queue_unread_separator_refresh();
     }
 
     fn mark_thread_read(&self, channel_id: &str, thread_ts: &str) {
@@ -3752,6 +3752,18 @@ impl ConduitWindow {
             thread_ts: thread_ts.to_string(),
         });
         self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+        self.queue_unread_separator_refresh();
+    }
+
+    /// Deferred so row rebuilds never run inside the timeline callback
+    /// that marked the message read.
+    fn queue_unread_separator_refresh(&self) {
+        let weak_window = self.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(window) = weak_window.upgrade() {
+                window.refresh_unread_separators();
+            }
+        });
     }
 
     /// Bold immediately; the coordinator derives the badge from history.
@@ -7880,10 +7892,6 @@ impl ConduitWindow {
             .borrow_mut()
             .open_thread(channel_id, ts);
         self.restore_thread_draft(channel_id, ts);
-        self.imp()
-            .unread_separator_anchors
-            .borrow_mut()
-            .remove(&format!("{channel_id}:{ts}"));
         match outcome {
             ThreadOpenOutcome::RenderCurrent => {
                 let messages = self
@@ -8001,51 +8009,56 @@ impl ConduitWindow {
         })
     }
 
-    fn channel_member_row(&self, user_id: &str) -> crate::channel_details::MemberRow {
+    /// Resolves member rows in one pass: shared state (asset context, user
+    /// directory, emoji catalog) is borrowed once per batch, not per member.
+    fn channel_member_rows(&self, user_ids: &[String]) -> Vec<crate::channel_details::MemberRow> {
         let imp = self.imp();
-        let user = imp.workspace.users.borrow().get(user_id).cloned();
-        let name = imp
-            .user_names
-            .borrow()
-            .get(user_id)
-            .cloned()
-            .or_else(|| user.as_ref().and_then(SlackUser::display_name))
-            .unwrap_or_else(|| user_id.to_string());
-        let now = current_unix_seconds();
-        let emojis = imp.custom_emojis.borrow();
-        let status = user
-            .as_ref()
-            .and_then(SlackUser::status)
-            .filter(|status| status.active_at(now))
-            .map(|status| {
-                let glyph = match crate::emoji::EmojiCatalog::new(&emojis).resolve(status.emoji_name())
-                {
-                    Some(crate::emoji::EmojiValue::Unicode(glyph)) => glyph,
-                    _ => "",
-                };
-                [glyph, status.text.trim()]
-                    .into_iter()
-                    .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
-        let avatar_url = imp
-            .user_avatar_urls
-            .borrow()
-            .get(user_id)
-            .cloned()
-            .or_else(|| user.as_ref().and_then(SlackUser::avatar_url));
         let context = self.message_html_context(None);
-        let avatar_path = avatar_url.and_then(|url| {
-            crate::timeline_message_widget::resolve_cached_asset_path(&url, &context)
-        });
-        crate::channel_details::MemberRow {
-            user_id: user_id.to_string(),
-            name,
-            status,
-            avatar_path,
-        }
+        let users = imp.workspace.users.borrow();
+        let user_names = imp.user_names.borrow();
+        let avatar_urls = imp.user_avatar_urls.borrow();
+        let emojis = imp.custom_emojis.borrow();
+        let catalog = crate::emoji::EmojiCatalog::new(&emojis);
+        let now = current_unix_seconds();
+        user_ids
+            .iter()
+            .map(|user_id| {
+                let user = users.get(user_id);
+                let name = user_names
+                    .get(user_id)
+                    .cloned()
+                    .or_else(|| user.and_then(SlackUser::display_name))
+                    .unwrap_or_else(|| user_id.clone());
+                let status = user
+                    .and_then(SlackUser::status)
+                    .filter(|status| status.active_at(now))
+                    .map(|status| {
+                        let glyph = match catalog.resolve(status.emoji_name()) {
+                            Some(crate::emoji::EmojiValue::Unicode(glyph)) => glyph,
+                            _ => "",
+                        };
+                        [glyph, status.text.trim()]
+                            .into_iter()
+                            .filter(|part| !part.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                let avatar_path = avatar_urls
+                    .get(user_id)
+                    .cloned()
+                    .or_else(|| user.and_then(SlackUser::avatar_url))
+                    .and_then(|url| {
+                        crate::timeline_message_widget::resolve_cached_asset_path(&url, &context)
+                    });
+                crate::channel_details::MemberRow {
+                    user_id: user_id.clone(),
+                    name,
+                    status,
+                    avatar_path,
+                }
+            })
+            .collect()
     }
 
     fn channel_details_callbacks(&self) -> crate::channel_details_dialog::Callbacks {
@@ -8086,14 +8099,17 @@ impl ConduitWindow {
                     window.show_profile_dialog(&user_id);
                 }
             }),
-            resolve_member: Rc::new(move |user_id| match member_weak.upgrade() {
-                Some(window) => window.channel_member_row(user_id),
-                None => crate::channel_details::MemberRow {
-                    user_id: user_id.to_string(),
-                    name: user_id.to_string(),
-                    status: String::new(),
-                    avatar_path: None,
-                },
+            resolve_members: Rc::new(move |user_ids| match member_weak.upgrade() {
+                Some(window) => window.channel_member_rows(user_ids),
+                None => user_ids
+                    .iter()
+                    .map(|user_id| crate::channel_details::MemberRow {
+                        user_id: user_id.clone(),
+                        name: user_id.clone(),
+                        status: String::new(),
+                        avatar_path: None,
+                    })
+                    .collect(),
             }),
             user_name: Rc::new(move |user_id| {
                 name_weak
@@ -8935,17 +8951,18 @@ impl ConduitWindow {
                 );
             }
         }
-        if !application.read_state_changed_ids().is_empty()
-            && !application.conversation_reset()
-            && !self.render_changed_conversations(application.read_state_changed_ids())
-        {
-            self.render_conversations();
+        if !application.read_state_changed_ids().is_empty() && !application.conversation_reset() {
+            if !self.render_changed_conversations(application.read_state_changed_ids()) {
+                self.render_conversations();
+            }
+            self.refresh_unread_separators();
         }
         if application.thread_catalog_changed() {
             // Sidebar thread sub-rows ("Thread (N responses) (M unread)")
             // are derived from the thread catalog independently of which
             // main view is active, so they need their own invalidation here.
             self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+            self.refresh_unread_separators();
             if self.current_main_view() == MainMessageView::Threads {
                 self.populate_threads();
             }
@@ -11150,7 +11167,6 @@ impl ConduitWindow {
         self.restore_channel_draft(channel_id);
         self.set_composer_canonical_text(ComposerTarget::Thread, "");
         self.close_thread_pane();
-        imp.unread_separator_anchors.borrow_mut().remove(channel_id);
         imp.workspace_split.set_show_content(true);
         self.render_conversations();
 
@@ -11224,8 +11240,7 @@ impl ConduitWindow {
             context.load_more_url = self.channel_load_more_url(channel_id);
         }
         context.timeline_scroll = scroll_behavior;
-        context.unread_separator_ts =
-            self.unread_separator_anchor_ts(channel_id, context.last_read.as_deref(), &messages);
+        context.unread_separator_ts = earliest_unread_ts(context.last_read.as_deref(), &messages);
         let active_open_generation = imp
             .conversation_opening
             .borrow()
@@ -11381,11 +11396,7 @@ impl ConduitWindow {
             .borrow()
             .get(channel_id, ts)
             .and_then(|record| record.last_read.clone());
-        context.unread_separator_ts = self.unread_separator_anchor_ts(
-            &format!("{channel_id}:{ts}"),
-            thread_last_read.as_deref(),
-            &messages,
-        );
+        context.unread_separator_ts = earliest_unread_ts(thread_last_read.as_deref(), &messages);
         let focus_message_ts = imp
             .workspace
             .view
@@ -12867,26 +12878,45 @@ impl ConduitWindow {
         (fallback, controls)
     }
 
-    /// Returns the frozen "first unread message" timestamp for the given
-    /// surface key, computing and caching it on first use. Deliberately not
-    /// recomputed on successive timeline updates for the current view - advancing
-    /// read-state live must not make line vanish while user scrolled mid-backlog.
-    /// Cache invalidated when switching conversation target or opening thread.
-    fn unread_separator_anchor_ts(
-        &self,
-        key: &str,
-        last_read: Option<&str>,
-        messages: &[SlackMessage],
-    ) -> Option<String> {
-        if let Some(cached) = self.imp().unread_separator_anchors.borrow().get(key) {
-            return cached.clone();
+    /// Moves the "New" separators to the first message after the current
+    /// read position, so dwell-based reads move (or clear) the line live.
+    fn refresh_unread_separators(&self) {
+        let imp = self.imp();
+        if let Some(channel_id) = self.visible_channel_id() {
+            let last_read = imp
+                .workspace
+                .read_states
+                .borrow()
+                .get(&channel_id)
+                .and_then(|state| state.last_read.clone());
+            let anchor = earliest_unread_ts(
+                last_read.as_deref(),
+                imp.workspace.view.borrow().channel_messages(&channel_id),
+            );
+            let native_timeline = imp.native_timeline_view.borrow().clone();
+            if let Some(native_timeline) = native_timeline {
+                native_timeline.set_unread_separator(anchor);
+            }
         }
-        let anchor = earliest_unread_ts(last_read, messages);
-        self.imp()
-            .unread_separator_anchors
-            .borrow_mut()
-            .insert(key.to_string(), anchor.clone());
-        anchor
+        let thread_target = imp
+            .workspace
+            .view
+            .borrow()
+            .selected_thread_target()
+            .map(|(channel_id, ts)| (channel_id.to_string(), ts.to_string()));
+        if let Some((channel_id, ts)) = thread_target {
+            let last_read = imp
+                .workspace
+                .threads
+                .borrow()
+                .get(&channel_id, &ts)
+                .and_then(|record| record.last_read.clone());
+            let anchor = earliest_unread_ts(
+                last_read.as_deref(),
+                imp.workspace.view.borrow().current_thread_messages(),
+            );
+            self.thread_pane().ensure_native_timeline().set_unread_separator(anchor);
+        }
     }
 
     fn message_html_context_with_image_keys(

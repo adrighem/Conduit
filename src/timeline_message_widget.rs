@@ -964,6 +964,37 @@ impl NativeTimelineView {
         });
     }
 
+    /// Moves the "New" unread separator to `anchor_ts`, rebuilding only the
+    /// rows that gain or lose it so the list keeps its scroll position.
+    pub fn set_unread_separator(&self, anchor_ts: Option<String>) {
+        let previous = {
+            let mut context = self.context.borrow_mut();
+            let Some(context) = context.as_mut() else {
+                return;
+            };
+            if context.unread_separator_ts == anchor_ts {
+                return;
+            }
+            std::mem::replace(&mut context.unread_separator_ts, anchor_ts.clone())
+        };
+        for i in 0..self.store.n_items() {
+            let Some(obj) = self
+                .store
+                .item(i)
+                .and_then(|o| o.downcast::<TimelineMessageObject>().ok())
+            else {
+                continue;
+            };
+            if obj.is_day_separator() {
+                continue;
+            }
+            let ts = obj.message().ts;
+            if previous.as_deref() == Some(ts.as_str()) || anchor_ts.as_deref() == Some(ts.as_str()) {
+                self.store.splice(i, 1, &[obj.duplicate()]);
+            }
+        }
+    }
+
     pub fn set_messages(
         &self,
         messages: &[SlackMessage],
@@ -3311,6 +3342,27 @@ pub(crate) mod tests {
         // Two same-day messages: one leading day separator plus both rows.
         assert_eq!(timeline_view.store.n_items(), 3);
         timeline_view.update_image_asset(&ctx);
+        assert_eq!(timeline_view.store.n_items(), 3);
+
+        // Moving the unread separator rebuilds rows in place.
+        let separator_ts = |view: &NativeTimelineView| {
+            view.context
+                .borrow()
+                .as_ref()
+                .and_then(|context| context.unread_separator_ts.clone())
+        };
+        let second_ts = timeline_view
+            .store
+            .item(2)
+            .and_downcast::<TimelineMessageObject>()
+            .expect("message row")
+            .message()
+            .ts;
+        timeline_view.set_unread_separator(Some(second_ts.clone()));
+        assert_eq!(separator_ts(&timeline_view), Some(second_ts));
+        assert_eq!(timeline_view.store.n_items(), 3);
+        timeline_view.set_unread_separator(None);
+        assert_eq!(separator_ts(&timeline_view), None);
         assert_eq!(timeline_view.store.n_items(), 3);
 
         // 12. Custom emoji reactions & resolve_cached_asset_path
