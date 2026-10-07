@@ -3287,10 +3287,11 @@ mod tests {
             })
             .expect("reduction expected");
 
-        assert!(reduction.patch().changes().iter().any(|c| matches!(
-            c,
-            WorkspaceChange::ThreadCatalogChanged(_)
-        )));
+        assert!(reduction
+            .patch()
+            .changes()
+            .iter()
+            .any(|c| matches!(c, WorkspaceChange::ThreadCatalogChanged(_))));
 
         let rec = coordinator.thread_catalog.get("C1", "100.0").unwrap();
         assert!(!rec.has_unread_replies());

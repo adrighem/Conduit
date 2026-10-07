@@ -8732,6 +8732,7 @@ impl ReadFlusherQueue {
         Self::default()
     }
 
+    #[allow(dead_code)]
     pub fn set_last_marked(&mut self, channel_id: impl Into<String>, ts: impl Into<String>) {
         let channel_id = channel_id.into();
         let ts = ts.into();
@@ -8744,10 +8745,12 @@ impl ReadFlusherQueue {
         }
     }
 
+    #[allow(dead_code)]
     pub fn last_marked(&self, channel_id: &str) -> Option<&str> {
         self.last_marked.get(channel_id).map(String::as_str)
     }
 
+    #[allow(dead_code)]
     pub fn pending_mark(&self, channel_id: &str) -> Option<&str> {
         self.pending.get(channel_id).map(String::as_str)
     }
@@ -8773,6 +8776,7 @@ impl ReadFlusherQueue {
             .insert(channel_id.to_string(), target_ts.to_string());
     }
 
+    #[allow(dead_code)]
     pub fn set_last_marked_thread(
         &mut self,
         channel_id: impl Into<String>,
@@ -8790,11 +8794,13 @@ impl ReadFlusherQueue {
         }
     }
 
+    #[allow(dead_code)]
     pub fn last_marked_thread(&self, channel_id: &str, thread_ts: &str) -> Option<&str> {
         let key = (channel_id.to_string(), thread_ts.to_string());
         self.last_marked_threads.get(&key).map(String::as_str)
     }
 
+    #[allow(dead_code)]
     pub fn pending_thread_mark(&self, channel_id: &str, thread_ts: &str) -> Option<&str> {
         let key = (channel_id.to_string(), thread_ts.to_string());
         self.pending_threads.get(&key).map(String::as_str)
@@ -8812,11 +8818,11 @@ impl ReadFlusherQueue {
                 return false;
             }
         }
-        self.pending_threads
-            .insert(key, target_ts.to_string());
+        self.pending_threads.insert(key, target_ts.to_string());
         true
     }
 
+    #[allow(dead_code)]
     pub fn enqueue_thread_force(&mut self, channel_id: &str, thread_ts: &str, target_ts: &str) {
         let key = (channel_id.to_string(), thread_ts.to_string());
         self.pending_threads.insert(key, target_ts.to_string());
@@ -8874,6 +8880,7 @@ impl ReadFlusherHandle {
         Self { queue, notify }
     }
 
+    #[allow(dead_code)]
     pub fn set_last_marked(&self, channel_id: &str, ts: &str) {
         let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
         q.set_last_marked(channel_id, ts);
@@ -8890,6 +8897,7 @@ impl ReadFlusherHandle {
         updated
     }
 
+    #[allow(dead_code)]
     pub fn enqueue_force(&self, channel_id: &str, target_ts: &str) {
         {
             let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
@@ -8898,6 +8906,7 @@ impl ReadFlusherHandle {
         self.notify.notify_one();
     }
 
+    #[allow(dead_code)]
     pub fn set_last_marked_thread(&self, channel_id: &str, thread_ts: &str, ts: &str) {
         let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
         q.set_last_marked_thread(channel_id, thread_ts, ts);
@@ -8914,6 +8923,7 @@ impl ReadFlusherHandle {
         updated
     }
 
+    #[allow(dead_code)]
     pub fn enqueue_thread_force(&self, channel_id: &str, thread_ts: &str, target_ts: &str) {
         {
             let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
@@ -8922,6 +8932,7 @@ impl ReadFlusherHandle {
         self.notify.notify_one();
     }
 
+    #[allow(dead_code)]
     pub fn flush_channel(&self, channel_id: &str) -> Option<PendingReadMark> {
         let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
         q.flush_channel(channel_id)
@@ -9037,8 +9048,7 @@ pub async fn run_read_flusher_loop(
                     "read_flusher",
                     &format!(
                         "subscriptions_thread_mark failed channel={} thread={} error={error}",
-                        thread_mark.channel_id,
-                        thread_mark.thread_ts,
+                        thread_mark.channel_id, thread_mark.thread_ts,
                     ),
                 );
             }
