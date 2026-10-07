@@ -1282,17 +1282,23 @@ impl SlackApi {
         }
 
         let partial_path = partial_download_path(destination);
+        let parsed_preview_mime = PreviewAssetMime::parse(&mime_type);
         let result = async {
             let mut file = tokio::fs::File::create(&partial_path)
                 .await
                 .context("failed to create the Slack media cache file")?;
             let mut response = response;
             let mut size = 0_u64;
+            let mut prefix = Vec::new();
             while let Some(chunk) = response
                 .chunk()
                 .await
                 .context("failed to read Slack media bytes")?
             {
+                if prefix.len() < 64 {
+                    let needed = (64 - prefix.len()).min(chunk.len());
+                    prefix.extend_from_slice(&chunk[..needed]);
+                }
                 size = size
                     .checked_add(chunk.len() as u64)
                     .ok_or_else(|| SlackError::validation("Slack media is larger than 1 GiB"))?;
@@ -1300,6 +1306,13 @@ impl SlackApi {
                 file.write_all(&chunk)
                     .await
                     .context("failed to write the Slack media cache file")?;
+            }
+            if let Some(parsed) = parsed_preview_mime {
+                if !parsed.validate_signature(&prefix) {
+                    return Err(SlackError::validation(
+                        "Slack media bytes do not match the declared content type",
+                    ));
+                }
             }
             file.flush()
                 .await
