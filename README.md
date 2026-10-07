@@ -17,6 +17,10 @@ Conduit is pre-1.0. It is becoming useful for daily messaging, but it does not c
 every Slack feature and its setup or behavior may still change. It is not affiliated
 with or endorsed by Slack Technologies, LLC.
 
+<p align="center">
+  <img src="data/screenshots/main-window-profile.png" alt="Conduit main window with a direct message conversation and a user profile dialog open" width="900">
+</p>
+
 ## Before you start
 
 - Conduit is intentionally designed for one connected Slack workspace.
