@@ -114,7 +114,6 @@ impl MessageAuthor {
         }
     }
 
-
     pub(crate) fn bot_id(&self) -> Option<&str> {
         match self {
             Self::App { bot_id, .. } => bot_id.as_deref(),
@@ -858,8 +857,12 @@ mod tests {
         let document = MessageDocument::new(
             vec![MessageNode::Context(vec![
                 MessageContextElement::Image(
-                    MessageImage::new(Some("https://a.slack-edge.com/g.png".to_string()), "giphy", None)
-                        .with_size(Some(16), Some(16)),
+                    MessageImage::new(
+                        Some("https://a.slack-edge.com/g.png".to_string()),
+                        "giphy",
+                        None,
+                    )
+                    .with_size(Some(16), Some(16)),
                 ),
                 MessageContextElement::Text("by fuzzyghost".to_string()),
             ])],

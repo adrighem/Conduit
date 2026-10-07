@@ -140,7 +140,11 @@ pub fn parse_slash_command(text: &str) -> Option<SlashCommand> {
     }
     let mut parts = stripped.splitn(2, |c: char| c.is_whitespace());
     let name = parts.next().unwrap_or("").to_lowercase();
-    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
         return None;
     }
     let arguments = parts.next().unwrap_or("").trim().to_string();
@@ -2486,10 +2490,7 @@ mod tests {
                 channel_id: "C1".to_string(),
             },
         }];
-        assert_eq!(
-            serialize_composer_semantics(text, &[], &spans),
-            "see <#C1>"
-        );
+        assert_eq!(serialize_composer_semantics(text, &[], &spans), "see <#C1>");
     }
 
     #[test]
@@ -3085,4 +3086,3 @@ mod tests {
         );
     }
 }
-

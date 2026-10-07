@@ -3058,7 +3058,9 @@ impl ConduitWindow {
         }
 
         imp.navigation_toggle_group
-            .update_property(&[gtk::accessible::Property::Label(&gettext("Workspace views"))]);
+            .update_property(&[gtk::accessible::Property::Label(&gettext(
+                "Workspace views",
+            ))]);
     }
 
     fn setup_runtime(&self) {
@@ -3869,11 +3871,12 @@ impl ConduitWindow {
         });
         self.connect_widget(&imp.connect_button.get(), |window| window.start_auth());
         let weak_window = self.downgrade();
-        imp.navigation_toggle_group.connect_active_name_notify(move |group| {
-            if let Some(window) = weak_window.upgrade() {
-                window.navigation_toggle_changed(group);
-            }
-        });
+        imp.navigation_toggle_group
+            .connect_active_name_notify(move |group| {
+                if let Some(window) = weak_window.upgrade() {
+                    window.navigation_toggle_changed(group);
+                }
+            });
         self.connect_widget(&imp.refresh_button.get(), |window| {
             window.refresh_conversations()
         });
@@ -8000,7 +8003,8 @@ impl ConduitWindow {
             channel_id: conversation.id.clone(),
             title: self.conversation_title(&conversation.id),
             layout,
-            is_private: sidebar::conversation_kind(conversation) == ConversationKind::PrivateChannel,
+            is_private: sidebar::conversation_kind(conversation)
+                == ConversationKind::PrivateChannel,
             muted: conversation.is_muted_conversation(),
             starred: conversation.is_starred(),
             about: crate::channel_details::about_model(conversation),
@@ -12915,7 +12919,9 @@ impl ConduitWindow {
                 last_read.as_deref(),
                 imp.workspace.view.borrow().current_thread_messages(),
             );
-            self.thread_pane().ensure_native_timeline().set_unread_separator(anchor);
+            self.thread_pane()
+                .ensure_native_timeline()
+                .set_unread_separator(anchor);
         }
     }
 
@@ -16036,22 +16042,29 @@ mod tests {
             ..Default::default()
         };
         let external = "https://images.example.test/card.png";
-        let requests = message_image_asset_requests(
-            &[attachment(external)],
-            &HashMap::new(),
-            &HashMap::new(),
-        );
+        let requests =
+            message_image_asset_requests(&[attachment(external)], &HashMap::new(), &HashMap::new());
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, external);
         assert!(
-            requests[0].1.starts_with("https://slack-imgs.com/?c=1&o1=ro&url="),
+            requests[0]
+                .1
+                .starts_with("https://slack-imgs.com/?c=1&o1=ro&url="),
             "{}",
             requests[0].1
         );
-        for private in ["http://localhost/a.png", "https://10.0.0.1/a.png", "http://192.168.1.2/a.png"] {
+        for private in [
+            "http://localhost/a.png",
+            "https://10.0.0.1/a.png",
+            "http://192.168.1.2/a.png",
+        ] {
             assert!(
-                message_image_asset_requests(&[attachment(private)], &HashMap::new(), &HashMap::new())
-                    .is_empty(),
+                message_image_asset_requests(
+                    &[attachment(private)],
+                    &HashMap::new(),
+                    &HashMap::new()
+                )
+                .is_empty(),
                 "{private}"
             );
         }
@@ -16127,7 +16140,10 @@ mod tests {
             Some("https://files.slack.com/files-pri/T1-F1/shot.png")
         );
         let proxied = fetch_for("https://example.test/og.png").expect("og image requested");
-        assert!(proxied.starts_with("https://slack-imgs.com/?c=1&o1=ro&url="), "{proxied}");
+        assert!(
+            proxied.starts_with("https://slack-imgs.com/?c=1&o1=ro&url="),
+            "{proxied}"
+        );
         assert_eq!(fetch_for("http://localhost/icon.png"), None);
 
         for url in urls {

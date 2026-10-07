@@ -25,7 +25,6 @@ mod rich_plan;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 
-
 #[cfg(test)]
 const DEFAULT_DOCUMENT_LANGUAGE: &str = "en";
 #[cfg(test)]
@@ -3161,8 +3160,6 @@ fn thread_response_html(
     )
 }
 
-
-
 pub fn thread_action_url(channel_id: &str, ts: &str) -> String {
     format!(
         "conduit://thread?channel={}&ts={}",
@@ -3190,8 +3187,6 @@ pub fn reaction_action_url(
 
     url
 }
-
-
 
 pub fn load_more_action_url(channel_id: &str, cursor: &str, thread_ts: Option<&str>) -> String {
     let mut url = format!(

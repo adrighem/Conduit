@@ -22,7 +22,8 @@ pub(crate) struct ThreadPane {
     split: adw::OverlaySplitView,
     title: adw::WindowTitle,
     view_box: gtk::Box,
-    pub(crate) native_timeline_view: Rc<RefCell<Option<crate::timeline_message_widget::NativeTimelineView>>>,
+    pub(crate) native_timeline_view:
+        Rc<RefCell<Option<crate::timeline_message_widget::NativeTimelineView>>>,
 }
 
 impl ThreadPane {
@@ -39,7 +40,9 @@ impl ThreadPane {
         }
     }
 
-    pub(crate) fn ensure_native_timeline(&self) -> crate::timeline_message_widget::NativeTimelineView {
+    pub(crate) fn ensure_native_timeline(
+        &self,
+    ) -> crate::timeline_message_widget::NativeTimelineView {
         if let Some(view) = self.native_timeline_view.borrow().as_ref().cloned() {
             return view;
         }
@@ -65,7 +68,11 @@ impl ThreadPane {
     pub(crate) fn close(&self) {
         self.split.set_show_sidebar(false);
         if let Some(native_view) = self.native_timeline_view.borrow().as_ref() {
-            native_view.set_messages(&[], &crate::message_html::MessageHtmlContext::default(), None);
+            native_view.set_messages(
+                &[],
+                &crate::message_html::MessageHtmlContext::default(),
+                None,
+            );
         }
     }
 

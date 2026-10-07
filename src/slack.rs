@@ -2372,9 +2372,10 @@ fn is_slack_image_proxy_url(url: &str) -> bool {
     url.scheme() == "https"
         && url.username().is_empty()
         && url.password().is_none()
-        && url
-            .host_str()
-            .is_some_and(|host| host.trim_end_matches('.').eq_ignore_ascii_case("slack-imgs.com"))
+        && url.host_str().is_some_and(|host| {
+            host.trim_end_matches('.')
+                .eq_ignore_ascii_case("slack-imgs.com")
+        })
 }
 
 /// Only Slack-owned hosts get the workspace credentials; everything else
@@ -4843,7 +4844,10 @@ mod tests {
     fn conversation_text_params_use_field_name() {
         assert_eq!(
             conversation_text_params("C1", "topic", "  hello  ").unwrap(),
-            vec![("channel", "C1".to_string()), ("topic", "hello".to_string())]
+            vec![
+                ("channel", "C1".to_string()),
+                ("topic", "hello".to_string())
+            ]
         );
         assert_eq!(
             conversation_text_params("C1", "purpose", "").unwrap()[1],

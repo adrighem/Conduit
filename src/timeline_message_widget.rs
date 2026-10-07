@@ -6,9 +6,8 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib::subclass::prelude::*;
 use gtk::{
-    gio, glib, pango, Box, Button, CssProvider, Image, Label,
-    ListView, NoSelection, Orientation, Picture, ScrolledWindow, Separator,
-    SignalListItemFactory, TextView, ToggleButton, Widget,
+    gio, glib, pango, Box, Button, CssProvider, Image, Label, ListView, NoSelection, Orientation,
+    Picture, ScrolledWindow, Separator, SignalListItemFactory, TextView, ToggleButton, Widget,
 };
 
 use crate::message_html::MessageHtmlContext;
@@ -81,10 +80,7 @@ impl TimelineMessageObject {
 
 pub(crate) type OpenMediaCallback = Rc<dyn Fn(crate::window::MediaGalleryItem)>;
 
-type CacheEntry = (
-    Option<gdk_pixbuf::PixbufAnimation>,
-    gtk::gdk::Texture,
-);
+type CacheEntry = (Option<gdk_pixbuf::PixbufAnimation>, gtk::gdk::Texture);
 
 const MAX_TEXTURE_CACHE_SIZE: usize = 256;
 
@@ -381,7 +377,11 @@ pub(crate) fn get_or_load_texture(path: &Path) -> Option<gtk::gdk::Texture> {
 pub(crate) enum TimelineAction {
     OpenMedia(crate::window::MediaGalleryItem),
     OpenThread(String),
-    ToggleReaction { ts: String, name: String, add: bool },
+    ToggleReaction {
+        ts: String,
+        name: String,
+        add: bool,
+    },
     ForwardMessage(String),
     MarkUnread(String),
     CopyMessageLink(String),
@@ -452,7 +452,8 @@ impl NativeTimelineView {
 
         let factory = SignalListItemFactory::new();
         let context: Rc<RefCell<Option<MessageHtmlContext>>> = Rc::new(RefCell::new(None));
-        let on_action: Rc<RefCell<Option<Rc<dyn Fn(TimelineAction)>>>> = Rc::new(RefCell::new(None));
+        let on_action: Rc<RefCell<Option<Rc<dyn Fn(TimelineAction)>>>> =
+            Rc::new(RefCell::new(None));
         let hovered: Rc<RefCell<Option<HoveredMessage>>> = Rc::new(RefCell::new(None));
         let hover_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         // Holds the quick-bar's current overflow popover (rebuilt fresh on
@@ -717,13 +718,15 @@ impl NativeTimelineView {
             let hovered = hovered.clone();
             let hover_generation = hover_generation.clone();
             let quick_bar_weak = quick_bar.downgrade();
-            scrolled_window.vadjustment().connect_value_changed(move |_| {
-                hover_generation.set(hover_generation.get().wrapping_add(1));
-                *hovered.borrow_mut() = None;
-                if let Some(bar) = quick_bar_weak.upgrade() {
-                    bar.set_visible(false);
-                }
-            });
+            scrolled_window
+                .vadjustment()
+                .connect_value_changed(move |_| {
+                    hover_generation.set(hover_generation.get().wrapping_add(1));
+                    *hovered.borrow_mut() = None;
+                    if let Some(bar) = quick_bar_weak.upgrade() {
+                        bar.set_visible(false);
+                    }
+                });
         }
 
         // --- Visibility-based automatic read-marking ---
@@ -834,17 +837,22 @@ impl NativeTimelineView {
         {
             let recheck = recheck_read_visibility.clone();
             let pending = scroll_check_pending.clone();
-            scrolled_window.vadjustment().connect_value_changed(move |_| {
-                if !pending.get() {
-                    pending.set(true);
-                    let recheck = recheck.clone();
-                    let pending = pending.clone();
-                    glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
-                        pending.set(false);
-                        recheck();
-                    });
-                }
-            });
+            scrolled_window
+                .vadjustment()
+                .connect_value_changed(move |_| {
+                    if !pending.get() {
+                        pending.set(true);
+                        let recheck = recheck.clone();
+                        let pending = pending.clone();
+                        glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(50),
+                            move || {
+                                pending.set(false);
+                                recheck();
+                            },
+                        );
+                    }
+                });
         }
         {
             let recheck = recheck_read_visibility.clone();
@@ -934,7 +942,8 @@ impl NativeTimelineView {
         *self.read_mark_target.borrow_mut() =
             Some((channel_id.to_string(), thread_ts.map(ToString::to_string)));
         *self.read_candidate.borrow_mut() = None;
-        self.read_generation.set(self.read_generation.get().wrapping_add(1));
+        self.read_generation
+            .set(self.read_generation.get().wrapping_add(1));
         (self.recheck_read_visibility)();
     }
 
@@ -954,7 +963,11 @@ impl NativeTimelineView {
             let n_items = this.store.n_items();
             let mut new_items = Vec::with_capacity(n_items as usize);
             for i in 0..n_items {
-                if let Some(obj) = this.store.item(i).and_then(|o| o.downcast::<TimelineMessageObject>().ok()) {
+                if let Some(obj) = this
+                    .store
+                    .item(i)
+                    .and_then(|o| o.downcast::<TimelineMessageObject>().ok())
+                {
                     new_items.push(obj.duplicate());
                 }
             }
@@ -989,7 +1002,8 @@ impl NativeTimelineView {
                 continue;
             }
             let ts = obj.message().ts;
-            if previous.as_deref() == Some(ts.as_str()) || anchor_ts.as_deref() == Some(ts.as_str()) {
+            if previous.as_deref() == Some(ts.as_str()) || anchor_ts.as_deref() == Some(ts.as_str())
+            {
                 self.store.splice(i, 1, &[obj.duplicate()]);
             }
         }
@@ -1006,7 +1020,8 @@ impl NativeTimelineView {
         *self.context.borrow_mut() = Some(context.clone());
         *self.latest_message_ts.borrow_mut() = messages.first().map(|msg| msg.ts.clone());
         *self.read_candidate.borrow_mut() = None;
-        self.read_generation.set(self.read_generation.get().wrapping_add(1));
+        self.read_generation
+            .set(self.read_generation.get().wrapping_add(1));
         self.store.remove_all();
         let (items, focus_index) = build_store_items(messages, focus_ts);
         self.store.splice(0, 0, &items);
@@ -1073,7 +1088,11 @@ pub(crate) fn resolve_cached_asset_path(
     let cache_dir = crate::config::image_asset_cache_dir();
 
     if let Some(cache_key) = cache_key {
-        let clean_key = cache_key.split('?').next().unwrap_or(cache_key).trim_matches('/');
+        let clean_key = cache_key
+            .split('?')
+            .next()
+            .unwrap_or(cache_key)
+            .trim_matches('/');
         if !clean_key.is_empty() {
             if let Some(path) = check_file_extensions(&cache_dir, clean_key) {
                 return Some(path);
@@ -1129,9 +1148,7 @@ struct InlineCustomEmoji {
     url: String,
 }
 
-fn extract_custom_emojis_and_prepare_markup(
-    pango: &str,
-) -> (String, Vec<InlineCustomEmoji>) {
+fn extract_custom_emojis_and_prepare_markup(pango: &str) -> (String, Vec<InlineCustomEmoji>) {
     let mut result = String::with_capacity(pango.len());
     let mut emojis = Vec::new();
     let mut rest = pango;
@@ -1170,12 +1187,12 @@ fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
     Some(unescape_xml_attribute(&tag[start..end]))
 }
 
-fn create_inline_emoji_widget(
-    emoji: &InlineCustomEmoji,
-    context: &MessageHtmlContext,
-) -> Widget {
-    let local_path = resolve_cached_asset_path(&emoji.url, context)
-        .or_else(|| Path::new(&emoji.url).exists().then(|| PathBuf::from(&emoji.url)));
+fn create_inline_emoji_widget(emoji: &InlineCustomEmoji, context: &MessageHtmlContext) -> Widget {
+    let local_path = resolve_cached_asset_path(&emoji.url, context).or_else(|| {
+        Path::new(&emoji.url)
+            .exists()
+            .then(|| PathBuf::from(&emoji.url))
+    });
 
     let widget = if let Some(path) = local_path {
         load_animated_or_static_picture(&path, 18, 18, gtk::ContentFit::Contain)
@@ -1229,7 +1246,11 @@ fn strip_anchor_tags(markup: &str) -> (String, Vec<MarkupLink>) {
         } else if tag == "</a>" {
             if let Some((start, href)) = open.take() {
                 if !href.is_empty() && offset > start {
-                    links.push(MarkupLink { start, end: offset, href });
+                    links.push(MarkupLink {
+                        start,
+                        end: offset,
+                        href,
+                    });
                 }
             }
         } else {
@@ -1284,10 +1305,7 @@ fn attach_text_view_links(view: &TextView, links: Vec<MarkupLink>) {
     view.add_controller(click);
 }
 
-pub(crate) fn create_message_text_widget(
-    pango: &str,
-    context: &MessageHtmlContext,
-) -> Widget {
+pub(crate) fn create_message_text_widget(pango: &str, context: &MessageHtmlContext) -> Widget {
     if !pango.contains("<conduit-custom-emoji ") {
         let label = Label::new(None);
         label.set_wrap(true);
@@ -1446,11 +1464,7 @@ fn parse_line_by_line_quotes(text: &str, segments: &mut Vec<TextSegment>) {
     }
 }
 
-pub(crate) fn render_text_content(
-    text: &str,
-    target_box: &Box,
-    context: &MessageHtmlContext,
-) {
+pub(crate) fn render_text_content(text: &str, target_box: &Box, context: &MessageHtmlContext) {
     let segments = parse_text_segments(text);
     for seg in segments {
         match seg {
@@ -1656,7 +1670,8 @@ fn render_files(
             });
 
             let img_widget: Widget = if let Some(path) = local_path {
-                let pic = load_animated_or_static_picture(&path, 400, 300, gtk::ContentFit::ScaleDown);
+                let pic =
+                    load_animated_or_static_picture(&path, 400, 300, gtk::ContentFit::ScaleDown);
                 pic.add_css_class("rounded");
                 pic
             } else {
@@ -1823,7 +1838,11 @@ fn load_custom_emoji_picture(path: &Path) -> Widget {
             let start_animation = |p: &Picture, anim_obj: &gdk_pixbuf::PixbufAnimation| {
                 let iter = anim_obj.iter(None);
                 let last_update = Rc::new(Cell::new(std::time::Instant::now()));
-                let delay_ms = iter.delay_time().map(|d| d.as_millis() as u64).unwrap_or(60).max(60);
+                let delay_ms = iter
+                    .delay_time()
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(60)
+                    .max(60);
 
                 p.add_tick_callback(move |p, _frame_clock| {
                     if !p.is_mapped() {
@@ -1875,7 +1894,8 @@ fn load_add_reaction_widget() -> Widget {
     if let Ok(loader) = gdk_pixbuf::PixbufLoader::with_type("svg") {
         if loader.write(ADD_REACTION_SVG.as_bytes()).is_ok() && loader.close().is_ok() {
             if let Some(pixbuf) = loader.pixbuf() {
-                if let Some(scaled) = pixbuf.scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear) {
+                if let Some(scaled) = pixbuf.scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear)
+                {
                     let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
                     pic.set_paintable(Some(&texture));
                     return pic.upcast::<Widget>();
@@ -1950,7 +1970,8 @@ fn rebuild_quick_bar(
     for entry in reactions {
         let btn = Button::new();
         btn.set_focus_on_click(false);
-        let widget = resolve_reaction_emoji_widget(&entry.name, &entry.name, context, &emoji_catalog);
+        let widget =
+            resolve_reaction_emoji_widget(&entry.name, &entry.name, context, &emoji_catalog);
         btn.set_child(Some(&widget));
         btn.add_css_class("flat");
         btn.add_css_class("circular");
@@ -2404,7 +2425,10 @@ pub(crate) fn build_timeline_message_widget(
         .unwrap_or_else(|| message.author_label());
 
     let author_label = Label::new(None);
-    author_label.set_markup(&format!("<b>{}</b>", glib::markup_escape_text(&author_name)));
+    author_label.set_markup(&format!(
+        "<b>{}</b>",
+        glib::markup_escape_text(&author_name)
+    ));
     author_label.set_xalign(0.0);
 
     let author_user_id = context.display_user_id(message);
@@ -2460,7 +2484,8 @@ pub(crate) fn build_timeline_message_widget(
             let count = r.count.unwrap_or(1);
             let clean_name = raw_name.trim_matches(':');
 
-            let emoji_widget = resolve_reaction_emoji_widget(clean_name, raw_name, context, &emoji_catalog);
+            let emoji_widget =
+                resolve_reaction_emoji_widget(clean_name, raw_name, context, &emoji_catalog);
 
             let has_self = if let Some(ref my_id) = context.current_user_id {
                 r.users.as_ref().is_some_and(|users| users.contains(my_id))
@@ -2495,12 +2520,7 @@ pub(crate) fn build_timeline_message_widget(
             let tooltip_text = if let Some(users) = &r.users {
                 let reactor_names: Vec<&str> = users
                     .iter()
-                    .filter_map(|user_id| {
-                        context
-                            .user_names
-                            .get(user_id)
-                            .map(|s| s.as_str())
-                    })
+                    .filter_map(|user_id| context.user_names.get(user_id).map(|s| s.as_str()))
                     .collect();
                 if !reactor_names.is_empty() {
                     format!(":{clean_name}: reacted by {}", reactor_names.join(", "))
@@ -2534,7 +2554,9 @@ pub(crate) fn build_timeline_message_widget(
             let cb = cb.clone();
 
             add_btn.connect_clicked(move |_| {
-                let Some(btn) = weak_add_btn.upgrade() else { return; };
+                let Some(btn) = weak_add_btn.upgrade() else {
+                    return;
+                };
                 let cb = cb.clone();
                 let message_ts = message_ts.clone();
                 let picker = crate::emoji_picker_window::EmojiPickerWindow::new(
@@ -2580,10 +2602,12 @@ pub(crate) fn build_timeline_message_widget(
         reply_button.set_focus_on_click(false);
         reply_button.add_css_class("flat");
         reply_button.add_css_class("thread-reply-pill");
-        let replied = message
-            .reply_users
-            .as_deref()
-            .is_some_and(|users| context.current_user_id.as_deref().is_some_and(|me| users.iter().any(|u| u == me)));
+        let replied = message.reply_users.as_deref().is_some_and(|users| {
+            context
+                .current_user_id
+                .as_deref()
+                .is_some_and(|me| users.iter().any(|u| u == me))
+        });
         if replied {
             reply_button.add_css_class("thread-reply-active");
         }
@@ -2628,7 +2652,9 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use crate::message_html::MessageHtmlContext;
-    use crate::models::{SlackAttachment, SlackAttachmentField, SlackFile, SlackMessage, SlackReaction};
+    use crate::models::{
+        SlackAttachment, SlackAttachmentField, SlackFile, SlackMessage, SlackReaction,
+    };
 
     #[test]
     fn dispatch_allows_handler_to_replace_itself() {
@@ -2655,7 +2681,11 @@ pub(crate) mod tests {
         assert_eq!(clean, "a &amp; <b>b</b> link z");
         assert_eq!(
             links,
-            vec![MarkupLink { start: 6, end: 10, href: "https://x.io/?a=1&b=2".into() }]
+            vec![MarkupLink {
+                start: 6,
+                end: 10,
+                href: "https://x.io/?a=1&b=2".into()
+            }]
         );
     }
 
@@ -2754,7 +2784,10 @@ pub(crate) mod tests {
     fn media_collapse_key_is_stable_and_namespaced_per_slot() {
         let a = media_collapse_key("1710000000.000100", "file:0");
         let b = media_collapse_key("1710000000.000100", "file:0");
-        assert_eq!(a, b, "querying the same ts/slot twice must yield the same key");
+        assert_eq!(
+            a, b,
+            "querying the same ts/slot twice must yield the same key"
+        );
 
         let c = media_collapse_key("1710000000.000100", "attachment:0");
         assert_ne!(
@@ -2783,10 +2816,9 @@ pub(crate) mod tests {
     }
 
     fn cached_roundtrip(message: SlackMessage) -> SlackMessage {
-        let stored = serde_json::to_value(crate::slack_message_wire::normalize_cached_message(
-            message,
-        ))
-        .expect("message serializes for the cache");
+        let stored =
+            serde_json::to_value(crate::slack_message_wire::normalize_cached_message(message))
+                .expect("message serializes for the cache");
         crate::slack_message_wire::normalize_cached_message(
             serde_json::from_value(stored).expect("cached message deserializes"),
         )
@@ -2844,11 +2876,15 @@ pub(crate) mod tests {
 
         assert_eq!(message.app_invoking_user_id(), Some("U04R5M67EBV"));
         let crate::rich_message::MessageNode::Image(image) = &message.document.nodes()[0] else {
-            panic!("first node should be the GIF image: {:?}", message.document.nodes());
+            panic!(
+                "first node should be the GIF image: {:?}",
+                message.document.nodes()
+            );
         };
         assert_eq!(image.title.as_deref(), Some("plumber"));
         assert_eq!((image.width, image.height), (Some(480), Some(270)));
-        let crate::rich_message::MessageNode::Context(elements) = &message.document.nodes()[1] else {
+        let crate::rich_message::MessageNode::Context(elements) = &message.document.nodes()[1]
+        else {
             panic!("second node should be the context line");
         };
         assert!(matches!(
@@ -2870,14 +2906,22 @@ pub(crate) mod tests {
     fn app_message_author_prefers_known_invoking_person_only() {
         let message = cached_roundtrip(giphy_command_message());
         let mut ctx = test_context();
-        assert_eq!(ctx.display_user_id(&message), None, "unknown user keeps the app");
+        assert_eq!(
+            ctx.display_user_id(&message),
+            None,
+            "unknown user keeps the app"
+        );
 
         Arc::make_mut(&mut ctx.user_full_names)
             .insert("U04R5M67EBV".to_string(), "Robey Groeneweg".to_string());
         assert_eq!(ctx.display_user_id(&message), Some("U04R5M67EBV"));
 
         Arc::make_mut(&mut ctx.bot_user_ids).insert("U04R5M67EBV".to_string());
-        assert_eq!(ctx.display_user_id(&message), None, "bot users keep the app");
+        assert_eq!(
+            ctx.display_user_id(&message),
+            None,
+            "bot users keep the app"
+        );
     }
 
     #[test]
@@ -2888,15 +2932,21 @@ pub(crate) mod tests {
             Arc::make_mut(&mut ctx.user_full_names)
                 .insert("U04R5M67EBV".to_string(), "Robey Groeneweg".to_string());
 
-            let widget = build_timeline_message_widget(&message, &ctx, None, None, None, None, None)
-                .upcast::<Widget>();
+            let widget =
+                build_timeline_message_widget(&message, &ctx, None, None, None, None, None)
+                    .upcast::<Widget>();
             let texts = label_texts(&widget);
 
-            assert!(texts.iter().any(|text| text == "Robey Groeneweg"), "{texts:?}");
+            assert!(
+                texts.iter().any(|text| text == "Robey Groeneweg"),
+                "{texts:?}"
+            );
             assert!(!texts.iter().any(|text| text == "giphy"), "{texts:?}");
             assert!(texts.iter().any(|text| text == "plumber"), "{texts:?}");
             assert!(
-                texts.iter().any(|text| text.starts_with("Posted using /giphy | GIF by")),
+                texts
+                    .iter()
+                    .any(|text| text.starts_with("Posted using /giphy | GIF by")),
                 "{texts:?}"
             );
             assert!(descendants(&widget)
@@ -2933,22 +2983,34 @@ pub(crate) mod tests {
             .expect("cached GIF picker message deserializes");
             let message = crate::slack_message_wire::normalize_cached_message(cached);
 
-            let widget = build_timeline_message_widget(&message, &test_context(), None, None, None, None, None)
-                .upcast::<Widget>();
+            let widget = build_timeline_message_widget(
+                &message,
+                &test_context(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .upcast::<Widget>();
 
             assert!(label_texts(&widget).iter().any(|text| text == "GIF"));
             let placeholder = descendants(&widget)
                 .into_iter()
                 .find(|widget| widget.has_css_class("timeline-media-placeholder"))
                 .expect("pending GIF reserves a placeholder");
-            assert_eq!(placeholder.tooltip_text().as_deref(), Some("Oh Yeah Yes GIF by FILMRISE"));
+            assert_eq!(
+                placeholder.tooltip_text().as_deref(),
+                Some("Oh Yeah Yes GIF by FILMRISE")
+            );
         });
     }
 
     #[test]
     fn downloaded_document_image_renders_picture_fitted_to_media_box() {
         run_gtk_test(|| {
-            let dir = std::env::temp_dir().join(format!("conduit-media-test-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("conduit-media-test-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("temp dir");
             let path = dir.join("wide.png");
             gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 960, 540)
@@ -3009,11 +3071,21 @@ pub(crate) mod tests {
             };
             message.refresh_canonical_content();
 
-            let widget = build_timeline_message_widget(&message, &test_context(), None, None, None, None, None)
-                .upcast::<Widget>();
+            let widget = build_timeline_message_widget(
+                &message,
+                &test_context(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .upcast::<Widget>();
             let all = descendants(&widget);
 
-            assert!(!all.iter().any(|widget| widget.has_css_class("timeline-image-container")));
+            assert!(!all
+                .iter()
+                .any(|widget| widget.has_css_class("timeline-image-container")));
             assert_eq!(
                 all.iter()
                     .filter(|widget| widget.downcast_ref::<ToggleButton>().is_some())
@@ -3091,7 +3163,13 @@ pub(crate) mod tests {
             });
 
             let widget = build_timeline_message_widget(
-                &message, &test_context(), None, None, None, None, Some(&on_action),
+                &message,
+                &test_context(),
+                None,
+                None,
+                None,
+                None,
+                Some(&on_action),
             );
             let button = find_menu_button(widget.upcast_ref()).expect("author menu button");
             assert!(button.menu_model().is_some());
@@ -3106,7 +3184,13 @@ pub(crate) mod tests {
             let mut own = test_context();
             own.current_user_id = Some("U123".to_string());
             let widget = build_timeline_message_widget(
-                &message, &own, None, None, None, None, Some(&on_action),
+                &message,
+                &own,
+                None,
+                None,
+                None,
+                None,
+                Some(&on_action),
             );
             let button = find_menu_button(widget.upcast_ref()).expect("author menu button");
             seen.borrow_mut().clear();
@@ -3119,7 +3203,13 @@ pub(crate) mod tests {
             let mut bot = test_context();
             bot.bot_user_ids = Arc::new(HashSet::from(["U123".to_string()]));
             let widget = build_timeline_message_widget(
-                &message, &bot, None, None, None, None, Some(&on_action),
+                &message,
+                &bot,
+                None,
+                None,
+                None,
+                None,
+                Some(&on_action),
             );
             assert!(find_menu_button(widget.upcast_ref()).is_none());
         });
@@ -3130,289 +3220,305 @@ pub(crate) mod tests {
         run_gtk_test(|| {
             let ctx = test_context();
 
-        // 1. Basic message
-        let mut msg1 = SlackMessage::default();
-        msg1.ts = "1700000000.000100".to_string();
-        msg1.user = Some("U123".to_string());
-        msg1.text = Some("Hello *world*!".to_string());
-        msg1.reactions = Some(vec![
-            SlackReaction {
-                name: Some("thumbsup".to_string()),
-                count: Some(3),
-                users: None,
-            },
-            SlackReaction {
-                name: Some("smile".to_string()),
-                count: Some(1),
-                users: None,
-            },
-        ]);
-        msg1.reply_count = Some(5);
+            // 1. Basic message
+            let mut msg1 = SlackMessage::default();
+            msg1.ts = "1700000000.000100".to_string();
+            msg1.user = Some("U123".to_string());
+            msg1.text = Some("Hello *world*!".to_string());
+            msg1.reactions = Some(vec![
+                SlackReaction {
+                    name: Some("thumbsup".to_string()),
+                    count: Some(3),
+                    users: None,
+                },
+                SlackReaction {
+                    name: Some("smile".to_string()),
+                    count: Some(1),
+                    users: None,
+                },
+            ]);
+            msg1.reply_count = Some(5);
 
-        let widget1 = build_timeline_message_widget(&msg1, &ctx, None, None, None, None, None);
-        assert_eq!(widget1.orientation(), Orientation::Vertical);
+            let widget1 = build_timeline_message_widget(&msg1, &ctx, None, None, None, None, None);
+            assert_eq!(widget1.orientation(), Orientation::Vertical);
 
-        // 2. Section blocks and fields
-        let mut msg2 = SlackMessage::default();
-        msg2.ts = "1700000000.000200".to_string();
-        msg2.user = Some("U123".to_string());
-        msg2.blocks = Some(serde_json::json!([
-            {
-                "type": "header",
-                "text": { "type": "plain_text", "text": "Header Title" }
-            },
-            {
-                "type": "section",
-                "text": { "type": "mrkdwn", "text": "Main section content" },
-                "fields": [
-                    { "type": "mrkdwn", "text": "*Field 1*" },
-                    { "type": "mrkdwn", "text": "*Field 2*" }
-                ]
-            }
-        ]));
+            // 2. Section blocks and fields
+            let mut msg2 = SlackMessage::default();
+            msg2.ts = "1700000000.000200".to_string();
+            msg2.user = Some("U123".to_string());
+            msg2.blocks = Some(serde_json::json!([
+                {
+                    "type": "header",
+                    "text": { "type": "plain_text", "text": "Header Title" }
+                },
+                {
+                    "type": "section",
+                    "text": { "type": "mrkdwn", "text": "Main section content" },
+                    "fields": [
+                        { "type": "mrkdwn", "text": "*Field 1*" },
+                        { "type": "mrkdwn", "text": "*Field 2*" }
+                    ]
+                }
+            ]));
 
-        let widget2 = build_timeline_message_widget(&msg2, &ctx, None, None, None, None, None);
-        assert_eq!(widget2.orientation(), Orientation::Vertical);
+            let widget2 = build_timeline_message_widget(&msg2, &ctx, None, None, None, None, None);
+            assert_eq!(widget2.orientation(), Orientation::Vertical);
 
-        // 3. Divider, actions and context
-        let mut msg3 = SlackMessage::default();
-        msg3.ts = "1700000000.000300".to_string();
-        msg3.user = Some("U123".to_string());
-        msg3.blocks = Some(serde_json::json!([
-            { "type": "divider" },
-            {
-                "type": "actions",
-                "elements": [
-                    { "type": "button", "text": { "type": "plain_text", "text": "Approve" } },
-                    { "type": "button", "text": { "type": "plain_text", "text": "Reject" } }
-                ]
-            },
-            {
-                "type": "context",
-                "elements": [
-                    { "type": "mrkdwn", "text": "Footer context info" }
-                ]
-            }
-        ]));
+            // 3. Divider, actions and context
+            let mut msg3 = SlackMessage::default();
+            msg3.ts = "1700000000.000300".to_string();
+            msg3.user = Some("U123".to_string());
+            msg3.blocks = Some(serde_json::json!([
+                { "type": "divider" },
+                {
+                    "type": "actions",
+                    "elements": [
+                        { "type": "button", "text": { "type": "plain_text", "text": "Approve" } },
+                        { "type": "button", "text": { "type": "plain_text", "text": "Reject" } }
+                    ]
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        { "type": "mrkdwn", "text": "Footer context info" }
+                    ]
+                }
+            ]));
 
-        let widget3 = build_timeline_message_widget(&msg3, &ctx, None, None, None, None, None);
-        assert_eq!(widget3.orientation(), Orientation::Vertical);
+            let widget3 = build_timeline_message_widget(&msg3, &ctx, None, None, None, None, None);
+            assert_eq!(widget3.orientation(), Orientation::Vertical);
 
-        // 4. Attachments with color border
-        let mut msg4 = SlackMessage::default();
-        msg4.ts = "1700000000.000400".to_string();
-        msg4.user = Some("U123".to_string());
-        msg4.attachments = Some(vec![SlackAttachment {
-            color: Some("good".to_string()),
-            pretext: Some("Pretext label".to_string()),
-            title: Some("Attachment Title".to_string()),
-            title_link: Some("https://example.com".to_string()),
-            text: Some("Attachment body text".to_string()),
-            fields: Some(vec![SlackAttachmentField {
-                title: Some("Priority".to_string()),
-                value: Some("High".to_string()),
-                short: Some(true),
-            }]),
-            ..Default::default()
-        }]);
-
-        let widget4 = build_timeline_message_widget(&msg4, &ctx, None, None, None, None, None);
-        assert_eq!(widget4.orientation(), Orientation::Vertical);
-
-        // 5. Image file
-        let mut msg_img = SlackMessage::default();
-        msg_img.ts = "1700000000.000500".to_string();
-        msg_img.user = Some("U123".to_string());
-        msg_img.files = Some(vec![SlackFile {
-            id: Some("F1".to_string()),
-            name: Some("photo.png".to_string()),
-            title: Some("Sample Photo".to_string()),
-            mimetype: Some("image/png".to_string()),
-            thumb_360: Some("https://example.com/thumb.png".to_string()),
-            ..Default::default()
-        }]);
-
-        let widget_img = build_timeline_message_widget(&msg_img, &ctx, None, None, None, None, None);
-        assert_eq!(widget_img.orientation(), Orientation::Vertical);
-
-        // 6. Video file
-        let mut msg_vid = SlackMessage::default();
-        msg_vid.ts = "1700000000.000600".to_string();
-        msg_vid.user = Some("U123".to_string());
-        msg_vid.files = Some(vec![SlackFile {
-            id: Some("F2".to_string()),
-            name: Some("demo.mp4".to_string()),
-            title: Some("Demo Recording".to_string()),
-            mimetype: Some("video/mp4".to_string()),
-            thumb_video: Some("https://example.com/video_thumb.png".to_string()),
-            ..Default::default()
-        }]);
-
-        let widget_vid = build_timeline_message_widget(&msg_vid, &ctx, None, None, None, None, None);
-        assert_eq!(widget_vid.orientation(), Orientation::Vertical);
-
-        // 7. Document file with size
-        let mut msg_doc = SlackMessage::default();
-        msg_doc.ts = "1700000000.000700".to_string();
-        msg_doc.user = Some("U123".to_string());
-        msg_doc.files = Some(vec![SlackFile {
-            id: Some("F3".to_string()),
-            name: Some("report.pdf".to_string()),
-            title: Some("Annual Report".to_string()),
-            mimetype: Some("application/pdf".to_string()),
-            size: Some(2097152),
-            ..Default::default()
-        }]);
-
-        let widget_doc = build_timeline_message_widget(&msg_doc, &ctx, None, None, None, None, None);
-        assert_eq!(widget_doc.orientation(), Orientation::Vertical);
-
-        // 8. Rich text blocks
-        let mut msg_rich = SlackMessage::default();
-        msg_rich.ts = "1700000000.000800".to_string();
-        msg_rich.user = Some("U123".to_string());
-        msg_rich.blocks = Some(serde_json::json!([
-            {
-                "type": "rich_text",
-                "elements": [
-                    {
-                        "type": "rich_text_section",
-                        "elements": [
-                            { "type": "text", "text": "Rich text section ", "style": { "bold": true } },
-                            { "type": "link", "url": "https://example.com", "text": "click here" }
-                        ]
-                    },
-                    {
-                        "type": "rich_text_list",
-                        "style": "bullet",
-                        "indent": 1,
-                        "elements": [
-                            {
-                                "type": "rich_text_section",
-                                "elements": [ { "type": "text", "text": "Bullet item 1" } ]
-                            },
-                            {
-                                "type": "rich_text_section",
-                                "elements": [ { "type": "text", "text": "Bullet item 2" } ]
-                            }
-                        ]
-                    },
-                    {
-                        "type": "rich_text_preformatted",
-                        "elements": [
-                            { "type": "text", "text": "let x = 42;" }
-                        ]
-                    },
-                    {
-                        "type": "rich_text_quote",
-                        "elements": [
-                            { "type": "text", "text": "A quoted phrase" }
-                        ]
-                    }
-                ]
-            }
-        ]));
-
-        let widget_rich = build_timeline_message_widget(&msg_rich, &ctx, None, None, None, None, None);
-        assert_eq!(widget_rich.orientation(), Orientation::Vertical);
-
-        // 9. Subtype system message
-        let mut msg_sys = SlackMessage::default();
-        msg_sys.ts = "1700000000.000900".to_string();
-        msg_sys.user = Some("U123".to_string());
-        msg_sys.subtype = Some("channel_join".to_string());
-        msg_sys.text = Some("joined the channel".to_string());
-
-        let widget_sys = build_timeline_message_widget(&msg_sys, &ctx, None, None, None, None, None);
-        assert_eq!(widget_sys.orientation(), Orientation::Horizontal);
-
-        // 10. Thread broadcast banner
-        let mut msg_bc = SlackMessage::default();
-        msg_bc.ts = "1700000000.0001000".to_string();
-        msg_bc.user = Some("U123".to_string());
-        msg_bc.text = Some("Broadcast reply".to_string());
-        msg_bc.is_thread_broadcast = Some(true);
-
-        let widget_bc = build_timeline_message_widget(&msg_bc, &ctx, None, None, None, None, None);
-        assert_eq!(widget_bc.orientation(), Orientation::Vertical);
-
-        // 11. Native timeline view & update_image_asset
-        let timeline_view = NativeTimelineView::new();
-        timeline_view.set_messages(&[msg1, msg2], &ctx, None);
-        // Two same-day messages: one leading day separator plus both rows.
-        assert_eq!(timeline_view.store.n_items(), 3);
-        timeline_view.update_image_asset(&ctx);
-        assert_eq!(timeline_view.store.n_items(), 3);
-
-        // Moving the unread separator rebuilds rows in place.
-        let separator_ts = |view: &NativeTimelineView| {
-            view.context
-                .borrow()
-                .as_ref()
-                .and_then(|context| context.unread_separator_ts.clone())
-        };
-        let second_ts = timeline_view
-            .store
-            .item(2)
-            .and_downcast::<TimelineMessageObject>()
-            .expect("message row")
-            .message()
-            .ts;
-        timeline_view.set_unread_separator(Some(second_ts.clone()));
-        assert_eq!(separator_ts(&timeline_view), Some(second_ts));
-        assert_eq!(timeline_view.store.n_items(), 3);
-        timeline_view.set_unread_separator(None);
-        assert_eq!(separator_ts(&timeline_view), None);
-        assert_eq!(timeline_view.store.n_items(), 3);
-
-        // 12. Custom emoji reactions & resolve_cached_asset_path
-        let mut ctx_emoji = ctx.clone();
-        std::sync::Arc::make_mut(&mut ctx_emoji.custom_emojis)
-            .insert("party_blob".to_string(), "https://example.com/blob.gif".to_string());
-        let mut msg_reaction = SlackMessage::default();
-        msg_reaction.ts = "1700000000.001100".to_string();
-        msg_reaction.user = Some("U123".to_string());
-        msg_reaction.text = Some("Reaction test".to_string());
-        msg_reaction.reactions = Some(vec![
-            SlackReaction {
-                name: Some(":robot_face:".to_string()),
-                count: Some(5),
+            // 4. Attachments with color border
+            let mut msg4 = SlackMessage::default();
+            msg4.ts = "1700000000.000400".to_string();
+            msg4.user = Some("U123".to_string());
+            msg4.attachments = Some(vec![SlackAttachment {
+                color: Some("good".to_string()),
+                pretext: Some("Pretext label".to_string()),
+                title: Some("Attachment Title".to_string()),
+                title_link: Some("https://example.com".to_string()),
+                text: Some("Attachment body text".to_string()),
+                fields: Some(vec![SlackAttachmentField {
+                    title: Some("Priority".to_string()),
+                    value: Some("High".to_string()),
+                    short: Some(true),
+                }]),
                 ..Default::default()
-            },
-            SlackReaction {
-                name: Some(":party_blob:".to_string()),
-                count: Some(2),
+            }]);
+
+            let widget4 = build_timeline_message_widget(&msg4, &ctx, None, None, None, None, None);
+            assert_eq!(widget4.orientation(), Orientation::Vertical);
+
+            // 5. Image file
+            let mut msg_img = SlackMessage::default();
+            msg_img.ts = "1700000000.000500".to_string();
+            msg_img.user = Some("U123".to_string());
+            msg_img.files = Some(vec![SlackFile {
+                id: Some("F1".to_string()),
+                name: Some("photo.png".to_string()),
+                title: Some("Sample Photo".to_string()),
+                mimetype: Some("image/png".to_string()),
+                thumb_360: Some("https://example.com/thumb.png".to_string()),
                 ..Default::default()
-            },
-        ]);
-        let widget_rx = build_timeline_message_widget(&msg_reaction, &ctx_emoji, None, None, None, None, None);
-        assert_eq!(widget_rx.orientation(), Orientation::Vertical);
+            }]);
 
-        let path = resolve_cached_asset_path("nonexistent_key", &ctx_emoji);
-        assert!(path.is_none());
+            let widget_img =
+                build_timeline_message_widget(&msg_img, &ctx, None, None, None, None, None);
+            assert_eq!(widget_img.orientation(), Orientation::Vertical);
 
-        // 13. Direct disk cache hash lookup test
-        let cache_dir = crate::config::image_asset_cache_dir();
-        let ws_dir = cache_dir.join("test_ws_direct");
-        let _ = std::fs::create_dir_all(&ws_dir);
+            // 6. Video file
+            let mut msg_vid = SlackMessage::default();
+            msg_vid.ts = "1700000000.000600".to_string();
+            msg_vid.user = Some("U123".to_string());
+            msg_vid.files = Some(vec![SlackFile {
+                id: Some("F2".to_string()),
+                name: Some("demo.mp4".to_string()),
+                title: Some("Demo Recording".to_string()),
+                mimetype: Some("video/mp4".to_string()),
+                thumb_video: Some("https://example.com/video_thumb.png".to_string()),
+                ..Default::default()
+            }]);
 
-        let test_url = "https://example.com/direct_test_img.png";
-        let hash = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update("test_ws_direct".as_bytes());
-            hasher.update([0]);
-            hasher.update(test_url.as_bytes());
-            format!("{:x}", hasher.finalize())
-        };
-        let dummy_file = ws_dir.join(format!("{hash}.png"));
-        std::fs::write(&dummy_file, b"test").unwrap();
+            let widget_vid =
+                build_timeline_message_widget(&msg_vid, &ctx, None, None, None, None, None);
+            assert_eq!(widget_vid.orientation(), Orientation::Vertical);
 
-        let found = resolve_cached_asset_path(test_url, &ctx);
-        assert_eq!(found, Some(dummy_file.clone()));
+            // 7. Document file with size
+            let mut msg_doc = SlackMessage::default();
+            msg_doc.ts = "1700000000.000700".to_string();
+            msg_doc.user = Some("U123".to_string());
+            msg_doc.files = Some(vec![SlackFile {
+                id: Some("F3".to_string()),
+                name: Some("report.pdf".to_string()),
+                title: Some("Annual Report".to_string()),
+                mimetype: Some("application/pdf".to_string()),
+                size: Some(2097152),
+                ..Default::default()
+            }]);
 
-        let _ = std::fs::remove_file(dummy_file);
-        let _ = std::fs::remove_dir(ws_dir);
+            let widget_doc =
+                build_timeline_message_widget(&msg_doc, &ctx, None, None, None, None, None);
+            assert_eq!(widget_doc.orientation(), Orientation::Vertical);
+
+            // 8. Rich text blocks
+            let mut msg_rich = SlackMessage::default();
+            msg_rich.ts = "1700000000.000800".to_string();
+            msg_rich.user = Some("U123".to_string());
+            msg_rich.blocks = Some(serde_json::json!([
+                {
+                    "type": "rich_text",
+                    "elements": [
+                        {
+                            "type": "rich_text_section",
+                            "elements": [
+                                { "type": "text", "text": "Rich text section ", "style": { "bold": true } },
+                                { "type": "link", "url": "https://example.com", "text": "click here" }
+                            ]
+                        },
+                        {
+                            "type": "rich_text_list",
+                            "style": "bullet",
+                            "indent": 1,
+                            "elements": [
+                                {
+                                    "type": "rich_text_section",
+                                    "elements": [ { "type": "text", "text": "Bullet item 1" } ]
+                                },
+                                {
+                                    "type": "rich_text_section",
+                                    "elements": [ { "type": "text", "text": "Bullet item 2" } ]
+                                }
+                            ]
+                        },
+                        {
+                            "type": "rich_text_preformatted",
+                            "elements": [
+                                { "type": "text", "text": "let x = 42;" }
+                            ]
+                        },
+                        {
+                            "type": "rich_text_quote",
+                            "elements": [
+                                { "type": "text", "text": "A quoted phrase" }
+                            ]
+                        }
+                    ]
+                }
+            ]));
+
+            let widget_rich =
+                build_timeline_message_widget(&msg_rich, &ctx, None, None, None, None, None);
+            assert_eq!(widget_rich.orientation(), Orientation::Vertical);
+
+            // 9. Subtype system message
+            let mut msg_sys = SlackMessage::default();
+            msg_sys.ts = "1700000000.000900".to_string();
+            msg_sys.user = Some("U123".to_string());
+            msg_sys.subtype = Some("channel_join".to_string());
+            msg_sys.text = Some("joined the channel".to_string());
+
+            let widget_sys =
+                build_timeline_message_widget(&msg_sys, &ctx, None, None, None, None, None);
+            assert_eq!(widget_sys.orientation(), Orientation::Horizontal);
+
+            // 10. Thread broadcast banner
+            let mut msg_bc = SlackMessage::default();
+            msg_bc.ts = "1700000000.0001000".to_string();
+            msg_bc.user = Some("U123".to_string());
+            msg_bc.text = Some("Broadcast reply".to_string());
+            msg_bc.is_thread_broadcast = Some(true);
+
+            let widget_bc =
+                build_timeline_message_widget(&msg_bc, &ctx, None, None, None, None, None);
+            assert_eq!(widget_bc.orientation(), Orientation::Vertical);
+
+            // 11. Native timeline view & update_image_asset
+            let timeline_view = NativeTimelineView::new();
+            timeline_view.set_messages(&[msg1, msg2], &ctx, None);
+            // Two same-day messages: one leading day separator plus both rows.
+            assert_eq!(timeline_view.store.n_items(), 3);
+            timeline_view.update_image_asset(&ctx);
+            assert_eq!(timeline_view.store.n_items(), 3);
+
+            // Moving the unread separator rebuilds rows in place.
+            let separator_ts = |view: &NativeTimelineView| {
+                view.context
+                    .borrow()
+                    .as_ref()
+                    .and_then(|context| context.unread_separator_ts.clone())
+            };
+            let second_ts = timeline_view
+                .store
+                .item(2)
+                .and_downcast::<TimelineMessageObject>()
+                .expect("message row")
+                .message()
+                .ts;
+            timeline_view.set_unread_separator(Some(second_ts.clone()));
+            assert_eq!(separator_ts(&timeline_view), Some(second_ts));
+            assert_eq!(timeline_view.store.n_items(), 3);
+            timeline_view.set_unread_separator(None);
+            assert_eq!(separator_ts(&timeline_view), None);
+            assert_eq!(timeline_view.store.n_items(), 3);
+
+            // 12. Custom emoji reactions & resolve_cached_asset_path
+            let mut ctx_emoji = ctx.clone();
+            std::sync::Arc::make_mut(&mut ctx_emoji.custom_emojis).insert(
+                "party_blob".to_string(),
+                "https://example.com/blob.gif".to_string(),
+            );
+            let mut msg_reaction = SlackMessage::default();
+            msg_reaction.ts = "1700000000.001100".to_string();
+            msg_reaction.user = Some("U123".to_string());
+            msg_reaction.text = Some("Reaction test".to_string());
+            msg_reaction.reactions = Some(vec![
+                SlackReaction {
+                    name: Some(":robot_face:".to_string()),
+                    count: Some(5),
+                    ..Default::default()
+                },
+                SlackReaction {
+                    name: Some(":party_blob:".to_string()),
+                    count: Some(2),
+                    ..Default::default()
+                },
+            ]);
+            let widget_rx = build_timeline_message_widget(
+                &msg_reaction,
+                &ctx_emoji,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(widget_rx.orientation(), Orientation::Vertical);
+
+            let path = resolve_cached_asset_path("nonexistent_key", &ctx_emoji);
+            assert!(path.is_none());
+
+            // 13. Direct disk cache hash lookup test
+            let cache_dir = crate::config::image_asset_cache_dir();
+            let ws_dir = cache_dir.join("test_ws_direct");
+            let _ = std::fs::create_dir_all(&ws_dir);
+
+            let test_url = "https://example.com/direct_test_img.png";
+            let hash = {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update("test_ws_direct".as_bytes());
+                hasher.update([0]);
+                hasher.update(test_url.as_bytes());
+                format!("{:x}", hasher.finalize())
+            };
+            let dummy_file = ws_dir.join(format!("{hash}.png"));
+            std::fs::write(&dummy_file, b"test").unwrap();
+
+            let found = resolve_cached_asset_path(test_url, &ctx);
+            assert_eq!(found, Some(dummy_file.clone()));
+
+            let _ = std::fs::remove_file(dummy_file);
+            let _ = std::fs::remove_dir(ws_dir);
         });
     }
 
@@ -3425,12 +3531,22 @@ pub(crate) mod tests {
             msg.user = Some("U123".to_string());
             msg.text = Some("hi".to_string());
             msg.reactions = Some(vec![
-                SlackReaction { name: Some("thumbsup".to_string()), count: Some(2), users: None },
-                SlackReaction { name: Some("smile".to_string()), count: Some(1), users: None },
+                SlackReaction {
+                    name: Some("thumbsup".to_string()),
+                    count: Some(2),
+                    users: None,
+                },
+                SlackReaction {
+                    name: Some("smile".to_string()),
+                    count: Some(1),
+                    users: None,
+                },
             ]);
             let widget = build_timeline_message_widget(&msg, &ctx, None, None, None, None, None);
-            let row = find_descendant(&widget.clone().upcast(), &|w| w.has_css_class("reaction-row"))
-                .expect("reaction row");
+            let row = find_descendant(&widget.clone().upcast(), &|w| {
+                w.has_css_class("reaction-row")
+            })
+            .expect("reaction row");
             let wrap = row.downcast::<adw::WrapBox>().expect("adw::WrapBox");
             assert_eq!(wrap.child_spacing(), 4);
             let mut pills = 0;

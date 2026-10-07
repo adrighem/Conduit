@@ -61,8 +61,6 @@ pub(crate) struct UserStatusPresentation {
     pub(crate) accessible_text: String,
 }
 
-
-
 pub(crate) fn status_expiration_options(
     existing_expiration: i64,
     now: i64,
@@ -239,12 +237,12 @@ pub(crate) fn user_status_presentation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use crate::emoji::{
-        EmojiEntry, EmojiPickerModel, EmojiPickerQuery, EmojiPickerResult,
-        EmojiPickerResultEntry, EmojiPickerResultValueKind,
-        EMOJI_PICKER_MAX_QUERY_CHARS, EMOJI_PICKER_PROTOCOL_VERSION, EMOJI_PICKER_RESULT_LIMIT,
+        EmojiEntry, EmojiPickerModel, EmojiPickerQuery, EmojiPickerResult, EmojiPickerResultEntry,
+        EmojiPickerResultValueKind, EMOJI_PICKER_MAX_QUERY_CHARS, EMOJI_PICKER_PROTOCOL_VERSION,
+        EMOJI_PICKER_RESULT_LIMIT,
     };
+    use std::collections::HashSet;
 
     #[derive(Debug, Clone)]
     struct StatusEmojiPickerModel {
@@ -263,7 +261,9 @@ mod tests {
             let mut seen = HashSet::new();
             let mut entries = catalog_entries
                 .into_iter()
-                .filter(|entry| entry.category == "Workspace" || !workspace_names.contains(&entry.name))
+                .filter(|entry| {
+                    entry.category == "Workspace" || !workspace_names.contains(&entry.name)
+                })
                 .filter(|entry| seen.insert(entry.name.clone()))
                 .collect::<Vec<_>>();
 
@@ -296,12 +296,7 @@ mod tests {
                 .map(EmojiPickerResultEntry::from)
         }
 
-        fn page(
-            &self,
-            query: &str,
-            category: Option<&str>,
-            offset: usize,
-        ) -> EmojiPickerResult {
+        fn page(&self, query: &str, category: Option<&str>, offset: usize) -> EmojiPickerResult {
             self.emojis
                 .query(&EmojiPickerQuery {
                     version: EMOJI_PICKER_PROTOCOL_VERSION,

@@ -259,7 +259,11 @@ mod tests {
 
     #[test]
     fn unproxyable_images_are_unavailable_not_pending() {
-        for url in ["http://localhost/a.png", "https://10.0.0.1/a.png", "ftp://x.test/a"] {
+        for url in [
+            "http://localhost/a.png",
+            "https://10.0.0.1/a.png",
+            "ftp://x.test/a",
+        ] {
             assert_eq!(fetchable_url(&image(url)), None, "{url}");
             assert_eq!(
                 media_state(&image(url), &pending_sources()),
@@ -301,10 +305,7 @@ mod tests {
 
     #[test]
     fn untrusted_or_missing_urls_are_unavailable() {
-        for url in [
-            "/home/user/secret.png",
-            "",
-        ] {
+        for url in ["/home/user/secret.png", ""] {
             assert_eq!(
                 media_state(&image(url), &pending_sources()),
                 MediaState::Unavailable,
@@ -312,7 +313,10 @@ mod tests {
             );
         }
         let no_url = MessageImage::new(None, "alt", None);
-        assert_eq!(media_state(&no_url, &pending_sources()), MediaState::Unavailable);
+        assert_eq!(
+            media_state(&no_url, &pending_sources()),
+            MediaState::Unavailable
+        );
     }
 
     #[test]

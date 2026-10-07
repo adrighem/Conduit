@@ -446,7 +446,11 @@ impl EmojiPickerWindow {
                 pending_views.borrow_mut().clear();
 
                 let q = query.trim().to_lowercase();
-                let filter_category = if category == "All" { None } else { Some(category) };
+                let filter_category = if category == "All" {
+                    None
+                } else {
+                    Some(category)
+                };
 
                 let mut matching = Vec::new();
                 for entry in all_entries.iter() {

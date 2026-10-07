@@ -472,7 +472,10 @@ fn two_column_grid(widgets: Vec<Widget>) -> Grid {
 }
 
 fn controls_row(controls: &[MessageControl]) -> adw::WrapBox {
-    let row = adw::WrapBox::builder().child_spacing(6).line_spacing(6).build();
+    let row = adw::WrapBox::builder()
+        .child_spacing(6)
+        .line_spacing(6)
+        .build();
     for control in controls {
         row.append(&control_button(control));
     }

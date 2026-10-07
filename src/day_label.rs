@@ -87,7 +87,10 @@ mod tests {
     fn today_and_yesterday_use_names() {
         let now = at(2026, 7, 15, 12, 0);
         assert_eq!(day_label(&at(2026, 7, 15, 0, 1), &now).unwrap(), "Today");
-        assert_eq!(day_label(&at(2026, 7, 14, 23, 59), &now).unwrap(), "Yesterday");
+        assert_eq!(
+            day_label(&at(2026, 7, 14, 23, 59), &now).unwrap(),
+            "Yesterday"
+        );
     }
 
     #[test]
@@ -97,7 +100,10 @@ mod tests {
         assert_eq!(days_old(&late, &now), 1);
         assert_eq!(day_label(&late, &now).unwrap(), "Yesterday");
         let now_late = at(2026, 7, 15, 23, 59);
-        assert_eq!(day_label(&at(2026, 7, 14, 0, 0), &now_late).unwrap(), "Yesterday");
+        assert_eq!(
+            day_label(&at(2026, 7, 14, 0, 0), &now_late).unwrap(),
+            "Yesterday"
+        );
     }
 
     #[test]
@@ -109,29 +115,45 @@ mod tests {
     #[test]
     fn other_year_includes_year() {
         let now = at(2026, 7, 15, 12, 0);
-        assert_eq!(day_label(&at(2025, 9, 15, 9, 0), &now).unwrap(), "15 Sep 2025");
+        assert_eq!(
+            day_label(&at(2025, 9, 15, 9, 0), &now).unwrap(),
+            "15 Sep 2025"
+        );
     }
 
     #[test]
     fn year_boundary_dec_31_and_jan_1() {
         let now = at(2026, 1, 1, 10, 0);
-        assert_eq!(day_label(&at(2025, 12, 31, 23, 0), &now).unwrap(), "Yesterday");
+        assert_eq!(
+            day_label(&at(2025, 12, 31, 23, 0), &now).unwrap(),
+            "Yesterday"
+        );
         let later = at(2026, 1, 2, 10, 0);
-        assert_eq!(day_label(&at(2025, 12, 31, 23, 0), &later).unwrap(), "31 Dec 2025");
-        assert_eq!(day_label(&at(2026, 1, 1, 0, 0), &later).unwrap(), "Yesterday");
+        assert_eq!(
+            day_label(&at(2025, 12, 31, 23, 0), &later).unwrap(),
+            "31 Dec 2025"
+        );
+        assert_eq!(
+            day_label(&at(2026, 1, 1, 0, 0), &later).unwrap(),
+            "Yesterday"
+        );
     }
 
     #[test]
     fn separator_before_marks_day_changes() {
         let days = [Some(10), Some(10), Some(11), Some(11), Some(13)];
-        let flags: Vec<bool> = (0..days.len()).map(|i| separator_before(&days, i)).collect();
+        let flags: Vec<bool> = (0..days.len())
+            .map(|i| separator_before(&days, i))
+            .collect();
         assert_eq!(flags, [true, false, true, false, true]);
     }
 
     #[test]
     fn separator_before_skips_undated_items() {
         let days = [Some(10), None, Some(10), None, Some(11)];
-        let flags: Vec<bool> = (0..days.len()).map(|i| separator_before(&days, i)).collect();
+        let flags: Vec<bool> = (0..days.len())
+            .map(|i| separator_before(&days, i))
+            .collect();
         assert_eq!(flags, [true, false, false, false, true]);
         assert!(!separator_before(&days, 99));
     }
