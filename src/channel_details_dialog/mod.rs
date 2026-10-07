@@ -24,6 +24,9 @@ use about::{build_about, AboutWidgets};
 use members::{build_members, MembersWidgets};
 use settings::build_settings;
 
+type MemberResolver = Rc<dyn Fn(&[String]) -> Vec<MemberRow>>;
+type UserNameLookup = Rc<dyn Fn(&str) -> Option<String>>;
+
 /// Window-side hooks. All callbacks run on the main thread.
 #[derive(Clone)]
 pub(crate) struct Callbacks {
@@ -32,8 +35,8 @@ pub(crate) struct Callbacks {
     pub(crate) on_leave: Rc<dyn Fn(String)>,
     pub(crate) on_profile: Rc<dyn Fn(String)>,
     /// Resolves a batch of member IDs to display rows in one pass.
-    pub(crate) resolve_members: Rc<dyn Fn(&[String]) -> Vec<MemberRow>>,
-    pub(crate) user_name: Rc<dyn Fn(&str) -> Option<String>>,
+    pub(crate) resolve_members: MemberResolver,
+    pub(crate) user_name: UserNameLookup,
     /// Slack mrkdwn to plain text (unicode emoji, no markup).
     pub(crate) plain_text: Rc<dyn Fn(&str) -> String>,
 }

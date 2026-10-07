@@ -3435,7 +3435,8 @@ mod tests {
             unread_count: 2,
         };
 
-        let items = model.keyed_items_with_collapsed_sections(&HashSet::new(), &[summary.clone()]);
+        let items = model
+            .keyed_items_with_collapsed_sections(&HashSet::new(), std::slice::from_ref(&summary));
 
         // header, C1, thread-summary, C2
         assert_eq!(items.len(), 4);

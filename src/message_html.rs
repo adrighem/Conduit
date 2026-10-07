@@ -2076,7 +2076,7 @@ fn compact_timestamp_text(
     let day = if days_old == 1 {
         gettext("Yesterday")
     } else if (2..=6).contains(&days_old) {
-        capitalize_first_letter(&datetime.format("%A").ok()?.to_string())
+        capitalize_first_letter(&datetime.format("%A").ok()?)
     } else {
         date_text(datetime, now)?
     };

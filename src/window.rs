@@ -2649,10 +2649,9 @@ fn messages_use_image_asset(
                         if !code.is_empty()
                             && code.len() <= 64
                             && code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+                            && matches!(catalog.resolve(code), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if url == key)
                         {
-                            if matches!(catalog.resolve(code), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if url == key) {
-                                return true;
-                            }
+                            return true;
                         }
                         rest = &rest[end + 1..];
                     } else {

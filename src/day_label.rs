@@ -44,7 +44,6 @@ pub(crate) fn date_text(datetime: &DateTime, now: &DateTime) -> Option<String> {
     let raw = datetime
         .format(&format_str)
         .ok()?
-        .trim()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");

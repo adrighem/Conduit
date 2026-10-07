@@ -59,6 +59,9 @@ fn resolve_custom_emoji_cached_file(url: &str) -> Option<PathBuf> {
     None
 }
 
+/// Emoji image widgets waiting for a download, keyed by URL.
+type PendingViews =
+    Rc<RefCell<HashMap<String, Vec<(glib::WeakRef<gtk::Picture>, glib::WeakRef<gtk::Label>)>>>>;
 type DownloadCallback = Box<dyn FnOnce(PathBuf) + Send + 'static>;
 
 struct DownloadRequest {
@@ -308,9 +311,7 @@ impl EmojiPickerWindow {
 
         let (download_tx, mut download_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, PathBuf)>();
-        let pending_views: Rc<
-            RefCell<HashMap<String, Vec<(glib::WeakRef<gtk::Picture>, glib::WeakRef<gtk::Label>)>>>,
-        > = Rc::new(RefCell::new(HashMap::new()));
+        let pending_views: PendingViews = Rc::new(RefCell::new(HashMap::new()));
 
         {
             let pending_views = pending_views.clone();
@@ -332,10 +333,10 @@ impl EmojiPickerWindow {
 
         let loader = emoji_loader();
         for url in custom_emojis.values() {
-            if url.starts_with("http://") || url.starts_with("https://") {
-                if resolve_custom_emoji_cached_file(url).is_none() {
-                    loader.queue(url.clone(), false, None);
-                }
+            if (url.starts_with("http://") || url.starts_with("https://"))
+                && resolve_custom_emoji_cached_file(url).is_none()
+            {
+                loader.queue(url.clone(), false, None);
             }
         }
 

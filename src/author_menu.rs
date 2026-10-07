@@ -13,6 +13,9 @@ use gtk::gio;
 
 use crate::timeline_message_widget::TimelineAction;
 
+/// Menu item: action name, label, enabled flag and action constructor.
+type MenuEntry<'a> = (&'a str, String, bool, fn(String) -> TimelineAction);
+
 /// Which author menu entries are usable for a given author.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AuthorMenuAccess {
@@ -72,7 +75,7 @@ pub(crate) fn author_menu_button(
 
     let group = gio::SimpleActionGroup::new();
     let menu = gio::Menu::new();
-    let entries: [(&str, String, bool, fn(String) -> TimelineAction); 2] = [
+    let entries: [MenuEntry; 2] = [
         (
             "message",
             gettext("Message…"),

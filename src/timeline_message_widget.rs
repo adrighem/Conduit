@@ -80,6 +80,10 @@ impl TimelineMessageObject {
 
 pub(crate) type OpenMediaCallback = Rc<dyn Fn(crate::window::MediaGalleryItem)>;
 
+type ActionHandler = Rc<dyn Fn(TimelineAction)>;
+type ActionSlot = Rc<RefCell<Option<ActionHandler>>>;
+type ReadMarkTarget = Rc<RefCell<Option<(String, Option<String>)>>>;
+type ToggleReactionCallback = Rc<dyn Fn(String, String, bool)>;
 type CacheEntry = (Option<gdk_pixbuf::PixbufAnimation>, gtk::gdk::Texture);
 
 const MAX_TEXTURE_CACHE_SIZE: usize = 256;
@@ -139,10 +143,7 @@ thread_local! {
 /// Invokes the timeline action handler without holding the `RefCell` borrow:
 /// handlers may re-render the view, which replaces the handler via
 /// `set_on_action` and would otherwise panic with "already borrowed".
-fn dispatch_timeline_action(
-    on_action: &RefCell<Option<Rc<dyn Fn(TimelineAction)>>>,
-    action: TimelineAction,
-) {
+fn dispatch_timeline_action(on_action: &RefCell<Option<ActionHandler>>, action: TimelineAction) {
     let handler = on_action.borrow().clone();
     if let Some(handler) = handler {
         handler(action);
@@ -426,9 +427,9 @@ pub struct NativeTimelineView {
     placeholder_label: Label,
     pub store: gio::ListStore,
     context: Rc<RefCell<Option<MessageHtmlContext>>>,
-    on_action: Rc<RefCell<Option<Rc<dyn Fn(TimelineAction)>>>>,
+    on_action: ActionSlot,
     asset_update_pending: Rc<Cell<bool>>,
-    read_mark_target: Rc<RefCell<Option<(String, Option<String>)>>>,
+    read_mark_target: ReadMarkTarget,
     latest_message_ts: Rc<RefCell<Option<String>>>,
     read_candidate: Rc<RefCell<Option<String>>>,
     read_generation: Rc<Cell<u64>>,
@@ -452,8 +453,7 @@ impl NativeTimelineView {
 
         let factory = SignalListItemFactory::new();
         let context: Rc<RefCell<Option<MessageHtmlContext>>> = Rc::new(RefCell::new(None));
-        let on_action: Rc<RefCell<Option<Rc<dyn Fn(TimelineAction)>>>> =
-            Rc::new(RefCell::new(None));
+        let on_action: ActionSlot = Rc::new(RefCell::new(None));
         let hovered: Rc<RefCell<Option<HoveredMessage>>> = Rc::new(RefCell::new(None));
         let hover_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         // Holds the quick-bar's current overflow popover (rebuilt fresh on
@@ -644,11 +644,13 @@ impl NativeTimelineView {
                                     &ts,
                                     &reactions,
                                     ctx,
-                                    &on_action_for_hover,
-                                    &hover_generation,
-                                    &hovered,
-                                    &current_popover,
-                                    &bar_motion,
+                                    &QuickBarState {
+                                        on_action: &on_action_for_hover,
+                                        hover_generation: &hover_generation,
+                                        hovered: &hovered,
+                                        current_popover: &current_popover,
+                                        bar_motion: &bar_motion,
+                                    },
                                 );
                             }
                             quick_bar.set_visible(true);
@@ -734,8 +736,7 @@ impl NativeTimelineView {
         // and once after new content loads - never on a per-frame tick
         // callback, which would keep the compositor/display pipeline from
         // idling for a check that's a no-op nearly all the time.
-        let read_mark_target: Rc<RefCell<Option<(String, Option<String>)>>> =
-            Rc::new(RefCell::new(None));
+        let read_mark_target: ReadMarkTarget = Rc::new(RefCell::new(None));
         let latest_message_ts: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let read_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let read_candidate: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -1223,7 +1224,7 @@ fn strip_anchor_tags(markup: &str) -> (String, Vec<MarkupLink>) {
     let mut open: Option<(i32, String)> = None;
     let mut rest = markup;
 
-    while let Some(pos) = rest.find(|c| c == '<' || c == '&') {
+    while let Some(pos) = rest.find(['<', '&']) {
         let (text, tail) = rest.split_at(pos);
         out.push_str(text);
         offset += text.chars().count() as i32;
@@ -1339,8 +1340,8 @@ pub(crate) fn create_message_text_widget(pango: &str, context: &MessageHtmlConte
         if let Some((start_match, end_match)) =
             search_iter.forward_search("\u{FFFC}", gtk::TextSearchFlags::empty(), None)
         {
-            let mut del_start = start_match.clone();
-            let mut del_end = end_match.clone();
+            let mut del_start = start_match;
+            let mut del_end = end_match;
             buffer.delete(&mut del_start, &mut del_end);
             let anchor = buffer.create_child_anchor(&mut del_start);
             let emoji_widget = create_inline_emoji_widget(emoji, context);
@@ -1936,7 +1937,7 @@ fn resolve_reaction_emoji_widget(
                 let lbl = Label::new(Some(unicode.as_str()));
                 lbl.add_css_class("reaction-emoji-unicode");
                 lbl.upcast()
-            } else if clean_name.chars().any(|c| !c.is_ascii()) {
+            } else if !clean_name.is_ascii() {
                 let lbl = Label::new(Some(clean_name));
                 lbl.add_css_class("reaction-emoji-unicode");
                 lbl.upcast()
@@ -1950,17 +1951,29 @@ fn resolve_reaction_emoji_widget(
     }
 }
 
+/// Shared hover state the quick bar buttons need to cooperate with the row.
+struct QuickBarState<'a> {
+    on_action: &'a ActionSlot,
+    hover_generation: &'a Rc<Cell<u64>>,
+    hovered: &'a Rc<RefCell<Option<HoveredMessage>>>,
+    current_popover: &'a Rc<RefCell<Option<gtk::Popover>>>,
+    bar_motion: &'a gtk::EventControllerMotion,
+}
+
 fn rebuild_quick_bar(
     quick_bar: &Box,
     ts: &str,
     reactions: &[crate::emoji::EmojiEntry],
     context: &MessageHtmlContext,
-    on_action: &Rc<RefCell<Option<Rc<dyn Fn(TimelineAction)>>>>,
-    hover_generation: &Rc<Cell<u64>>,
-    hovered: &Rc<RefCell<Option<HoveredMessage>>>,
-    current_popover: &Rc<RefCell<Option<gtk::Popover>>>,
-    bar_motion: &gtk::EventControllerMotion,
+    state: &QuickBarState<'_>,
 ) {
+    let QuickBarState {
+        on_action,
+        hover_generation,
+        hovered,
+        current_popover,
+        bar_motion,
+    } = *state;
     while let Some(child) = quick_bar.first_child() {
         quick_bar.remove(&child);
     }
@@ -2356,9 +2369,9 @@ pub(crate) fn build_timeline_message_widget(
     context: &MessageHtmlContext,
     on_open_media: Option<&OpenMediaCallback>,
     on_open_thread: Option<&Rc<dyn Fn(String)>>,
-    on_toggle_reaction: Option<&Rc<dyn Fn(String, String, bool)>>,
+    on_toggle_reaction: Option<&ToggleReactionCallback>,
     on_hover: Option<&Rc<dyn Fn(HoverEvent)>>,
-    on_author_action: Option<&Rc<dyn Fn(TimelineAction)>>,
+    on_author_action: Option<&ActionHandler>,
 ) -> Box {
     register_timeline_css();
     if let Some(subtype) = message.subtype.as_deref() {
@@ -2377,7 +2390,7 @@ pub(crate) fn build_timeline_message_widget(
             icon.set_pixel_size(16);
             root_box.append(&icon);
 
-            let sys_text = message.text.as_deref().unwrap_or_else(|| match subtype {
+            let sys_text = message.text.as_deref().unwrap_or(match subtype {
                 "channel_join" => "joined the channel",
                 "channel_leave" => "left the channel",
                 "channel_topic" => "set the channel topic",
@@ -2658,8 +2671,7 @@ pub(crate) mod tests {
 
     #[test]
     fn dispatch_allows_handler_to_replace_itself() {
-        type Handler = Rc<dyn Fn(TimelineAction)>;
-        let on_action: Rc<RefCell<Option<Handler>>> = Rc::new(RefCell::new(None));
+        let on_action: ActionSlot = Rc::new(RefCell::new(None));
         let replaced = Rc::new(Cell::new(false));
         let slot = on_action.clone();
         let flag = replaced.clone();
@@ -2716,9 +2728,9 @@ pub(crate) mod tests {
         }
     }
 
-    static GTK_TEST_RUNNER: std::sync::OnceLock<
-        Option<std::sync::mpsc::Sender<std::boxed::Box<dyn FnOnce() + Send>>>,
-    > = std::sync::OnceLock::new();
+    type GtkTestJob = std::boxed::Box<dyn FnOnce() + Send>;
+    static GTK_TEST_RUNNER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<GtkTestJob>>> =
+        std::sync::OnceLock::new();
 
     pub(crate) fn run_gtk_test<F: FnOnce() + Send + 'static>(f: F) {
         let sender = GTK_TEST_RUNNER.get_or_init(|| {
@@ -3151,10 +3163,12 @@ pub(crate) mod tests {
     #[test]
     fn author_header_is_a_menu_target_for_people_only() {
         run_gtk_test(|| {
-            let mut message = SlackMessage::default();
-            message.ts = "1700000000.000100".to_string();
-            message.user = Some("U123".to_string());
-            message.text = Some("hi".to_string());
+            let message = SlackMessage {
+                ts: "1700000000.000100".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("hi".to_string()),
+                ..Default::default()
+            };
 
             let seen: Rc<RefCell<Vec<String>>> = Rc::default();
             let recorder = seen.clone();
@@ -3221,212 +3235,232 @@ pub(crate) mod tests {
             let ctx = test_context();
 
             // 1. Basic message
-            let mut msg1 = SlackMessage::default();
-            msg1.ts = "1700000000.000100".to_string();
-            msg1.user = Some("U123".to_string());
-            msg1.text = Some("Hello *world*!".to_string());
-            msg1.reactions = Some(vec![
-                SlackReaction {
-                    name: Some("thumbsup".to_string()),
-                    count: Some(3),
-                    users: None,
-                },
-                SlackReaction {
-                    name: Some("smile".to_string()),
-                    count: Some(1),
-                    users: None,
-                },
-            ]);
-            msg1.reply_count = Some(5);
+            let msg1 = SlackMessage {
+                ts: "1700000000.000100".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("Hello *world*!".to_string()),
+                reactions: Some(vec![
+                    SlackReaction {
+                        name: Some("thumbsup".to_string()),
+                        count: Some(3),
+                        users: None,
+                    },
+                    SlackReaction {
+                        name: Some("smile".to_string()),
+                        count: Some(1),
+                        users: None,
+                    },
+                ]),
+                reply_count: Some(5),
+                ..Default::default()
+            };
 
             let widget1 = build_timeline_message_widget(&msg1, &ctx, None, None, None, None, None);
             assert_eq!(widget1.orientation(), Orientation::Vertical);
 
             // 2. Section blocks and fields
-            let mut msg2 = SlackMessage::default();
-            msg2.ts = "1700000000.000200".to_string();
-            msg2.user = Some("U123".to_string());
-            msg2.blocks = Some(serde_json::json!([
-                {
-                    "type": "header",
-                    "text": { "type": "plain_text", "text": "Header Title" }
-                },
-                {
-                    "type": "section",
-                    "text": { "type": "mrkdwn", "text": "Main section content" },
-                    "fields": [
-                        { "type": "mrkdwn", "text": "*Field 1*" },
-                        { "type": "mrkdwn", "text": "*Field 2*" }
-                    ]
-                }
-            ]));
+            let msg2 = SlackMessage {
+                ts: "1700000000.000200".to_string(),
+                user: Some("U123".to_string()),
+                blocks: Some(serde_json::json!([
+                    {
+                        "type": "header",
+                        "text": { "type": "plain_text", "text": "Header Title" }
+                    },
+                    {
+                        "type": "section",
+                        "text": { "type": "mrkdwn", "text": "Main section content" },
+                        "fields": [
+                            { "type": "mrkdwn", "text": "*Field 1*" },
+                            { "type": "mrkdwn", "text": "*Field 2*" }
+                        ]
+                    }
+                ])),
+                ..Default::default()
+            };
 
             let widget2 = build_timeline_message_widget(&msg2, &ctx, None, None, None, None, None);
             assert_eq!(widget2.orientation(), Orientation::Vertical);
 
             // 3. Divider, actions and context
-            let mut msg3 = SlackMessage::default();
-            msg3.ts = "1700000000.000300".to_string();
-            msg3.user = Some("U123".to_string());
-            msg3.blocks = Some(serde_json::json!([
-                { "type": "divider" },
-                {
-                    "type": "actions",
-                    "elements": [
-                        { "type": "button", "text": { "type": "plain_text", "text": "Approve" } },
-                        { "type": "button", "text": { "type": "plain_text", "text": "Reject" } }
-                    ]
-                },
-                {
-                    "type": "context",
-                    "elements": [
-                        { "type": "mrkdwn", "text": "Footer context info" }
-                    ]
-                }
-            ]));
+            let msg3 = SlackMessage {
+                ts: "1700000000.000300".to_string(),
+                user: Some("U123".to_string()),
+                blocks: Some(serde_json::json!([
+                    { "type": "divider" },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            { "type": "button", "text": { "type": "plain_text", "text": "Approve" } },
+                            { "type": "button", "text": { "type": "plain_text", "text": "Reject" } }
+                        ]
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            { "type": "mrkdwn", "text": "Footer context info" }
+                        ]
+                    }
+                ])),
+                ..Default::default()
+            };
 
             let widget3 = build_timeline_message_widget(&msg3, &ctx, None, None, None, None, None);
             assert_eq!(widget3.orientation(), Orientation::Vertical);
 
             // 4. Attachments with color border
-            let mut msg4 = SlackMessage::default();
-            msg4.ts = "1700000000.000400".to_string();
-            msg4.user = Some("U123".to_string());
-            msg4.attachments = Some(vec![SlackAttachment {
-                color: Some("good".to_string()),
-                pretext: Some("Pretext label".to_string()),
-                title: Some("Attachment Title".to_string()),
-                title_link: Some("https://example.com".to_string()),
-                text: Some("Attachment body text".to_string()),
-                fields: Some(vec![SlackAttachmentField {
-                    title: Some("Priority".to_string()),
-                    value: Some("High".to_string()),
-                    short: Some(true),
+            let msg4 = SlackMessage {
+                ts: "1700000000.000400".to_string(),
+                user: Some("U123".to_string()),
+                attachments: Some(vec![SlackAttachment {
+                    color: Some("good".to_string()),
+                    pretext: Some("Pretext label".to_string()),
+                    title: Some("Attachment Title".to_string()),
+                    title_link: Some("https://example.com".to_string()),
+                    text: Some("Attachment body text".to_string()),
+                    fields: Some(vec![SlackAttachmentField {
+                        title: Some("Priority".to_string()),
+                        value: Some("High".to_string()),
+                        short: Some(true),
+                    }]),
+                    ..Default::default()
                 }]),
                 ..Default::default()
-            }]);
+            };
 
             let widget4 = build_timeline_message_widget(&msg4, &ctx, None, None, None, None, None);
             assert_eq!(widget4.orientation(), Orientation::Vertical);
 
             // 5. Image file
-            let mut msg_img = SlackMessage::default();
-            msg_img.ts = "1700000000.000500".to_string();
-            msg_img.user = Some("U123".to_string());
-            msg_img.files = Some(vec![SlackFile {
-                id: Some("F1".to_string()),
-                name: Some("photo.png".to_string()),
-                title: Some("Sample Photo".to_string()),
-                mimetype: Some("image/png".to_string()),
-                thumb_360: Some("https://example.com/thumb.png".to_string()),
+            let msg_img = SlackMessage {
+                ts: "1700000000.000500".to_string(),
+                user: Some("U123".to_string()),
+                files: Some(vec![SlackFile {
+                    id: Some("F1".to_string()),
+                    name: Some("photo.png".to_string()),
+                    title: Some("Sample Photo".to_string()),
+                    mimetype: Some("image/png".to_string()),
+                    thumb_360: Some("https://example.com/thumb.png".to_string()),
+                    ..Default::default()
+                }]),
                 ..Default::default()
-            }]);
+            };
 
             let widget_img =
                 build_timeline_message_widget(&msg_img, &ctx, None, None, None, None, None);
             assert_eq!(widget_img.orientation(), Orientation::Vertical);
 
             // 6. Video file
-            let mut msg_vid = SlackMessage::default();
-            msg_vid.ts = "1700000000.000600".to_string();
-            msg_vid.user = Some("U123".to_string());
-            msg_vid.files = Some(vec![SlackFile {
-                id: Some("F2".to_string()),
-                name: Some("demo.mp4".to_string()),
-                title: Some("Demo Recording".to_string()),
-                mimetype: Some("video/mp4".to_string()),
-                thumb_video: Some("https://example.com/video_thumb.png".to_string()),
+            let msg_vid = SlackMessage {
+                ts: "1700000000.000600".to_string(),
+                user: Some("U123".to_string()),
+                files: Some(vec![SlackFile {
+                    id: Some("F2".to_string()),
+                    name: Some("demo.mp4".to_string()),
+                    title: Some("Demo Recording".to_string()),
+                    mimetype: Some("video/mp4".to_string()),
+                    thumb_video: Some("https://example.com/video_thumb.png".to_string()),
+                    ..Default::default()
+                }]),
                 ..Default::default()
-            }]);
+            };
 
             let widget_vid =
                 build_timeline_message_widget(&msg_vid, &ctx, None, None, None, None, None);
             assert_eq!(widget_vid.orientation(), Orientation::Vertical);
 
             // 7. Document file with size
-            let mut msg_doc = SlackMessage::default();
-            msg_doc.ts = "1700000000.000700".to_string();
-            msg_doc.user = Some("U123".to_string());
-            msg_doc.files = Some(vec![SlackFile {
-                id: Some("F3".to_string()),
-                name: Some("report.pdf".to_string()),
-                title: Some("Annual Report".to_string()),
-                mimetype: Some("application/pdf".to_string()),
-                size: Some(2097152),
+            let msg_doc = SlackMessage {
+                ts: "1700000000.000700".to_string(),
+                user: Some("U123".to_string()),
+                files: Some(vec![SlackFile {
+                    id: Some("F3".to_string()),
+                    name: Some("report.pdf".to_string()),
+                    title: Some("Annual Report".to_string()),
+                    mimetype: Some("application/pdf".to_string()),
+                    size: Some(2097152),
+                    ..Default::default()
+                }]),
                 ..Default::default()
-            }]);
+            };
 
             let widget_doc =
                 build_timeline_message_widget(&msg_doc, &ctx, None, None, None, None, None);
             assert_eq!(widget_doc.orientation(), Orientation::Vertical);
 
             // 8. Rich text blocks
-            let mut msg_rich = SlackMessage::default();
-            msg_rich.ts = "1700000000.000800".to_string();
-            msg_rich.user = Some("U123".to_string());
-            msg_rich.blocks = Some(serde_json::json!([
-                {
-                    "type": "rich_text",
-                    "elements": [
-                        {
-                            "type": "rich_text_section",
-                            "elements": [
-                                { "type": "text", "text": "Rich text section ", "style": { "bold": true } },
-                                { "type": "link", "url": "https://example.com", "text": "click here" }
-                            ]
-                        },
-                        {
-                            "type": "rich_text_list",
-                            "style": "bullet",
-                            "indent": 1,
-                            "elements": [
-                                {
-                                    "type": "rich_text_section",
-                                    "elements": [ { "type": "text", "text": "Bullet item 1" } ]
-                                },
-                                {
-                                    "type": "rich_text_section",
-                                    "elements": [ { "type": "text", "text": "Bullet item 2" } ]
-                                }
-                            ]
-                        },
-                        {
-                            "type": "rich_text_preformatted",
-                            "elements": [
-                                { "type": "text", "text": "let x = 42;" }
-                            ]
-                        },
-                        {
-                            "type": "rich_text_quote",
-                            "elements": [
-                                { "type": "text", "text": "A quoted phrase" }
-                            ]
-                        }
-                    ]
-                }
-            ]));
+            let msg_rich = SlackMessage {
+                ts: "1700000000.000800".to_string(),
+                user: Some("U123".to_string()),
+                blocks: Some(serde_json::json!([
+                    {
+                        "type": "rich_text",
+                        "elements": [
+                            {
+                                "type": "rich_text_section",
+                                "elements": [
+                                    { "type": "text", "text": "Rich text section ", "style": { "bold": true } },
+                                    { "type": "link", "url": "https://example.com", "text": "click here" }
+                                ]
+                            },
+                            {
+                                "type": "rich_text_list",
+                                "style": "bullet",
+                                "indent": 1,
+                                "elements": [
+                                    {
+                                        "type": "rich_text_section",
+                                        "elements": [ { "type": "text", "text": "Bullet item 1" } ]
+                                    },
+                                    {
+                                        "type": "rich_text_section",
+                                        "elements": [ { "type": "text", "text": "Bullet item 2" } ]
+                                    }
+                                ]
+                            },
+                            {
+                                "type": "rich_text_preformatted",
+                                "elements": [
+                                    { "type": "text", "text": "let x = 42;" }
+                                ]
+                            },
+                            {
+                                "type": "rich_text_quote",
+                                "elements": [
+                                    { "type": "text", "text": "A quoted phrase" }
+                                ]
+                            }
+                        ]
+                    }
+                ])),
+                ..Default::default()
+            };
 
             let widget_rich =
                 build_timeline_message_widget(&msg_rich, &ctx, None, None, None, None, None);
             assert_eq!(widget_rich.orientation(), Orientation::Vertical);
 
             // 9. Subtype system message
-            let mut msg_sys = SlackMessage::default();
-            msg_sys.ts = "1700000000.000900".to_string();
-            msg_sys.user = Some("U123".to_string());
-            msg_sys.subtype = Some("channel_join".to_string());
-            msg_sys.text = Some("joined the channel".to_string());
+            let msg_sys = SlackMessage {
+                ts: "1700000000.000900".to_string(),
+                user: Some("U123".to_string()),
+                subtype: Some("channel_join".to_string()),
+                text: Some("joined the channel".to_string()),
+                ..Default::default()
+            };
 
             let widget_sys =
                 build_timeline_message_widget(&msg_sys, &ctx, None, None, None, None, None);
             assert_eq!(widget_sys.orientation(), Orientation::Horizontal);
 
             // 10. Thread broadcast banner
-            let mut msg_bc = SlackMessage::default();
-            msg_bc.ts = "1700000000.0001000".to_string();
-            msg_bc.user = Some("U123".to_string());
-            msg_bc.text = Some("Broadcast reply".to_string());
-            msg_bc.is_thread_broadcast = Some(true);
+            let msg_bc = SlackMessage {
+                ts: "1700000000.0001000".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("Broadcast reply".to_string()),
+                is_thread_broadcast: Some(true),
+                ..Default::default()
+            };
 
             let widget_bc =
                 build_timeline_message_widget(&msg_bc, &ctx, None, None, None, None, None);
@@ -3467,22 +3501,24 @@ pub(crate) mod tests {
                 "party_blob".to_string(),
                 "https://example.com/blob.gif".to_string(),
             );
-            let mut msg_reaction = SlackMessage::default();
-            msg_reaction.ts = "1700000000.001100".to_string();
-            msg_reaction.user = Some("U123".to_string());
-            msg_reaction.text = Some("Reaction test".to_string());
-            msg_reaction.reactions = Some(vec![
-                SlackReaction {
-                    name: Some(":robot_face:".to_string()),
-                    count: Some(5),
-                    ..Default::default()
-                },
-                SlackReaction {
-                    name: Some(":party_blob:".to_string()),
-                    count: Some(2),
-                    ..Default::default()
-                },
-            ]);
+            let msg_reaction = SlackMessage {
+                ts: "1700000000.001100".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("Reaction test".to_string()),
+                reactions: Some(vec![
+                    SlackReaction {
+                        name: Some(":robot_face:".to_string()),
+                        count: Some(5),
+                        ..Default::default()
+                    },
+                    SlackReaction {
+                        name: Some(":party_blob:".to_string()),
+                        count: Some(2),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            };
             let widget_rx = build_timeline_message_widget(
                 &msg_reaction,
                 &ctx_emoji,
@@ -3526,22 +3562,24 @@ pub(crate) mod tests {
     fn test_reaction_row_is_adw_wrap_box() {
         run_gtk_test(|| {
             let ctx = test_context();
-            let mut msg = SlackMessage::default();
-            msg.ts = "1700000000.000900".to_string();
-            msg.user = Some("U123".to_string());
-            msg.text = Some("hi".to_string());
-            msg.reactions = Some(vec![
-                SlackReaction {
-                    name: Some("thumbsup".to_string()),
-                    count: Some(2),
-                    users: None,
-                },
-                SlackReaction {
-                    name: Some("smile".to_string()),
-                    count: Some(1),
-                    users: None,
-                },
-            ]);
+            let msg = SlackMessage {
+                ts: "1700000000.000900".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("hi".to_string()),
+                reactions: Some(vec![
+                    SlackReaction {
+                        name: Some("thumbsup".to_string()),
+                        count: Some(2),
+                        users: None,
+                    },
+                    SlackReaction {
+                        name: Some("smile".to_string()),
+                        count: Some(1),
+                        users: None,
+                    },
+                ]),
+                ..Default::default()
+            };
             let widget = build_timeline_message_widget(&msg, &ctx, None, None, None, None, None);
             let row = find_descendant(&widget.clone().upcast(), &|w| {
                 w.has_css_class("reaction-row")

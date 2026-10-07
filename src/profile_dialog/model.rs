@@ -113,14 +113,14 @@ pub(crate) fn profile_view_model(
         .status()
         .filter(|status| status.active_at(now))
         .map(|status| {
-            let emoji = (!status.emoji_name().is_empty())
-                .then(
-                    || match EmojiCatalog::new(custom_emojis).resolve(status.emoji_name()) {
-                        Some(EmojiValue::Unicode(glyph)) => glyph.to_string(),
-                        _ => String::new(),
-                    },
-                )
-                .unwrap_or_default();
+            let emoji = if status.emoji_name().is_empty() {
+                String::new()
+            } else {
+                match EmojiCatalog::new(custom_emojis).resolve(status.emoji_name()) {
+                    Some(EmojiValue::Unicode(glyph)) => glyph.to_string(),
+                    _ => String::new(),
+                }
+            };
             let text = [emoji.as_str(), status.text.trim()]
                 .into_iter()
                 .filter(|part| !part.is_empty())
