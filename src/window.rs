@@ -681,9 +681,11 @@ mod imp {
                         let weak_window = obj.downgrade();
                         glib::timeout_add_local_once(Duration::from_millis(100), move || {
                             if let Some(window) = weak_window.upgrade() {
+                                let url = "https://emoji.example/late-status-parrot.gif";
+                                seed_test_status_emoji_cache(url);
                                 window.replace_custom_emojis(HashMap::from([(
                                     "late_status_parrot".to_string(),
-                                    "https://emoji.example/late-status-parrot.gif".to_string(),
+                                    url.to_string(),
                                 )]));
                             }
                         });
@@ -8598,6 +8600,9 @@ impl ConduitWindow {
     fn replace_custom_emojis(&self, emojis: HashMap<String, String>) {
         *self.imp().custom_emojis.borrow_mut() = Arc::new(emojis);
         if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
+            state
+                .emoji_preview
+                .set_custom_emojis(&self.imp().custom_emojis.borrow());
             write_status_dialog_test_state(self, state);
         }
         for target in COMPOSER_TARGETS {
@@ -10193,25 +10198,21 @@ impl ConduitWindow {
             .title(gettext("Status emoji"))
             .activatable(true)
             .build();
-        let emoji_btn_label = if status.emoji_name().is_empty() {
-            "💬".to_string()
-        } else {
-            format!(":{}:", status.emoji_name())
-        };
-        let emoji_button = gtk::Button::with_label(&emoji_btn_label);
-        emoji_button.add_css_class("flat");
+        let emoji_preview =
+            StatusEmojiPreview::new(status.emoji_name(), &self.imp().custom_emojis.borrow());
+        let emoji_button = emoji_preview.button().clone();
 
         let weak_dialog = dialog.downgrade();
         let weak_status_entry = status_entry.downgrade();
         let selected_emoji_clone = selected_emoji.clone();
-        let weak_button = emoji_button.downgrade();
+        let preview_for_picker = emoji_preview.clone();
         let weak_window = self.downgrade();
 
         let open_picker = move |btn: &gtk::Button| {
             let weak_dialog = weak_dialog.clone();
             let weak_status_entry = weak_status_entry.clone();
             let selected_emoji_clone = selected_emoji_clone.clone();
-            let weak_button = weak_button.clone();
+            let preview_for_picker = preview_for_picker.clone();
             let Some(window) = weak_window.upgrade() else {
                 return;
             };
@@ -10221,9 +10222,7 @@ impl ConduitWindow {
                 &custom_emojis,
                 move |chosen| {
                     selected_emoji_clone.replace(chosen.to_string());
-                    if let Some(button) = weak_button.upgrade() {
-                        button.set_label(&format!(":{chosen}:"));
-                    }
+                    preview_for_picker.set_name(chosen);
                     if let (Some(dialog), Some(status_entry)) =
                         (weak_dialog.upgrade(), weak_status_entry.upgrade())
                     {
@@ -10340,6 +10339,7 @@ impl ConduitWindow {
                 dialog: dialog.clone(),
                 status_entry: status_entry.clone(),
                 selected_emoji,
+                emoji_preview,
                 expiration_choice_count,
             });
         dialog.present(Some(self));
@@ -13169,6 +13169,20 @@ fn record_test_huddle_surface(window: &imp::ConduitWindow) {
     );
 }
 
+/// Test hook: stores `CONDUIT_TEST_STATUS_EMOJI_FILE` in the image asset cache
+/// as if the emoji download had completed, after startup cache maintenance.
+fn seed_test_status_emoji_cache(url: &str) {
+    use sha2::{Digest, Sha256};
+
+    let Some(source) = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_FILE") else {
+        return;
+    };
+    let directory = crate::config::image_asset_cache_dir();
+    let hash = format!("{:x}", Sha256::digest(url.as_bytes()));
+    let _ = std::fs::create_dir_all(&directory);
+    let _ = std::fs::copy(source, directory.join(format!("{hash}.gif")));
+}
+
 fn write_status_dialog_test_state(window: &ConduitWindow, state: &StatusDialogState) {
     let Some(path) = std::env::var_os("CONDUIT_TEST_STATUS_UI_FILE") else {
         return;
@@ -13179,6 +13193,7 @@ fn write_status_dialog_test_state(window: &ConduitWindow, state: &StatusDialogSt
         serde_json::json!({
             "dialog_heading": state.dialog.heading().map(|heading| heading.to_string()),
             "emoji_selected_name": state.selected_emoji.borrow().clone(),
+            "emoji_preview_kind": state.emoji_preview.kind().as_str(),
             "expiration_choice_count": state.expiration_choice_count,
             "save_enabled": state.dialog.is_response_enabled("save"),
             "clear_available": state.dialog.has_response("clear"),

@@ -115,6 +115,7 @@ def main() -> None:
                 "header_subtitle": "",
                 "maximum_width": None,
                 "emoji_selected_name": "",
+                "emoji_preview_kind": "none",
             },
             {
                 "name": "preset-narrow",
@@ -128,6 +129,7 @@ def main() -> None:
                 "header_subtitle": "🏠 Working remotely",
                 "maximum_width": 400,
                 "emoji_selected_name": "house",
+                "emoji_preview_kind": "unicode",
             },
             {
                 "name": "late-custom-preset",
@@ -142,6 +144,7 @@ def main() -> None:
                 "header_subtitle": "● Working remotely",
                 "maximum_width": None,
                 "emoji_selected_name": "late_status_parrot",
+                "emoji_preview_kind": "image",
             },
         ]
 
@@ -179,6 +182,8 @@ def main() -> None:
                         state.get("dialog_heading") == "Set a status"
                         and state.get("emoji_selected_name")
                         == case["emoji_selected_name"]
+                        and state.get("emoji_preview_kind")
+                        == case["emoji_preview_kind"]
                         and state.get("expiration_choice_count") == 6
                         and state.get("save_enabled") == case["save_enabled"]
                         and state.get("clear_available") == case["clear_available"]

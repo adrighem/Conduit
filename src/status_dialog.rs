@@ -18,8 +18,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -34,6 +35,7 @@ pub(crate) struct StatusDialogState {
     pub(crate) dialog: adw::AlertDialog,
     pub(crate) status_entry: adw::EntryRow,
     pub(crate) selected_emoji: Rc<RefCell<String>>,
+    pub(crate) emoji_preview: StatusEmojiPreview,
     pub(crate) expiration_choice_count: usize,
 }
 
@@ -360,6 +362,35 @@ mod tests {
     }
 
     #[test]
+    fn status_emoji_preview_source_selects_kind() {
+        let custom = HashMap::from([(
+            "party_parrot".to_string(),
+            "https://emoji.example/party.gif".to_string(),
+        )]);
+        let uncached = |_: &str| None;
+        let cached = |_: &str| Some(PathBuf::from("/tmp/party.gif"));
+        let kind = |name: &str, lookup: &dyn Fn(&str) -> Option<PathBuf>| {
+            status_emoji_preview_source(name, &custom, lookup).kind()
+        };
+        assert_eq!(kind("", &uncached), StatusEmojiPreviewKind::None);
+        assert_eq!(kind("::", &uncached), StatusEmojiPreviewKind::None);
+        assert_eq!(kind(":house:", &uncached), StatusEmojiPreviewKind::Unicode);
+        assert_eq!(kind("party_parrot", &cached), StatusEmojiPreviewKind::Image);
+        assert_eq!(
+            status_emoji_preview_source("party_parrot", &custom, uncached),
+            StatusEmojiPreviewSource::PendingImage("https://emoji.example/party.gif".to_string())
+        );
+        assert_eq!(
+            kind("party_parrot", &uncached),
+            StatusEmojiPreviewKind::TextFallback
+        );
+        assert_eq!(
+            kind("not_known", &cached),
+            StatusEmojiPreviewKind::TextFallback
+        );
+    }
+
+    #[test]
     fn status_dialog_builds_text_only_and_emoji_only_statuses() {
         assert_eq!(
             status_from_dialog_input(
@@ -579,5 +610,175 @@ mod tests {
             ),
             None
         );
+    }
+}
+
+const STATUS_EMOJI_PREVIEW_SIZE: i32 = 24;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StatusEmojiPreviewSource {
+    None,
+    Unicode(String),
+    Image(PathBuf),
+    /// Custom image that is not cached yet; carries its URL.
+    PendingImage(String),
+    /// Name that does not resolve to anything known (yet).
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusEmojiPreviewKind {
+    None,
+    Unicode,
+    Image,
+    TextFallback,
+}
+
+impl StatusEmojiPreviewKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unicode => "unicode",
+            Self::Image => "image",
+            Self::TextFallback => "text-fallback",
+        }
+    }
+}
+
+impl StatusEmojiPreviewSource {
+    pub(crate) fn kind(&self) -> StatusEmojiPreviewKind {
+        match self {
+            Self::None => StatusEmojiPreviewKind::None,
+            Self::Unicode(_) => StatusEmojiPreviewKind::Unicode,
+            Self::Image(_) => StatusEmojiPreviewKind::Image,
+            Self::PendingImage(_) | Self::Unresolved => StatusEmojiPreviewKind::TextFallback,
+        }
+    }
+}
+
+pub(crate) fn status_emoji_preview_source(
+    name: &str,
+    custom_emojis: &HashMap<String, String>,
+    cached_file: impl Fn(&str) -> Option<PathBuf>,
+) -> StatusEmojiPreviewSource {
+    let name = name.trim().trim_matches(':');
+    if name.is_empty() {
+        return StatusEmojiPreviewSource::None;
+    }
+    match EmojiCatalog::new(custom_emojis).resolve(name) {
+        Some(EmojiValue::Unicode(glyph)) => StatusEmojiPreviewSource::Unicode(glyph.to_string()),
+        Some(EmojiValue::CustomImage(url)) => match cached_file(&url) {
+            Some(path) => StatusEmojiPreviewSource::Image(path),
+            None => StatusEmojiPreviewSource::PendingImage(url),
+        },
+        None => StatusEmojiPreviewSource::Unresolved,
+    }
+}
+
+/// The emoji button of the status dialog: shows the selected emoji as a
+/// glyph or image, and upgrades itself when the catalog or asset arrives.
+#[derive(Debug, Clone)]
+pub(crate) struct StatusEmojiPreview {
+    button: gtk::Button,
+    name: Rc<RefCell<String>>,
+    custom_emojis: Rc<RefCell<HashMap<String, String>>>,
+    kind: Rc<Cell<StatusEmojiPreviewKind>>,
+}
+
+impl StatusEmojiPreview {
+    pub(crate) fn new(name: &str, custom_emojis: &HashMap<String, String>) -> Self {
+        let button = gtk::Button::new();
+        button.add_css_class("flat");
+        let preview = Self {
+            button,
+            name: Rc::new(RefCell::new(String::new())),
+            custom_emojis: Rc::new(RefCell::new(custom_emojis.clone())),
+            kind: Rc::new(Cell::new(StatusEmojiPreviewKind::None)),
+        };
+        preview.set_name(name);
+        preview
+    }
+
+    pub(crate) fn button(&self) -> &gtk::Button {
+        &self.button
+    }
+
+    pub(crate) fn kind(&self) -> StatusEmojiPreviewKind {
+        self.kind.get()
+    }
+
+    pub(crate) fn set_name(&self, name: &str) {
+        self.name.replace(name.trim().trim_matches(':').to_string());
+        self.render();
+    }
+
+    pub(crate) fn set_custom_emojis(&self, custom_emojis: &HashMap<String, String>) {
+        self.custom_emojis.replace(custom_emojis.clone());
+        self.render();
+    }
+
+    fn render(&self) {
+        let name = self.name.borrow().clone();
+        let source = status_emoji_preview_source(
+            &name,
+            &self.custom_emojis.borrow(),
+            crate::emoji_picker_window::resolve_custom_emoji_cached_file,
+        );
+        self.kind.set(source.kind());
+        let child: gtk::Widget = match &source {
+            StatusEmojiPreviewSource::None => gtk::Label::new(Some("💬")).upcast(),
+            StatusEmojiPreviewSource::Unicode(glyph) => {
+                let label = gtk::Label::new(Some(glyph));
+                label.add_css_class("title-3");
+                label.upcast()
+            }
+            StatusEmojiPreviewSource::Image(path) => {
+                crate::timeline_message_widget::load_animated_or_static_picture(
+                    path,
+                    STATUS_EMOJI_PREVIEW_SIZE,
+                    STATUS_EMOJI_PREVIEW_SIZE,
+                    gtk::ContentFit::Contain,
+                )
+            }
+            StatusEmojiPreviewSource::PendingImage(_) | StatusEmojiPreviewSource::Unresolved => {
+                gtk::Label::new(Some(&format!(":{name}:"))).upcast()
+            }
+        };
+        self.button.set_child(Some(&child));
+        if name.is_empty() {
+            self.button
+                .set_tooltip_text(Some(&gettext("Choose a status emoji")));
+            self.button
+                .update_property(&[gtk::accessible::Property::Label(&gettext(
+                    "Choose a status emoji",
+                ))]);
+        } else {
+            self.button.set_tooltip_text(Some(&format!(":{name}:")));
+            self.button
+                .update_property(&[gtk::accessible::Property::Label(
+                    &gettext("Status emoji: {name}").replace("{name}", &name),
+                )]);
+        }
+        if let StatusEmojiPreviewSource::PendingImage(url) = source {
+            self.await_download(&name, &url);
+        }
+    }
+
+    fn await_download(&self, name: &str, url: &str) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+        crate::emoji_picker_window::request_custom_emoji_file(url, move |path| {
+            let _ = tx.send(path);
+        });
+        let preview = self.clone();
+        let weak_button = self.button.downgrade();
+        let name = name.to_string();
+        glib::spawn_future_local(async move {
+            if rx.recv().await.is_none() || weak_button.upgrade().is_none() {
+                return;
+            }
+            if *preview.name.borrow() == name {
+                preview.render();
+            }
+        });
     }
 }

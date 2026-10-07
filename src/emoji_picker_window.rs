@@ -38,7 +38,7 @@ pub(crate) struct EmojiPickerWindow {
     window: adw::Window,
 }
 
-fn resolve_custom_emoji_cached_file(url: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_custom_emoji_cached_file(url: &str) -> Option<PathBuf> {
     if let Ok(path) = PathBuf::from(url).canonicalize() {
         if path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
             return Some(path);
@@ -297,6 +297,15 @@ static LOADER: OnceLock<CustomEmojiLoader> = OnceLock::new();
 
 fn emoji_loader() -> &'static CustomEmojiLoader {
     LOADER.get_or_init(CustomEmojiLoader::new)
+}
+
+/// Queues a high-priority download of a custom emoji image through the shared
+/// loader. `on_ready` runs on the loader thread once the file is cached.
+pub(crate) fn request_custom_emoji_file(
+    url: &str,
+    on_ready: impl FnOnce(PathBuf) + Send + 'static,
+) {
+    emoji_loader().queue(url.to_string(), true, Some(Box::new(on_ready)));
 }
 
 impl EmojiPickerWindow {
