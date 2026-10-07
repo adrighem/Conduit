@@ -912,6 +912,32 @@ impl SlackApi {
         Ok(())
     }
 
+    pub async fn subscriptions_thread_mark(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        ts: &str,
+    ) -> Result<()> {
+        let channel_id = channel_id.trim_matches(|c: char| c.is_ascii_whitespace());
+        let thread_ts = thread_ts.trim_matches(|c: char| c.is_ascii_whitespace());
+        let ts = ts.trim_matches(|c: char| c.is_ascii_whitespace());
+        if channel_id.is_empty() || thread_ts.is_empty() || ts.is_empty() {
+            return Err(SlackError::InvalidParameters);
+        }
+        let _: BasicResponse = self
+            .post_form(
+                "subscriptions.thread.mark",
+                &[
+                    ("channel", channel_id.to_string()),
+                    ("thread_ts", thread_ts.to_string()),
+                    ("ts", ts.to_string()),
+                    ("read", "1".to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Read-state baseline for every conversation (`client.counts`).
     pub async fn client_counts(&self) -> Result<Vec<ServerReadCounts>> {
         let response: ClientCountsResponse = self
@@ -4821,6 +4847,69 @@ mod tests {
             .collect::<HashMap<_, _>>();
         assert_eq!(form.get("channel").map(String::as_str), Some("C12345"));
         assert_eq!(form.get("ts").map(String::as_str), Some("1234.5678"));
+    }
+
+    #[test]
+    fn test_subscriptions_thread_mark_parameter_validation() {
+        let token = user_test_token();
+        let api = SlackApi::new(token);
+        let rt = tokio::runtime::Runtime::new().expect("test runtime should start");
+
+        let res = rt.block_on(api.subscriptions_thread_mark("", "100.0", "100.1"));
+        assert!(matches!(res, Err(SlackError::InvalidParameters)));
+
+        let res = rt.block_on(api.subscriptions_thread_mark("C123", "", "100.1"));
+        assert!(matches!(res, Err(SlackError::InvalidParameters)));
+
+        let res = rt.block_on(api.subscriptions_thread_mark("C123", "100.0", ""));
+        assert!(matches!(res, Err(SlackError::InvalidParameters)));
+
+        let res = rt.block_on(api.subscriptions_thread_mark("   ", "  \n", "\t"));
+        assert!(matches!(res, Err(SlackError::InvalidParameters)));
+    }
+
+    #[test]
+    fn test_subscriptions_thread_mark_request_formatting() {
+        let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
+        let address = server
+            .server_addr()
+            .to_ip()
+            .expect("mock Slack server should use an IP address");
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(r#"{"ok":true}"#).with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            (path, body)
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        let result = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.subscriptions_thread_mark("  C12345  ", "\t1234.0001\n", " 1234.0002 "));
+        assert!(result.is_ok());
+
+        let (path, body) = received.join().expect("mock Slack server should finish");
+        assert_eq!(path, "/api/subscriptions.thread.mark");
+        let form = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(form.get("channel").map(String::as_str), Some("C12345"));
+        assert_eq!(form.get("thread_ts").map(String::as_str), Some("1234.0001"));
+        assert_eq!(form.get("ts").map(String::as_str), Some("1234.0002"));
+        assert_eq!(form.get("read").map(String::as_str), Some("1"));
     }
 
     #[test]
