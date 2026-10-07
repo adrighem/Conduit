@@ -11,6 +11,7 @@ mod members;
 mod settings;
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -30,7 +31,8 @@ pub(crate) struct Callbacks {
     pub(crate) on_edit: Rc<dyn Fn(String, ConversationTextField, String)>,
     pub(crate) on_leave: Rc<dyn Fn(String)>,
     pub(crate) on_profile: Rc<dyn Fn(String)>,
-    pub(crate) resolve_member: Rc<dyn Fn(&str) -> MemberRow>,
+    /// Resolves a batch of member IDs to display rows in one pass.
+    pub(crate) resolve_members: Rc<dyn Fn(&[String]) -> Vec<MemberRow>>,
     pub(crate) user_name: Rc<dyn Fn(&str) -> Option<String>>,
     /// Slack mrkdwn to plain text (unicode emoji, no markup).
     pub(crate) plain_text: Rc<dyn Fn(&str) -> String>,
@@ -67,6 +69,10 @@ struct Inner {
     members_page: RefCell<Option<adw::ViewStackPage>>,
     members: MembersWidgets,
     member_ids: RefCell<Vec<String>>,
+    member_id_set: RefCell<HashSet<String>>,
+    /// IDs received but not yet resolved; drained in idle batches.
+    pending_members: RefCell<VecDeque<String>>,
+    resolving_members: Cell<bool>,
     member_total: Cell<Option<usize>>,
     members_complete: Cell<bool>,
 }
@@ -116,15 +122,18 @@ pub(crate) fn update(input: &DetailsInput) {
 pub(crate) fn append_members(channel_id: &str, user_ids: &[String], complete: bool) {
     if let Some(inner) = current_for(channel_id) {
         {
+            let mut seen = inner.member_id_set.borrow_mut();
             let mut ids = inner.member_ids.borrow_mut();
+            let mut pending = inner.pending_members.borrow_mut();
             for id in user_ids {
-                if !ids.contains(id) {
+                if seen.insert(id.clone()) {
                     ids.push(id.clone());
+                    pending.push_back(id.clone());
                 }
             }
         }
         inner.members_complete.set(complete);
-        inner.rebuild_members();
+        inner.schedule_member_resolution();
     }
 }
 
@@ -212,6 +221,9 @@ fn build(input: &DetailsInput, callbacks: Callbacks) -> Rc<Inner> {
         members_page: RefCell::new(Some(members_page)),
         members,
         member_ids: RefCell::new(Vec::new()),
+        member_id_set: RefCell::new(HashSet::new()),
+        pending_members: RefCell::new(VecDeque::new()),
+        resolving_members: Cell::new(false),
         member_total: Cell::new(input.about.member_count),
         members_complete: Cell::new(false),
     });

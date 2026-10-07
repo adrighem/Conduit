@@ -6,9 +6,13 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gettextrs::gettext;
+use gtk::glib;
 
 use super::{Callbacks, Inner};
 use crate::channel_details::{filter_members, members_tab_title, sort_members, MemberRow};
+
+/// Members resolved per idle tick; keeps each tick well under a frame.
+const MEMBER_RESOLVE_BATCH: usize = 150;
 
 pub(super) struct MembersWidgets {
     pub(super) rows: Rc<RefCell<HashMap<String, MemberRow>>>,
@@ -16,7 +20,7 @@ pub(super) struct MembersWidgets {
     pub(super) store: gtk::StringList,
     pub(super) search: gtk::SearchEntry,
     pub(super) pages: gtk::Stack,
-    pub(super) footer: gtk::Label,
+    pub(super) footer: gtk::Box,
     pub(super) error_page: adw::StatusPage,
 }
 
@@ -131,11 +135,17 @@ pub(super) fn build_members(callbacks: &Callbacks) -> (gtk::Box, MembersWidgets)
     search.set_margin_bottom(6);
     search.set_margin_start(12);
     search.set_margin_end(12);
-    let footer = gtk::Label::new(Some(&gettext("Loading more members...")));
-    footer.add_css_class("dim-label");
-    footer.add_css_class("caption");
+    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    footer.set_halign(gtk::Align::Center);
     footer.set_margin_top(4);
     footer.set_margin_bottom(6);
+    let footer_spinner = adw::Spinner::new();
+    footer_spinner.set_size_request(16, 16);
+    let footer_label = gtk::Label::new(Some(&gettext("Loading more members…")));
+    footer_label.add_css_class("dim-label");
+    footer_label.add_css_class("caption");
+    footer.append(&footer_spinner);
+    footer.append(&footer_label);
     footer.set_visible(false);
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -175,25 +185,50 @@ impl Inner {
         }
     }
 
-    pub(super) fn rebuild_members(&self) {
-        let resolve = &self.callbacks.resolve_member;
-        let mut rows: Vec<MemberRow> = self
-            .member_ids
-            .borrow()
-            .iter()
-            .map(|id| resolve(id))
-            .collect();
-        sort_members(&mut rows);
-        *self.members.rows.borrow_mut() = rows
-            .iter()
-            .map(|row| (row.user_id.clone(), row.clone()))
-            .collect();
-        *self.members.visible.borrow_mut() = rows;
-        self.members
-            .footer
-            .set_visible(!self.members_complete.get());
+    /// Resolves pending member IDs in small idle batches so large channels
+    /// never block the main loop; the list fills in as batches land.
+    pub(super) fn schedule_member_resolution(self: &Rc<Self>) {
+        self.update_members_footer();
         self.refresh_members_title();
-        self.apply_member_filter();
+        if self.resolving_members.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local(move || {
+            let Some(inner) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let batch: Vec<String> = {
+                let mut pending = inner.pending_members.borrow_mut();
+                let take = pending.len().min(MEMBER_RESOLVE_BATCH);
+                pending.drain(..take).collect()
+            };
+            if !batch.is_empty() {
+                let resolved = (inner.callbacks.resolve_members)(&batch);
+                {
+                    let mut rows = inner.members.rows.borrow_mut();
+                    let mut visible = inner.members.visible.borrow_mut();
+                    for row in resolved {
+                        rows.insert(row.user_id.clone(), row.clone());
+                        visible.push(row);
+                    }
+                    sort_members(&mut visible);
+                }
+                inner.apply_member_filter();
+            }
+            if inner.pending_members.borrow().is_empty() {
+                inner.resolving_members.set(false);
+                inner.update_members_footer();
+                inner.apply_member_filter();
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    fn update_members_footer(&self) {
+        let loading = !self.members_complete.get() || self.resolving_members.get();
+        self.members.footer.set_visible(loading);
     }
 
     pub(super) fn apply_member_filter(&self) {
@@ -211,7 +246,9 @@ impl Inner {
             .splice(0, self.members.store.n_items(), &refs);
         let page = if !ids.is_empty() {
             "list"
-        } else if self.member_ids.borrow().is_empty() && !self.members_complete.get() {
+        } else if self.members.visible.borrow().is_empty()
+            && (!self.members_complete.get() || self.resolving_members.get())
+        {
             "loading"
         } else {
             "empty"
