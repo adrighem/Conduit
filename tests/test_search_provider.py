@@ -146,11 +146,11 @@ def main() -> None:
             encoding="utf-8",
         )
         environment = os.environ.copy()
-        lifecycle_path = root / "webview-lifecycle.json"
+        lifecycle_path = root / "timeline-lifecycle.json"
         environment.update(
             {
                 "CONDUIT_RESOURCE_PATH": str(resource),
-                "CONDUIT_TEST_WEBVIEW_LIFECYCLE_FILE": str(lifecycle_path),
+                "CONDUIT_TEST_TIMELINE_LIFECYCLE_FILE": str(lifecycle_path),
                 "CONDUIT_TEST_WORKSPACE": "1",
                 "CONDUIT_TEST_OPEN_TARGET_FILE": str(root / "opened-target.json"),
                 "GSETTINGS_SCHEMA_DIR": str(root),
@@ -163,7 +163,7 @@ def main() -> None:
             [
                 "dbus-update-activation-environment",
                 "CONDUIT_RESOURCE_PATH",
-                "CONDUIT_TEST_WEBVIEW_LIFECYCLE_FILE",
+                "CONDUIT_TEST_TIMELINE_LIFECYCLE_FILE",
                 "CONDUIT_TEST_WORKSPACE",
                 "CONDUIT_TEST_OPEN_TARGET_FILE",
                 "GSETTINGS_SCHEMA_DIR",
@@ -218,7 +218,7 @@ def main() -> None:
             "channel_id": "C_TEST",
         }
         startup_lifecycle = wait_until(lambda: read_json(lifecycle_path))
-        assert startup_lifecycle["thread_web_view_creations"] == 0
+        assert startup_lifecycle["thread_native_timeline_creations"] == 0
 
         target_path.unlink()
         subprocess.run(
@@ -252,11 +252,11 @@ def main() -> None:
             lambda: (
                 state
                 if (state := read_json(lifecycle_path))
-                and state.get("thread_web_view_creations") == 1
+                and state.get("thread_native_timeline_creations") == 1
                 else None
             )
         )
-        assert first_open_lifecycle["thread_web_view"] is True
+        assert first_open_lifecycle["thread_native_timeline"] is True
         assert first_open_lifecycle["thread_open"] is True
         assert first_open_lifecycle["thread_widget_children"] == 1
 
@@ -291,8 +291,8 @@ def main() -> None:
                 else None
             )
         )
-        assert closed_lifecycle["thread_web_view_creations"] == 1
-        assert closed_lifecycle["thread_web_view"] is True
+        assert closed_lifecycle["thread_native_timeline_creations"] == 1
+        assert closed_lifecycle["thread_native_timeline"] is True
         assert closed_lifecycle["thread_widget_children"] == 1
 
         target_path.unlink()
@@ -326,8 +326,8 @@ def main() -> None:
                 else None
             )
         )
-        assert reopened_lifecycle["thread_web_view_creations"] == 1
-        assert reopened_lifecycle["thread_web_view"] is True
+        assert reopened_lifecycle["thread_native_timeline_creations"] == 1
+        assert reopened_lifecycle["thread_native_timeline"] is True
         assert reopened_lifecycle["thread_widget_children"] == 1
 
         # Closing a window with manually parented composer popovers must not

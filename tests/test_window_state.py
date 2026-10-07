@@ -277,11 +277,11 @@ def main() -> None:
             text=True,
         )
         environment = os.environ.copy()
-        lifecycle_file = root / "webview-lifecycle.json"
+        lifecycle_file = root / "timeline-lifecycle.json"
         environment.update(
             {
                 "CONDUIT_RESOURCE_PATH": str(resource),
-                "CONDUIT_TEST_WEBVIEW_LIFECYCLE_FILE": str(lifecycle_file),
+                "CONDUIT_TEST_TIMELINE_LIFECYCLE_FILE": str(lifecycle_file),
                 "CONDUIT_TEST_WORKSPACE": "1",
                 "GSETTINGS_BACKEND": "keyfile",
                 "GSETTINGS_SCHEMA_DIR": str(root),
@@ -297,9 +297,9 @@ def main() -> None:
             environment["CONDUIT_TEST_INITIAL_SYNC"] = "1"
             process, window_id = run_application(binary, environment)
             lifecycle = wait_until(lambda: read_json(lifecycle_file))
-            assert lifecycle["main_web_view"] is True
-            assert lifecycle["thread_web_view"] is False
-            assert lifecycle["thread_web_view_creations"] == 0
+            assert lifecycle["main_native_timeline"] is True
+            assert lifecycle["thread_native_timeline"] is False
+            assert lifecycle["thread_native_timeline_creations"] == 0
             assert lifecycle["thread_open"] is False
             assert lifecycle["thread_widget_children"] == 0
             verify_initial_sync_interactive(window_id)

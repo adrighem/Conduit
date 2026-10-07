@@ -103,6 +103,8 @@ def main() -> None:
                 "XDG_DATA_HOME": str(root / "data"),
             }
         )
+        # The status dialog picks emoji through the shared EmojiPickerWindow;
+        # the dialog itself only owns the selected name, text and expiration.
         cases = [
             {
                 "name": "empty-wide",
@@ -112,13 +114,7 @@ def main() -> None:
                 "status_has_value": False,
                 "header_subtitle": "",
                 "maximum_width": None,
-                "emoji_query": "",
-                "emoji_first_visible_name": None,
-                "emoji_contains_late_custom": False,
-                "emoji_visible_count": 0,
-                "emoji_popup_visible": False,
                 "emoji_selected_name": "",
-                "emoji_selected_visible_name": None,
             },
             {
                 "name": "preset-narrow",
@@ -131,40 +127,10 @@ def main() -> None:
                 "status_has_value": True,
                 "header_subtitle": "🏠 Working remotely",
                 "maximum_width": 400,
-                "emoji_query": "",
-                "emoji_first_visible_name": None,
-                "emoji_contains_late_custom": False,
-                "emoji_visible_count": 0,
-                "emoji_popup_visible": False,
                 "emoji_selected_name": "house",
-                "emoji_selected_visible_name": None,
-                "emoji_selected_summary_kind": "unicode",
             },
             {
-                "name": "late-custom-filter",
-                "extra_environment": {
-                    "CONDUIT_TEST_STATUS_EMOJI_QUERY": "late status parr",
-                    "CONDUIT_TEST_STATUS_LATE_EMOJI": "1",
-                    "CONDUIT_TEST_STATUS_OPEN_EMOJI": "1",
-                    "CONDUIT_TEST_STATUS_PRESET": "1",
-                },
-                "save_enabled": True,
-                "clear_available": True,
-                "status_has_value": True,
-                "header_subtitle": "🏠 Working remotely",
-                "maximum_width": None,
-                "emoji_query": "late status parr",
-                "emoji_first_visible_name": "late_status_parrot",
-                "emoji_contains_late_custom": True,
-                "emoji_visible_count": 1,
-                "emoji_popup_visible": True,
-                "emoji_selected_name": "house",
-                "emoji_selected_visible_name": None,
-                "emoji_selected_summary_kind": "unicode",
-                "expect_animation": True,
-            },
-            {
-                "name": "selected-custom-summary",
+                "name": "late-custom-preset",
                 "extra_environment": {
                     "CONDUIT_TEST_STATUS_CUSTOM_PRESET": "1",
                     "CONDUIT_TEST_STATUS_LATE_EMOJI": "1",
@@ -175,56 +141,7 @@ def main() -> None:
                 "status_has_value": True,
                 "header_subtitle": "● Working remotely",
                 "maximum_width": None,
-                "emoji_query": "",
-                "emoji_first_visible_name": None,
-                "emoji_contains_late_custom": True,
-                "emoji_visible_count": 0,
-                "emoji_popup_visible": False,
                 "emoji_selected_name": "late_status_parrot",
-                "emoji_selected_visible_name": None,
-                "emoji_selected_summary_kind": "custom-image",
-                "expect_animation": True,
-            },
-            {
-                "name": "default-grid",
-                "extra_environment": {
-                    "CONDUIT_TEST_STATUS_OPEN_EMOJI": "1",
-                },
-                "save_enabled": False,
-                "clear_available": False,
-                "status_has_value": False,
-                "header_subtitle": "",
-                "maximum_width": None,
-                "emoji_query": "",
-                "emoji_first_visible_name": "grinning",
-                "emoji_contains_late_custom": False,
-                "emoji_visible_count": 64,
-                "emoji_popup_visible": True,
-                "emoji_selected_name": "",
-                "emoji_selected_visible_name": None,
-            },
-            {
-                "name": "late-custom-reopen",
-                "extra_environment": {
-                    "CONDUIT_TEST_STATUS_EMOJI_QUERY": "late status parr",
-                    "CONDUIT_TEST_STATUS_LATE_EMOJI": "1",
-                    "CONDUIT_TEST_STATUS_OPEN_EMOJI": "1",
-                    "CONDUIT_TEST_STATUS_PRESET": "1",
-                    "CONDUIT_TEST_STATUS_REOPEN_EMOJI": "1",
-                },
-                "save_enabled": True,
-                "clear_available": True,
-                "status_has_value": True,
-                "header_subtitle": "🏠 Working remotely",
-                "maximum_width": None,
-                "emoji_query": "",
-                "emoji_first_visible_name": "grinning",
-                "emoji_contains_late_custom": True,
-                "emoji_visible_count": 64,
-                "emoji_popup_visible": True,
-                "emoji_selected_name": "house",
-                "emoji_selected_visible_name": None,
-                "emoji_selected_summary_kind": "unicode",
             },
         ]
 
@@ -233,9 +150,6 @@ def main() -> None:
             environment = base_environment.copy()
             environment.update(case["extra_environment"])
             environment["CONDUIT_TEST_STATUS_UI_FILE"] = str(state_path)
-            animation_path = root / f"{case['name']}-animation.json"
-            if case.get("expect_animation"):
-                environment["CONDUIT_TEST_STATUS_ANIMATION_FILE"] = str(animation_path)
             process = subprocess.Popen(
                 [str(binary)],
                 env=environment,
@@ -261,42 +175,10 @@ def main() -> None:
                     width_matches = case["maximum_width"] is None or (
                         0 < state.get("window_width", 0) <= case["maximum_width"]
                     )
-                    visible_count = state.get("emoji_visible_choice_count")
-                    expected_visible_count = case["emoji_visible_count"]
-                    visible_count_matches = (
-                        visible_count == state.get("emoji_choice_count")
-                        if expected_visible_count is None
-                        else visible_count == expected_visible_count
-                    )
-                    page_total = state.get("emoji_page_total")
-                    page_total_matches = (
-                        page_total >= visible_count
-                        if case["emoji_popup_visible"]
-                        else page_total == 0
-                    )
                     if (
                         state.get("dialog_heading") == "Set a status"
-                        and state.get("emoji_search") is True
-                        and state.get("emoji_filter_ready") is True
-                        and state.get("emoji_layout") == "reaction-grid"
-                        and state.get("emoji_category_count") == 10
-                        and state.get("emoji_active_category") == "Smileys"
-                        and state.get("emoji_choice_count", 0) > 1_800
-                        and visible_count_matches
-                        and page_total_matches
-                        and state.get("emoji_query") == case["emoji_query"]
-                        and state.get("emoji_first_visible_name")
-                        == case["emoji_first_visible_name"]
-                        and state.get("emoji_contains_late_custom")
-                        == case["emoji_contains_late_custom"]
-                        and state.get("emoji_popup_visible")
-                        == case["emoji_popup_visible"]
                         and state.get("emoji_selected_name")
                         == case["emoji_selected_name"]
-                        and state.get("emoji_selected_visible_name")
-                        == case["emoji_selected_visible_name"]
-                        and state.get("emoji_selected_summary_kind")
-                        == case.get("emoji_selected_summary_kind", "text")
                         and state.get("expiration_choice_count") == 6
                         and state.get("save_enabled") == case["save_enabled"]
                         and state.get("clear_available") == case["clear_available"]
@@ -319,26 +201,6 @@ def main() -> None:
                     raise AssertionError(
                         f"{error}; last observed state: {observed}"
                     ) from error
-
-                if case.get("expect_animation"):
-                    def animation_advanced() -> bool:
-                        try:
-                            animation = json.loads(animation_path.read_text(encoding="utf-8"))
-                        except (FileNotFoundError, json.JSONDecodeError):
-                            return False
-                        return animation.get("frame_updates", 0) >= 2
-
-                    try:
-                        wait_until(animation_advanced, timeout=5.0)
-                    except AssertionError as error:
-                        observed = (
-                            animation_path.read_text(encoding="utf-8")
-                            if animation_path.exists()
-                            else "<missing>"
-                        )
-                        raise AssertionError(
-                            f"{error}; last animation state: {observed}"
-                        ) from error
 
                 quit_application(environment)
                 assert process.wait(timeout=10) == 0

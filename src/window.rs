@@ -11417,6 +11417,7 @@ impl ConduitWindow {
             thread_native_timeline.set_read_mark_target(channel_id, Some(ts));
             thread_native_timeline.set_messages(&messages, &context, focus_message_ts.as_deref());
             self.thread_pane().ensure_open();
+            record_test_timeline_lifecycle(self);
         }
     }
 
@@ -12533,7 +12534,7 @@ impl ConduitWindow {
             .borrow_mut()
             .reset();
         self.thread_pane().close();
-        record_test_web_view_lifecycle(self);
+        record_test_timeline_lifecycle(self);
     }
 
     fn show_thread_placeholder(&self, message: &str) {
@@ -12541,7 +12542,7 @@ impl ConduitWindow {
             .borrow_mut()
             .reset();
         self.thread_pane().show_placeholder(message);
-        record_test_web_view_lifecycle(self);
+        record_test_timeline_lifecycle(self);
     }
 
     fn thread_pane(&self) -> ThreadPane {
@@ -13063,11 +13064,12 @@ fn set_huddle_button_state(button: &gtk::Button, icon_name: &str, label: &str) {
     button.update_property(&[gtk::accessible::Property::Label(label)]);
 }
 
-fn record_test_web_view_lifecycle(window: &ConduitWindow) {
-    let Some(path) = std::env::var_os("CONDUIT_TEST_WEBVIEW_LIFECYCLE_FILE") else {
+fn record_test_timeline_lifecycle(window: &ConduitWindow) {
+    let Some(path) = std::env::var_os("CONDUIT_TEST_TIMELINE_LIFECYCLE_FILE") else {
         return;
     };
     let imp = window.imp();
+    let thread_pane = window.thread_pane();
     let mut thread_widget_children = 0;
     let mut child = imp.thread_view_box.first_child();
     while let Some(widget) = child {
@@ -13077,10 +13079,10 @@ fn record_test_web_view_lifecycle(window: &ConduitWindow) {
     let _ = std::fs::write(
         path,
         serde_json::json!({
-            "main_web_view": false,
-            "thread_web_view": false,
-            "thread_web_view_creations": 0,
-            "thread_open": window.thread_pane().is_open(),
+            "main_native_timeline": imp.native_timeline_view.borrow().is_some(),
+            "thread_native_timeline": thread_pane.has_native_timeline(),
+            "thread_native_timeline_creations": thread_pane.native_timeline_creations(),
+            "thread_open": thread_pane.is_open(),
             "thread_widget_children": thread_widget_children,
             "selected_channel": window.selected_channel_id(),
         })
