@@ -3735,12 +3735,15 @@ impl ConduitWindow {
     }
 
     fn mark_thread_read(&self, channel_id: &str, thread_ts: &str) {
-        let advanced = self
-            .imp()
-            .workspace
-            .threads
-            .borrow_mut()
-            .mark_read(channel_id, thread_ts);
+        let (advanced, target_ts) = {
+            let mut threads = self.imp().workspace.threads.borrow_mut();
+            let advanced = threads.mark_read(channel_id, thread_ts);
+            let target_ts = threads
+                .get(channel_id, thread_ts)
+                .and_then(|r| r.last_read.clone())
+                .unwrap_or_else(|| thread_ts.to_string());
+            (advanced, target_ts)
+        };
         crate::debug::log(
             "readstate",
             &format!(
@@ -3753,6 +3756,7 @@ impl ConduitWindow {
         self.send_command(RuntimeCommand::MarkThreadRead {
             channel_id: channel_id.to_string(),
             thread_ts: thread_ts.to_string(),
+            target_ts: Some(target_ts),
         });
         self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
         self.queue_unread_separator_refresh();

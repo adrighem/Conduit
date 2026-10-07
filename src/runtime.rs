@@ -594,6 +594,7 @@ impl RuntimeCommand {
             Self::MarkThreadRead {
                 channel_id,
                 thread_ts,
+                ..
             } => RuntimeCommandDescriptor::mutation(
                 OperationContext::new(
                     RuntimeOperation::MarkThreadRead,
@@ -2847,10 +2848,63 @@ impl HuddleSessionSupervisor {
     }
 }
 
+struct ReadFlusherSessionSupervisor {
+    session: SessionId,
+    start: Option<oneshot::Sender<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ReadFlusherSessionSupervisor {
+    fn spawn(
+        session: SessionId,
+        handle: ReadFlusherHandle,
+        api: SlackApi,
+        debounce_delay: Duration,
+    ) -> Self {
+        let (start, start_receiver) = oneshot::channel();
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            if start_receiver.await.is_err() {
+                return;
+            }
+            run_read_flusher_loop(handle, api, debounce_delay, shutdown_receiver).await;
+        });
+        Self {
+            session,
+            start: Some(start),
+            shutdown: Some(shutdown),
+            task,
+        }
+    }
+
+    fn start(&mut self) -> bool {
+        self.start
+            .take()
+            .is_some_and(|start| start.send(()).is_ok())
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Err(error) = self.task.await {
+            crate::debug::log(
+                "read_flusher",
+                &format!(
+                    "ReadFlusherSupervisorFailed session={:?} error={error}",
+                    self.session
+                ),
+            );
+        }
+    }
+}
+
 #[derive(Default)]
 struct RuntimeSessionSupervisors {
     realtime: Option<RealtimeSessionSupervisor>,
     huddle: Option<HuddleSessionSupervisor>,
+    read_flusher: Option<ReadFlusherSessionSupervisor>,
 }
 
 struct RuntimeState {
@@ -2858,6 +2912,7 @@ struct RuntimeState {
     connection: Option<RuntimeConnection>,
     realtime: Option<RealtimeSessionSupervisor>,
     huddle: Option<HuddleSessionSupervisor>,
+    read_flusher: Option<ReadFlusherSessionSupervisor>,
     attention_preferences: AttentionPreferences,
     tasks: HashMap<u64, tokio::task::AbortHandle>,
     task_requests: HashMap<u64, TrackedRequest>,
@@ -2875,6 +2930,7 @@ impl RuntimeState {
             connection: None,
             realtime: None,
             huddle: None,
+            read_flusher: None,
             attention_preferences: AttentionPreferences::default(),
             tasks: HashMap::new(),
             task_requests: HashMap::new(),
@@ -2900,6 +2956,7 @@ impl RuntimeState {
         RuntimeSessionSupervisors {
             realtime: self.realtime.take(),
             huddle: self.huddle.take(),
+            read_flusher: self.read_flusher.take(),
         }
     }
 
@@ -2928,6 +2985,20 @@ impl RuntimeState {
             return Err(supervisor);
         }
         self.huddle = Some(supervisor);
+        Ok(())
+    }
+
+    fn install_read_flusher_supervisor(
+        &mut self,
+        mut supervisor: ReadFlusherSessionSupervisor,
+    ) -> std::result::Result<(), ReadFlusherSessionSupervisor> {
+        if self.active_session != supervisor.session || self.read_flusher.is_some() {
+            return Err(supervisor);
+        }
+        if !supervisor.start() {
+            return Err(supervisor);
+        }
+        self.read_flusher = Some(supervisor);
         Ok(())
     }
 
@@ -3084,6 +3155,9 @@ async fn replace_session_and_drain(state: &Arc<Mutex<RuntimeState>>, session: Se
     }
     if let Some(huddle) = supervisors.huddle {
         huddle.shutdown().await;
+    }
+    if let Some(flusher) = supervisors.read_flusher {
+        flusher.shutdown().await;
     }
 }
 
@@ -4701,6 +4775,22 @@ async fn spawn_workspace_tasks(
         .err();
     if let Some(rejected_huddle) = rejected_huddle {
         rejected_huddle.shutdown().await;
+        return;
+    }
+
+    let flusher_supervisor = ReadFlusherSessionSupervisor::spawn(
+        identity.session,
+        connection.read_flusher.clone(),
+        connection.slack.clone(),
+        Duration::from_millis(500),
+    );
+    let rejected_flusher = state
+        .lock()
+        .expect("runtime state lock poisoned")
+        .install_read_flusher_supervisor(flusher_supervisor)
+        .err();
+    if let Some(rejected_flusher) = rejected_flusher {
+        rejected_flusher.shutdown().await;
         return;
     }
 
@@ -6678,15 +6768,20 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         RuntimeCommand::MarkThreadRead {
             channel_id,
             thread_ts,
+            target_ts,
         } => {
             apply_local_read_state(
                 context,
                 WorkspaceMutation::ThreadRead {
-                    channel_id,
-                    root_ts: thread_ts,
+                    channel_id: channel_id.clone(),
+                    root_ts: thread_ts.clone(),
                 },
             )
             .await;
+            let target = target_ts.as_deref().unwrap_or(&thread_ts);
+            context
+                .read_flusher
+                .enqueue_thread(&channel_id, &thread_ts, target);
         }
     }
 
@@ -8612,14 +8707,12 @@ impl EventSenderExt for RuntimeEventSender {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct PendingReadMark {
     pub channel_id: String,
     pub target_ts: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct PendingThreadReadMark {
     pub channel_id: String,
     pub thread_ts: String,
@@ -8627,7 +8720,6 @@ pub struct PendingThreadReadMark {
 }
 
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 pub struct ReadFlusherQueue {
     last_marked: HashMap<String, String>,
     pending: HashMap<String, String>,
@@ -8635,7 +8727,6 @@ pub struct ReadFlusherQueue {
     pending_threads: HashMap<(String, String), String>,
 }
 
-#[allow(dead_code)]
 impl ReadFlusherQueue {
     pub fn new() -> Self {
         Self::default()
@@ -8773,13 +8864,11 @@ impl ReadFlusherQueue {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct ReadFlusherHandle {
     queue: Arc<Mutex<ReadFlusherQueue>>,
     notify: Arc<Notify>,
 }
 
-#[allow(dead_code)]
 impl ReadFlusherHandle {
     pub fn new(queue: Arc<Mutex<ReadFlusherQueue>>, notify: Arc<Notify>) -> Self {
         Self { queue, notify }
@@ -8849,7 +8938,6 @@ impl ReadFlusherHandle {
     }
 }
 
-#[allow(dead_code)]
 pub async fn execute_read_flusher_mark(api: &SlackApi, mark: &PendingReadMark) -> Result<()> {
     let mut retries = 0usize;
     loop {
@@ -8870,24 +8958,65 @@ pub async fn execute_read_flusher_mark(api: &SlackApi, mark: &PendingReadMark) -
     }
 }
 
-#[allow(dead_code)]
+pub async fn execute_read_flusher_thread_mark(
+    api: &SlackApi,
+    mark: &PendingThreadReadMark,
+) -> Result<()> {
+    let mut retries = 0usize;
+    loop {
+        match api
+            .subscriptions_thread_mark(&mark.channel_id, &mark.thread_ts, &mark.target_ts)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(slack_err) => {
+                if slack_err.category() == SlackErrorCategory::RateLimited && retries < 3 {
+                    retries += 1;
+                    tokio::time::sleep(Duration::from_millis(500 * (1 << retries))).await;
+                    continue;
+                }
+                return Err(anyhow::Error::from(slack_err));
+            }
+        }
+    }
+}
+
 pub async fn run_read_flusher_loop(
     handle: ReadFlusherHandle,
     api: SlackApi,
     debounce_delay: Duration,
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
-        if shutdown.try_recv().is_ok() {
+        if wait_for_realtime_or_shutdown(&mut shutdown, handle.notify.notified())
+            .await
+            .is_none()
+        {
             let marks = handle.flush();
             for mark in marks {
                 let _ = execute_read_flusher_mark(&api, &mark).await;
             }
+            let thread_marks = handle.flush_threads();
+            for thread_mark in thread_marks {
+                let _ = execute_read_flusher_thread_mark(&api, &thread_mark).await;
+            }
             break;
         }
 
-        handle.notify.notified().await;
-        tokio::time::sleep(debounce_delay).await;
+        if wait_for_realtime_or_shutdown(&mut shutdown, tokio::time::sleep(debounce_delay))
+            .await
+            .is_none()
+        {
+            let marks = handle.flush();
+            for mark in marks {
+                let _ = execute_read_flusher_mark(&api, &mark).await;
+            }
+            let thread_marks = handle.flush_threads();
+            for thread_mark in thread_marks {
+                let _ = execute_read_flusher_thread_mark(&api, &thread_mark).await;
+            }
+            break;
+        }
 
         let marks = handle.flush();
         for mark in marks {
@@ -8897,6 +9026,19 @@ pub async fn run_read_flusher_loop(
                     &format!(
                         "conversations_mark failed channel={} error={error}",
                         mark.channel_id
+                    ),
+                );
+            }
+        }
+        let thread_marks = handle.flush_threads();
+        for thread_mark in thread_marks {
+            if let Err(error) = execute_read_flusher_thread_mark(&api, &thread_mark).await {
+                crate::debug::log(
+                    "read_flusher",
+                    &format!(
+                        "subscriptions_thread_mark failed channel={} thread={} error={error}",
+                        thread_mark.channel_id,
+                        thread_mark.thread_ts,
                     ),
                 );
             }
@@ -16993,6 +17135,7 @@ mod tests {
             RuntimeCommand::MarkThreadRead {
                 channel_id: "C1".to_string(),
                 thread_ts: "1.0".to_string(),
+                target_ts: Some("1.0".to_string()),
             },
             RuntimeCommand::UploadFiles {
                 channel_id: "C1".to_string(),
@@ -19992,5 +20135,94 @@ mod tests {
             Some("110.000000")
         );
         assert!(queue.flush_threads().is_empty());
+    }
+
+    #[test]
+    fn read_flusher_loop_flushes_conversations_and_threads() {
+        admission_test_runtime().block_on(async {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let server_addr = server.server_addr().to_ip().unwrap();
+
+            let server_thread = std::thread::spawn(move || {
+                // First request: conversations.mark
+                let mut req = server.recv().unwrap();
+                assert_eq!(req.url(), "/api/conversations.mark");
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                assert!(body.contains("channel=C1"));
+                assert!(body.contains("ts=150.000000"));
+                req.respond(
+                    tiny_http::Response::from_string(r#"{"ok":true}"#).with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                    ),
+                )
+                .unwrap();
+
+                // Second request: subscriptions.thread.mark
+                let mut req = server.recv().unwrap();
+                assert_eq!(req.url(), "/api/subscriptions.thread.mark");
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                assert!(body.contains("channel=C1"));
+                assert!(body.contains("thread_ts=100.000000"));
+                assert!(body.contains("ts=120.000000"));
+                req.respond(
+                    tiny_http::Response::from_string(r#"{"ok":true}"#).with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                    ),
+                )
+                .unwrap();
+            });
+
+            let mut slack = SlackApi::new(StoredToken {
+                access_token: "test-token".to_string(),
+                ..Default::default()
+            });
+            slack.api_base_url = format!("http://{server_addr}/api");
+
+            let handle = ReadFlusherHandle::new(
+                Arc::new(Mutex::new(ReadFlusherQueue::new())),
+                Arc::new(Notify::new()),
+            );
+            handle.enqueue("C1", "150.000000");
+            handle.enqueue_thread("C1", "100.000000", "120.000000");
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let flusher_task = tokio::spawn(run_read_flusher_loop(
+                handle.clone(),
+                slack,
+                Duration::from_millis(10),
+                shutdown_rx,
+            ));
+
+            // Sleep to allow debounce + flush
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = shutdown_tx.send(());
+            flusher_task.await.unwrap();
+            server_thread.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn read_flusher_supervisor_lifecycle() {
+        admission_test_runtime().block_on(async {
+            let handle = ReadFlusherHandle::new(
+                Arc::new(Mutex::new(ReadFlusherQueue::new())),
+                Arc::new(Notify::new()),
+            );
+            let slack = SlackApi::new(StoredToken {
+                access_token: "test-token".to_string(),
+                ..Default::default()
+            });
+            let session = SessionId(42);
+            let mut supervisor = ReadFlusherSessionSupervisor::spawn(
+                session,
+                handle,
+                slack,
+                Duration::from_millis(10),
+            );
+            assert!(supervisor.start());
+            supervisor.shutdown().await;
+        });
     }
 }

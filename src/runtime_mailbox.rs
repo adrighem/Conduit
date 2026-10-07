@@ -185,11 +185,11 @@ pub enum RuntimeCommand {
         channel_id: String,
         ts: String,
     },
-    /// Local-only: no Slack API backs thread-level read state. Marks the
-    /// given thread fully read up to its latest known reply.
+    /// Marks given thread read up to target_ts or latest reply.
     MarkThreadRead {
         channel_id: String,
         thread_ts: String,
+        target_ts: Option<String>,
     },
     UploadFiles {
         channel_id: String,
