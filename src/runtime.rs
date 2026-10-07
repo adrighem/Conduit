@@ -20225,4 +20225,50 @@ mod tests {
             supervisor.shutdown().await;
         });
     }
+
+    #[test]
+    fn realtime_marked_events_reduce_to_workspace_patches() {
+        let workspace = WorkspaceReducerAdapter::default();
+        let key = crate::thread_catalog::ThreadKey::new("C1", "100.0").unwrap();
+        let mut record = crate::thread_catalog::ThreadRecord::placeholder(key);
+        record.reply_count = 1;
+        record.latest_reply = Some("110.0".to_string());
+        workspace.apply(
+            MutationOrigin::WebApi,
+            WorkspaceMutation::ThreadCatalogChanged(vec![record]),
+        );
+        workspace.apply(
+            MutationOrigin::WebApi,
+            WorkspaceMutation::CountsSnapshot(vec![crate::unread_ledger::ServerReadCounts {
+                channel_id: "C1".to_string(),
+                last_read: Some("100.0".to_string()),
+                latest: Some("150.0".to_string()),
+                mention_count: 0,
+                unread_count: 1,
+                has_unreads: true,
+            }]),
+        );
+
+        let conv_marked_event = SocketModeEvent::ConversationMarked {
+            channel_id: "C1".to_string(),
+            ts: "150.0".to_string(),
+        };
+        let reduction = reduce_realtime_workspace_event(&workspace, &conv_marked_event)
+            .expect("conversation marked reduction expected");
+        assert!(reduction.patch().changes().iter().any(|c| matches!(
+            c,
+            crate::workspace_pipeline::WorkspaceChange::ReadStatesChanged(_)
+        )));
+
+        let thread_marked_event = SocketModeEvent::ThreadMarked {
+            channel_id: "C1".to_string(),
+            thread_ts: "100.0".to_string(),
+        };
+        let reduction = reduce_realtime_workspace_event(&workspace, &thread_marked_event)
+            .expect("thread marked reduction expected");
+        assert!(reduction.patch().changes().iter().any(|c| matches!(
+            c,
+            crate::workspace_pipeline::WorkspaceChange::ThreadCatalogChanged(_)
+        )));
+    }
 }

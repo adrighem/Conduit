@@ -3268,6 +3268,37 @@ mod tests {
     }
 
     #[test]
+    fn thread_read_mutation_marks_thread_read_and_updates_catalog() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let key = ThreadKey::new("C1", "100.0").unwrap();
+        let mut record = ThreadRecord::placeholder(key);
+        record.reply_count = 2;
+        record.latest_reply = Some("120.0".to_string());
+        coordinator.apply(WorkspaceMutation::ThreadCatalogChanged(vec![record]));
+
+        let rec = coordinator.thread_catalog.get("C1", "100.0").unwrap();
+        assert!(rec.has_unread_replies());
+        assert_eq!(rec.unread_reply_count(), 2);
+
+        let reduction = coordinator
+            .apply(WorkspaceMutation::ThreadRead {
+                channel_id: "C1".to_string(),
+                root_ts: "100.0".to_string(),
+            })
+            .expect("reduction expected");
+
+        assert!(reduction.patch().changes().iter().any(|c| matches!(
+            c,
+            WorkspaceChange::ThreadCatalogChanged(_)
+        )));
+
+        let rec = coordinator.thread_catalog.get("C1", "100.0").unwrap();
+        assert!(!rec.has_unread_replies());
+        assert_eq!(rec.unread_reply_count(), 0);
+        assert_eq!(rec.last_read.as_deref(), Some("120.0"));
+    }
+
+    #[test]
     fn mark_unread_moves_back_and_derives_badges_from_loaded_history() {
         let mut coordinator = WorkspaceCoordinator::default();
         configure_attention(&mut coordinator);
