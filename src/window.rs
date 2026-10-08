@@ -1663,9 +1663,10 @@ fn runtime_event_is_start_failure(event: &RuntimeEvent) -> bool {
 fn message_notification_body(
     message: Option<&SlackMessage>,
     user_names: &HashMap<String, String>,
+    user_full_names: &HashMap<String, String>,
 ) -> Option<String> {
     let visible_text = message.map(SlackMessage::visible_text).unwrap_or_default();
-    let text = rendering::notification_plain_text(&visible_text, user_names)?;
+    let text = rendering::notification_plain_text(&visible_text, user_names, user_full_names)?;
     if !text.is_empty() {
         Some(text)
     } else if message
@@ -1683,8 +1684,9 @@ fn message_notification_content(
     channel_notification: bool,
     message: &SlackMessage,
     user_names: &HashMap<String, String>,
+    user_full_names: &HashMap<String, String>,
 ) -> Option<(String, String)> {
-    let body = message_notification_body(Some(message), user_names)?;
+    let body = message_notification_body(Some(message), user_names, user_full_names)?;
     if !channel_notification {
         return Some((conversation_title.to_string(), body));
     }
@@ -1692,7 +1694,12 @@ fn message_notification_content(
     let sender = message
         .user
         .as_deref()
-        .and_then(|user_id| user_names.get(user_id).cloned())
+        .and_then(|user_id| {
+            user_full_names
+                .get(user_id)
+                .or_else(|| user_names.get(user_id))
+                .cloned()
+        })
         .or_else(|| message.user.is_none().then(|| message.author_label()))?;
     Some((conversation_title.to_string(), format!("{sender}: {body}")))
 }
@@ -1791,6 +1798,19 @@ fn notification_target_resolution(
         Some(_) if !workspace_ready => NotificationTargetResolution::Wait,
         Some(_) => NotificationTargetResolution::Open,
     }
+}
+
+fn is_focus_in_conversation_or_thread(window: &ConduitWindow) -> bool {
+    let Some(focus) = window.focus() else {
+        return false;
+    };
+    let imp = window.imp();
+    let message_pane = imp.message_pane.get();
+    let thread_pane = imp.thread_pane.get();
+    focus == message_pane
+        || focus.is_ancestor(&message_pane)
+        || focus == thread_pane
+        || focus.is_ancestor(&thread_pane)
 }
 
 fn conversation_target_action<'a>(
@@ -3450,15 +3470,22 @@ impl ConduitWindow {
                 });
         }
 
-        let close_click = gtk::GestureClick::new();
-        close_click.set_button(gtk::gdk::BUTTON_PRIMARY);
-        let weak_window = self.downgrade();
-        close_click.connect_released(move |_, _, _, _| {
-            if let Some(window) = weak_window.upgrade() {
-                window.close_media_viewer();
-            }
+        let drag = gtk::GestureDrag::new();
+        let start_pos = Rc::new(Cell::new((0.0, 0.0)));
+        let start_pos_begin = start_pos.clone();
+        let scroller_begin = viewer.image_scroller.clone();
+        drag.connect_drag_begin(move |_, _, _| {
+            let h = scroller_begin.hadjustment().value();
+            let v = scroller_begin.vadjustment().value();
+            start_pos_begin.set((h, v));
         });
-        viewer.image.add_controller(close_click);
+        let scroller_update = viewer.image_scroller.clone();
+        drag.connect_drag_update(move |_, offset_x, offset_y| {
+            let (start_h, start_v) = start_pos.get();
+            scroller_update.hadjustment().set_value(start_h - offset_x);
+            scroller_update.vadjustment().set_value(start_v - offset_y);
+        });
+        viewer.image_scroller.add_controller(drag);
 
         let context_click = gtk::GestureClick::new();
         context_click.set_button(gtk::gdk::BUTTON_SECONDARY);
@@ -3940,6 +3967,34 @@ impl ConduitWindow {
             {
                 window.cancel_message_edit();
                 glib::Propagation::Stop
+            } else if key == gtk::gdk::Key::Escape
+                && !state.intersects(
+                    gtk::gdk::ModifierType::CONTROL_MASK
+                        | gtk::gdk::ModifierType::ALT_MASK
+                        | gtk::gdk::ModifierType::SUPER_MASK,
+                )
+            {
+                let completion_open = window
+                    .composer_completion(ComposerTarget::Message)
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|c| c.popover.is_visible())
+                    || window
+                        .composer_completion(ComposerTarget::Thread)
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|c| c.popover.is_visible());
+                if completion_open {
+                    return glib::Propagation::Proceed;
+                }
+                if window.imp().thread_split.shows_sidebar()
+                    && is_focus_in_conversation_or_thread(&window)
+                {
+                    window.close_thread();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
             } else {
                 glib::Propagation::Proceed
             }
@@ -7417,6 +7472,7 @@ impl ConduitWindow {
             self.set_status(&gettext("Wait for the edited message to finish saving."));
             return;
         }
+        self.close_thread();
         let imp = self.imp();
         if imp.profile_visible.replace(false) {
             imp.pending_profile_user_id.borrow_mut().take();
@@ -11293,6 +11349,7 @@ impl ConduitWindow {
         }
         self.imp().pending_last_conversation.borrow_mut().take();
         self.save_selected_conversation();
+        imp.message_entry.grab_focus();
         true
     }
 
@@ -11317,6 +11374,7 @@ impl ConduitWindow {
             imp.message_title
                 .set_title(&self.conversation_title(channel_id));
         }
+        self.request_image_assets(messages.iter());
         let mut context = self.message_html_context(None);
         (
             context.message_control_handles,
@@ -12185,6 +12243,7 @@ impl ConduitWindow {
                 channel_notification,
                 message,
                 &self.imp().user_names.borrow(),
+                &self.imp().user_full_names.borrow(),
             )
         });
         if let Some((title, body)) = content {
@@ -12292,6 +12351,7 @@ impl ConduitWindow {
                 channel_notification,
                 &notification.message,
                 &user_names,
+                &user_full_names,
             ) else {
                 continue;
             };
@@ -14971,7 +15031,7 @@ mod tests {
     #[test]
     fn notification_body_uses_fallback_for_empty_message_text() {
         assert_eq!(
-            message_notification_body(None, &HashMap::new()),
+            message_notification_body(None, &HashMap::new(), &HashMap::new()),
             Some("New message".into())
         );
         assert_eq!(
@@ -14981,14 +15041,16 @@ mod tests {
                     text: Some("   ".to_string()),
                     ..Default::default()
                 }),
-                &HashMap::new()
+                &HashMap::new(),
+                &HashMap::new(),
             ),
             Some("New message".into())
         );
         assert_eq!(
             message_notification_body(
                 Some(&message("1710000200.000000", "Hello")),
-                &HashMap::new()
+                &HashMap::new(),
+                &HashMap::new(),
             ),
             Some("Hello".into())
         );
@@ -15008,6 +15070,7 @@ mod tests {
             message_notification_body(
                 Some(&message),
                 &HashMap::from([("U123".to_string(), "Ada".to_string())]),
+                &HashMap::new(),
             )
             .as_deref(),
             Some("Review with @Ada")
@@ -15019,7 +15082,13 @@ mod tests {
         let mut incoming = message("1710000200.000000", "Hello <@U789>");
         incoming.user = Some("U456".into());
         assert_eq!(
-            message_notification_content("general", true, &incoming, &HashMap::new()),
+            message_notification_content(
+                "general",
+                true,
+                &incoming,
+                &HashMap::new(),
+                &HashMap::new()
+            ),
             None
         );
         assert_eq!(
@@ -15028,6 +15097,7 @@ mod tests {
                 true,
                 &incoming,
                 &HashMap::from([("U456".into(), "Ada".into())]),
+                &HashMap::new(),
             ),
             None
         );
@@ -15040,8 +15110,25 @@ mod tests {
                     ("U456".into(), "Ada".into()),
                     ("U789".into(), "Grace".into()),
                 ]),
+                &HashMap::new(),
             ),
             Some(("general".into(), "Ada: Hello @Grace".into()))
+        );
+        assert_eq!(
+            message_notification_content(
+                "general",
+                true,
+                &incoming,
+                &HashMap::from([
+                    ("U456".into(), "ada".into()),
+                    ("U789".into(), "grace".into()),
+                ]),
+                &HashMap::from([
+                    ("U456".into(), "Ada Lovelace".into()),
+                    ("U789".into(), "Grace Hopper".into()),
+                ]),
+            ),
+            Some(("general".into(), "Ada Lovelace: Hello @Grace Hopper".into()))
         );
         assert_eq!(
             message_notification_content(
@@ -15049,6 +15136,7 @@ mod tests {
                 false,
                 &incoming,
                 &HashMap::from([("U789".into(), "Grace".into())]),
+                &HashMap::new(),
             ),
             Some(("Ada".into(), "Hello @Grace".into()))
         );

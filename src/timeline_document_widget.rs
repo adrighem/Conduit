@@ -73,7 +73,9 @@ impl<'a> DocumentRenderer<'a> {
 
     fn render_node(&self, node: &MessageNode, target: &Box) {
         match node {
-            MessageNode::Text(text) => render_text_content(text, target, self.context),
+            MessageNode::Text(text) => {
+                render_text_content(text, target, self.context, self.on_action)
+            }
             MessageNode::Header(text) => target.append(&markup_label(&format!(
                 "<span size=\"larger\" weight=\"bold\">{}</span>",
                 glib::markup_escape_text(text)
@@ -119,6 +121,7 @@ impl<'a> DocumentRenderer<'a> {
         create_message_text_widget(
             &crate::message_html::mrkdwn_to_pango(text, self.context),
             self.context,
+            self.on_action,
         )
     }
 
@@ -133,7 +136,7 @@ impl<'a> DocumentRenderer<'a> {
         let body = Box::new(Orientation::Vertical, 4);
         body.set_hexpand(true);
         if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
-            render_text_content(text, &body, self.context);
+            render_text_content(text, &body, self.context, self.on_action);
         }
         if !fields.is_empty() {
             let widgets = fields
@@ -171,6 +174,7 @@ impl<'a> DocumentRenderer<'a> {
                     let widget = create_message_text_widget(
                         &format!("<span size=\"small\">{pango}</span>"),
                         self.context,
+                        self.on_action,
                     );
                     widget.add_css_class("dim-label");
                     widget.set_valign(gtk::Align::Center);
@@ -184,7 +188,12 @@ impl<'a> DocumentRenderer<'a> {
     fn render_rich_text(&self, node: &RichTextNode, target: &Box) {
         match node {
             RichTextNode::Paragraph(inlines) => {
-                render_text_content(&inlines_to_mrkdwn(inlines), target, self.context);
+                render_text_content(
+                    &inlines_to_mrkdwn(inlines),
+                    target,
+                    self.context,
+                    self.on_action,
+                );
             }
             RichTextNode::Preformatted(inlines) => {
                 let frame = Box::new(Orientation::Vertical, 0);
@@ -222,7 +231,7 @@ impl<'a> DocumentRenderer<'a> {
     fn render_attachment(&self, attachment: &MessageAttachment, target: &Box) {
         register_timeline_css();
         if let Some(pretext) = attachment.pretext.as_deref() {
-            render_text_content(pretext, target, self.context);
+            render_text_content(pretext, target, self.context, self.on_action);
         }
         let card = Box::new(Orientation::Vertical, 4);
         card.add_css_class("timeline-attachment");
@@ -236,7 +245,7 @@ impl<'a> DocumentRenderer<'a> {
             card.append(&linked_label(title, "medium", true));
         }
         if let Some(text) = attachment.text.as_deref() {
-            render_text_content(text, &card, self.context);
+            render_text_content(text, &card, self.context, self.on_action);
         }
         if !attachment.fields.is_empty() {
             let widgets = attachment
@@ -252,7 +261,7 @@ impl<'a> DocumentRenderer<'a> {
             || !attachment.fields.is_empty();
         if !has_text {
             if let Some(fallback) = attachment.fallback.as_deref() {
-                render_text_content(fallback, &card, self.context);
+                render_text_content(fallback, &card, self.context, self.on_action);
             }
         }
         // Unfurl previews on the linked site's own host are never fetched
@@ -302,7 +311,7 @@ impl<'a> DocumentRenderer<'a> {
             (None, Some(value)) => value,
             (None, None) => String::new(),
         };
-        create_message_text_widget(&markup, self.context)
+        create_message_text_widget(&markup, self.context, self.on_action)
     }
 
     fn quote(&self, quote: &MessageQuote) -> Box {

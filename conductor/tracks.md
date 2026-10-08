@@ -81,7 +81,12 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: Slash command detection and Giphy support
+## [x] Track: Slash command detection and Giphy support
 *Link: [./conductor/tracks/slash_commands_giphy_20260915/](./conductor/tracks/slash_commands_giphy_20260915/)*
+
+---
+
+## [x] Track: Bi-directional Read State Sync
+*Link: [./conductor/tracks/read_state_sync_20261007/](./conductor/tracks/read_state_sync_20261007/)*
 
 

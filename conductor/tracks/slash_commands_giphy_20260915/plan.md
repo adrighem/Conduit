@@ -13,13 +13,13 @@
 - [x] Task: Wire slash command execution from composer through runtime dispatch in `src/window.rs` db7ba59
 - [x] Task: Unit and integration tests for `chat.command` client calls and runtime command admission 875d4aa a206fc0
 
-## Phase 3: Giphy Command Support & Ephemeral Handling
+## Phase 3: Giphy Command Support & Ephemeral Handling [checkpoint: db7ba59]
 
-- [~] Task: Add `/giphy` to the supported slash command registry with parameter handling
-- [ ] Task: Handle ephemeral message responses and block actions (Send, Shuffle, Cancel) for Giphy previews
-- [ ] Task: Test Giphy command execution in channels and thread contexts
+- [x] Task: Add `/giphy` to the supported slash command registry with parameter handling 842c376
+- [x] Task: Handle ephemeral message responses and block actions for Giphy previews db7ba59
+- [x] Task: Test Giphy command execution in channels and thread contexts 875d4aa
 
-## Phase 4: Verification & Quality Gates
+## Phase 4: Verification & Quality Gates [checkpoint: a206fc0]
 
-- [ ] Task: Run full test suite (`cargo test`), format check (`cargo fmt --check`), and linter (`cargo clippy`)
-- [ ] Task: Verify manual user workflow for valid and invalid slash commands
+- [x] Task: Run full test suite (`cargo test`), format check (`cargo fmt --check`), and linter (`cargo clippy`) a206fc0
+- [x] Task: Verify manual user workflow for valid and invalid slash commands db7ba59

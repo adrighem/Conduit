@@ -54,7 +54,11 @@ fn extract_mentions(text: &str, ids: &mut Vec<String>) {
 ///
 /// Returns `None` while a mentioned user is still unresolved so callers can
 /// wait for names. Custom workspace emoji stay as `:name:` text.
-pub fn notification_plain_text(text: &str, user_names: &HashMap<String, String>) -> Option<String> {
+pub fn notification_plain_text(
+    text: &str,
+    user_names: &HashMap<String, String>,
+    user_full_names: &HashMap<String, String>,
+) -> Option<String> {
     let custom = HashMap::new();
     let emoji = EmojiCatalog::new(&custom);
     let mut out = String::with_capacity(text.len());
@@ -69,7 +73,11 @@ pub fn notification_plain_text(text: &str, user_names: &HashMap<String, String>)
                     rest = tail;
                     continue;
                 };
-                out.push_str(&plain_angle_token(&tail[..end], user_names)?);
+                out.push_str(&plain_angle_token(
+                    &tail[..end],
+                    user_names,
+                    user_full_names,
+                )?);
                 rest = &tail[end + 1..];
             }
             '&' => match decode_html_entity_prefix(rest) {
@@ -104,13 +112,20 @@ pub fn notification_plain_text(text: &str, user_names: &HashMap<String, String>)
 }
 
 /// Plain text for the inside of one `<...>` token, `None` for unresolved users.
-fn plain_angle_token(inner: &str, user_names: &HashMap<String, String>) -> Option<String> {
+fn plain_angle_token(
+    inner: &str,
+    user_names: &HashMap<String, String>,
+    user_full_names: &HashMap<String, String>,
+) -> Option<String> {
     let (target, label) = match inner.split_once('|') {
         Some((target, label)) => (target, Some(label.trim()).filter(|label| !label.is_empty())),
         None => (inner, None),
     };
     if let Some(user_id) = target.strip_prefix('@') {
-        let name = user_names.get(user_id.trim())?.trim();
+        let name = user_full_names
+            .get(user_id.trim())
+            .or_else(|| user_names.get(user_id.trim()))?
+            .trim();
         return (!name.is_empty()).then(|| format!("@{name}"));
     }
     if let Some(channel) = target.strip_prefix('#') {
@@ -252,24 +267,33 @@ mod tests {
     #[test]
     fn resolves_user_mentions_to_display_names() {
         let names = std::collections::HashMap::from([
+            ("U123".to_string(), "ada".to_string()),
+            ("U456".to_string(), "grace".to_string()),
+        ]);
+        let full_names = std::collections::HashMap::from([
             ("U123".to_string(), "Ada Lovelace".to_string()),
             ("U456".to_string(), "Grace Hopper".to_string()),
         ]);
 
         assert_eq!(
-            notification_plain_text("Hi <@U123>, meet <@U456|grace>.", &names).as_deref(),
+            notification_plain_text("Hi <@U123>, meet <@U456|grace>.", &names, &full_names)
+                .as_deref(),
             Some("Hi @Ada Lovelace, meet @Grace Hopper.")
         );
-        assert_eq!(notification_plain_text("Hi <@U999>", &names), None);
         assert_eq!(
-            notification_plain_text("Malformed <@U123", &names).as_deref(),
+            notification_plain_text("Hi <@U999>", &names, &full_names),
+            None
+        );
+        assert_eq!(
+            notification_plain_text("Malformed <@U123", &names, &full_names).as_deref(),
             Some("Malformed <@U123")
         );
     }
 
     fn plain(text: &str) -> Option<String> {
         let names = HashMap::from([("U123".to_string(), "Ada".to_string())]);
-        notification_plain_text(text, &names)
+        let full_names = HashMap::new();
+        notification_plain_text(text, &names, &full_names)
     }
 
     #[test]

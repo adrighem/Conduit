@@ -11,6 +11,7 @@ use adw::prelude::*;
 use gettextrs::gettext;
 use gtk::gio;
 
+use crate::message_html::MessageHtmlContext;
 use crate::timeline_message_widget::TimelineAction;
 
 /// Menu item: action name, label, enabled flag and action constructor.
@@ -114,6 +115,77 @@ pub(crate) fn author_menu_button(
     button
 }
 
+/// Builds "Message…" and "Profile" popover menu anchored to `parent` widget for `user_id`.
+pub(crate) fn user_mention_popover(
+    parent: &impl IsA<gtk::Widget>,
+    user_id: &str,
+    context: &MessageHtmlContext,
+    on_action: Rc<dyn Fn(TimelineAction)>,
+    pointing_to: Option<gtk::gdk::Rectangle>,
+) -> Option<gtk::PopoverMenu> {
+    let access = author_menu_access(
+        Some(user_id),
+        context.current_user_id.as_deref(),
+        &context.bot_user_ids,
+    );
+    if !access.any() {
+        return None;
+    }
+    let group = gio::SimpleActionGroup::new();
+    let menu = gio::Menu::new();
+    let entries: [MenuEntry; 2] = [
+        (
+            "message",
+            gettext("Message…"),
+            access.message,
+            TimelineAction::MessageUser,
+        ),
+        (
+            "profile",
+            gettext("Profile"),
+            access.profile,
+            TimelineAction::ShowProfile,
+        ),
+    ];
+    for (name, label, enabled, make_action) in entries {
+        let action = gio::SimpleAction::new(name, None);
+        action.set_enabled(enabled);
+        let on_action = on_action.clone();
+        let user_id = user_id.to_string();
+        action.connect_activate(move |_, _| on_action(make_action(user_id.clone())));
+        group.add_action(&action);
+        menu.append(Some(&label), Some(&format!("author.{name}")));
+    }
+
+    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.set_parent(parent);
+    popover.set_has_arrow(true);
+    if let Some(rect) = pointing_to {
+        popover.set_pointing_to(Some(&rect));
+    }
+    popover.insert_action_group("author", Some(&group));
+    let popover_weak = popover.downgrade();
+    popover.connect_closed(move |_| {
+        if let Some(p) = popover_weak.upgrade() {
+            p.unparent();
+        }
+    });
+    Some(popover)
+}
+
+/// Shows "Message…" and "Profile" popover menu anchored to `parent` widget for `user_id`.
+pub(crate) fn show_user_mention_popover(
+    parent: &impl IsA<gtk::Widget>,
+    user_id: &str,
+    context: &MessageHtmlContext,
+    on_action: Rc<dyn Fn(TimelineAction)>,
+    pointing_to: Option<gtk::gdk::Rectangle>,
+) {
+    if let Some(popover) = user_mention_popover(parent, user_id, context, on_action, pointing_to) {
+        popover.popup();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +239,26 @@ mod tests {
     fn unknown_self_still_allows_message() {
         let access = author_menu_access(Some("U1"), None, &bots());
         assert!(access.message && access.profile);
+    }
+
+    #[test]
+    fn user_mention_popover_builds_menu_and_popover() {
+        crate::timeline_message_widget::tests::run_gtk_test(|| {
+            let label = gtk::Label::new(None);
+            let context = MessageHtmlContext {
+                current_user_id: Some("U_SELF".to_string()),
+                ..Default::default()
+            };
+            let action_taken = Rc::new(std::cell::Cell::new(false));
+            let on_action = {
+                let action_taken = action_taken.clone();
+                Rc::new(move |_action| {
+                    action_taken.set(true);
+                })
+            };
+            let popover = user_mention_popover(&label, "U_OTHER", &context, on_action, None);
+            assert!(popover.is_some());
+            assert!(!action_taken.get());
+        });
     }
 }

@@ -3414,13 +3414,21 @@ fn render_slack_entity_pango(text: &str, context: &MessageHtmlContext) -> Option
 
     let end = text.find('>')?;
     let raw = &text[1..end];
-    let rendered = if let Some(user_id) = raw.strip_prefix('@') {
+    let rendered = if let Some(user) = raw.strip_prefix('@') {
+        let (user_id, fallback) = user
+            .split_once('|')
+            .map_or((user, None), |(user_id, label)| (user_id, Some(label)));
         let name = context
             .user_names
             .get(user_id)
             .cloned()
+            .or_else(|| fallback.map(ToString::to_string))
             .unwrap_or_else(|| user_id.to_string());
-        mention_pill_pango("@", &name)
+        format!(
+            "<a href=\"conduit-user://{}\">{}</a>",
+            escape_pango(user_id),
+            mention_pill_pango("@", &name)
+        )
     } else if raw.starts_with("!subteam^") {
         user_group_mention_pango(raw, context)
     } else if let Some(channel) = raw.strip_prefix('#') {
@@ -6182,7 +6190,7 @@ mod tests {
         let output = mrkdwn_to_pango(input, &context);
         assert_eq!(
             output,
-            "<span background=\"#D6ECFF\" foreground=\"#1264A3\"> @Alice </span> in <span background=\"#D6ECFF\" foreground=\"#1264A3\"> #general </span> and <span background=\"#D6ECFF\" foreground=\"#1264A3\"> #C999 </span>"
+            "<a href=\"conduit-user://U123\"><span background=\"#D6ECFF\" foreground=\"#1264A3\"> @Alice </span></a> in <span background=\"#D6ECFF\" foreground=\"#1264A3\"> #general </span> and <span background=\"#D6ECFF\" foreground=\"#1264A3\"> #C999 </span>"
         );
     }
 

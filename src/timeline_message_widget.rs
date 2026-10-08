@@ -1032,11 +1032,14 @@ impl NativeTimelineView {
         self.store.splice(0, 0, &items);
 
         let list_view = self.list_view.clone();
+        let n_items = items.len() as u32;
         let vadj = self.scrolled_window.vadjustment();
         let recheck_read_visibility = self.recheck_read_visibility.clone();
         glib::idle_add_local_once(move || {
             if let Some(index) = focus_index {
                 list_view.scroll_to(index, gtk::ListScrollFlags::empty(), None);
+            } else if n_items > 0 {
+                list_view.scroll_to(n_items - 1, gtk::ListScrollFlags::empty(), None);
             } else {
                 vadj.set_value(vadj.upper() - vadj.page_size());
             }
@@ -1267,8 +1270,38 @@ fn strip_anchor_tags(markup: &str) -> (String, Vec<MarkupLink>) {
     (out, links)
 }
 
+fn attach_label_links(
+    label: &Label,
+    context: &MessageHtmlContext,
+    on_action: Option<&ActionHandler>,
+) {
+    let context = context.clone();
+    let on_action = on_action.cloned();
+    label.connect_activate_link(move |label, uri| {
+        if let Some(user_id) = uri.strip_prefix("conduit-user://") {
+            if let Some(on_action) = on_action.as_ref() {
+                crate::author_menu::show_user_mention_popover(
+                    label,
+                    user_id,
+                    &context,
+                    on_action.clone(),
+                    None,
+                );
+            }
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+}
+
 /// Underlines link ranges in a TextView buffer and opens them on click.
-fn attach_text_view_links(view: &TextView, links: Vec<MarkupLink>) {
+fn attach_text_view_links(
+    view: &TextView,
+    links: Vec<MarkupLink>,
+    context: &MessageHtmlContext,
+    on_action: Option<&ActionHandler>,
+) {
     if links.is_empty() {
         return;
     }
@@ -1290,6 +1323,8 @@ fn attach_text_view_links(view: &TextView, links: Vec<MarkupLink>) {
     }
     let click = gtk::GestureClick::new();
     let click_view = view.clone();
+    let context = context.clone();
+    let on_action = on_action.cloned();
     click.connect_released(move |_, _, x, y| {
         let (bx, by) =
             click_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
@@ -1299,10 +1334,23 @@ fn attach_text_view_links(view: &TextView, links: Vec<MarkupLink>) {
         for tag in iter.tags() {
             let Some(tag_name) = tag.name() else { continue };
             if let Some((_, href)) = hrefs.iter().find(|(n, _)| n.as_str() == tag_name.as_str()) {
-                let _ = gtk::gio::AppInfo::launch_default_for_uri(
-                    href,
-                    None::<&gtk::gio::AppLaunchContext>,
-                );
+                if let Some(user_id) = href.strip_prefix("conduit-user://") {
+                    if let Some(on_action) = on_action.as_ref() {
+                        let rect = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+                        crate::author_menu::show_user_mention_popover(
+                            &click_view,
+                            user_id,
+                            &context,
+                            on_action.clone(),
+                            Some(rect),
+                        );
+                    }
+                } else {
+                    let _ = gtk::gio::AppInfo::launch_default_for_uri(
+                        href,
+                        None::<&gtk::gio::AppLaunchContext>,
+                    );
+                }
                 break;
             }
         }
@@ -1310,7 +1358,11 @@ fn attach_text_view_links(view: &TextView, links: Vec<MarkupLink>) {
     view.add_controller(click);
 }
 
-pub(crate) fn create_message_text_widget(pango: &str, context: &MessageHtmlContext) -> Widget {
+pub(crate) fn create_message_text_widget(
+    pango: &str,
+    context: &MessageHtmlContext,
+    on_action: Option<&ActionHandler>,
+) -> Widget {
     if !pango.contains("<conduit-custom-emoji ") {
         let label = Label::new(None);
         label.set_wrap(true);
@@ -1321,6 +1373,7 @@ pub(crate) fn create_message_text_widget(pango: &str, context: &MessageHtmlConte
         // libadwaita's document font (family, size, line height) for reading content.
         label.add_css_class("document");
         label.set_markup(pango);
+        attach_label_links(&label, context, on_action);
         return label.upcast::<Widget>();
     }
 
@@ -1337,7 +1390,7 @@ pub(crate) fn create_message_text_widget(pango: &str, context: &MessageHtmlConte
     let buffer = view.buffer();
     let mut iter = buffer.start_iter();
     buffer.insert_markup(&mut iter, &markup_clean);
-    attach_text_view_links(&view, links);
+    attach_text_view_links(&view, links, context, on_action);
 
     let mut search_iter = buffer.start_iter();
     for emoji in &emojis {
@@ -1469,7 +1522,12 @@ fn parse_line_by_line_quotes(text: &str, segments: &mut Vec<TextSegment>) {
     }
 }
 
-pub(crate) fn render_text_content(text: &str, target_box: &Box, context: &MessageHtmlContext) {
+pub(crate) fn render_text_content(
+    text: &str,
+    target_box: &Box,
+    context: &MessageHtmlContext,
+    on_action: Option<&ActionHandler>,
+) {
     let segments = parse_text_segments(text);
     for seg in segments {
         match seg {
@@ -1492,14 +1550,15 @@ pub(crate) fn render_text_content(text: &str, target_box: &Box, context: &Messag
                 let quote_box = Box::new(Orientation::Vertical, 0);
                 quote_box.add_css_class("blockquote");
                 let pango = crate::message_html::mrkdwn_to_pango(&quote_text, context);
-                let text_widget = create_message_text_widget(&format!("<i>{}</i>", pango), context);
+                let text_widget =
+                    create_message_text_widget(&format!("<i>{}</i>", pango), context, on_action);
                 quote_box.append(&text_widget);
                 target_box.append(&quote_box);
             }
             TextSegment::Normal(normal_text) => {
                 if !normal_text.trim().is_empty() {
                     let pango = crate::message_html::mrkdwn_to_pango(&normal_text, context);
-                    let text_widget = create_message_text_widget(&pango, context);
+                    let text_widget = create_message_text_widget(&pango, context, on_action);
                     target_box.append(&text_widget);
                 }
             }
@@ -2343,7 +2402,7 @@ fn render_message_content(
     if !crate::timeline_document_widget::document_replaces_text(&document) {
         let content_text = message.text.as_deref().unwrap_or("");
         if !content_text.trim().is_empty() {
-            render_text_content(content_text, root_box, context);
+            render_text_content(content_text, root_box, context, on_action);
         }
     }
 
@@ -2409,7 +2468,8 @@ pub(crate) fn build_timeline_message_widget(
             });
 
             let pango = crate::message_html::mrkdwn_to_pango(sys_text, context);
-            let text_widget = create_message_text_widget(&format!("<i>{}</i>", pango), context);
+            let text_widget =
+                create_message_text_widget(&format!("<i>{}</i>", pango), context, on_author_action);
             text_widget.add_css_class("dim-label");
             root_box.append(&text_widget);
 
@@ -3663,9 +3723,23 @@ pub(crate) mod tests {
         run_gtk_test(|| {
             let context = test_context();
             let pango = "Hi <b><conduit-custom-emoji name=\"heart-sparkle\" url=\"https://example.com/heart.gif\"/></b> there";
-            let widget = create_message_text_widget(pango, &context);
+            let widget = create_message_text_widget(pango, &context, None);
             let view = widget.downcast::<TextView>().ok();
             assert!(view.is_some(), "expected TextView for custom emoji markup");
+        });
+    }
+
+    #[test]
+    fn test_create_message_text_widget_with_user_mention() {
+        run_gtk_test(|| {
+            let context = test_context();
+            let pango = "<a href=\"conduit-user://U123\"><span background=\"#D6ECFF\" foreground=\"#1264A3\"> @Alice </span></a>";
+            let widget = create_message_text_widget(pango, &context, None);
+            let label = widget.downcast::<Label>().ok();
+            assert!(
+                label.is_some(),
+                "expected Label for standard mention markup"
+            );
         });
     }
 }

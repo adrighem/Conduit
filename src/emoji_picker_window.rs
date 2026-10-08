@@ -50,18 +50,46 @@ pub(crate) fn resolve_custom_emoji_cached_file(url: &str) -> Option<PathBuf> {
         hasher.update(url.as_bytes());
         format!("{:x}", hasher.finalize())
     };
-    for ext in ["png", "gif", "jpg", "webp"] {
+    for ext in ["png", "gif", "jpg", "jpeg", "webp"] {
         let p = cache_dir.join(format!("{hash}.{ext}"));
         if p.exists() && p.metadata().map(|m| m.len() > 0).unwrap_or(false) {
             return Some(p);
         }
     }
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                for ext in ["png", "gif", "jpg", "jpeg", "webp"] {
+                    let p = path.join(format!("{hash}.{ext}"));
+                    if p.exists() && p.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                        return Some(p);
+                    }
+                }
+                if let Some(workspace_dir_name) = entry.file_name().to_str() {
+                    let ws_hash = {
+                        let mut hasher = Sha256::new();
+                        hasher.update(workspace_dir_name.as_bytes());
+                        hasher.update([0]);
+                        hasher.update(url.as_bytes());
+                        format!("{:x}", hasher.finalize())
+                    };
+                    for ext in ["png", "gif", "jpg", "jpeg", "webp"] {
+                        let p = path.join(format!("{ws_hash}.{ext}"));
+                        if p.exists() && p.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
     None
 }
 
-/// Emoji image widgets waiting for a download, keyed by URL.
+/// Emoji widgets waiting for a download, keyed by URL.
 type PendingViews =
-    Rc<RefCell<HashMap<String, Vec<(glib::WeakRef<gtk::Picture>, glib::WeakRef<gtk::Label>)>>>>;
+    Rc<RefCell<HashMap<String, Vec<(glib::WeakRef<gtk::Stack>, glib::WeakRef<gtk::Picture>)>>>>;
 type DownloadCallback = Box<dyn FnOnce(PathBuf) + Send + 'static>;
 
 struct DownloadRequest {
@@ -77,7 +105,7 @@ struct LoaderState {
 
 struct CustomEmojiLoader {
     state: Arc<Mutex<LoaderState>>,
-    condvar: Arc<std::sync::Condvar>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl CustomEmojiLoader {
@@ -87,17 +115,14 @@ impl CustomEmojiLoader {
             in_flight: HashMap::new(),
             failed: HashSet::new(),
         }));
-        let condvar = Arc::new(std::sync::Condvar::new());
+        let notify = Arc::new(tokio::sync::Notify::new());
 
         let state_clone = Arc::clone(&state);
-        let condvar_clone = Arc::clone(&condvar);
+        let notify_clone = Arc::clone(&notify);
 
         std::thread::Builder::new()
             .name("conduit-emoji-loader".to_string())
             .spawn(move || {
-                // Downloads are network-bound, so a single-thread executor is
-                // enough concurrency (bounded further by the semaphore below)
-                // without paying for a dedicated multi-thread runtime here.
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -106,81 +131,92 @@ impl CustomEmojiLoader {
                     Err(_) => return,
                 };
 
-                let client = match crate::http_client::builder().build() {
+                let client = match crate::http_client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                {
                     Ok(c) => c,
                     Err(_) => return,
                 };
 
                 rt.block_on(async move {
-                    let sem = Arc::new(tokio::sync::Semaphore::new(6));
-                    loop {
-                        let next_req = {
-                            let mut s = state_clone.lock().unwrap();
-                            while s.queue.is_empty() {
-                                s = condvar_clone.wait(s).unwrap();
-                            }
-                            s.queue.pop_front()
-                        };
+                    const NUM_WORKERS: usize = 6;
+                    let mut handles = Vec::new();
 
-                        let Some(req) = next_req else { continue };
-
-                        if let Some(path) = resolve_custom_emoji_cached_file(&req.url) {
-                            if let Some(cb) = req.callback {
-                                cb(path);
-                            }
-                            continue;
-                        }
-
-                        {
-                            let mut s = state_clone.lock().unwrap();
-                            // A prior failure doesn't permanently block this URL: drop it from
-                            // `failed` and retry, so a caller's callback always eventually fires
-                            // instead of being silently dropped forever.
-                            s.failed.remove(&req.url);
-                            if let Some(cb) = req.callback {
-                                if let Some(cbs) = s.in_flight.get_mut(&req.url) {
-                                    cbs.push(cb);
-                                    continue;
-                                } else {
-                                    s.in_flight.insert(req.url.clone(), vec![cb]);
-                                }
-                            } else if s.in_flight.contains_key(&req.url) {
-                                continue;
-                            } else {
-                                s.in_flight.insert(req.url.clone(), Vec::new());
-                            }
-                        }
-
-                        let client = client.clone();
-                        let sem = Arc::clone(&sem);
+                    for _ in 0..NUM_WORKERS {
                         let state = Arc::clone(&state_clone);
-                        let url = req.url;
+                        let notify = Arc::clone(&notify_clone);
+                        let client = client.clone();
 
-                        tokio::spawn(async move {
-                            let _permit = sem.acquire().await;
-                            let res = download_custom_emoji_file(&client, &url).await;
+                        handles.push(tokio::spawn(async move {
+                            loop {
+                                let notified = notify.notified();
+                                let next_url = {
+                                    let mut s = state.lock().unwrap();
+                                    loop {
+                                        let Some(req) = s.queue.pop_front() else {
+                                            break None;
+                                        };
 
-                            let (callbacks, is_ok) = {
-                                let mut s = state.lock().unwrap();
-                                let cbs = s.in_flight.remove(&url).unwrap_or_default();
-                                if res.is_none() {
-                                    s.failed.insert(url.clone());
-                                }
-                                (cbs, res)
-                            };
+                                        if let Some(path) =
+                                            resolve_custom_emoji_cached_file(&req.url)
+                                        {
+                                            if let Some(cb) = req.callback {
+                                                cb(path);
+                                            }
+                                            continue;
+                                        }
 
-                            if let Some(path) = is_ok {
-                                for cb in callbacks {
-                                    cb(path.clone());
+                                        s.failed.remove(&req.url);
+                                        if let Some(cb) = req.callback {
+                                            if let Some(cbs) = s.in_flight.get_mut(&req.url) {
+                                                cbs.push(cb);
+                                                continue;
+                                            } else {
+                                                s.in_flight.insert(req.url.clone(), vec![cb]);
+                                            }
+                                        } else if s.in_flight.contains_key(&req.url) {
+                                            continue;
+                                        } else {
+                                            s.in_flight.insert(req.url.clone(), Vec::new());
+                                        }
+
+                                        break Some(req.url);
+                                    }
+                                };
+
+                                let Some(url) = next_url else {
+                                    notified.await;
+                                    continue;
+                                };
+
+                                let res = download_custom_emoji_file(&client, &url).await;
+
+                                let (callbacks, is_ok) = {
+                                    let mut s = state.lock().unwrap();
+                                    let cbs = s.in_flight.remove(&url).unwrap_or_default();
+                                    if res.is_none() {
+                                        s.failed.insert(url.clone());
+                                    }
+                                    (cbs, res)
+                                };
+
+                                if let Some(path) = is_ok {
+                                    for cb in callbacks {
+                                        cb(path.clone());
+                                    }
                                 }
                             }
-                        });
+                        }));
                     }
+
+                    futures_util::future::join_all(handles).await;
                 });
             })
             .expect("spawn emoji loader thread");
 
-        Self { state, condvar }
+        Self { state, notify }
     }
 
     fn queue(&self, url: String, high_priority: bool, callback: Option<DownloadCallback>) {
@@ -192,8 +228,6 @@ impl CustomEmojiLoader {
         }
 
         let mut s = self.state.lock().unwrap();
-        // A previously-failed URL is retried rather than dropped, so every
-        // caller that queues a callback for it eventually gets a resolution.
         s.failed.remove(&url);
 
         if let Some(cbs) = s.in_flight.get_mut(&url) {
@@ -203,20 +237,28 @@ impl CustomEmojiLoader {
             return;
         }
 
-        if let Some(existing) = s.queue.iter_mut().find(|r| r.url == url) {
+        if let Some(pos) = s.queue.iter().position(|r| r.url == url) {
+            let mut req = s.queue.remove(pos).unwrap();
             if let Some(cb) = callback {
-                match existing.callback.take() {
+                match req.callback.take() {
                     Some(prev) => {
-                        existing.callback = Some(Box::new(move |p| {
+                        req.callback = Some(Box::new(move |p| {
                             prev(p.clone());
                             cb(p);
                         }));
                     }
                     None => {
-                        existing.callback = Some(cb);
+                        req.callback = Some(cb);
                     }
                 }
             }
+            if high_priority {
+                s.queue.push_front(req);
+            } else {
+                s.queue.push_back(req);
+            }
+            drop(s);
+            self.notify.notify_waiters();
             return;
         }
 
@@ -226,7 +268,8 @@ impl CustomEmojiLoader {
         } else {
             s.queue.push_back(req);
         }
-        self.condvar.notify_one();
+        drop(s);
+        self.notify.notify_waiters();
     }
 }
 
@@ -241,7 +284,17 @@ async fn download_custom_emoji_file(client: &reqwest::Client, url: &str) -> Opti
         return None;
     }
 
-    let resp = client.get(url).send().await.ok()?;
+    let mut req = client.get(url);
+    if let Some(ua) = crate::config::slack_user_agent() {
+        req = req.header(reqwest::header::USER_AGENT, ua);
+    } else {
+        req = req.header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        );
+    }
+
+    let resp = req.send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -327,11 +380,11 @@ impl EmojiPickerWindow {
             glib::spawn_future_local(async move {
                 while let Some((url, path)) = download_rx.recv().await {
                     if let Some(views) = pending_views.borrow_mut().remove(&url) {
-                        for (pic_weak, placeholder_weak) in views {
+                        for (stack_weak, pic_weak) in views {
                             if let Some(pic) = pic_weak.upgrade() {
                                 pic.set_filename(Some(&path));
-                                if let Some(ph) = placeholder_weak.upgrade() {
-                                    ph.set_visible(false);
+                                if let Some(stack) = stack_weak.upgrade() {
+                                    stack.set_visible_child_name("pic");
                                 }
                             }
                         }
@@ -501,27 +554,30 @@ impl EmojiPickerWindow {
                                 pic.set_content_fit(gtk::ContentFit::Cover);
                                 pic.upcast()
                             } else {
-                                let overlay = gtk::Overlay::new();
-                                overlay.set_size_request(36, 36);
+                                let stack = gtk::Stack::new();
+                                stack.set_size_request(36, 36);
+                                stack.set_transition_type(gtk::StackTransitionType::Crossfade);
 
                                 let placeholder = gtk::Label::new(Some("💬"));
                                 placeholder.add_css_class("dim-label");
                                 placeholder.set_size_request(36, 36);
-                                overlay.set_child(Some(&placeholder));
+                                stack.add_named(&placeholder, Some("placeholder"));
 
                                 let pic = gtk::Picture::new();
                                 pic.set_size_request(32, 32);
                                 pic.set_can_shrink(true);
                                 pic.set_content_fit(gtk::ContentFit::Cover);
-                                overlay.add_overlay(&pic);
+                                stack.add_named(&pic, Some("pic"));
 
+                                stack.set_visible_child_name("placeholder");
+
+                                let stack_weak = stack.downgrade();
                                 let pic_weak = pic.downgrade();
-                                let placeholder_weak = placeholder.downgrade();
                                 pending_views
                                     .borrow_mut()
                                     .entry(url.clone())
                                     .or_default()
-                                    .push((pic_weak, placeholder_weak));
+                                    .push((stack_weak, pic_weak));
 
                                 let tx = download_tx.clone();
                                 let url_clone = url.clone();
@@ -533,7 +589,7 @@ impl EmojiPickerWindow {
                                     })),
                                 );
 
-                                overlay.upcast()
+                                stack.upcast()
                             }
                         }
                     };
