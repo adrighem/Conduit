@@ -553,6 +553,17 @@
                                     <property name="spacing">4</property>
                                     <property name="visible">False</property>
                                     <child>
+                                      <object class="GtkSeparator" id="message_composer_resize_handle">
+                                        <property name="orientation">horizontal</property>
+                                        <property name="valign">start</property>
+                                        <property name="focusable">True</property>
+                                        <property name="tooltip-text" translatable="yes">Resize Composer</property>
+                                        <style>
+                                          <class name="composer-resize-handle"/>
+                                        </style>
+                                      </object>
+                                    </child>
+                                    <child>
                                       <object class="AdwBreakpointBin" id="message_format_breakpoint">
                                         <property name="child">
                                           <object class="GtkBox" id="message_format_toolbar">
@@ -589,7 +600,7 @@
                                         <property name="orientation">horizontal</property>
                                         <property name="spacing">6</property>
                                         <child>
-                                          <object class="GtkScrolledWindow">
+                                          <object class="GtkScrolledWindow" id="message_scrolled_window">
                                             <property name="hexpand">True</property>
                                             <property name="min-content-height">42</property>
                                             <property name="max-content-height">132</property>
@@ -674,9 +685,20 @@
                                   </object>
                                 </child>
                                 <child>
-                                  <object class="GtkBox">
+                                  <object class="GtkBox" id="thread_composer">
                                     <property name="orientation">vertical</property>
                                     <property name="spacing">4</property>
+                                    <child>
+                                      <object class="GtkSeparator" id="thread_composer_resize_handle">
+                                        <property name="orientation">horizontal</property>
+                                        <property name="valign">start</property>
+                                        <property name="focusable">True</property>
+                                        <property name="tooltip-text" translatable="yes">Resize Reply Composer</property>
+                                        <style>
+                                          <class name="composer-resize-handle"/>
+                                        </style>
+                                      </object>
+                                    </child>
                                     <child>
                                       <object class="AdwBreakpointBin" id="thread_format_breakpoint">
                                         <property name="child">
@@ -714,7 +736,7 @@
                                         <property name="orientation">horizontal</property>
                                         <property name="spacing">6</property>
                                         <child>
-                                          <object class="GtkScrolledWindow">
+                                          <object class="GtkScrolledWindow" id="thread_scrolled_window">
                                             <property name="hexpand">True</property>
                                             <property name="min-content-height">42</property>
                                             <property name="max-content-height">132</property>
