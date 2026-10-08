@@ -4780,6 +4780,16 @@ impl ConduitWindow {
         self.setup_single_composer_resizing(ComposerTarget::Thread);
     }
 
+    fn set_composer_fixed_height(scrolled: &gtk::ScrolledWindow, height: i32) {
+        if height > scrolled.max_content_height() {
+            scrolled.set_max_content_height(height);
+            scrolled.set_min_content_height(height);
+        } else {
+            scrolled.set_min_content_height(height);
+            scrolled.set_max_content_height(height);
+        }
+    }
+
     fn setup_single_composer_resizing(&self, target: ComposerTarget) {
         let (handle, scrolled) = match target {
             ComposerTarget::Message => (
@@ -4795,28 +4805,51 @@ impl ConduitWindow {
         handle.set_cursor_from_name(Some("row-resize"));
 
         let initial_height = Rc::new(Cell::new(0));
+        let initial_win_y = Rc::new(Cell::new(0.0));
         let drag = gtk::GestureDrag::new();
         let begin_initial_height = initial_height.clone();
+        let begin_initial_win_y = initial_win_y.clone();
         let target_scrolled = scrolled.clone();
+        let begin_handle = handle.clone();
+        let weak_window_begin = self.downgrade();
 
-        drag.connect_drag_begin(move |_, _, _| {
-            let height = target_scrolled.height();
-            begin_initial_height.set(height);
+        drag.connect_drag_begin(move |_, start_x, start_y| {
+            let Some(window) = weak_window_begin.upgrade() else {
+                return;
+            };
+            begin_initial_height.set(target_scrolled.height());
+            let point = gtk::graphene::Point::new(start_x as f32, start_y as f32);
+            if let Some(win_point) = begin_handle.compute_point(&window, &point) {
+                begin_initial_win_y.set(f64::from(win_point.y()));
+            }
         });
 
         let weak_window_update = self.downgrade();
         let update_initial_height = initial_height;
+        let update_initial_win_y = initial_win_y;
         let update_scrolled = scrolled.clone();
-        drag.connect_drag_update(move |_, _, offset_y| {
+        let update_handle = handle.clone();
+        drag.connect_drag_update(move |gesture, _, offset_y| {
             let Some(window) = weak_window_update.upgrade() else {
                 return;
             };
-            let start = update_initial_height.get();
-            let new_h = (f64::from(start) - offset_y).round() as i32;
+            let start_h = update_initial_height.get();
+            let start_win_y = update_initial_win_y.get();
+            let delta_y =
+                if let Some((cur_x, cur_y)) = gesture.point(gesture.current_sequence().as_ref()) {
+                    let cur_point = gtk::graphene::Point::new(cur_x as f32, cur_y as f32);
+                    if let Some(win_point) = update_handle.compute_point(&window, &cur_point) {
+                        f64::from(win_point.y()) - start_win_y
+                    } else {
+                        offset_y
+                    }
+                } else {
+                    offset_y
+                };
+            let new_h = (f64::from(start_h) - delta_y).round() as i32;
             let max_h = (window.height() * 3 / 4).max(COMPOSER_DEFAULT_MAX_HEIGHT);
             let clamped = new_h.clamp(COMPOSER_DEFAULT_MIN_HEIGHT, max_h);
-            update_scrolled.set_min_content_height(clamped);
-            update_scrolled.set_max_content_height(clamped);
+            Self::set_composer_fixed_height(&update_scrolled, clamped);
         });
 
         handle.add_controller(drag);
@@ -4836,8 +4869,7 @@ impl ConduitWindow {
             let current = key_scrolled.height();
             let max_h = (window.height() * 3 / 4).max(COMPOSER_DEFAULT_MAX_HEIGHT);
             let clamped = (current + step).clamp(COMPOSER_DEFAULT_MIN_HEIGHT, max_h);
-            key_scrolled.set_min_content_height(clamped);
-            key_scrolled.set_max_content_height(clamped);
+            Self::set_composer_fixed_height(&key_scrolled, clamped);
             glib::Propagation::Stop
         });
         handle.add_controller(keys);
