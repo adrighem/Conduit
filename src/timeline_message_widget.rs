@@ -2355,7 +2355,7 @@ fn unread_separator_widget() -> Box {
     line.set_hexpand(true);
     separator_row.append(&line);
 
-    let label = Label::new(Some("New"));
+    let label = Label::new(Some(&gettextrs::gettext("New")));
     label.add_css_class("caption");
     label.add_css_class("unread-separator-label");
     separator_row.append(&label);
