@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.6.0](https://github.com/adrighem/Conduit/compare/v0.5.0...v0.6.0) (2026-10-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* Conduit no longer reports read state to Slack, so other clients will not see conversations marked read from here. Historical backfill no longer distinguishes messages that arrived while away from older ones, since that distinction was the read cursor itself.
+
+### Features
+
+* **attention:** add mention-priority tier independent of mute/unread ([2258ef2](https://github.com/adrighem/Conduit/commit/2258ef25fa9ea3c9d4f457d8efb0c70ccc149938))
+* **composer:** Guard against unsupported slash commands in submit_composer ([c2e2fbc](https://github.com/adrighem/Conduit/commit/c2e2fbc380417e87cbbd501d6e45733d165e91c8))
+* **composer:** Implement slash command tokenizer and allowlist validation ([842c376](https://github.com/adrighem/Conduit/commit/842c37604ced689a0a8d457c05f1dabdd99c32e1))
+* **composer:** make composer resizable with vertical drag handle ([384bd2d](https://github.com/adrighem/Conduit/commit/384bd2dc820a5c5c94f553c75b28165b224e5a7e))
+* native timeline polish — quick-action bar, mentions, media, theming ([c0d1701](https://github.com/adrighem/Conduit/commit/c0d1701aba22c3ef34b8dacf8006b81b2297f23b))
+* **read-state:** unread ledger, client.counts badges, plain-text notifications ([47df40a](https://github.com/adrighem/Conduit/commit/47df40a14ff3f22a7f554631cc54daa9a48d8f76))
+* remove all read/unread status, counters and mention badges ([355d5a0](https://github.com/adrighem/Conduit/commit/355d5a0ad7e9a133382fdc7ed0b5fba47fe4b60b))
+* **runtime:** Add RuntimeCommand::ExecuteSlashCommand and dispatch handling ([afd4462](https://github.com/adrighem/Conduit/commit/afd4462193587e107f09d1e5c8c90f6dcf463b32))
+* **runtime:** add thread support to read flusher queue ([fb2e444](https://github.com/adrighem/Conduit/commit/fb2e44482d58c35d9fcdfeb150087d9ab663fe98))
+* **runtime:** wire read flusher supervisor and thread mark loop ([2a84124](https://github.com/adrighem/Conduit/commit/2a841249ad80243fcad81cf568b62f32bf0eeb70))
+* **sidebar:** workspace theme on all windows, unread filter, read-state groundwork ([5c71525](https://github.com/adrighem/Conduit/commit/5c715254e67ed7f43a535bb881489a6ec32a33c1))
+* **slack:** add subscriptions_thread_mark api method ([ab2a414](https://github.com/adrighem/Conduit/commit/ab2a4141e3309e514114165937961c79a661c079))
+* **slack:** Implement chat.command endpoint with execute_slash_command ([340df30](https://github.com/adrighem/Conduit/commit/340df3082611bdfdca271aca766e103703280aa0))
+* **status:** restore emoji image preview in status dialog ([9d75866](https://github.com/adrighem/Conduit/commit/9d75866952a1a2e63160f4dbbe1d93d75d42362a))
+* **timeline:** use libadwaita document font for message body text ([f2946e9](https://github.com/adrighem/Conduit/commit/f2946e9f36110db19c280052eaf6c9dd2f0bd612))
+* **ui:** day separators, image proxy, author menu, profile and channel details ([5c0ba3f](https://github.com/adrighem/Conduit/commit/5c0ba3f3e39a1dfdddff0fe42262d309d7bb5eaa))
+* **views:** native Threads, Search, Files and Later views ([a511be9](https://github.com/adrighem/Conduit/commit/a511be92672717d7fc1729443c5d288e75346f39))
+* **window:** Wire slash command execution from composer through runtime dispatch ([db7ba59](https://github.com/adrighem/Conduit/commit/db7ba592fa337550990491f047435decf6a7831a))
+
+
+### Bug Fixes
+
+* **composer:** fix scrolled window resize ordering and pointer jitter ([942a6fe](https://github.com/adrighem/Conduit/commit/942a6fe7eb9c49015781576019ca5b00238e98bf))
+* **composer:** remove stray merge conflict marker ([f3a6699](https://github.com/adrighem/Conduit/commit/f3a6699ae952b1ca9b547f37b10ab3ffc4e4d656))
+* **deps:** bump rustls to 0.23.45 to fix GHSA-2mjx-qc3c-rqvc (fixes [#22](https://github.com/adrighem/Conduit/issues/22)) ([7903b06](https://github.com/adrighem/Conduit/commit/7903b06fe31d19f3609ee9fb2afebf2b5f86d65a))
+* **flatpak:** regenerate cargo-sources.json for bumped dependencies ([2981b5c](https://github.com/adrighem/Conduit/commit/2981b5c63d33d909cb05af6a56ea86edde26dd39))
+* **l10n:** add missing sources to POTFILES.in and localize unread separator ([33ccd38](https://github.com/adrighem/Conduit/commit/33ccd3886561213f2951faa96717982991b99526))
+* resolve clippy -D warnings lints ([8706ace](https://github.com/adrighem/Conduit/commit/8706acea99b681e86017776b2a5d1f59937dbcd2))
+* **slack:** validate payload signature on media downloads ([2e12c41](https://github.com/adrighem/Conduit/commit/2e12c4193fc9886a394aa843dbd480d769b171ad))
+* **thread-pane:** show loading placeholder on first open; update headless tests ([8610964](https://github.com/adrighem/Conduit/commit/861096413f87fe183c051522d46f1a52b211252a))
+* **timeline:** apply review fixes for native timeline, thread pane and window refs [#123](https://github.com/adrighem/Conduit/issues/123) ([d78ea3c](https://github.com/adrighem/Conduit/commit/d78ea3cc9914b33276d61d8e6975edb0daf4a8eb))
+* **timeline:** dispatch actions without holding handler borrow ([a9ce697](https://github.com/adrighem/Conduit/commit/a9ce697374ac76939f7968a830aabb6254f964b3))
+* **timeline:** fix layout breaking scroll on optimistic message insert ([4574699](https://github.com/adrighem/Conduit/commit/45746991274c58d1e831a663b09c549e9d1fb5be))
+* **timeline:** move "New" separator with live read state ([3b567f1](https://github.com/adrighem/Conduit/commit/3b567f14db6f3f1e1777303a5ca615f939ae98bc))
+* **timeline:** render native messages from MessageDocument, show GIFs ([a2a61b0](https://github.com/adrighem/Conduit/commit/a2a61b0d60a446960f1ec80dcdd6516907a448bf))
+* **timeline:** resolve reaction flex wrap, static CSS providers, and LRU texture cache ([c4a0bda](https://github.com/adrighem/Conduit/commit/c4a0bda23dd82fe9e552bfe3418e1c33efe284e0))
+* **timeline:** wire interactive giphy actions and clear codeql logging alert ([e6fec35](https://github.com/adrighem/Conduit/commit/e6fec353758a15851f657e59b411c37b03e79a1f))
+
+
+### Performance Improvements
+
+* **channel-details:** resolve members in idle batches ([25e8202](https://github.com/adrighem/Conduit/commit/25e8202c75bbaccc30a3b67017f844710ff03173))
+
 ## [0.5.0](https://github.com/adrighem/Conduit/compare/v0.4.0...v0.5.0) (2026-09-12)
 
 
