@@ -3,19 +3,23 @@
 ## [0.6.0](https://github.com/adrighem/Conduit/compare/v0.5.0...v0.6.0) (2026-10-08)
 
 
-### ⚠ BREAKING CHANGES
+### Highlights since 0.3
 
-* Conduit no longer reports read state to Slack, so other clients will not see conversations marked read from here. Historical backfill no longer distinguishes messages that arrived while away from older ones, since that distinction was the read cursor itself.
+* **Fully native.** The web view is gone: every message is real GTK, so it's fast, smooth and matches your theme.
+* **Read state syncs with Slack.** Read it here and it's read everywhere.
+* **Threads, Search, Files, Later.** All native, all new.
+* **A composer you'll love.** Rich text, several attachments at once, slash commands, and drag to resize.
+* **Emoji that work.** Custom emoji, your favourite reactions, correct skin tones.
+* **Your workspace, your colors.** Your Slack theme on every window.
+* **Locked down.** Signed media downloads, proxied images, no tokens in logs.
 
 ### Features
 
-* **attention:** add mention-priority tier independent of mute/unread ([2258ef2](https://github.com/adrighem/Conduit/commit/2258ef25fa9ea3c9d4f457d8efb0c70ccc149938))
 * **composer:** Guard against unsupported slash commands in submit_composer ([c2e2fbc](https://github.com/adrighem/Conduit/commit/c2e2fbc380417e87cbbd501d6e45733d165e91c8))
 * **composer:** Implement slash command tokenizer and allowlist validation ([842c376](https://github.com/adrighem/Conduit/commit/842c37604ced689a0a8d457c05f1dabdd99c32e1))
 * **composer:** make composer resizable with vertical drag handle ([384bd2d](https://github.com/adrighem/Conduit/commit/384bd2dc820a5c5c94f553c75b28165b224e5a7e))
 * native timeline polish — quick-action bar, mentions, media, theming ([c0d1701](https://github.com/adrighem/Conduit/commit/c0d1701aba22c3ef34b8dacf8006b81b2297f23b))
 * **read-state:** unread ledger, client.counts badges, plain-text notifications ([47df40a](https://github.com/adrighem/Conduit/commit/47df40a14ff3f22a7f554631cc54daa9a48d8f76))
-* remove all read/unread status, counters and mention badges ([355d5a0](https://github.com/adrighem/Conduit/commit/355d5a0ad7e9a133382fdc7ed0b5fba47fe4b60b))
 * **runtime:** Add RuntimeCommand::ExecuteSlashCommand and dispatch handling ([afd4462](https://github.com/adrighem/Conduit/commit/afd4462193587e107f09d1e5c8c90f6dcf463b32))
 * **runtime:** add thread support to read flusher queue ([fb2e444](https://github.com/adrighem/Conduit/commit/fb2e44482d58c35d9fcdfeb150087d9ab663fe98))
 * **runtime:** wire read flusher supervisor and thread mark loop ([2a84124](https://github.com/adrighem/Conduit/commit/2a841249ad80243fcad81cf568b62f32bf0eeb70))
