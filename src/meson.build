@@ -115,7 +115,7 @@ test('Rust formatting',
     '--manifest-path', meson.project_source_root() / 'Cargo.toml',
   ],
   env: cargo_env,
-  suite: 'rust',
+  suite: 'rust-lint',
   timeout: 60,
 )
 

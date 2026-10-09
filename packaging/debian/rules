@@ -18,4 +18,4 @@ override_dh_auto_build:
 	CARGO_NET_OFFLINE=true dh_auto_build --buildsystem=meson
 
 override_dh_auto_test:
-	CARGO_NET_OFFLINE=true dh_auto_test --buildsystem=meson
+	CARGO_NET_OFFLINE=true dh_auto_test --buildsystem=meson -- --no-suite rust-lint

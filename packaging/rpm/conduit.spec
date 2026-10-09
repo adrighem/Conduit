@@ -46,7 +46,7 @@ CARGO_NET_OFFLINE=true %meson_build
 %meson_install
 
 %check
-CARGO_NET_OFFLINE=true %meson_test
+CARGO_NET_OFFLINE=true %meson_test --no-suite rust-lint
 
 %files
 %doc %{_docdir}/%{name}/README.md
