@@ -449,6 +449,9 @@ pub struct NativeTimelineView {
     read_candidate: Rc<RefCell<Option<String>>>,
     read_generation: Rc<Cell<u64>>,
     recheck_read_visibility: Rc<dyn Fn()>,
+    /// False inside the thread pane: the root message is already the open
+    /// thread, so it gets no "N replies" footer linking to itself.
+    opens_threads: Rc<Cell<bool>>,
 }
 
 impl std::fmt::Debug for NativeTimelineView {
@@ -477,6 +480,7 @@ impl NativeTimelineView {
         // can never go stale relative to whatever GTK's show/closed signals
         // actually do or when they fire.
         let current_popover: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
+        let opens_threads = Rc::new(Cell::new(true));
 
         let quick_bar = Box::new(Orientation::Horizontal, 2);
         quick_bar.add_css_class("card");
@@ -548,6 +552,7 @@ impl NativeTimelineView {
 
         let context_clone = context.clone();
         let on_action_clone = on_action.clone();
+        let opens_threads_for_bind = opens_threads.clone();
         let hovered_for_bind = hovered.clone();
         let hover_generation_for_bind = hover_generation.clone();
         let current_popover_for_bind = current_popover.clone();
@@ -715,7 +720,7 @@ impl NativeTimelineView {
                     &msg,
                     ctx,
                     Some(&cb_media),
-                    Some(&cb_thread),
+                    opens_threads_for_bind.get().then_some(&cb_thread),
                     Some(&cb_reaction),
                     Some(&cb_hover),
                     Some(&cb_author),
@@ -946,7 +951,14 @@ impl NativeTimelineView {
             read_candidate,
             read_generation,
             recheck_read_visibility,
+            opens_threads,
         }
+    }
+
+    /// Whether messages with replies show a footer that opens their thread.
+    /// The thread pane turns this off for its own root message.
+    pub(crate) fn set_opens_threads(&self, opens_threads: bool) {
+        self.opens_threads.set(opens_threads);
     }
 
     /// Sets which conversation/thread this view's visibility-based
@@ -2709,9 +2721,11 @@ pub(crate) fn build_timeline_message_widget(
         root_box.append(&wrap_box);
     }
 
-    // Thread footer
-    if message.reply_count.unwrap_or(0) > 0 {
-        let reply_count = message.reply_count.unwrap();
+    // Thread footer: only where it can open the thread (not in the thread pane).
+    if let (Some(reply_count), Some(cb)) = (
+        message.reply_count.filter(|count| *count > 0),
+        on_open_thread,
+    ) {
         let thread_footer = Box::new(Orientation::Horizontal, 6);
         let count_str = if reply_count == 1 {
             "1 reply".to_string()
@@ -2742,13 +2756,11 @@ pub(crate) fn build_timeline_message_widget(
         if replied {
             reply_button.add_css_class("thread-reply-active");
         }
-        if let Some(cb) = on_open_thread {
-            let cb = cb.clone();
-            let ts = message.ts.clone();
-            reply_button.connect_clicked(move |_| {
-                cb(ts.clone());
-            });
-        }
+        let cb = cb.clone();
+        let ts = message.ts.clone();
+        reply_button.connect_clicked(move |_| {
+            cb(ts.clone());
+        });
         thread_footer.append(&reply_button);
         root_box.append(&thread_footer);
     }
@@ -3683,6 +3695,37 @@ pub(crate) mod tests {
 
             let _ = std::fs::remove_file(dummy_file);
             let _ = std::fs::remove_dir(ws_dir);
+        });
+    }
+
+    #[test]
+    fn thread_footer_needs_an_open_thread_handler() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let msg = SlackMessage {
+                ts: "1700000000.000950".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("root".to_string()),
+                reply_count: Some(1),
+                ..Default::default()
+            };
+            let has_footer = |widget: Box| {
+                find_descendant(&widget.upcast(), &|w| w.has_css_class("thread-reply-pill"))
+                    .is_some()
+            };
+            let open_thread: Rc<dyn Fn(String)> = Rc::new(|_| {});
+            assert!(has_footer(build_timeline_message_widget(
+                &msg,
+                &ctx,
+                None,
+                Some(&open_thread),
+                None,
+                None,
+                None,
+            )));
+            assert!(!has_footer(build_timeline_message_widget(
+                &msg, &ctx, None, None, None, None, None,
+            )));
         });
     }
 

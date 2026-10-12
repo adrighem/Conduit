@@ -49,6 +49,7 @@ impl ThreadPane {
             return view;
         }
         let view = crate::timeline_message_widget::NativeTimelineView::new();
+        view.set_opens_threads(false);
         self.view_box.append(view.widget());
         self.native_timeline_view.replace(Some(view.clone()));
         self.native_timeline_creations
