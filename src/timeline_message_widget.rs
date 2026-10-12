@@ -87,6 +87,7 @@ type ToggleReactionCallback = Rc<dyn Fn(String, String, bool)>;
 type CacheEntry = (Option<gdk_pixbuf::PixbufAnimation>, gtk::gdk::Texture);
 
 const MAX_TEXTURE_CACHE_SIZE: usize = 256;
+const REACTION_EMOJI_SIZE: i32 = 32;
 
 struct BoundedTextureCache {
     entries: HashMap<PathBuf, CacheEntry>,
@@ -133,6 +134,11 @@ impl BoundedTextureCache {
 
 thread_local! {
     static TEXTURE_CACHE: RefCell<BoundedTextureCache> = RefCell::new(BoundedTextureCache::new());
+    // Reaction emoji pre-scaled to 32px. Kept apart from TEXTURE_CACHE, which
+    // stores full-size textures for the same paths (inline emoji, media): a
+    // shared cache hands whichever size loaded first to the other caller.
+    static REACTION_TEXTURE_CACHE: RefCell<BoundedTextureCache> =
+        RefCell::new(BoundedTextureCache::new());
     // Collapsed image/video attachments, in-memory only (reset on app restart).
     // Message rows are fully rebuilt on every scroll-recycle (no connect_unbind),
     // so this state cannot live on the transient widget - it must survive here,
@@ -1851,8 +1857,26 @@ fn build_avatar_widget(message: &SlackMessage, context: &MessageHtmlContext) -> 
     fallback.upcast::<Widget>()
 }
 
+/// Scales `pixbuf` so its longest side is `REACTION_EMOJI_SIZE`, keeping the
+/// aspect ratio so non-square custom emoji are not stretched.
+fn scale_reaction_pixbuf(pixbuf: &gdk_pixbuf::Pixbuf) -> gdk_pixbuf::Pixbuf {
+    let (width, height) = fit_within(pixbuf.width(), pixbuf.height(), REACTION_EMOJI_SIZE);
+    pixbuf
+        .scale_simple(width, height, gdk_pixbuf::InterpType::Bilinear)
+        .unwrap_or_else(|| pixbuf.clone())
+}
+
+/// Returns `(width, height)` scaled so the longest side equals `max`.
+fn fit_within(width: i32, height: i32, max: i32) -> (i32, i32) {
+    let longest = width.max(height).max(1);
+    let scale = |side: i32| {
+        ((side as i64 * max as i64 + longest as i64 / 2) / longest as i64).max(1) as i32
+    };
+    (scale(width), scale(height))
+}
+
 fn load_custom_emoji_picture(path: &Path) -> Widget {
-    let cached = TEXTURE_CACHE.with(|cache| {
+    let cached = REACTION_TEXTURE_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
         if let Some(entry) = map.get(path) {
             return Some(entry.clone());
@@ -1860,9 +1884,7 @@ fn load_custom_emoji_picture(path: &Path) -> Widget {
         if let Ok(anim) = gdk_pixbuf::PixbufAnimation::from_file(path) {
             if anim.is_static_image() {
                 if let Some(pixbuf) = anim.static_image() {
-                    let scaled = pixbuf
-                        .scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear)
-                        .unwrap_or(pixbuf);
+                    let scaled = scale_reaction_pixbuf(&pixbuf);
                     let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
                     let entry = (None, texture);
                     map.insert(path.to_path_buf(), entry.clone());
@@ -1871,18 +1893,14 @@ fn load_custom_emoji_picture(path: &Path) -> Widget {
             } else {
                 let iter = anim.iter(None);
                 let initial_pixbuf = iter.pixbuf();
-                let scaled = initial_pixbuf
-                    .scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear)
-                    .unwrap_or(initial_pixbuf);
+                let scaled = scale_reaction_pixbuf(&initial_pixbuf);
                 let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
                 let entry = (Some(anim), texture);
                 map.insert(path.to_path_buf(), entry.clone());
                 return Some(entry);
             }
         } else if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file(path) {
-            let scaled = pixbuf
-                .scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear)
-                .unwrap_or(pixbuf);
+            let scaled = scale_reaction_pixbuf(&pixbuf);
             let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
             let entry = (None, texture);
             map.insert(path.to_path_buf(), entry.clone());
@@ -1895,7 +1913,7 @@ fn load_custom_emoji_picture(path: &Path) -> Widget {
         let pic = Picture::for_paintable(&texture);
         pic.set_size_request(32, 32);
         pic.set_can_shrink(true);
-        pic.set_content_fit(gtk::ContentFit::Cover);
+        pic.set_content_fit(gtk::ContentFit::Contain);
         pic.add_css_class("reaction-emoji-image");
 
         if let Some(anim) = opt_anim {
@@ -1916,9 +1934,7 @@ fn load_custom_emoji_picture(path: &Path) -> Widget {
                         last_update.set(std::time::Instant::now());
                         iter.advance(std::time::SystemTime::now());
                         let pixbuf = iter.pixbuf();
-                        let scaled = pixbuf
-                            .scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear)
-                            .unwrap_or(pixbuf);
+                        let scaled = scale_reaction_pixbuf(&pixbuf);
                         p.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&scaled)));
                     }
                     glib::ControlFlow::Continue
@@ -1941,7 +1957,7 @@ fn load_custom_emoji_picture(path: &Path) -> Widget {
     let pic = Picture::for_filename(path);
     pic.set_size_request(32, 32);
     pic.set_can_shrink(true);
-    pic.set_content_fit(gtk::ContentFit::Cover);
+    pic.set_content_fit(gtk::ContentFit::Contain);
     pic.add_css_class("reaction-emoji-image");
     pic.upcast::<Widget>()
 }
@@ -2738,6 +2754,15 @@ pub(crate) mod tests {
     use crate::models::{
         SlackAttachment, SlackAttachmentField, SlackFile, SlackMessage, SlackReaction,
     };
+
+    #[test]
+    fn fit_within_keeps_aspect_ratio() {
+        assert_eq!(fit_within(128, 128, 32), (32, 32));
+        assert_eq!(fit_within(128, 64, 32), (32, 16));
+        assert_eq!(fit_within(48, 96, 32), (16, 32));
+        assert_eq!(fit_within(16, 16, 32), (32, 32));
+        assert_eq!(fit_within(1000, 1, 32), (32, 1));
+    }
 
     #[test]
     fn dispatch_allows_handler_to_replace_itself() {
