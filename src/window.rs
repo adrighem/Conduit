@@ -4335,6 +4335,15 @@ impl ConduitWindow {
         notification_opened || slack_uri_opened
     }
 
+    fn draft_channel_ids(&self) -> HashSet<String> {
+        self.imp()
+            .workspace_id
+            .borrow()
+            .as_deref()
+            .map(|workspace_id| self.imp().drafts.borrow().channel_ids(workspace_id))
+            .unwrap_or_default()
+    }
+
     fn draft_key(&self, channel_id: &str, thread_ts: Option<&str>) -> Option<DraftKey> {
         let workspace_id = self.imp().workspace_id.borrow().clone()?;
         Some(DraftKey::new(&workspace_id, channel_id, thread_ts))
@@ -9649,6 +9658,7 @@ impl ConduitWindow {
             let user_avatar_urls = imp.user_avatar_urls.borrow();
             let current_user_id = imp.current_user_id.borrow();
             let read_states = imp.workspace.read_states.borrow();
+            let draft_channel_ids = self.draft_channel_ids();
             let query = imp.sidebar_filter_entry.text();
             let selected_channel = self.visible_channel_id();
             let active_huddle_channel_id = imp
@@ -9665,6 +9675,7 @@ impl ConduitWindow {
                 unread_only: false,
                 unread_thread_channel_ids: None,
                 read_states: Some(&read_states),
+                draft_channel_ids: Some(&draft_channel_ids),
                 loading: false,
                 has_error: imp.sidebar_error.borrow().is_some(),
                 user_search_aliases: Some(&user_search_aliases),
@@ -9992,6 +10003,7 @@ impl ConduitWindow {
                     unread_only: imp.sidebar_unread_filter_button.is_active(),
                     unread_thread_channel_ids: Some(&unread_thread_channel_ids),
                     read_states: Some(&imp.workspace.read_states.borrow()),
+                    draft_channel_ids: Some(&self.draft_channel_ids()),
                     loading: false,
                     has_error: imp.sidebar_error.borrow().is_some(),
                     user_search_aliases: Some(&user_search_aliases),
@@ -11062,6 +11074,7 @@ impl ConduitWindow {
                     user_statuses: &imp.user_statuses.borrow(),
                     user_avatar_urls: &imp.user_avatar_urls.borrow(),
                     read_states: Some(&imp.workspace.read_states.borrow()),
+                    draft_channel_ids: Some(&self.draft_channel_ids()),
                 },
                 query.as_str(),
             )
@@ -14039,6 +14052,7 @@ mod tests {
             status: None,
             avatar_url: None,
             latest_ts: None,
+            has_draft: false,
         }
     }
 

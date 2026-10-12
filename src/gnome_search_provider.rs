@@ -221,6 +221,7 @@ fn prepare_states(states: Vec<CachedSearchState>) -> Vec<PreparedSearchState> {
                 None,
                 None,
                 None,
+                None,
             );
             PreparedSearchState {
                 workspace_id: state.workspace_id,

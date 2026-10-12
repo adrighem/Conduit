@@ -1,5 +1,5 @@
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gtk::gio;
 use gtk::gio::prelude::SettingsExt;
@@ -128,6 +128,15 @@ impl Drafts {
 
     pub fn remove(&mut self, key: &DraftKey) -> bool {
         self.entries.remove(key).is_some()
+    }
+
+    /// Channels in `workspace_id` with a channel or thread draft.
+    pub fn channel_ids(&self, workspace_id: &str) -> HashSet<String> {
+        self.entries
+            .keys()
+            .filter(|key| key.workspace_id == workspace_id)
+            .map(|key| key.channel_id.clone())
+            .collect()
     }
 
     pub fn len(&self) -> usize {

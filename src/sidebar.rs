@@ -85,6 +85,8 @@ pub struct SidebarRowModel {
     pub status: Option<SlackUserStatus>,
     pub avatar_url: Option<String>,
     pub latest_ts: Option<String>,
+    /// Unsent composer text is saved for this conversation or one of its threads.
+    pub has_draft: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +384,10 @@ fn sidebar_row_can_update_in_place(previous: &SidebarRowModel, next: &SidebarRow
         && previous.starred == next.starred
         && previous.user_deleted == next.user_deleted
         && previous.search_aliases == next.search_aliases
+        // Attention and drafts feed row order (see `compare_ranking`).
+        && previous.unread == next.unread
+        && previous.mention_count == next.mention_count
+        && previous.has_draft == next.has_draft
 }
 
 fn keyed_sidebar_items_are_unique(items: &[KeyedSidebarItem]) -> bool {
@@ -538,6 +544,8 @@ pub struct SidebarBuildOptions<'a> {
     pub unread_only: bool,
     pub unread_thread_channel_ids: Option<&'a HashSet<String>>,
     pub read_states: Option<&'a UnreadLedger>,
+    /// Conversations with a saved draft (channel or thread composer).
+    pub draft_channel_ids: Option<&'a HashSet<String>>,
     pub loading: bool,
     pub has_error: bool,
     pub user_search_aliases: Option<&'a UserSearchAliases>,
@@ -550,6 +558,7 @@ pub struct SidebarBuildOptions<'a> {
 struct SidebarRowOptions<'a> {
     selected_channel: Option<&'a str>,
     read_state: Option<&'a ConversationReadState>,
+    has_draft: bool,
     current_user_id: Option<&'a str>,
     active_huddle_channel_id: Option<&'a str>,
     user_search_aliases: Option<&'a UserSearchAliases>,
@@ -631,6 +640,7 @@ impl SidebarRowModel {
                 .and_then(|state| state.latest_ts())
                 .or_else(|| conversation.latest_message_ts())
                 .map(str::to_string),
+            has_draft: options.has_draft,
         }
     }
 
@@ -663,6 +673,9 @@ pub(crate) fn sidebar_row_for_conversation(
             read_state: options
                 .read_states
                 .and_then(|read_states| read_states.get(&conversation.id)),
+            has_draft: options
+                .draft_channel_ids
+                .is_some_and(|ids| ids.contains(&conversation.id)),
             current_user_id: options.current_user_id,
             active_huddle_channel_id: options.active_huddle_channel_id,
             user_search_aliases: options.user_search_aliases,
@@ -816,6 +829,7 @@ pub fn conversation_switcher_items(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -830,6 +844,7 @@ pub(crate) fn conversation_switcher_items_with_aliases(
     user_statuses: Option<&UserStatuses>,
     user_avatar_urls: Option<&HashMap<String, String>>,
     read_states: Option<&UnreadLedger>,
+    draft_channel_ids: Option<&HashSet<String>>,
 ) -> Vec<SidebarRowModel> {
     let rows = conversation_switcher_rows_with_aliases(
         conversations,
@@ -840,6 +855,7 @@ pub(crate) fn conversation_switcher_items_with_aliases(
         user_statuses,
         user_avatar_urls,
         read_states,
+        draft_channel_ids,
     );
     filter_conversation_switcher_rows(
         &rows,
@@ -861,6 +877,7 @@ pub(crate) fn conversation_switcher_rows_with_aliases(
     user_statuses: Option<&UserStatuses>,
     user_avatar_urls: Option<&HashMap<String, String>>,
     read_states: Option<&UnreadLedger>,
+    draft_channel_ids: Option<&HashSet<String>>,
 ) -> Vec<SidebarRowModel> {
     conversations
         .iter()
@@ -876,6 +893,7 @@ pub(crate) fn conversation_switcher_rows_with_aliases(
                     user_statuses,
                     user_avatar_urls,
                     read_state: read_states.and_then(|states| states.get(&conversation.id)),
+                    has_draft: draft_channel_ids.is_some_and(|ids| ids.contains(&conversation.id)),
                     ..Default::default()
                 },
             )
@@ -925,10 +943,7 @@ pub(crate) fn filter_conversation_switcher_rows(
             } else {
                 right_score.band().cmp(&left_score.band())
             })
-            .then_with(|| compare_participant_coverage(left, right, Some(&participant_coverage)))
-            .then_with(|| compare_user_deleted(left, right))
-            .then_with(|| compare_attention(left, right))
-            .then_with(|| compare_recency(left, right))
+            .then_with(|| compare_ranking(left, right, Some(&participant_coverage)))
             .then_with(|| (left_sort_key, &left.id).cmp(&(right_sort_key, &right.id)))
         },
     );
@@ -977,6 +992,7 @@ pub fn conversation_picker_sections_with_aliases(
             user_statuses: &HashMap::new(),
             user_avatar_urls: &HashMap::new(),
             read_states: None,
+            draft_channel_ids: None,
         },
         query,
     )
@@ -993,6 +1009,7 @@ pub struct ConversationPickerSource<'a> {
     pub user_statuses: &'a UserStatuses,
     pub user_avatar_urls: &'a HashMap<String, String>,
     pub read_states: Option<&'a UnreadLedger>,
+    pub draft_channel_ids: Option<&'a HashSet<String>>,
 }
 
 pub fn conversation_picker_sections_with_statuses(
@@ -1010,6 +1027,7 @@ pub fn conversation_picker_sections_with_statuses(
         user_statuses,
         user_avatar_urls,
         read_states,
+        draft_channel_ids,
     } = source;
     let search_query = SearchQuery::parse(query);
     let mut all_user_search_aliases = known_user_search_aliases.clone();
@@ -1068,6 +1086,7 @@ pub fn conversation_picker_sections_with_statuses(
         Some(user_statuses),
         Some(user_avatar_urls),
         read_states,
+        draft_channel_ids,
     )
     .into_iter()
     .map(|row| ConversationPickerItem {
@@ -1122,6 +1141,7 @@ pub fn conversation_picker_sections_with_statuses(
                     .filter(|status| status.active_at(current_unix_seconds())),
                 avatar_url: user_avatar_urls.get(id).cloned(),
                 latest_ts: None,
+                has_draft: false,
             };
             row.match_score(&search_query)
                 .is_some()
@@ -1156,15 +1176,8 @@ fn sort_picker_items(
 ) {
     items.sort_by(|left, right| {
         compare_relevance(&left.row, &right.row, query)
-            .then_with(|| compare_participant_coverage(&left.row, &right.row, participant_coverage))
-            .then_with(|| compare_user_deleted(&left.row, &right.row))
-            .then_with(|| compare_attention(&left.row, &right.row))
-            .then_with(|| compare_recency(&left.row, &right.row))
-            .then_with(|| {
-                title_sort_key(&left.row.title)
-                    .cmp(&title_sort_key(&right.row.title))
-                    .then_with(|| left.row.id.cmp(&right.row.id))
-            })
+            .then_with(|| compare_ranking(&left.row, &right.row, participant_coverage))
+            .then_with(|| compare_title(&left.row, &right.row))
     });
 }
 
@@ -1202,11 +1215,11 @@ fn build_sidebar_sections_from_rows(
         }
     }
 
-    sort_rows_by_title(&mut priority_direct_messages, query);
-    sort_rows_by_title(&mut priority_channels, query);
-    sort_rows_by_title(&mut channels, query);
-    sort_rows_by_title(&mut direct_messages, query);
-    sort_rows_by_title(&mut other, query);
+    sort_section_rows(&mut priority_direct_messages, query);
+    sort_section_rows(&mut priority_channels, query);
+    sort_section_rows(&mut channels, query);
+    sort_section_rows(&mut direct_messages, query);
+    sort_section_rows(&mut other, query);
 
     let priority = priority_direct_messages
         .into_iter()
@@ -1387,11 +1400,11 @@ fn section(kind: SidebarSectionKind, rows: Vec<SidebarRowModel>) -> Option<Sideb
     })
 }
 
-fn sort_rows_by_title(rows: &mut [SidebarRowModel], query: Option<&SearchQuery>) {
+fn sort_section_rows(rows: &mut [SidebarRowModel], query: Option<&SearchQuery>) {
     rows.sort_by(|left, right| {
-        compare_relevance(left, right, query).then_with(|| {
-            (title_sort_key(&left.title), &left.id).cmp(&(title_sort_key(&right.title), &right.id))
-        })
+        compare_relevance(left, right, query)
+            .then_with(|| compare_attention(left, right))
+            .then_with(|| compare_title(left, right))
     });
 }
 
@@ -1469,13 +1482,24 @@ fn sort_search_rows(
 ) {
     rows.sort_by(|left, right| {
         compare_relevance(left, right, Some(query))
-            .then_with(|| compare_participant_coverage(left, right, Some(participant_coverage)))
-            .then_with(|| compare_user_deleted(left, right))
-            .then_with(|| {
-                (title_sort_key(&left.title), &left.id)
-                    .cmp(&(title_sort_key(&right.title), &right.id))
-            })
+            .then_with(|| compare_ranking(left, right, Some(participant_coverage)))
+            .then_with(|| compare_title(left, right))
     });
+}
+
+/// Ranking after match quality, shared by the conversation switcher, the
+/// forward picker and sidebar search: people coverage, deactivated users
+/// last, attention, drafts, recency.
+fn compare_ranking(
+    left: &SidebarRowModel,
+    right: &SidebarRowModel,
+    participant_coverage: Option<&HashMap<String, ParticipantCoverage>>,
+) -> std::cmp::Ordering {
+    compare_participant_coverage(left, right, participant_coverage)
+        .then_with(|| compare_user_deleted(left, right))
+        .then_with(|| compare_attention(left, right))
+        .then_with(|| compare_draft(left, right))
+        .then_with(|| compare_recency(left, right))
 }
 
 fn compare_participant_coverage(
@@ -1513,6 +1537,14 @@ fn compare_attention(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cm
         .mention_count
         .cmp(&left.mention_count)
         .then_with(|| right.unread.cmp(&left.unread))
+}
+
+fn compare_draft(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::Ordering {
+    right.has_draft.cmp(&left.has_draft)
+}
+
+fn compare_title(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::Ordering {
+    (title_sort_key(&left.title), &left.id).cmp(&(title_sort_key(&right.title), &right.id))
 }
 
 fn compare_recency(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::Ordering {
@@ -1655,6 +1687,7 @@ mod tests {
             status: None,
             avatar_url: None,
             latest_ts: None,
+            has_draft: false,
         }
     }
 
@@ -2608,6 +2641,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let empty_conversations = Vec::new();
         let empty_users = Vec::new();
@@ -2626,6 +2660,7 @@ mod tests {
                 user_statuses: &empty_statuses,
                 user_avatar_urls: &empty_avatar_urls,
                 read_states: None,
+                draft_channel_ids: None,
             },
             "",
         );
@@ -3144,6 +3179,7 @@ mod tests {
                 user_statuses: &HashMap::new(),
                 user_avatar_urls: &HashMap::new(),
                 read_states: Some(&ledger),
+                draft_channel_ids: None,
             },
             "",
         );
@@ -3155,6 +3191,114 @@ mod tests {
                 .map(|item| item.row.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["D_MENTION", "D_UNREAD", "D_RECENT", "D_READ"]
+        );
+    }
+
+    fn ranking_fixture() -> (
+        Vec<SlackConversation>,
+        HashMap<String, String>,
+        UnreadLedger,
+    ) {
+        let conversations = [
+            ("D_MENTION", "U_MENTION", "10.000000"),
+            ("D_UNREAD", "U_UNREAD", "50.000000"),
+            ("D_DRAFT", "U_DRAFT", "20.000000"),
+            ("D_RECENT", "U_RECENT", "200.000000"),
+            ("D_READ", "U_READ", "100.000000"),
+        ]
+        .into_iter()
+        .map(|(id, user, latest)| {
+            let mut conversation = dm(id, user);
+            conversation
+                .extra
+                .insert("latest".to_string(), serde_json::json!(latest));
+            conversation
+        })
+        .collect();
+        let user_names = HashMap::from([
+            ("U_MENTION".to_string(), "Ann Zed".to_string()),
+            ("U_UNREAD".to_string(), "Ann Yon".to_string()),
+            ("U_DRAFT".to_string(), "Ann Xu".to_string()),
+            ("U_RECENT".to_string(), "Ann Wu".to_string()),
+            ("U_READ".to_string(), "Ann Abe".to_string()),
+        ]);
+        let ledger = read_states(&[("D_UNREAD", 0), ("D_MENTION", 2)]);
+        (conversations, user_names, ledger)
+    }
+
+    #[test]
+    fn switcher_and_sidebar_search_rank_drafts_after_attention_before_recency() {
+        let (conversations, user_names, ledger) = ranking_fixture();
+        let drafts = HashSet::from(["D_DRAFT".to_string()]);
+        let expected = vec!["D_MENTION", "D_UNREAD", "D_DRAFT", "D_RECENT", "D_READ"];
+
+        let picker = conversation_picker_sections_with_statuses(
+            ConversationPickerSource {
+                conversations: &conversations,
+                discovered_channels: &[],
+                discovered_users: &[],
+                user_names: &user_names,
+                current_user_id: None,
+                known_user_search_aliases: &HashMap::new(),
+                user_full_names: &HashMap::new(),
+                user_statuses: &HashMap::new(),
+                user_avatar_urls: &HashMap::new(),
+                read_states: Some(&ledger),
+                draft_channel_ids: Some(&drafts),
+            },
+            "ann",
+        );
+        let picker_ids = picker
+            .search_results
+            .expect("flat list expected")
+            .into_iter()
+            .map(|item| item.row.id)
+            .collect::<Vec<_>>();
+        assert_eq!(picker_ids, expected);
+
+        let SidebarListModel::Rows(rows) = build_sidebar_list(
+            &conversations,
+            &user_names,
+            SidebarBuildOptions {
+                query: "ann",
+                read_states: Some(&ledger),
+                draft_channel_ids: Some(&drafts),
+                ..Default::default()
+            },
+        ) else {
+            panic!("search returns flat rows");
+        };
+        let sidebar_ids = rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        assert_eq!(sidebar_ids, expected);
+    }
+
+    #[test]
+    fn sidebar_sections_sort_by_attention_then_title() {
+        let ledger = read_states(&[("C_BRAVO", 0), ("C_CHARLIE", 1)]);
+        let sections = list_sections(build_sidebar_list(
+            &[
+                channel("C_ALPHA", "alpha"),
+                channel("C_BRAVO", "bravo"),
+                channel("C_CHARLIE", "charlie"),
+                channel("C_DELTA", "delta"),
+            ],
+            &HashMap::new(),
+            SidebarBuildOptions {
+                read_states: Some(&ledger),
+                ..Default::default()
+            },
+        ));
+        let channels = sections
+            .iter()
+            .find(|section| section.kind == SidebarSectionKind::Channels)
+            .expect("channels section");
+        assert_eq!(
+            channels
+                .rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["C_CHARLIE", "C_BRAVO", "C_ALPHA", "C_DELTA"]
         );
     }
 
@@ -3726,6 +3870,13 @@ mod tests {
         let mut reordered = starred.clone();
         reordered.title = "#renamed".to_string();
         assert_eq!(projection.update_conversation_rows(&[reordered]), None);
+
+        let mut attention_changed = starred.clone();
+        attention_changed.mention_count = 1;
+        assert_eq!(
+            projection.update_conversation_rows(&[attention_changed]),
+            None
+        );
 
         let mut membership_changed = starred;
         membership_changed.starred = true;

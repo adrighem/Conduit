@@ -105,40 +105,16 @@ pub fn picker_sections(
     source: sidebar::ConversationPickerSource<'_>,
     query: &str,
 ) -> ConversationPickerSections {
-    let sidebar::ConversationPickerSource {
-        conversations,
-        discovered_channels,
-        discovered_users,
-        user_names,
-        current_user_id,
-        known_user_search_aliases,
-        user_full_names,
-        user_statuses,
-        user_avatar_urls,
-        read_states,
-    } = source;
-    let channels = if include_discovery {
-        discovered_channels
+    let (channels, users): (&[_], &[_]) = if include_discovery {
+        (source.discovered_channels, source.discovered_users)
     } else {
-        &[]
-    };
-    let users = if include_discovery {
-        discovered_users
-    } else {
-        &[]
+        (&[], &[])
     };
     sidebar::conversation_picker_sections_with_statuses(
         sidebar::ConversationPickerSource {
-            conversations,
             discovered_channels: channels,
             discovered_users: users,
-            user_names,
-            current_user_id,
-            known_user_search_aliases,
-            user_full_names,
-            user_statuses,
-            user_avatar_urls,
-            read_states,
+            ..source
         },
         query,
     )
