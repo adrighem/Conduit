@@ -122,7 +122,6 @@ pub enum RuntimeCommand {
         url: String,
         name: String,
     },
-    #[allow(dead_code)]
     DownloadAttachment {
         url: String,
         name: String,

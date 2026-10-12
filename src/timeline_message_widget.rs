@@ -390,6 +390,11 @@ pub(crate) enum TimelineAction {
         add: bool,
     },
     ForwardMessage(String),
+    /// Download a non-media file attachment and open it with the default app.
+    DownloadFile {
+        url: String,
+        name: String,
+    },
     MarkUnread(String),
     CopyMessageLink(String),
     CopyMessageText(String),
@@ -1594,6 +1599,7 @@ fn render_files(
     root_box: &Box,
     context: &MessageHtmlContext,
     on_open_media: Option<&OpenMediaCallback>,
+    on_action: Option<&ActionHandler>,
     ts: &str,
 ) {
     let files_box = Box::new(Orientation::Vertical, 6);
@@ -1820,6 +1826,25 @@ fn render_files(
             download_btn.set_focus_on_click(false);
             download_btn.add_css_class("flat");
             download_btn.set_tooltip_text(Some("Download file"));
+            match (on_action, file.download_url()) {
+                (Some(on_action), Some(url)) => {
+                    let on_action = on_action.clone();
+                    let url = url.to_string();
+                    let name = file
+                        .name
+                        .as_deref()
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or(&title)
+                        .to_string();
+                    download_btn.connect_clicked(move |_| {
+                        on_action(TimelineAction::DownloadFile {
+                            url: url.clone(),
+                            name: name.clone(),
+                        });
+                    });
+                }
+                _ => download_btn.set_sensitive(false),
+            }
             file_card.append(&download_btn);
 
             files_box.append(&file_card);
@@ -2445,7 +2470,14 @@ fn render_message_content(
         .cloned()
         .collect::<Vec<_>>();
     if !files.is_empty() {
-        render_files(&files, root_box, context, on_open_media, &message.ts);
+        render_files(
+            &files,
+            root_box,
+            context,
+            on_open_media,
+            on_action,
+            &message.ts,
+        );
     }
 }
 
@@ -3651,6 +3683,51 @@ pub(crate) mod tests {
 
             let _ = std::fs::remove_file(dummy_file);
             let _ = std::fs::remove_dir(ws_dir);
+        });
+    }
+
+    #[test]
+    fn file_card_download_dispatches_download_action() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let msg = SlackMessage {
+                ts: "1700000000.000960".to_string(),
+                user: Some("U123".to_string()),
+                files: Some(vec![SlackFile {
+                    name: Some("report.pdf".to_string()),
+                    mimetype: Some("application/pdf".to_string()),
+                    url_private_download: Some(
+                        "https://files.slack.com/files-pri/T1-F1/download/report.pdf".to_string(),
+                    ),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            };
+            let received: Rc<RefCell<Option<TimelineAction>>> = Rc::new(RefCell::new(None));
+            let sink = received.clone();
+            let on_action: ActionHandler = Rc::new(move |action| {
+                *sink.borrow_mut() = Some(action);
+            });
+            let widget =
+                build_timeline_message_widget(&msg, &ctx, None, None, None, None, Some(&on_action));
+            let button = find_descendant(&widget.upcast(), &|w| {
+                w.tooltip_text().as_deref() == Some("Download file")
+            })
+            .and_downcast::<Button>()
+            .expect("download button");
+            assert!(button.is_sensitive());
+            button.emit_clicked();
+            let action = received.borrow_mut().take();
+            match action {
+                Some(TimelineAction::DownloadFile { url, name }) => {
+                    assert_eq!(
+                        url,
+                        "https://files.slack.com/files-pri/T1-F1/download/report.pdf"
+                    );
+                    assert_eq!(name, "report.pdf");
+                }
+                other => panic!("expected DownloadFile, got {other:?}"),
+            }
         });
     }
 

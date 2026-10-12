@@ -3173,6 +3173,14 @@ impl ConduitWindow {
                     self.forward_message(&channel_id, &ts);
                 }
             }
+            TimelineAction::DownloadFile { url, name } => {
+                if self.send_command(RuntimeCommand::DownloadAttachment {
+                    url,
+                    name: name.clone(),
+                }) {
+                    self.set_status(&format!("Downloading {name}..."));
+                }
+            }
             TimelineAction::MarkUnread(ts) => {
                 if let Some(channel_id) = self.visible_channel_id() {
                     self.mark_conversation_unread(&channel_id, &ts);
