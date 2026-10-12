@@ -5,9 +5,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -15,10 +15,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use adw::prelude::*;
 use gettextrs::gettext;
 use gtk::gdk::Key;
-use gtk::glib;
+use gtk::{gio, glib};
 use sha2::{Digest, Sha256};
 
-use crate::emoji::{EmojiCatalog, EmojiValue};
+use crate::emoji::{EmojiCatalog, EmojiEntry, EmojiValue};
 
 const CATEGORY_ICONS: &[(&str, &str)] = &[
     ("All", "🌟"),
@@ -38,7 +38,33 @@ pub(crate) struct EmojiPickerWindow {
     window: adw::Window,
 }
 
+static RESOLVED_CACHE_MAP: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+
+fn resolved_cache_map() -> &'static Mutex<HashMap<String, Option<PathBuf>>> {
+    RESOLVED_CACHE_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn invalidate_or_set_custom_emoji_cached_file(url: &str, path: PathBuf) {
+    if let Ok(mut map) = resolved_cache_map().lock() {
+        map.insert(url.to_string(), Some(path));
+    }
+}
+
 pub(crate) fn resolve_custom_emoji_cached_file(url: &str) -> Option<PathBuf> {
+    if let Ok(map) = resolved_cache_map().lock() {
+        if let Some(cached) = map.get(url) {
+            return cached.clone();
+        }
+    }
+
+    let resolved = resolve_custom_emoji_cached_file_disk(url);
+    if let Ok(mut map) = resolved_cache_map().lock() {
+        map.insert(url.to_string(), resolved.clone());
+    }
+    resolved
+}
+
+fn resolve_custom_emoji_cached_file_disk(url: &str) -> Option<PathBuf> {
     if let Ok(path) = PathBuf::from(url).canonicalize() {
         if path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
             return Some(path);
@@ -87,9 +113,6 @@ pub(crate) fn resolve_custom_emoji_cached_file(url: &str) -> Option<PathBuf> {
     None
 }
 
-/// Emoji widgets waiting for a download, keyed by URL.
-type PendingViews =
-    Rc<RefCell<HashMap<String, Vec<(glib::WeakRef<gtk::Stack>, glib::WeakRef<gtk::Picture>)>>>>;
 type DownloadCallback = Box<dyn FnOnce(PathBuf) + Send + 'static>;
 
 struct DownloadRequest {
@@ -343,6 +366,7 @@ async fn download_custom_emoji_file(client: &reqwest::Client, url: &str) -> Opti
         return None;
     }
 
+    invalidate_or_set_custom_emoji_cached_file(url, final_path.clone());
     Some(final_path)
 }
 
@@ -368,39 +392,14 @@ impl EmojiPickerWindow {
         on_selected: impl Fn(&str) + 'static,
     ) -> Self {
         let catalog = EmojiCatalog::new(custom_emojis);
-        let all_entries = Rc::new(catalog.entries());
+        let all_entries = Rc::new(
+            catalog
+                .entries()
+                .into_iter()
+                .map(Rc::new)
+                .collect::<Vec<_>>(),
+        );
         let on_selected = Rc::new(on_selected);
-
-        let (download_tx, mut download_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(String, PathBuf)>();
-        let pending_views: PendingViews = Rc::new(RefCell::new(HashMap::new()));
-
-        {
-            let pending_views = pending_views.clone();
-            glib::spawn_future_local(async move {
-                while let Some((url, path)) = download_rx.recv().await {
-                    if let Some(views) = pending_views.borrow_mut().remove(&url) {
-                        for (stack_weak, pic_weak) in views {
-                            if let Some(pic) = pic_weak.upgrade() {
-                                pic.set_filename(Some(&path));
-                                if let Some(stack) = stack_weak.upgrade() {
-                                    stack.set_visible_child_name("pic");
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        let loader = emoji_loader();
-        for url in custom_emojis.values() {
-            if (url.starts_with("http://") || url.starts_with("https://"))
-                && resolve_custom_emoji_cached_file(url).is_none()
-            {
-                loader.queue(url.clone(), false, None);
-            }
-        }
 
         let window = adw::Window::new();
         window.set_title(Some(&gettext("Emoji")));
@@ -441,7 +440,7 @@ impl EmojiPickerWindow {
 
         let mut category_buttons = Vec::new();
         let mut first_btn: Option<gtk::ToggleButton> = None;
-        let active_category = Rc::new(RefCell::new("All".to_string()));
+        let active_category = std::rc::Rc::new(std::cell::RefCell::new("All".to_string()));
 
         for (cat_name, icon) in CATEGORY_ICONS {
             let btn = gtk::ToggleButton::with_label(icon);
@@ -463,15 +462,182 @@ impl EmojiPickerWindow {
         category_scroller.set_child(Some(&category_box));
         content_box.append(&category_scroller);
 
-        // Row 3: Grid Scroller
-        let grid = gtk::FlowBox::new();
-        grid.set_activate_on_single_click(true);
-        grid.set_column_spacing(6);
-        grid.set_row_spacing(6);
-        grid.set_homogeneous(true);
-        grid.set_min_children_per_line(8);
-        grid.set_max_children_per_line(9);
-        grid.set_selection_mode(gtk::SelectionMode::None);
+        // Row 3: Virtualized GridView
+        let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let selection = gtk::SingleSelection::new(Some(store.clone()));
+        selection.set_autoselect(false);
+        selection.set_can_unselect(true);
+
+        let (download_tx, mut download_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, PathBuf)>();
+        let pending_widgets: std::rc::Rc<
+            std::cell::RefCell<HashMap<String, Vec<glib::WeakRef<gtk::Stack>>>>,
+        > = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
+
+        fn apply_custom_emoji_image(stack: &gtk::Stack, path: &Path, expected_url: &str) {
+            let Some(pic) = stack.child_by_name("pic").and_downcast::<gtk::Picture>() else {
+                return;
+            };
+            if let Ok(anim) = gdk_pixbuf::PixbufAnimation::from_file(path) {
+                if !anim.is_static_image() {
+                    let iter = anim.iter(None);
+                    let first_pixbuf = iter.pixbuf();
+                    pic.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&first_pixbuf)));
+
+                    let last_update = Rc::new(Cell::new(std::time::Instant::now()));
+                    let delay_ms = iter
+                        .delay_time()
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(60)
+                        .max(60);
+
+                    let stack_weak = stack.downgrade();
+                    let url_owned = expected_url.to_string();
+
+                    pic.add_tick_callback(move |p, _frame_clock| {
+                        let Some(stack) = stack_weak.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        if !p.is_mapped() || stack.widget_name() != url_owned {
+                            return glib::ControlFlow::Break;
+                        }
+                        if last_update.get().elapsed().as_millis() as u64 >= delay_ms {
+                            last_update.set(std::time::Instant::now());
+                            iter.advance(std::time::SystemTime::now());
+                            p.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&iter.pixbuf())));
+                        }
+                        glib::ControlFlow::Continue
+                    });
+
+                    stack.set_visible_child_name("pic");
+                    return;
+                }
+            }
+
+            pic.set_filename(Some(path));
+            stack.set_visible_child_name("pic");
+        }
+
+        {
+            let pending_widgets = pending_widgets.clone();
+            glib::spawn_future_local(async move {
+                while let Some((url, path)) = download_rx.recv().await {
+                    if let Some(stacks) = pending_widgets.borrow_mut().remove(&url) {
+                        for stack_weak in stacks {
+                            if let Some(stack) = stack_weak.upgrade() {
+                                if stack.widget_name() == url {
+                                    apply_custom_emoji_image(&stack, &path, &url);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(move |_, list_item| {
+            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+
+            let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            container.set_size_request(38, 38);
+            container.set_halign(gtk::Align::Center);
+            container.set_valign(gtk::Align::Center);
+
+            let stack = gtk::Stack::new();
+            stack.set_size_request(36, 36);
+            stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+
+            let lbl = gtk::Label::new(None);
+            lbl.add_css_class("title-3");
+            lbl.set_size_request(36, 36);
+            stack.add_named(&lbl, Some("text"));
+
+            let pic = gtk::Picture::new();
+            pic.set_size_request(32, 32);
+            pic.set_can_shrink(true);
+            pic.set_content_fit(gtk::ContentFit::Cover);
+            stack.add_named(&pic, Some("pic"));
+
+            let placeholder = gtk::Label::new(Some("💬"));
+            placeholder.add_css_class("dim-label");
+            placeholder.set_size_request(36, 36);
+            stack.add_named(&placeholder, Some("placeholder"));
+
+            container.append(&stack);
+            list_item.set_child(Some(&container));
+        });
+
+        {
+            let pending_widgets = pending_widgets.clone();
+            let download_tx = download_tx.clone();
+            factory.connect_bind(move |_, list_item| {
+                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+                let Some(boxed) = list_item.item().and_downcast::<glib::BoxedAnyObject>() else {
+                    return;
+                };
+                let entry: std::cell::Ref<Rc<EmojiEntry>> = boxed.borrow();
+                let entry = entry.clone();
+
+                let Some(container) = list_item.child().and_downcast::<gtk::Box>() else {
+                    return;
+                };
+                container.set_tooltip_text(Some(&format!(":{}:", entry.name)));
+                container.update_property(&[gtk::accessible::Property::Label(&entry.label)]);
+
+                let Some(stack) = container.first_child().and_downcast::<gtk::Stack>() else {
+                    return;
+                };
+
+                match &entry.value {
+                    EmojiValue::Unicode(u) => {
+                        stack.set_widget_name("");
+                        if let Some(lbl) = stack.child_by_name("text").and_downcast::<gtk::Label>()
+                        {
+                            lbl.set_text(u);
+                        }
+                        stack.set_visible_child_name("text");
+                    }
+                    EmojiValue::CustomImage(url) => {
+                        stack.set_widget_name(url);
+                        if let Some(cached_path) = resolve_custom_emoji_cached_file(url) {
+                            apply_custom_emoji_image(&stack, &cached_path, url);
+                        } else {
+                            stack.set_visible_child_name("placeholder");
+                            pending_widgets
+                                .borrow_mut()
+                                .entry(url.clone())
+                                .or_default()
+                                .push(stack.downgrade());
+
+                            let tx = download_tx.clone();
+                            let url_clone = url.clone();
+                            request_custom_emoji_file(url, move |path| {
+                                let _ = tx.send((url_clone, path));
+                            });
+                        }
+                    }
+                }
+            });
+        }
+
+        factory.connect_unbind(move |_, list_item| {
+            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+            if let Some(container) = list_item.child().and_downcast::<gtk::Box>() {
+                if let Some(stack) = container.first_child().and_downcast::<gtk::Stack>() {
+                    stack.set_widget_name("");
+                    if let Some(pic) = stack.child_by_name("pic").and_downcast::<gtk::Picture>() {
+                        pic.set_paintable(Option::<&gtk::gdk::Paintable>::None);
+                    }
+                }
+            }
+        });
+
+        let grid = gtk::GridView::new(Some(selection), Some(factory));
+        grid.set_min_columns(8);
+        grid.set_max_columns(9);
+        grid.set_enable_rubberband(false);
+        grid.set_single_click_activate(true);
         grid.set_valign(gtk::Align::Start);
         grid.set_halign(gtk::Align::Center);
 
@@ -491,23 +657,12 @@ impl EmojiPickerWindow {
         toolbar_view.set_content(Some(&content_box));
         window.set_content(Some(&toolbar_view));
 
-        let current_names = Rc::new(RefCell::new(Vec::<String>::new()));
-
         let populate = {
             let all_entries = all_entries.clone();
-            let grid = grid.clone();
+            let store = store.clone();
             let empty_label = empty_label.clone();
-            let current_names = current_names.clone();
-            let pending_views = pending_views.clone();
-            let download_tx = download_tx.clone();
 
             move |query: &str, category: &str| {
-                while let Some(child) = grid.first_child() {
-                    grid.remove(&child);
-                }
-                current_names.borrow_mut().clear();
-                pending_views.borrow_mut().clear();
-
                 let q = query.trim().to_lowercase();
                 let filter_category = if category == "All" {
                     None
@@ -529,74 +684,11 @@ impl EmojiPickerWindow {
                             continue;
                         }
                     }
-                    matching.push(entry);
+                    matching.push(glib::BoxedAnyObject::new(entry.clone()));
                 }
 
                 empty_label.set_visible(matching.is_empty());
-
-                for entry in matching {
-                    let child = gtk::FlowBoxChild::new();
-                    child.set_tooltip_text(Some(&format!(":{}:", entry.name)));
-                    child.update_property(&[gtk::accessible::Property::Label(&entry.label)]);
-
-                    let widget: gtk::Widget = match &entry.value {
-                        EmojiValue::Unicode(u) => {
-                            let lbl = gtk::Label::new(Some(u));
-                            lbl.add_css_class("title-3");
-                            lbl.set_size_request(36, 36);
-                            lbl.upcast()
-                        }
-                        EmojiValue::CustomImage(url) => {
-                            if let Some(cached_path) = resolve_custom_emoji_cached_file(url) {
-                                let pic = gtk::Picture::for_filename(&cached_path);
-                                pic.set_size_request(32, 32);
-                                pic.set_can_shrink(true);
-                                pic.set_content_fit(gtk::ContentFit::Cover);
-                                pic.upcast()
-                            } else {
-                                let stack = gtk::Stack::new();
-                                stack.set_size_request(36, 36);
-                                stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-
-                                let placeholder = gtk::Label::new(Some("💬"));
-                                placeholder.add_css_class("dim-label");
-                                placeholder.set_size_request(36, 36);
-                                stack.add_named(&placeholder, Some("placeholder"));
-
-                                let pic = gtk::Picture::new();
-                                pic.set_size_request(32, 32);
-                                pic.set_can_shrink(true);
-                                pic.set_content_fit(gtk::ContentFit::Cover);
-                                stack.add_named(&pic, Some("pic"));
-
-                                stack.set_visible_child_name("placeholder");
-
-                                let stack_weak = stack.downgrade();
-                                let pic_weak = pic.downgrade();
-                                pending_views
-                                    .borrow_mut()
-                                    .entry(url.clone())
-                                    .or_default()
-                                    .push((stack_weak, pic_weak));
-
-                                let tx = download_tx.clone();
-                                let url_clone = url.clone();
-                                emoji_loader().queue(
-                                    url.clone(),
-                                    true,
-                                    Some(Box::new(move |path| {
-                                        let _ = tx.send((url_clone, path));
-                                    })),
-                                );
-
-                                stack.upcast()
-                            }
-                        }
-                    };
-                    child.set_child(Some(&widget));
-                    grid.insert(&child, -1);
-                    current_names.borrow_mut().push(entry.name.clone());
-                }
+                store.splice(0, store.n_items(), &matching);
             }
         };
 
@@ -627,13 +719,13 @@ impl EmojiPickerWindow {
 
         // Item click
         {
-            let current_names = current_names.clone();
+            let store = store.clone();
             let on_selected = on_selected.clone();
             let win_weak = window.downgrade();
-            grid.connect_child_activated(move |_, child| {
-                let idx = child.index() as usize;
-                if let Some(name) = current_names.borrow().get(idx).cloned() {
-                    on_selected(&name);
+            grid.connect_activate(move |_, pos| {
+                if let Some(boxed) = store.item(pos).and_downcast::<glib::BoxedAnyObject>() {
+                    let entry: std::cell::Ref<Rc<EmojiEntry>> = boxed.borrow();
+                    on_selected(&entry.name);
                     if let Some(win) = win_weak.upgrade() {
                         win.close();
                     }
@@ -643,12 +735,13 @@ impl EmojiPickerWindow {
 
         // Search Enter key
         {
-            let current_names = current_names.clone();
+            let store = store.clone();
             let on_selected = on_selected.clone();
             let win_weak = window.downgrade();
             search_entry.connect_activate(move |_| {
-                if let Some(name) = current_names.borrow().first().cloned() {
-                    on_selected(&name);
+                if let Some(boxed) = store.item(0).and_downcast::<glib::BoxedAnyObject>() {
+                    let entry: std::cell::Ref<Rc<EmojiEntry>> = boxed.borrow();
+                    on_selected(&entry.name);
                     if let Some(win) = win_weak.upgrade() {
                         win.close();
                     }
