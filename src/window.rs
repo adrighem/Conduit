@@ -11053,6 +11053,7 @@ impl ConduitWindow {
                     user_full_names: &imp.user_full_names.borrow(),
                     user_statuses: &imp.user_statuses.borrow(),
                     user_avatar_urls: &imp.user_avatar_urls.borrow(),
+                    read_states: Some(&imp.workspace.read_states.borrow()),
                 },
                 query.as_str(),
             )
@@ -14029,6 +14030,7 @@ mod tests {
             search_aliases: Vec::new(),
             status: None,
             avatar_url: None,
+            latest_ts: None,
         }
     }
 

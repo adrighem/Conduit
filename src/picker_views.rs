@@ -115,6 +115,7 @@ pub fn picker_sections(
         user_full_names,
         user_statuses,
         user_avatar_urls,
+        read_states,
     } = source;
     let channels = if include_discovery {
         discovered_channels
@@ -137,6 +138,7 @@ pub fn picker_sections(
             user_full_names,
             user_statuses,
             user_avatar_urls,
+            read_states,
         },
         query,
     )

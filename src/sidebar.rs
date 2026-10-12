@@ -84,6 +84,7 @@ pub struct SidebarRowModel {
     pub search_aliases: Vec<String>,
     pub status: Option<SlackUserStatus>,
     pub avatar_url: Option<String>,
+    pub latest_ts: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -625,6 +626,11 @@ impl SidebarRowModel {
                 .then_some(conversation.user.as_deref())
                 .flatten()
                 .and_then(|user_id| options.user_avatar_urls?.get(user_id).cloned()),
+            latest_ts: options
+                .read_state
+                .and_then(|state| state.latest_ts())
+                .or_else(|| conversation.latest_message_ts())
+                .map(str::to_string),
         }
     }
 
@@ -809,6 +815,7 @@ pub fn conversation_switcher_items(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -822,6 +829,7 @@ pub(crate) fn conversation_switcher_items_with_aliases(
     user_full_names: Option<&HashMap<String, String>>,
     user_statuses: Option<&UserStatuses>,
     user_avatar_urls: Option<&HashMap<String, String>>,
+    read_states: Option<&UnreadLedger>,
 ) -> Vec<SidebarRowModel> {
     let rows = conversation_switcher_rows_with_aliases(
         conversations,
@@ -831,6 +839,7 @@ pub(crate) fn conversation_switcher_items_with_aliases(
         user_full_names,
         user_statuses,
         user_avatar_urls,
+        read_states,
     );
     filter_conversation_switcher_rows(
         &rows,
@@ -851,6 +860,7 @@ pub(crate) fn conversation_switcher_rows_with_aliases(
     user_full_names: Option<&HashMap<String, String>>,
     user_statuses: Option<&UserStatuses>,
     user_avatar_urls: Option<&HashMap<String, String>>,
+    read_states: Option<&UnreadLedger>,
 ) -> Vec<SidebarRowModel> {
     conversations
         .iter()
@@ -865,6 +875,7 @@ pub(crate) fn conversation_switcher_rows_with_aliases(
                     user_full_names,
                     user_statuses,
                     user_avatar_urls,
+                    read_state: read_states.and_then(|states| states.get(&conversation.id)),
                     ..Default::default()
                 },
             )
@@ -909,14 +920,16 @@ pub(crate) fn filter_conversation_switcher_rows(
     };
     items.sort_by(
         |(left, left_score, left_sort_key), (right, right_score, right_sort_key)| {
-            right_score
-                .band()
-                .cmp(&left_score.band())
-                .then_with(|| {
-                    compare_participant_coverage(left, right, Some(&participant_coverage))
-                })
-                .then_with(|| compare_user_deleted(left, right))
-                .then_with(|| (left_sort_key, &left.id).cmp(&(right_sort_key, &right.id)))
+            (if query.is_empty() {
+                std::cmp::Ordering::Equal
+            } else {
+                right_score.band().cmp(&left_score.band())
+            })
+            .then_with(|| compare_participant_coverage(left, right, Some(&participant_coverage)))
+            .then_with(|| compare_user_deleted(left, right))
+            .then_with(|| compare_attention(left, right))
+            .then_with(|| compare_recency(left, right))
+            .then_with(|| (left_sort_key, &left.id).cmp(&(right_sort_key, &right.id)))
         },
     );
     items.into_iter().map(|(item, _, _)| item).collect()
@@ -963,6 +976,7 @@ pub fn conversation_picker_sections_with_aliases(
             user_full_names: &HashMap::new(),
             user_statuses: &HashMap::new(),
             user_avatar_urls: &HashMap::new(),
+            read_states: None,
         },
         query,
     )
@@ -978,6 +992,7 @@ pub struct ConversationPickerSource<'a> {
     pub user_full_names: &'a HashMap<String, String>,
     pub user_statuses: &'a UserStatuses,
     pub user_avatar_urls: &'a HashMap<String, String>,
+    pub read_states: Option<&'a UnreadLedger>,
 }
 
 pub fn conversation_picker_sections_with_statuses(
@@ -994,6 +1009,7 @@ pub fn conversation_picker_sections_with_statuses(
         user_full_names,
         user_statuses,
         user_avatar_urls,
+        read_states,
     } = source;
     let search_query = SearchQuery::parse(query);
     let mut all_user_search_aliases = known_user_search_aliases.clone();
@@ -1051,6 +1067,7 @@ pub fn conversation_picker_sections_with_statuses(
         Some(user_full_names),
         Some(user_statuses),
         Some(user_avatar_urls),
+        read_states,
     )
     .into_iter()
     .map(|row| ConversationPickerItem {
@@ -1104,6 +1121,7 @@ pub fn conversation_picker_sections_with_statuses(
                     .status()
                     .filter(|status| status.active_at(current_unix_seconds())),
                 avatar_url: user_avatar_urls.get(id).cloned(),
+                latest_ts: None,
             };
             row.match_score(&search_query)
                 .is_some()
@@ -1115,28 +1133,19 @@ pub fn conversation_picker_sections_with_statuses(
         .collect::<Vec<_>>();
     sort_picker_items(&mut people, Some(&search_query), None);
 
-    if !search_query.is_empty() {
-        let mut search_results = conversations
-            .into_iter()
-            .chain(channels)
-            .chain(people)
-            .collect::<Vec<_>>();
-        sort_picker_items(
-            &mut search_results,
-            Some(&search_query),
-            Some(&participant_coverage),
-        );
-        return ConversationPickerSections {
-            search_results: Some(search_results),
-            ..Default::default()
-        };
-    }
-
+    let mut search_results = conversations
+        .into_iter()
+        .chain(channels)
+        .chain(people)
+        .collect::<Vec<_>>();
+    sort_picker_items(
+        &mut search_results,
+        Some(&search_query),
+        Some(&participant_coverage),
+    );
     ConversationPickerSections {
-        conversations,
-        channels,
-        people,
-        search_results: None,
+        search_results: Some(search_results),
+        ..Default::default()
     }
 }
 
@@ -1149,6 +1158,8 @@ fn sort_picker_items(
         compare_relevance(&left.row, &right.row, query)
             .then_with(|| compare_participant_coverage(&left.row, &right.row, participant_coverage))
             .then_with(|| compare_user_deleted(&left.row, &right.row))
+            .then_with(|| compare_attention(&left.row, &right.row))
+            .then_with(|| compare_recency(&left.row, &right.row))
             .then_with(|| {
                 title_sort_key(&left.row.title)
                     .cmp(&title_sort_key(&right.row.title))
@@ -1497,6 +1508,30 @@ fn compare_user_deleted(left: &SidebarRowModel, right: &SidebarRowModel) -> std:
     left.user_deleted.cmp(&right.user_deleted)
 }
 
+fn compare_attention(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::Ordering {
+    right
+        .mention_count
+        .cmp(&left.mention_count)
+        .then_with(|| right.unread.cmp(&left.unread))
+}
+
+fn compare_recency(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::Ordering {
+    match (&left.latest_ts, &right.latest_ts) {
+        (Some(left_ts), Some(right_ts)) => {
+            if crate::models::slack_timestamp_is_after(left_ts, right_ts) {
+                std::cmp::Ordering::Less
+            } else if crate::models::slack_timestamp_is_after(right_ts, left_ts) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
 fn compare_relevance(
     left: &SidebarRowModel,
     right: &SidebarRowModel,
@@ -1619,6 +1654,7 @@ mod tests {
             search_aliases: Vec::new(),
             status: None,
             avatar_url: None,
+            latest_ts: None,
         }
     }
 
@@ -2571,6 +2607,7 @@ mod tests {
             Some(&full_names),
             None,
             None,
+            None,
         );
         let empty_conversations = Vec::new();
         let empty_users = Vec::new();
@@ -2588,6 +2625,7 @@ mod tests {
                 user_full_names: &full_names,
                 user_statuses: &empty_statuses,
                 user_avatar_urls: &empty_avatar_urls,
+                read_states: None,
             },
             "",
         );
@@ -2595,7 +2633,7 @@ mod tests {
         assert_eq!(sidebar_rows[0].title, "Ada Lovelace (ada)");
         assert_eq!(switcher_rows[0].title, "Ada Lovelace (ada)");
         assert_eq!(
-            forward_picker.conversations[0].row.title,
+            forward_picker.search_results.as_ref().unwrap()[0].row.title,
             "Ada Lovelace (ada)"
         );
     }
@@ -3041,19 +3079,82 @@ mod tests {
             "",
         );
 
-        assert_eq!(sections.conversations.len(), 2);
-        assert!(sections.search_results.is_none());
-        assert_eq!(sections.channels.len(), 1);
-        assert_eq!(sections.channels[0].row.title, "#random");
+        let results = sections
+            .search_results
+            .expect("expected flat search results");
+        assert_eq!(results.len(), 4);
         assert_eq!(
-            sections.channels[0].action,
-            ConversationPickerAction::JoinChannel
+            results
+                .iter()
+                .map(|item| item.row.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Ada Lovelace", "#general", "Grace Hopper", "#random"]
         );
-        assert_eq!(sections.people.len(), 1);
-        assert_eq!(sections.people[0].row.title, "Grace Hopper");
         assert_eq!(
-            sections.people[0].action,
-            ConversationPickerAction::OpenDirectMessage
+            results.iter().map(|item| item.action).collect::<Vec<_>>(),
+            vec![
+                ConversationPickerAction::OpenConversation,
+                ConversationPickerAction::OpenConversation,
+                ConversationPickerAction::OpenDirectMessage,
+                ConversationPickerAction::JoinChannel,
+            ]
+        );
+    }
+
+    #[test]
+    fn conversation_picker_sorts_by_attention_then_recency() {
+        let mut dm_read = dm("D_READ", "U_READ");
+        dm_read
+            .extra
+            .insert("latest".to_string(), serde_json::json!("100.000000"));
+
+        let mut dm_recent = dm("D_RECENT", "U_RECENT");
+        dm_recent
+            .extra
+            .insert("latest".to_string(), serde_json::json!("200.000000"));
+
+        let mut dm_unread = dm("D_UNREAD", "U_UNREAD");
+        dm_unread
+            .extra
+            .insert("latest".to_string(), serde_json::json!("50.000000"));
+
+        let mut dm_mention = dm("D_MENTION", "U_MENTION");
+        dm_mention
+            .extra
+            .insert("latest".to_string(), serde_json::json!("10.000000"));
+
+        let ledger = read_states(&[("D_UNREAD", 0), ("D_MENTION", 2)]);
+
+        let user_names = HashMap::from([
+            ("U_READ".to_string(), "Zoe".to_string()),
+            ("U_RECENT".to_string(), "Bob".to_string()),
+            ("U_UNREAD".to_string(), "Alice".to_string()),
+            ("U_MENTION".to_string(), "Charlie".to_string()),
+        ]);
+
+        let sections = conversation_picker_sections_with_statuses(
+            ConversationPickerSource {
+                conversations: &[dm_read, dm_recent, dm_unread, dm_mention],
+                discovered_channels: &[],
+                discovered_users: &[],
+                user_names: &user_names,
+                current_user_id: None,
+                known_user_search_aliases: &HashMap::new(),
+                user_full_names: &HashMap::new(),
+                user_statuses: &HashMap::new(),
+                user_avatar_urls: &HashMap::new(),
+                read_states: Some(&ledger),
+            },
+            "",
+        );
+
+        let results = sections.search_results.expect("flat list expected");
+        assert_eq!(
+            results
+                .iter()
+                .map(|item| item.row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["D_MENTION", "D_UNREAD", "D_RECENT", "D_READ"]
         );
     }
 

@@ -122,6 +122,21 @@ impl ConversationReadState {
             || self.live_latest_unread.is_some()
     }
 
+    pub(crate) fn latest_ts(&self) -> Option<&str> {
+        let mut latest: Option<&str> = self.server_latest.as_deref();
+        if let Some(candidate) = self.live_latest_unread.as_deref() {
+            if latest.is_none_or(|current| slack_timestamp_is_after(candidate, current)) {
+                latest = Some(candidate);
+            }
+        }
+        if let Some(candidate) = self.live_mentions.iter().next_back() {
+            if latest.is_none_or(|current| slack_timestamp_is_after(candidate.as_str(), current)) {
+                latest = Some(candidate.as_str());
+            }
+        }
+        latest
+    }
+
     /// Live badge-worthy messages may seed state without a baseline (a DM
     /// that appeared after the last snapshot); history may not, because
     /// unsnapshotted backlog would otherwise badge everything.
