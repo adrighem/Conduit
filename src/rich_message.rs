@@ -593,13 +593,18 @@ fn project_node_text(node: &MessageNode, include_controls: bool, parts: &mut Vec
         }
         MessageNode::RichText(nodes) => {
             for node in nodes {
-                for inline in rich_text_inlines(node) {
-                    match inline {
-                        RichInline::Text { text, .. } => push_text(parts, text),
-                        RichInline::Link { label, .. } => push_text(parts, label),
-                        RichInline::User(id) => push_text(parts, id),
-                        RichInline::Channel(id) => push_text(parts, id),
-                        RichInline::Emoji(name) => push_text(parts, name),
+                match node {
+                    RichTextNode::Paragraph(inlines)
+                    | RichTextNode::Preformatted(inlines)
+                    | RichTextNode::Quote(inlines) => {
+                        let text = inlines_to_text(inlines);
+                        push_text(parts, &text);
+                    }
+                    RichTextNode::List { items, .. } => {
+                        for item in items {
+                            let text = inlines_to_text(item);
+                            push_text(parts, &text);
+                        }
                     }
                 }
             }
@@ -662,6 +667,26 @@ fn push_text(parts: &mut Vec<String>, value: &str) {
     if let Some(value) = non_empty(value) {
         parts.push(value.to_string());
     }
+}
+
+fn inlines_to_text(inlines: &[RichInline]) -> String {
+    let mut out = String::new();
+    for inline in inlines {
+        match inline {
+            RichInline::Text { text, .. } => out.push_str(text),
+            RichInline::Link { url, label, .. } => {
+                if label.is_empty() || label == url {
+                    out.push_str(&format!("<{url}>"));
+                } else {
+                    out.push_str(&format!("<{url}|{label}>"));
+                }
+            }
+            RichInline::User(id) => out.push_str(&format!("<@{id}>")),
+            RichInline::Channel(id) => out.push_str(&format!("<#{id}>")),
+            RichInline::Emoji(name) => out.push_str(&format!(":{name}:")),
+        }
+    }
+    out
 }
 
 fn rich_text_inlines(node: &RichTextNode) -> Box<dyn Iterator<Item = &RichInline> + '_> {
@@ -919,6 +944,38 @@ mod tests {
         assert_eq!(
             document.mentioned_user_ids().collect::<Vec<_>>(),
             vec!["U123"]
+        );
+    }
+
+    #[test]
+    fn rich_text_visible_text_formats_inlines_as_mrkdwn_tokens() {
+        let document = MessageDocument::new(
+            vec![MessageNode::RichText(vec![
+                RichTextNode::Paragraph(vec![
+                    RichInline::User("U09B1F3JJSK".to_string()),
+                    RichInline::Text {
+                        text: " LGTM ".to_string(),
+                        style: RichInlineStyle::default(),
+                    },
+                    RichInline::Emoji("pepe-kek".to_string()),
+                ]),
+                RichTextNode::List {
+                    ordered: false,
+                    items: vec![vec![
+                        RichInline::Channel("C123".to_string()),
+                        RichInline::Text {
+                            text: " item".to_string(),
+                            style: RichInlineStyle::default(),
+                        },
+                    ]],
+                },
+            ])],
+            None,
+        );
+
+        assert_eq!(
+            document.visible_text(),
+            "<@U09B1F3JJSK> LGTM :pepe-kek:\n<#C123> item"
         );
     }
 }
