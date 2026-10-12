@@ -421,18 +421,16 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(widgets.iter().all(|widget| widget.is::<adw::Clamp>()));
 
-            find_button(&widgets[1], "Open in Slack")
-                .expect("search card links to Slack")
-                .emit_clicked();
+            assert!(
+                find_button(&widgets[1], "Open in Slack").is_none(),
+                "search results open in Conduit, not in Slack"
+            );
             find_button(&widgets[3], "Mark Complete")
                 .expect("saved card can be completed")
                 .emit_clicked();
             let actions = actions.borrow();
-            assert!(
-                matches!(&actions[0], SecondaryAction::OpenExternal(url) if url.ends_with("/p3"))
-            );
             assert!(matches!(
-                &actions[1],
+                &actions[0],
                 SecondaryAction::RemoveSaved { channel_id, ts, .. } if channel_id == "C1" && ts == "4.0"
             ));
         });

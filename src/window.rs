@@ -7026,6 +7026,8 @@ impl ConduitWindow {
                         );
                     }
                     self.restore_workspace_status();
+                } else {
+                    self.recover_missing_message_context(&location);
                 }
             }
             RuntimeEventKind::SearchLoaded(results) => {
@@ -11907,25 +11909,77 @@ impl ConduitWindow {
     /// surrounding history when it is not cached.
     fn open_message_context(&self, location: crate::models::SearchMessageLocation) {
         let channel_id = location.channel_id().to_string();
-        let thread_ts = location.thread_ts().map(ToString::to_string);
+        // Replies are not part of the channel timeline: land it on the thread
+        // root and focus the reply itself in the thread pane.
+        let channel_target = location
+            .thread_ts()
+            .unwrap_or(location.message_ts())
+            .to_string();
         let title = self.conversation_title(&channel_id);
-        if !self.select_conversation_target(&channel_id, &title, Some(location.message_ts())) {
+        if !self.select_conversation_target(&channel_id, &title, Some(&channel_target)) {
             return;
         }
-        if let Some(thread_ts) = thread_ts.as_deref() {
+        let mut contexts = Vec::with_capacity(2);
+        if let Some(thread_ts) = location.thread_ts() {
             self.open_thread(&channel_id, thread_ts);
+            contexts.extend(crate::models::SearchMessageLocation::new(
+                &channel_id,
+                thread_ts,
+                None,
+            ));
         }
-        if !self
+        contexts.push(location);
+        let mut loading = false;
+        for context in contexts {
+            if self
+                .imp()
+                .workspace
+                .view
+                .borrow_mut()
+                .focus_message(&context)
+            {
+                loading |= self.send_command(RuntimeCommand::LoadMessageContext(context));
+            }
+        }
+        if loading {
+            self.set_status(&gettext("Loading message context"));
+        }
+    }
+
+    /// The loaded context did not contain the target message (deleted, or
+    /// beyond the pages fetched): stop waiting for it and show the latest
+    /// messages instead of a permanent loading placeholder.
+    fn recover_missing_message_context(&self, location: &crate::models::SearchMessageLocation) {
+        let channel_id = location.channel_id();
+        if let Some(thread_ts) = location.thread_ts() {
+            let messages = {
+                let view = self.imp().workspace.view.borrow();
+                (view.selected_thread_target() == Some((channel_id, thread_ts)))
+                    .then(|| view.current_thread_messages().to_vec())
+            };
+            if let Some(messages) = messages {
+                self.populate_thread(
+                    channel_id,
+                    thread_ts,
+                    messages,
+                    TimelineScrollBehavior::Preserve,
+                );
+            }
+        } else if self
             .imp()
-            .workspace
-            .view
-            .borrow_mut()
-            .focus_message(&location)
+            .conversation_opening
+            .borrow()
+            .active_waits_for_explicit_target(channel_id)
         {
-            return;
+            self.imp()
+                .conversation_opening
+                .borrow_mut()
+                .begin(channel_id, ConversationOpenIntent::Latest);
+            if self.visible_channel_id().as_deref() == Some(channel_id) {
+                self.rerender_current_main_messages();
+            }
         }
-        self.set_status(&gettext("Loading message context"));
-        self.send_command(RuntimeCommand::LoadMessageContext(location));
+        self.set_status(&gettext("Message not found, showing the latest messages"));
     }
 
     fn handle_huddle_event(&self, event: HuddleEvent) {

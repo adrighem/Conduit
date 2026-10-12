@@ -61,7 +61,7 @@ pub(crate) fn build_row(
     register_css();
     let card = match row {
         SecondaryRow::Thread(row) => thread_card(row, context, dispatch),
-        SecondaryRow::Search(row) => search_card(row, dispatch),
+        SecondaryRow::Search(row) => search_card(row),
         SecondaryRow::File(row) => file_card(row, context),
         SecondaryRow::Saved(row) => saved_card(row, context, dispatch),
     };
@@ -195,7 +195,7 @@ fn thread_card(row: &ThreadRow, context: &MessageHtmlContext, dispatch: &Dispatc
     card
 }
 
-fn search_card(row: &SearchRow, dispatch: &Dispatch) -> gtk::Box {
+fn search_card(row: &SearchRow) -> gtk::Box {
     let card = card_box();
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let author = heading(&row.author);
@@ -205,14 +205,6 @@ fn search_card(row: &SearchRow, dispatch: &Dispatch) -> gtk::Box {
     header.append(&channel);
     if let Some(time) = row.ts.as_deref().and_then(timestamp_label) {
         header.append(&time);
-    }
-    if let Some(permalink) = row.permalink.clone() {
-        header.append(&icon_button(
-            "adw-external-link-symbolic",
-            &gettext("Open in Slack"),
-            dispatch,
-            SecondaryAction::OpenExternal(permalink),
-        ));
     }
     card.append(&header);
 

@@ -40,6 +40,8 @@ const MAX_RETRY_AFTER_SECONDS: u64 = 300;
 pub(crate) const CHANNEL_HISTORY_PAGE_LIMIT: usize = 30;
 pub(crate) const MESSAGE_CONTEXT_LIMIT: usize = 15;
 const THREAD_HISTORY_PAGE_LIMIT: usize = 50;
+/// Upper bound on pages fetched to reach a search hit deep in a thread.
+const THREAD_CONTEXT_MAX_PAGES: usize = 20;
 const DEFAULT_DEBUG_CONVERSATION_PROPERTY_LIMIT: usize = 20;
 const DEBUG_CONVERSATION_PROPERTIES_ENV: &str = "CONDUIT_DEBUG_CONVERSATION_PROPERTIES";
 const CONVERSATIONS_LIST_METHOD: &str = "conversations.list";
@@ -1053,18 +1055,29 @@ impl SlackApi {
         ))
     }
 
+    /// Thread pages from the start up to the one holding `message_ts`.
+    /// `conversations.replies` pages oldest-first, so a `latest`-bounded
+    /// request would miss replies past the first page.
     pub async fn thread_replies_context(
         &self,
         channel_id: &str,
         thread_ts: &str,
         message_ts: &str,
     ) -> Result<SlackMessagePage> {
-        let params = thread_message_context_request_params(channel_id, thread_ts, message_ts);
-        let response: HistoryResponse = self.post_form("conversations.replies", &params).await?;
-        Ok(SlackMessagePage::from_response(
-            response,
-            thread_replies_in_history_order,
-        ))
+        let mut pages = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..THREAD_CONTEXT_MAX_PAGES {
+            let page = self
+                .thread_replies_page(channel_id, thread_ts, cursor.as_deref())
+                .await?;
+            let found = page.messages.iter().any(|message| message.ts == message_ts);
+            cursor = page.next_cursor.clone();
+            pages.push(page);
+            if found || cursor.is_none() {
+                break;
+            }
+        }
+        Ok(merge_thread_pages(pages))
     }
 
     pub async fn search_messages(&self, query: &str) -> Result<Vec<SearchMatch>> {
@@ -2167,14 +2180,33 @@ fn message_context_request_params(
     ]
 }
 
-fn thread_message_context_request_params(
-    channel_id: &str,
-    thread_ts: &str,
-    message_ts: &str,
-) -> Vec<(&'static str, String)> {
-    let mut params = message_context_request_params(channel_id, message_ts);
-    params.push(("ts", thread_ts.to_string()));
-    params
+/// Joins thread pages into one newest-first page without duplicate parents,
+/// keeping the last page's continuation.
+fn merge_thread_pages(pages: Vec<SlackMessagePage>) -> SlackMessagePage {
+    let (has_more, next_cursor) = pages
+        .last()
+        .map(|page| (page.has_more, page.next_cursor.clone()))
+        .unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let mut messages = pages
+        .into_iter()
+        .flat_map(|page| page.messages)
+        .filter(|message| seen.insert(message.ts.clone()))
+        .collect::<Vec<_>>();
+    messages.sort_by(|left, right| {
+        if crate::models::slack_timestamp_is_after(&left.ts, &right.ts) {
+            std::cmp::Ordering::Less
+        } else if crate::models::slack_timestamp_is_after(&right.ts, &left.ts) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    SlackMessagePage {
+        messages,
+        has_more,
+        next_cursor,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4683,16 +4715,36 @@ mod tests {
                 ("limit", "15".to_string()),
             ]
         );
+    }
 
+    #[test]
+    fn merged_thread_pages_are_newest_first_without_duplicates() {
+        let page = |ts: &[&str], cursor: Option<&str>| SlackMessagePage {
+            messages: ts
+                .iter()
+                .map(|ts| SlackMessage {
+                    ts: ts.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            has_more: cursor.is_some(),
+            next_cursor: cursor.map(ToString::to_string),
+        };
+        // Pages arrive oldest-first; each is already newest-first inside.
+        let merged = merge_thread_pages(vec![
+            page(&["3.0", "2.0", "1.0"], Some("next")),
+            page(&["5.0", "4.0", "1.0"], None),
+        ]);
         assert_eq!(
-            thread_message_context_request_params(
-                "C123",
-                "1709999999.000100",
-                "1710000000.000100",
-            )
-            .last(),
-            Some(&("ts", "1709999999.000100".to_string()))
+            merged
+                .messages
+                .iter()
+                .map(|message| message.ts.as_str())
+                .collect::<Vec<_>>(),
+            vec!["5.0", "4.0", "3.0", "2.0", "1.0"]
         );
+        assert!(!merged.has_more);
+        assert_eq!(merged.next_cursor, None);
     }
 
     #[test]

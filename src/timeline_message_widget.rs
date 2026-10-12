@@ -74,6 +74,9 @@ pub(crate) type OpenMediaCallback = Rc<dyn Fn(crate::window::MediaGalleryItem)>;
 pub(crate) type ActionHandler = Rc<dyn Fn(TimelineAction)>;
 type ActionSlot = Rc<RefCell<Option<ActionHandler>>>;
 type BoundItems = Rc<RefCell<Vec<glib::WeakRef<gtk::ListItem>>>>;
+
+const FOCUS_TARGET_CLASS: &str = "timeline-focus-target";
+const FOCUS_TARGET_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
 type ReadMarkTarget = Rc<RefCell<Option<(String, Option<String>)>>>;
 type ToggleReactionCallback = Rc<dyn Fn(String, String, bool)>;
 type CacheEntry = (Option<gdk_pixbuf::PixbufAnimation>, gtk::gdk::Texture);
@@ -347,6 +350,7 @@ pub(crate) fn register_timeline_css() {
             }
             .thread-reply-active { font-weight: bold; }
             .reaction-pill-active { background-color: #D6ECFF; color: #1264A3; }
+            .timeline-focus-target { background-color: alpha(@accent_bg_color, 0.18); border-radius: 8px; transition: background-color 800ms ease-out; }
             .day-separator-line {
                 background-color: color-mix(in srgb, currentColor 15%, transparent);
                 min-height: 1px;
@@ -460,6 +464,10 @@ pub struct NativeTimelineView {
     opens_threads: Rc<Cell<bool>>,
     bind_row: Rc<dyn Fn(&gtk::ListItem)>,
     bound_items: BoundItems,
+    /// Message opened from search, a link or a notification: highlighted
+    /// briefly so it stands out after the jump.
+    highlight_ts: Rc<RefCell<Option<String>>>,
+    highlight_generation: Rc<Cell<u64>>,
 }
 
 impl std::fmt::Debug for NativeTimelineView {
@@ -561,6 +569,8 @@ impl NativeTimelineView {
         let context_clone = context.clone();
         let on_action_clone = on_action.clone();
         let opens_threads_for_bind = opens_threads.clone();
+        let highlight_ts: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let highlight_ts_for_bind = highlight_ts.clone();
         let hovered_for_bind = hovered.clone();
         let hover_generation_for_bind = hover_generation.clone();
         let current_popover_for_bind = current_popover.clone();
@@ -733,6 +743,9 @@ impl NativeTimelineView {
                     Some(&cb_hover),
                     Some(&cb_author),
                 );
+                if highlight_ts_for_bind.borrow().as_deref() == Some(msg.ts.as_str()) {
+                    msg_widget.add_css_class(FOCUS_TARGET_CLASS);
+                }
                 item.set_child(Some(&msg_widget));
             }
         });
@@ -987,7 +1000,29 @@ impl NativeTimelineView {
             opens_threads,
             bind_row,
             bound_items,
+            highlight_ts,
+            highlight_generation: Rc::new(Cell::new(0)),
         }
+    }
+
+    /// Highlights the row for `ts`, fading out after a moment. Re-renders in
+    /// between keep it, since rows are bound against `highlight_ts`.
+    fn set_highlight(&self, ts: &str) {
+        *self.highlight_ts.borrow_mut() = Some(ts.to_string());
+        let generation = self.highlight_generation.get().wrapping_add(1);
+        self.highlight_generation.set(generation);
+        let this = self.clone();
+        glib::timeout_add_local_once(FOCUS_TARGET_DURATION, move || {
+            if this.highlight_generation.get() != generation {
+                return;
+            }
+            this.highlight_ts.borrow_mut().take();
+            for item in this.bound_items.borrow().iter() {
+                if let Some(child) = item.upgrade().and_then(|item| item.child()) {
+                    child.remove_css_class(FOCUS_TARGET_CLASS);
+                }
+            }
+        });
     }
 
     /// Rebuilds the bound rows matching `matches` in place. Store items are
@@ -1108,6 +1143,9 @@ impl NativeTimelineView {
             if let Some(root) = self.list_view.root() {
                 root.set_focus(None::<&Widget>);
             }
+        }
+        if let Some(ts) = focus_ts {
+            self.set_highlight(ts);
         }
         self.store.remove_all();
         let (items, focus_index) = build_store_items(messages, focus_ts);
@@ -3758,6 +3796,50 @@ pub(crate) mod tests {
 
             let _ = std::fs::remove_file(dummy_file);
             let _ = std::fs::remove_dir(ws_dir);
+        });
+    }
+
+    #[test]
+    fn focused_message_is_highlighted_and_scrolled_into_view() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let messages = (0..120)
+                .rev()
+                .map(|i| SlackMessage {
+                    ts: format!("1700000{i:03}.000100"),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("message {i}")),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let target = messages[100].ts.clone();
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(400, 500);
+            window.set_child(Some(view.widget()));
+            window.present();
+            view.set_messages(&messages, &ctx, Some(&target));
+            let context = glib::MainContext::default();
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(400);
+            while std::time::Instant::now() < end {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+
+            let highlighted = view
+                .bound_items
+                .borrow()
+                .iter()
+                .filter_map(glib::WeakRef::upgrade)
+                .filter(|item| {
+                    item.child()
+                        .is_some_and(|child| child.has_css_class(FOCUS_TARGET_CLASS))
+                })
+                .filter_map(|item| item.item().and_downcast::<TimelineMessageObject>())
+                .map(|obj| obj.message().ts)
+                .collect::<Vec<_>>();
+            assert_eq!(highlighted, vec![target]);
+            window.destroy();
         });
     }
 

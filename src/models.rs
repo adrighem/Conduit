@@ -1358,12 +1358,24 @@ pub struct SearchMatch {
 
 impl SearchMatch {
     pub fn message_location(&self) -> Option<SearchMessageLocation> {
+        let permalink_thread_ts = self.permalink.as_deref().and_then(permalink_thread_ts);
         SearchMessageLocation::new(
             self.channel.as_ref()?.id.as_deref()?,
             self.ts.as_deref()?,
-            self.thread_ts.as_deref(),
+            self.thread_ts.as_deref().or(permalink_thread_ts.as_deref()),
         )
     }
+}
+
+/// `search.messages` matches omit `thread_ts`; a reply's permalink carries
+/// it as the `thread_ts` query parameter instead.
+fn permalink_thread_ts(permalink: &str) -> Option<String> {
+    url::Url::parse(permalink)
+        .ok()?
+        .query_pairs()
+        .find(|(key, _)| key == "thread_ts")
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1656,6 +1668,31 @@ impl SlackUserProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_reply_location_takes_thread_from_permalink() {
+        let reply = SearchMatch {
+            channel: Some(SlackSearchChannel {
+                id: Some("C1".to_string()),
+                name: None,
+            }),
+            ts: Some("1700000002.000200".to_string()),
+            permalink: Some(
+                "https://example.slack.com/archives/C1/p1700000002000200?thread_ts=1700000001.000100&cid=C1"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let location = reply.message_location().expect("location");
+        assert_eq!(location.thread_ts(), Some("1700000001.000100"));
+        assert_eq!(location.message_ts(), "1700000002.000200");
+
+        let top_level = SearchMatch {
+            permalink: Some("https://example.slack.com/archives/C1/p1700000002000200".to_string()),
+            ..reply
+        };
+        assert_eq!(top_level.message_location().unwrap().thread_ts(), None);
+    }
 
     #[test]
     fn slack_message_preserves_client_message_identity() {
