@@ -64,15 +64,6 @@ impl TimelineMessageObject {
         self.imp().day_separator.get()
     }
 
-    /// Fresh object with the same content and kind, to force a re-bind.
-    pub fn duplicate(&self) -> Self {
-        if self.is_day_separator() {
-            Self::day_separator(self.message())
-        } else {
-            Self::new(self.message())
-        }
-    }
-
     pub fn message(&self) -> SlackMessage {
         self.imp().message.borrow().clone()
     }
@@ -82,6 +73,7 @@ pub(crate) type OpenMediaCallback = Rc<dyn Fn(crate::window::MediaGalleryItem)>;
 
 pub(crate) type ActionHandler = Rc<dyn Fn(TimelineAction)>;
 type ActionSlot = Rc<RefCell<Option<ActionHandler>>>;
+type BoundItems = Rc<RefCell<Vec<glib::WeakRef<gtk::ListItem>>>>;
 type ReadMarkTarget = Rc<RefCell<Option<(String, Option<String>)>>>;
 type ToggleReactionCallback = Rc<dyn Fn(String, String, bool)>;
 type CacheEntry = (Option<gdk_pixbuf::PixbufAnimation>, gtk::gdk::Texture);
@@ -302,6 +294,20 @@ pub(crate) fn load_animated_or_static_picture(
     pic.upcast::<Widget>()
 }
 
+/// Moves focus from inside `item`'s row content to the row itself before the
+/// content is replaced, so focus survives and the list does not jump.
+fn keep_focus_on_row(item: &gtk::ListItem) {
+    let Some(child) = item.child() else {
+        return;
+    };
+    if !child.has_focus() && !child.state_flags().contains(gtk::StateFlags::FOCUS_WITHIN) {
+        return;
+    }
+    if let Some(row) = child.parent() {
+        row.grab_focus();
+    }
+}
+
 pub(crate) fn register_timeline_css() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -452,6 +458,8 @@ pub struct NativeTimelineView {
     /// False inside the thread pane: the root message is already the open
     /// thread, so it gets no "N replies" footer linking to itself.
     opens_threads: Rc<Cell<bool>>,
+    bind_row: Rc<dyn Fn(&gtk::ListItem)>,
+    bound_items: BoundItems,
 }
 
 impl std::fmt::Debug for NativeTimelineView {
@@ -559,10 +567,7 @@ impl NativeTimelineView {
         let bar_motion_for_bind = bar_motion.clone();
         let quick_bar_for_bind = quick_bar.clone();
         let overlay_for_bind = overlay.clone();
-        factory.connect_bind(move |_factory, list_item| {
-            let item = list_item
-                .downcast_ref::<gtk::ListItem>()
-                .expect("ListItem expected");
+        let bind_row: Rc<dyn Fn(&gtk::ListItem)> = Rc::new(move |item| {
             let msg_obj = item
                 .item()
                 .and_then(|obj| obj.downcast::<TimelineMessageObject>().ok())
@@ -654,7 +659,10 @@ impl NativeTimelineView {
                                     hover_generation.get()
                                 ),
                             );
-                            *hovered.borrow_mut() = Some(HoveredMessage { row, ts: ts.clone() });
+                            *hovered.borrow_mut() = Some(HoveredMessage {
+                                row,
+                                ts: ts.clone(),
+                            });
                             if already_showing_this_message {
                                 return;
                             }
@@ -729,7 +737,32 @@ impl NativeTimelineView {
             }
         });
 
+        // Rows currently bound to a widget, so in-place updates (image assets,
+        // unread separator) can rebuild them without replacing store items.
+        let bound_items: BoundItems = Rc::new(RefCell::new(Vec::new()));
+        {
+            let bind_row = bind_row.clone();
+            let bound_items = bound_items.clone();
+            factory.connect_bind(move |_factory, list_item| {
+                let item = list_item
+                    .downcast_ref::<gtk::ListItem>()
+                    .expect("ListItem expected");
+                bound_items.borrow_mut().push(item.downgrade());
+                bind_row(item);
+            });
+        }
+        {
+            let bound_items = bound_items.clone();
+            factory.connect_unbind(move |_factory, list_item| {
+                bound_items
+                    .borrow_mut()
+                    .retain(|weak| weak.upgrade().is_some_and(|bound| bound != *list_item));
+            });
+        }
+
         let list_view = ListView::new(Some(selection), Some(factory));
+        // Tab into the list lands on the remembered row, not on the oldest message.
+        list_view.set_tab_behavior(gtk::ListTabBehavior::Item);
 
         let scrolled_window = ScrolledWindow::new();
         scrolled_window.set_hexpand(true);
@@ -952,6 +985,30 @@ impl NativeTimelineView {
             read_generation,
             recheck_read_visibility,
             opens_threads,
+            bind_row,
+            bound_items,
+        }
+    }
+
+    /// Rebuilds the bound rows matching `matches` in place. Store items are
+    /// kept: replacing them destroys the focused row, and GTK's focus fallback
+    /// then scrolls the list to its first item.
+    fn rebind_rows(&self, matches: impl Fn(&TimelineMessageObject) -> bool) {
+        let items = self
+            .bound_items
+            .borrow()
+            .iter()
+            .filter_map(glib::WeakRef::upgrade)
+            .collect::<Vec<_>>();
+        for item in items {
+            let Some(obj) = item.item().and_downcast::<TimelineMessageObject>() else {
+                continue;
+            };
+            if !matches(&obj) {
+                continue;
+            }
+            keep_focus_on_row(&item);
+            (self.bind_row)(&item);
         }
     }
 
@@ -979,8 +1036,19 @@ impl NativeTimelineView {
         *self.on_action.borrow_mut() = Some(Rc::new(f));
     }
 
+    /// Re-renders bound rows after an image asset arrived, keeping scroll
+    /// position and focus. Only the image fields of `context` are taken; the
+    /// rest (unread anchor, thread) belongs to the rendered conversation.
     pub fn update_image_asset(&self, context: &MessageHtmlContext) {
-        *self.context.borrow_mut() = Some(context.clone());
+        {
+            let mut current = self.context.borrow_mut();
+            let Some(current) = current.as_mut() else {
+                return;
+            };
+            current.image_assets = context.image_assets.clone();
+            current.failed_image_urls = context.failed_image_urls.clone();
+            current.user_avatar_urls = context.user_avatar_urls.clone();
+        }
         if self.asset_update_pending.get() {
             return;
         }
@@ -988,20 +1056,7 @@ impl NativeTimelineView {
         let this = self.clone();
         glib::idle_add_local_once(move || {
             this.asset_update_pending.set(false);
-            let n_items = this.store.n_items();
-            let mut new_items = Vec::with_capacity(n_items as usize);
-            for i in 0..n_items {
-                if let Some(obj) = this
-                    .store
-                    .item(i)
-                    .and_then(|o| o.downcast::<TimelineMessageObject>().ok())
-                {
-                    new_items.push(obj.duplicate());
-                }
-            }
-            if !new_items.is_empty() {
-                this.store.splice(0, n_items, &new_items);
-            }
+            this.rebind_rows(|obj| !obj.is_day_separator());
         });
     }
 
@@ -1018,23 +1073,15 @@ impl NativeTimelineView {
             }
             std::mem::replace(&mut context.unread_separator_ts, anchor_ts.clone())
         };
-        for i in 0..self.store.n_items() {
-            let Some(obj) = self
-                .store
-                .item(i)
-                .and_then(|o| o.downcast::<TimelineMessageObject>().ok())
-            else {
-                continue;
-            };
+        // Rows scrolled out of view pick the new anchor up from the context
+        // when they are bound again.
+        self.rebind_rows(|obj| {
             if obj.is_day_separator() {
-                continue;
+                return false;
             }
             let ts = obj.message().ts;
-            if previous.as_deref() == Some(ts.as_str()) || anchor_ts.as_deref() == Some(ts.as_str())
-            {
-                self.store.splice(i, 1, &[obj.duplicate()]);
-            }
-        }
+            previous.as_deref() == Some(ts.as_str()) || anchor_ts.as_deref() == Some(ts.as_str())
+        });
     }
 
     pub fn set_messages(
@@ -1050,6 +1097,18 @@ impl NativeTimelineView {
         *self.read_candidate.borrow_mut() = None;
         self.read_generation
             .set(self.read_generation.get().wrapping_add(1));
+        // Removing the focused row would hand focus to GTK's fallback, which
+        // scrolls the list to its first item. Park focus and restore it on the
+        // target row instead.
+        let had_focus = self
+            .list_view
+            .state_flags()
+            .contains(gtk::StateFlags::FOCUS_WITHIN);
+        if had_focus {
+            if let Some(root) = self.list_view.root() {
+                root.set_focus(None::<&Widget>);
+            }
+        }
         self.store.remove_all();
         let (items, focus_index) = build_store_items(messages, focus_ts);
         self.store.splice(0, 0, &items);
@@ -1059,10 +1118,14 @@ impl NativeTimelineView {
         let vadj = self.scrolled_window.vadjustment();
         let recheck_read_visibility = self.recheck_read_visibility.clone();
         glib::idle_add_local_once(move || {
-            if let Some(index) = focus_index {
-                list_view.scroll_to(index, gtk::ListScrollFlags::empty(), None);
-            } else if n_items > 0 {
-                list_view.scroll_to(n_items - 1, gtk::ListScrollFlags::empty(), None);
+            // FOCUS also moves GTK's remembered row (otherwise the oldest
+            // message), which keyboard entry and focus fallback start from.
+            let target = focus_index.or_else(|| n_items.checked_sub(1));
+            if let Some(index) = target {
+                list_view.scroll_to(index, gtk::ListScrollFlags::FOCUS, None);
+                if had_focus {
+                    list_view.grab_focus();
+                }
             } else {
                 vadj.set_value(vadj.upper() - vadj.page_size());
             }
@@ -3695,6 +3758,73 @@ pub(crate) mod tests {
 
             let _ = std::fs::remove_file(dummy_file);
             let _ = std::fs::remove_dir(ws_dir);
+        });
+    }
+
+    #[test]
+    fn in_place_updates_keep_scroll_and_focus_on_clicked_row() {
+        run_gtk_test(|| {
+            fn pump(ms: u64) {
+                let context = glib::MainContext::default();
+                let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+                while std::time::Instant::now() < end {
+                    context.iteration(false);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            let ctx = test_context();
+            // Newest first, as conversations are stored; all on one day.
+            let messages = (0..150)
+                .rev()
+                .map(|i| SlackMessage {
+                    ts: format!("1700000{i:03}.000100"),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("message {i}")),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(400, 500);
+            window.set_child(Some(view.widget()));
+            window.present();
+            view.set_messages(&messages, &ctx, None);
+            pump(400);
+
+            let vadj = view.scrolled_window.vadjustment();
+            let bottom = vadj.value();
+            assert!(bottom > 0.0, "opens at the newest message");
+
+            // Click-like focus on a visible row near the bottom.
+            let focused = view
+                .bound_items
+                .borrow()
+                .iter()
+                .filter_map(glib::WeakRef::upgrade)
+                .filter(|item| item.position() + 3 >= view.store.n_items())
+                .find_map(|item| item.child()?.parent())
+                .expect("visible row");
+            assert!(focused.grab_focus());
+            pump(100);
+            let first_item = view.store.item(0);
+
+            view.update_image_asset(&ctx);
+            pump(300);
+            let focused_ts = messages[1].ts.clone();
+            view.set_unread_separator(Some(focused_ts));
+            pump(300);
+
+            assert!(
+                (vadj.value() - bottom).abs() < 1.0,
+                "no jump: {} vs {bottom}",
+                vadj.value()
+            );
+            assert!(view
+                .list_view
+                .state_flags()
+                .contains(gtk::StateFlags::FOCUS_WITHIN));
+            assert_eq!(view.store.item(0), first_item, "store items are kept");
+            window.destroy();
         });
     }
 

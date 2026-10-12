@@ -7131,13 +7131,13 @@ impl ConduitWindow {
                         .collect::<Vec<_>>();
                     for evicted_source in evicted_sources {
                         imp.image_assets.borrow_mut().remove(&evicted_source);
-                        self.patch_image_asset(&evicted_source, None);
+                        self.patch_image_asset(&evicted_source);
                     }
                 }
                 imp.image_assets
                     .borrow_mut()
                     .insert(key.clone(), source.clone());
-                self.patch_image_asset(&key, Some(source));
+                self.patch_image_asset(&key);
             }
             RuntimeEventKind::ImageAssetFailed { key } => {
                 crate::debug::log(
@@ -9135,10 +9135,13 @@ impl ConduitWindow {
                 imp.conduit_assets.borrow_mut().remove(&cache_key);
             }
         }
-        self.patch_image_asset(key, None);
+        self.patch_image_asset(key);
     }
 
-    fn patch_image_asset(&self, key: &str, source: Option<CachedAssetSource>) {
+    /// Refreshes the surfaces that show image asset `key` (an avatar, custom
+    /// emoji or preview). Timelines re-render the affected rows in place, so
+    /// scroll position and focus are kept; assets nothing shows are ignored.
+    fn patch_image_asset(&self, key: &str) {
         let avatar_user_ids = self
             .imp()
             .user_avatar_urls
@@ -9146,53 +9149,37 @@ impl ConduitWindow {
             .iter()
             .filter_map(|(user_id, url)| (url == key).then_some(user_id.clone()))
             .collect::<Vec<_>>();
-        if avatar_user_ids
-            .iter()
-            .any(|user_id| self.main_view_uses_user(user_id))
-        {
-            self.queue_ui_invalidations(UiInvalidations::MAIN);
-        }
-        let thread_uses_avatar = {
+        let (main_uses_asset, thread_uses_asset, main_view) = {
+            let custom_emojis = self.imp().custom_emojis.borrow();
+            let main_uses = self.main_view_uses_image_asset(&custom_emojis, key)
+                || avatar_user_ids
+                    .iter()
+                    .any(|user_id| self.main_view_uses_user(user_id));
             let state = self.imp().workspace.view.borrow();
-            avatar_user_ids
-                .iter()
-                .any(|user_id| messages_use_user(state.current_thread_messages(), user_id))
-        };
-        if thread_uses_avatar {
-            self.queue_ui_invalidations(UiInvalidations::THREAD);
-        }
-        let custom_emojis = self.imp().custom_emojis.borrow();
-        let main_uses_asset = self.main_view_uses_image_asset(&custom_emojis, key);
-        let (main_view, thread_uses_asset) = {
-            let state = self.imp().workspace.view.borrow();
-            let thread = state.selected_thread_ts().is_some()
-                && messages_use_image_asset(state.current_thread_messages(), &custom_emojis, key);
-            (state.main_view(), thread)
+            let thread_messages = state.current_thread_messages();
+            let thread_uses = state.selected_thread_ts().is_some()
+                && (messages_use_image_asset(thread_messages, &custom_emojis, key)
+                    || avatar_user_ids
+                        .iter()
+                        .any(|user_id| messages_use_user(thread_messages, user_id)));
+            (main_uses, thread_uses, state.main_view())
         };
 
-        if main_view == MainMessageView::Conversation && main_uses_asset {
-            self.apply_timeline_patch(
-                TimelineSurface::Main,
-                message_html::update_image_patch(key, source.clone()),
-                UiInvalidations::MAIN,
-            );
-        } else if main_uses_asset {
-            self.queue_ui_invalidations(UiInvalidations::MAIN);
+        if main_uses_asset {
+            let native_timeline = self.imp().native_timeline_view.borrow().clone();
+            match native_timeline {
+                Some(timeline) if main_view == MainMessageView::Conversation => {
+                    timeline.update_image_asset(&self.message_html_context(None));
+                }
+                _ => self.queue_ui_invalidations(UiInvalidations::MAIN),
+            }
         }
         if thread_uses_asset {
-            self.apply_timeline_patch(
-                TimelineSurface::Thread,
-                message_html::update_image_patch(key, source),
-                UiInvalidations::THREAD,
-            );
-        }
-        if let Some(native_timeline) = self.imp().native_timeline_view.borrow().as_ref() {
-            let context = self.message_html_context(None);
-            native_timeline.update_image_asset(&context);
-        }
-        if let Some(native_timeline) = self.thread_pane().native_timeline_view.borrow().as_ref() {
-            let context = self.message_html_context(None);
-            native_timeline.update_image_asset(&context);
+            let native_timeline = self.thread_pane().native_timeline_view.borrow().clone();
+            match native_timeline {
+                Some(timeline) => timeline.update_image_asset(&self.message_html_context(None)),
+                None => self.queue_ui_invalidations(UiInvalidations::THREAD),
+            }
         }
     }
 
