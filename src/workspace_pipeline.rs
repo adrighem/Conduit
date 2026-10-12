@@ -1376,6 +1376,16 @@ impl WorkspaceCoordinator {
             })
             .collect::<Vec<_>>();
         previous_replies.sort_by(|left, right| left.0.cmp(&right.0));
+        // Slack may resend an ephemeral (Shuffle on a /giphy preview) as a new
+        // post with the same ts: replace it instead of dropping a duplicate.
+        let kind = if kind == MessageMutationKind::Posted
+            && message.is_ephemeral == Some(true)
+            && (previous_channel_known || !previous_replies.is_empty())
+        {
+            MessageMutationKind::Changed
+        } else {
+            kind
+        };
         let mut targets = Vec::new();
         if message.belongs_in_channel_timeline() {
             targets.push(TimelineTarget::Channel(channel_id.to_string()));
@@ -1577,13 +1587,21 @@ impl WorkspaceCoordinator {
                 revision,
             );
         }
-        let mut store_changes = vec![StoreChange::MessageDelta {
-            channel_id: channel_id.to_string(),
-            message: message.clone(),
-            kind,
-        }];
+        // Ephemeral messages (a /giphy preview) only live in memory: no store
+        // row, thread record or read state, since Slack never returns them
+        // from history and a stored copy would come back as a dead ghost.
+        let ephemeral = message.is_ephemeral == Some(true);
+        let mut store_changes = Vec::new();
+        if !ephemeral {
+            store_changes.push(StoreChange::MessageDelta {
+                channel_id: channel_id.to_string(),
+                message: message.clone(),
+                kind,
+            });
+        }
         let current_user_id = self.attention_context.current_user_id.clone();
         let catalog_delta = match kind {
+            _ if ephemeral => Vec::new(),
             MessageMutationKind::Posted => self
                 .thread_catalog
                 .observe_realtime(channel_id, &message, current_user_id.as_deref())
@@ -1601,7 +1619,10 @@ impl WorkspaceCoordinator {
         if patch_changes.is_empty() {
             return None;
         }
-        if let Some(state) = self.observe_message_read_state(channel_id, &message, kind, origin) {
+        let read_state = (!ephemeral)
+            .then(|| self.observe_message_read_state(channel_id, &message, kind, origin))
+            .flatten();
+        if let Some(state) = read_state {
             let changed = vec![(channel_id.to_string(), state)];
             patch_changes.push(WorkspaceChange::ReadStatesChanged(changed.clone()));
             store_changes.push(StoreChange::ReadStatesUpserted(changed));
@@ -1717,7 +1738,10 @@ impl WorkspaceCoordinator {
         origin: MutationOrigin,
         delivery: DeliveryState,
     ) -> Option<MessageAttentionEffect> {
-        if channel_id.trim().is_empty() || message.ts.trim().is_empty() {
+        if channel_id.trim().is_empty()
+            || message.ts.trim().is_empty()
+            || message.is_ephemeral == Some(true)
+        {
             return None;
         }
         let conversation = self.conversation(channel_id);
@@ -3480,6 +3504,43 @@ mod tests {
             })
             .is_none());
         assert_eq!(coordinator.revision(), revision);
+    }
+
+    #[test]
+    fn ephemeral_messages_stay_in_memory_and_reposts_replace_them() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut preview = message("10.0", "giphy preview one");
+        preview.is_ephemeral = Some(true);
+        let reduction = posted(
+            &mut coordinator,
+            "C1",
+            preview.clone(),
+            MessageMutationKind::Posted,
+            MutationOrigin::Realtime,
+        )
+        .expect("ephemeral is shown");
+        assert!(
+            reduction
+                .store_batch()
+                .is_none_or(|batch| batch.changes().is_empty()),
+            "ephemeral messages are never stored"
+        );
+        assert_eq!(coordinator.history("C1").len(), 1);
+
+        // Shuffle: Slack re-posts the preview with the same ts.
+        let mut shuffled = preview;
+        shuffled.text = Some("giphy preview two".to_string());
+        assert!(posted(
+            &mut coordinator,
+            "C1",
+            shuffled,
+            MessageMutationKind::Posted,
+            MutationOrigin::Realtime,
+        )
+        .is_some());
+        let history = coordinator.history("C1");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text.as_deref(), Some("giphy preview two"));
     }
 
     #[test]

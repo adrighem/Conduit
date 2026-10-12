@@ -17089,6 +17089,7 @@ mod tests {
                     is_ephemeral: false,
                     action: crate::rich_message::SlackControlAction::Block {
                         action: crate::rich_message::SensitiveValue::new("action-canary"),
+                        attachment_id: None,
                     },
                 },
                 control_handle: MessageControlHandle::synthetic(),
@@ -17459,6 +17460,7 @@ mod tests {
                     action: crate::rich_message::SensitiveValue::new(
                         r#"{"type":"button","block_id":"block","action_id":"approve"}"#,
                     ),
+                    attachment_id: None,
                 },
             },
             control_handle: MessageControlHandle::synthetic(),

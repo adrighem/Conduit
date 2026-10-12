@@ -1025,6 +1025,12 @@ impl NativeTimelineView {
         });
     }
 
+    /// Re-renders the row of message `ts`, e.g. to re-enable its controls
+    /// after an action finished.
+    pub(crate) fn refresh_message(&self, ts: &str) {
+        self.rebind_rows(|obj| !obj.is_day_separator() && obj.message().ts == ts);
+    }
+
     /// Rebuilds the bound rows matching `matches` in place. Store items are
     /// kept: replacing them destroys the focused row, and GTK's focus fallback
     /// then scrolls the list to its first item.

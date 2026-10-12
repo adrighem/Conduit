@@ -438,6 +438,19 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         Ok((handle, target))
     }
 
+    /// Marks `handle` as in flight. False when it already is, so a second
+    /// click cannot dispatch the same action twice.
+    pub(crate) fn claim(&mut self, handle: &MessageControlHandle) -> bool {
+        self.entries.contains_key(handle) && self.claimed.insert(handle.clone())
+    }
+
+    /// Message a registered handle belongs to.
+    pub(crate) fn message_for(&self, handle: &MessageControlHandle) -> Option<MessageRef> {
+        self.entries
+            .get(handle)
+            .map(|entry| entry.target.message.clone())
+    }
+
     pub(crate) fn release(&mut self, handle: &MessageControlHandle) {
         self.claimed.remove(handle);
     }
@@ -851,6 +864,37 @@ mod tests {
 
     fn target(channel_id: &str, timestamp: &str) -> MessageRef {
         MessageRef::new(channel_id, timestamp).expect("valid test message reference")
+    }
+
+    #[test]
+    fn claimed_control_rejects_a_second_dispatch_until_released() {
+        let mut registry = registry(&[
+            "33333333333333333333333333333333",
+            "44444444444444444444444444444444",
+        ]);
+        let message = target("C123", "1710000000.000100");
+        let document = MessageDocument::new(
+            vec![MessageNode::Actions(vec![MessageControl::new(
+                "Send", None,
+            )])],
+            None,
+        );
+        let keys = document.control_keys();
+        registry
+            .replace_message_with_controls(TimelineSurfaceId::Main, message.clone(), keys.clone())
+            .unwrap();
+        let handle = registry
+            .active_control_handle(TimelineSurfaceId::Main, &message, keys[0])
+            .unwrap();
+
+        assert!(registry.claim(&handle));
+        assert!(!registry.claim(&handle), "double click is rejected");
+        assert_eq!(registry.message_for(&handle), Some(message));
+        registry.release(&handle);
+        assert!(registry.claim(&handle), "a failed action can be retried");
+        registry.complete(&handle);
+        assert!(!registry.claim(&handle), "completed handles are gone");
+        assert_eq!(registry.message_for(&handle), None);
     }
 
     fn registry(tokens: &[&str]) -> MessageControlRegistry<SequenceTokenSource> {

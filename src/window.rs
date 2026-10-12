@@ -2163,7 +2163,7 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
             RuntimeFailureRecovery::NonDisruptive
         }
         (
-            RuntimeOperation::PostMessage,
+            RuntimeOperation::PostMessage | RuntimeOperation::ExecuteSlashCommand,
             RuntimeTarget::Message {
                 channel_id,
                 thread_ts,
@@ -3286,12 +3286,56 @@ impl ConduitWindow {
             registry.active_control_handle(TimelineSurfaceId::Main, &t, key)
         });
         let Some(control_handle) = control_handle else {
+            self.set_status(&gettext("This action is not available here"));
+            self.refresh_message_rows(ts);
             return;
         };
+        if !self
+            .imp()
+            .message_control_registry
+            .borrow_mut()
+            .claim(&control_handle)
+        {
+            self.set_status(&gettext("Action already in progress"));
+            return;
+        }
+        self.set_status(&gettext("Sending action"));
         self.send_command(RuntimeCommand::ExecuteMessageAction {
             request,
             control_handle,
         });
+    }
+
+    /// Re-renders message `ts` wherever it is shown, re-enabling its controls.
+    fn refresh_message_rows(&self, ts: &str) {
+        if let Some(timeline) = self.imp().native_timeline_view.borrow().as_ref() {
+            timeline.refresh_message(ts);
+        }
+        if let Some(timeline) = self.thread_pane().native_timeline_view.borrow().as_ref() {
+            timeline.refresh_message(ts);
+        }
+    }
+
+    /// Ends an action's pending state: frees its handle and re-enables the
+    /// buttons of its message.
+    fn finish_message_action(
+        &self,
+        control_handle: &crate::message_handoff::MessageControlHandle,
+        completed: bool,
+    ) {
+        let message = {
+            let mut registry = self.imp().message_control_registry.borrow_mut();
+            let message = registry.message_for(control_handle);
+            if completed {
+                registry.complete(control_handle);
+            } else {
+                registry.release(control_handle);
+            }
+            message
+        };
+        if let Some(message) = message {
+            self.refresh_message_rows(message.timestamp());
+        }
     }
 
     fn setup_message_view(&self) {
@@ -7191,20 +7235,14 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::MessageActionCompleted { control_handle } => {
-                self.imp()
-                    .message_control_registry
-                    .borrow_mut()
-                    .complete(&control_handle);
+                self.finish_message_action(&control_handle, true);
                 self.set_status("Action sent");
             }
             RuntimeEventKind::MessageActionFailed {
                 control_handle,
                 failure,
             } => {
-                self.imp()
-                    .message_control_registry
-                    .borrow_mut()
-                    .release(&control_handle);
+                self.finish_message_action(&control_handle, false);
                 self.set_status(&format!("Action failed: {}", failure.message));
             }
             RuntimeEventKind::MessagePostCompleted {
@@ -12959,10 +12997,7 @@ impl ConduitWindow {
             RuntimeCommand::SignOut | RuntimeCommand::Disconnect
         );
         if let RuntimeCommand::ExecuteMessageAction { control_handle, .. } = &command {
-            self.imp()
-                .message_control_registry
-                .borrow_mut()
-                .release(control_handle);
+            self.finish_message_action(control_handle, false);
         }
         let failure = RuntimeFailure::validation(gettext("Conduit is busy. Try again."));
         self.set_status(&failure.message);
@@ -14702,6 +14737,22 @@ mod tests {
             ),
             (
                 RuntimeOperation::PostMessage,
+                thread_message.clone(),
+                RuntimeFailureRecovery::PostMessage {
+                    channel_id: "C123".to_string(),
+                    thread_ts: Some("1.0".to_string()),
+                },
+            ),
+            (
+                RuntimeOperation::ExecuteSlashCommand,
+                main_message.clone(),
+                RuntimeFailureRecovery::PostMessage {
+                    channel_id: "C123".to_string(),
+                    thread_ts: None,
+                },
+            ),
+            (
+                RuntimeOperation::ExecuteSlashCommand,
                 thread_message.clone(),
                 RuntimeFailureRecovery::PostMessage {
                     channel_id: "C123".to_string(),

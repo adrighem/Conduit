@@ -520,7 +520,10 @@ impl<'a> DocumentRenderer<'a> {
                 let on_action = on_action.clone();
                 let ts = self.ts.to_string();
                 button.set_sensitive(true);
-                button.connect_clicked(move |_| {
+                button.connect_clicked(move |button| {
+                    // Pending until the action completes or fails; the row is
+                    // then re-rendered with fresh, enabled controls.
+                    button.set_sensitive(false);
                     let on_action = on_action.clone();
                     let ts = ts.clone();
                     glib::idle_add_local_once(move || {

@@ -693,7 +693,10 @@ impl SlackApi {
         ];
 
         match &request.action {
-            SlackControlAction::Block { action } => {
+            SlackControlAction::Block {
+                action,
+                attachment_id,
+            } => {
                 let action = parse_private_action_json(action.expose())?;
                 let mut container = json!({
                     "type": "message",
@@ -701,6 +704,10 @@ impl SlackApi {
                     "channel_id": request.channel_id,
                     "is_ephemeral": request.is_ephemeral,
                 });
+                if let Some(attachment_id) = attachment_id {
+                    container["type"] = Value::String("message_attachment".to_string());
+                    container["attachment_id"] = Value::from(*attachment_id);
+                }
                 if let Some(thread_ts) = request.thread_ts.as_ref() {
                     container["thread_ts"] = Value::String(thread_ts.clone());
                 }
@@ -710,6 +717,7 @@ impl SlackApi {
                     ("actions", Value::Array(vec![action]).to_string()),
                     ("container", container.to_string()),
                     ("client_token", client_token),
+                    ("state", json!({ "values": {} }).to_string()),
                     ("_x_reason", "dispatch_action_to_developer".to_string()),
                 ];
                 if let Some(app_id) = request.app_id.as_ref() {
@@ -1496,7 +1504,8 @@ impl SlackApi {
         text: &str,
         thread_ts: Option<&str>,
     ) -> Result<SlashCommandResponse> {
-        let params = execute_slash_command_params(channel_id, command, text, thread_ts);
+        let mut params = execute_slash_command_params(channel_id, command, text, thread_ts);
+        params.push(("client_token", browser_action_client_token()));
         self.post_form("chat.command", &params).await
     }
 
@@ -1941,10 +1950,13 @@ fn execute_slash_command_params(
     } else {
         format!("/{}", command)
     };
+    // Mirrors the Slack web client: `disp` is the command as typed.
     let mut params = vec![
         ("channel", channel_id.to_string()),
+        ("disp", command.clone()),
         ("command", command),
         ("text", text.to_string()),
+        ("_x_reason", "executeCommand".to_string()),
     ];
     if let Some(thread_ts) = thread_ts.filter(|thread_ts| !thread_ts.trim().is_empty()) {
         params.push(("thread_ts", thread_ts.to_string()));
@@ -3126,8 +3138,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn block_message_action_uses_private_browser_dispatch_shape() {
+    /// Dispatches `request` against a mock Slack and returns path and body.
+    fn dispatch_message_action(request: &SlackMessageActionRequest) -> (String, String) {
         let server = Server::http("127.0.0.1:0").expect("mock Slack server should start");
         let address = server.server_addr();
         let received = thread::spawn(move || {
@@ -3150,26 +3162,37 @@ mod tests {
         });
         let mut api = SlackApi::new(browser_test_token(Some("browser-cookie-value")));
         api.api_base_url = format!("http://{address}/api");
-        let request = SlackMessageActionRequest {
+        tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.execute_message_action("https://example.slack.com/", "T123", request))
+            .expect("message action should dispatch");
+        received.join().expect("mock Slack server should finish")
+    }
+
+    fn block_action_request(
+        attachment_id: Option<u64>,
+        is_ephemeral: bool,
+    ) -> SlackMessageActionRequest {
+        SlackMessageActionRequest {
             channel_id: "C123".to_string(),
             message_ts: "1710000000.000100".to_string(),
             thread_ts: None,
             service_id: "B123".to_string(),
             app_id: Some("A123".to_string()),
             bot_user_id: Some("U123".to_string()),
-            is_ephemeral: false,
+            is_ephemeral,
             action: SlackControlAction::Block {
                 action: SensitiveValue::new(
                     r#"{"type":"button","block_id":"block","action_id":"approve","value":"opaque","text":{"type":"plain_text","text":"Approve"}}"#,
                 ),
+                attachment_id,
             },
-        };
+        }
+    }
 
-        tokio::runtime::Runtime::new()
-            .expect("test runtime should start")
-            .block_on(api.execute_message_action("https://example.slack.com/", "T123", &request))
-            .expect("message action should dispatch");
-        let (path, body) = received.join().expect("mock Slack server should finish");
+    #[test]
+    fn block_message_action_uses_private_browser_dispatch_shape() {
+        let (path, body) = dispatch_message_action(&block_action_request(None, false));
 
         assert_eq!(path, "/api/blocks.actions");
         assert_eq!(multipart_field_value(&body, "service_id"), Some("B123"));
@@ -3184,6 +3207,10 @@ mod tests {
             multipart_field_value(&body, "_x_reason"),
             Some("dispatch_action_to_developer")
         );
+        assert_eq!(
+            multipart_field_value(&body, "state"),
+            Some(r#"{"values":{}}"#)
+        );
         let actions: Value = serde_json::from_str(
             multipart_field_value(&body, "actions").expect("actions field should exist"),
         )
@@ -3195,7 +3222,26 @@ mod tests {
         .expect("container should be JSON");
         assert_eq!(container["type"], "message");
         assert_eq!(container["channel_id"], "C123");
+        assert!(container.get("attachment_id").is_none());
         assert!(multipart_field_value(&body, "action_ts").is_none());
+    }
+
+    /// Matches the Slack web client's /giphy Shuffle request: block buttons
+    /// inside attachment 1 of an ephemeral message.
+    #[test]
+    fn attachment_block_action_targets_the_attachment_container() {
+        let (path, body) = dispatch_message_action(&block_action_request(Some(1), true));
+
+        assert_eq!(path, "/api/blocks.actions");
+        let container: Value = serde_json::from_str(
+            multipart_field_value(&body, "container").expect("container field should exist"),
+        )
+        .expect("container should be JSON");
+        assert_eq!(container["type"], "message_attachment");
+        assert_eq!(container["attachment_id"], 1);
+        assert_eq!(container["message_ts"], "1710000000.000100");
+        assert_eq!(container["channel_id"], "C123");
+        assert_eq!(container["is_ephemeral"], true);
     }
 
     #[test]
@@ -4200,6 +4246,7 @@ mod tests {
             execute_slash_command_params("C123", "giphy", "cat dance", Some("1710000000.000100"));
         assert!(params.contains(&("channel", "C123".to_string())));
         assert!(params.contains(&("command", "/giphy".to_string())));
+        assert!(params.contains(&("disp", "/giphy".to_string())));
         assert!(params.contains(&("text", "cat dance".to_string())));
         assert!(params.contains(&("thread_ts", "1710000000.000100".to_string())));
 

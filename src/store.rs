@@ -2281,7 +2281,7 @@ fn apply_store_change(
                         require_store_key("channel history", &channel_id)?;
                         Ok((
                             channel_id,
-                            channel_timeline_messages(normalize_cached_messages(messages)),
+                            channel_timeline_messages(persistable_messages(messages)),
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -2363,6 +2363,9 @@ fn apply_store_change(
         } => {
             require_store_key("message channel", &channel_id)?;
             require_store_key("message timestamp", &message.ts)?;
+            if is_ephemeral(&message) {
+                return Ok(false);
+            }
             apply_message_delta(transaction, workspace_key, &channel_id, message, kind)
         }
         StoreChange::HistoryReplaced {
@@ -2375,7 +2378,7 @@ fn apply_store_change(
                 workspace_key,
                 "channel_history",
                 &channel_id,
-                &channel_timeline_messages(normalize_cached_messages(messages)),
+                &channel_timeline_messages(persistable_messages(messages)),
             )
         }
         StoreChange::HistoryDelta {
@@ -2383,7 +2386,7 @@ fn apply_store_change(
             messages,
         } => {
             require_store_key("channel history", &channel_id)?;
-            let messages = normalize_cached_messages(messages);
+            let messages = persistable_messages(messages);
             let existing = normalize_cached_messages(
                 load_sqlite_item::<Vec<SlackMessage>>(
                     transaction,
@@ -2422,7 +2425,7 @@ fn apply_store_change(
                 workspace_key,
                 "thread_replies",
                 &thread_key(&channel_id, &thread_ts),
-                &pruned_history(normalize_cached_messages(messages)),
+                &pruned_history(persistable_messages(messages)),
             )
         }
         StoreChange::ThreadDelta {
@@ -2432,7 +2435,7 @@ fn apply_store_change(
         } => {
             require_store_key("thread channel", &channel_id)?;
             require_store_key("thread timestamp", &thread_ts)?;
-            let messages = normalize_cached_messages(messages);
+            let messages = persistable_messages(messages);
             let existing = normalize_cached_messages(
                 load_sqlite_item::<Vec<SlackMessage>>(
                     transaction,
@@ -2470,6 +2473,20 @@ struct StoredThreadTimeline {
     messages: Vec<SlackMessage>,
     original: Vec<SlackMessage>,
     existed: bool,
+}
+
+/// Ephemeral messages ("Only visible to you", such as a /giphy preview) are
+/// never stored: Slack never returns them from history, so a stored copy
+/// would come back after a restart as a ghost with dead buttons.
+fn is_ephemeral(message: &SlackMessage) -> bool {
+    message.is_ephemeral == Some(true)
+}
+
+fn persistable_messages(messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
+    normalize_cached_messages(messages)
+        .into_iter()
+        .filter(|message| !is_ephemeral(message))
+        .collect()
 }
 
 fn apply_message_delta(
@@ -4051,6 +4068,58 @@ mod tests {
             assert_eq!(recovered[0].name.as_deref(), Some("renamed"));
             assert_eq!(recovered[0].is_starred, Some(false));
             assert_eq!(recovered[0].is_archived, Some(true));
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn ephemeral_messages_are_never_persisted() {
+        let directory = temp_cache_dir("ephemeral-not-persisted");
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        runtime().block_on(async {
+            let revision = WorkspaceRevision::INITIAL.successor();
+            let kept = SlackMessage {
+                ts: "1.0".into(),
+                text: Some("kept".into()),
+                ..Default::default()
+            };
+            let preview = SlackMessage {
+                ts: "2.0".into(),
+                text: Some("giphy preview".into()),
+                is_ephemeral: Some(true),
+                ..Default::default()
+            };
+            store
+                .execute_store_batch(
+                    StoreBatch::new(
+                        revision,
+                        vec![
+                            StoreChange::HistoryReplaced {
+                                channel_id: "C1".into(),
+                                messages: vec![kept, preview.clone()],
+                            },
+                            StoreChange::MessageDelta {
+                                channel_id: "C1".into(),
+                                message: SlackMessage {
+                                    ts: "3.0".into(),
+                                    ..preview
+                                },
+                                kind: MessageMutationKind::Posted,
+                            },
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let history = store.load_history("C1").await.unwrap().unwrap();
+            assert_eq!(
+                history
+                    .iter()
+                    .map(|message| message.ts.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["1.0"]
+            );
         });
         let _ = std::fs::remove_dir_all(directory);
     }

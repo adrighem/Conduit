@@ -26,6 +26,8 @@ pub struct MessageControlKey(u32);
 pub enum SlackControlAction {
     Block {
         action: SensitiveValue,
+        /// Set when the block sits inside a message attachment.
+        attachment_id: Option<u64>,
     },
     LegacyAttachment {
         attachment_id: u64,
@@ -783,6 +785,7 @@ mod tests {
                 "Approve",
                 SlackControlAction::Block {
                     action: SensitiveValue::new("synthetic-private-action"),
+                    attachment_id: None,
                 },
                 None,
             ))],

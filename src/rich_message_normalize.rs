@@ -22,8 +22,26 @@ pub(crate) fn normalize_blocks_with_files(
         choose_option_label,
         more_actions_label,
         files,
-        true,
+        CallbackScope::Message,
     )
+}
+
+/// Where block buttons may dispatch to Slack: not at all (quoted content),
+/// from the message's own blocks, or from blocks inside an attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallbackScope {
+    None,
+    Message,
+    Attachment(u64),
+}
+
+impl CallbackScope {
+    fn attachment_id(self) -> Option<u64> {
+        match self {
+            Self::Attachment(id) => Some(id),
+            Self::None | Self::Message => None,
+        }
+    }
 }
 
 fn normalize_blocks_with_callback_mode(
@@ -31,7 +49,7 @@ fn normalize_blocks_with_callback_mode(
     choose_option_label: &str,
     more_actions_label: &str,
     files: &[SlackFile],
-    retain_callbacks: bool,
+    callbacks: CallbackScope,
 ) -> RichDocument {
     let nodes = blocks
         .as_array()
@@ -43,7 +61,7 @@ fn normalize_blocks_with_callback_mode(
                 choose_option_label,
                 more_actions_label,
                 files,
-                retain_callbacks,
+                callbacks,
             )
         })
         .collect();
@@ -55,7 +73,7 @@ fn normalize_block(
     choose_option_label: &str,
     more_actions_label: &str,
     files: &[SlackFile],
-    retain_callbacks: bool,
+    callbacks: CallbackScope,
 ) -> Option<RichNode> {
     match block.get("type")?.as_str()? {
         "header" => block_text(block).map(RichNode::Header),
@@ -75,7 +93,7 @@ fn normalize_block(
                     choose_option_label,
                     more_actions_label,
                     files,
-                    retain_callbacks,
+                    callbacks,
                 )
             });
             (text.is_some() || !fields.is_empty() || accessory.is_some()).then_some(
@@ -110,7 +128,7 @@ fn normalize_block(
                         block.get("block_id").and_then(Value::as_str),
                         choose_option_label,
                         more_actions_label,
-                        retain_callbacks,
+                        callbacks,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -137,7 +155,7 @@ fn normalize_accessory(
     choose_option_label: &str,
     more_actions_label: &str,
     files: &[SlackFile],
-    retain_callbacks: bool,
+    callbacks: CallbackScope,
 ) -> Option<RichAccessory> {
     if value.get("type").and_then(Value::as_str) == Some("image") {
         return normalize_image(value, files).map(RichAccessory::Image);
@@ -147,7 +165,7 @@ fn normalize_accessory(
         block_id,
         choose_option_label,
         more_actions_label,
-        retain_callbacks,
+        callbacks,
     )
     .map(RichAccessory::Control)
 }
@@ -277,7 +295,7 @@ fn normalize_control(
     block_id: Option<&str>,
     choose_option_label: &str,
     more_actions_label: &str,
-    retain_callbacks: bool,
+    callbacks: CallbackScope,
 ) -> Option<RichControl> {
     let kind = value.get("type")?.as_str()?;
     let url = extract_control_url(value);
@@ -291,7 +309,7 @@ fn normalize_control(
         _ => return None,
     };
     if kind == "button"
-        && retain_callbacks
+        && callbacks != CallbackScope::None
         && url.is_none()
         && value
             .get("action_id")
@@ -317,6 +335,7 @@ fn normalize_control(
                 label,
                 SlackControlAction::Block {
                     action: SensitiveValue::new(action),
+                    attachment_id: callbacks.attachment_id(),
                 },
                 normalize_block_confirmation(value.get("confirm")),
             ));
@@ -525,12 +544,17 @@ pub(crate) fn normalize_attachments(
             continue;
         }
         if let Some(blocks) = attachment.blocks.as_ref() {
+            // Interactive attachments (a /giphy preview's Send/Shuffle/Cancel)
+            // dispatch with their attachment id, like the Slack web client.
+            let attachment_id = attachment
+                .id
+                .unwrap_or_else(|| attachment_index.saturating_add(1) as u64);
             let embedded = normalize_blocks_with_callback_mode(
                 blocks,
                 "Choose an option",
                 "More actions",
                 files,
-                false,
+                CallbackScope::Attachment(attachment_id),
             )
             .nodes;
             if !embedded.is_empty() {
@@ -580,7 +604,7 @@ fn normalize_quote_attachment(
             "Choose an option",
             "More actions",
             files,
-            false,
+            CallbackScope::None,
         )
         .nodes
     } else if let Some(text) = non_empty(attachment.text.as_deref()) {
@@ -815,6 +839,43 @@ mod tests {
         assert!(!cached.contains("private-approval-value"));
     }
 
+    /// Shape of a /giphy preview: Block Kit buttons inside attachment 1.
+    #[test]
+    fn attachment_block_buttons_dispatch_with_their_attachment_id() {
+        let attachment: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "blocks": [{
+                "type": "actions",
+                "block_id": "giphy:ephemeral_preview",
+                "elements": [
+                    {"type": "button", "action_id": "post", "style": "primary",
+                     "value": "{}", "text": {"type": "plain_text", "text": "Send"}},
+                    {"type": "button", "action_id": "shuffle",
+                     "value": "{}", "text": {"type": "plain_text", "text": "Shuffle"}},
+                    {"type": "button", "action_id": "cancel",
+                     "value": "{}", "text": {"type": "plain_text", "text": "Cancel"}}
+                ]
+            }]
+        }))
+        .expect("attachment parses");
+        let document = normalize_attachments(&[attachment], &[]);
+        let [RichNode::Actions(actions)] = document.nodes() else {
+            panic!("expected one actions block");
+        };
+        assert_eq!(actions.len(), 3);
+        for control in actions {
+            let Some(SlackControlAction::Block {
+                action,
+                attachment_id,
+            }) = control.action()
+            else {
+                panic!("attachment buttons are clickable");
+            };
+            assert_eq!(*attachment_id, Some(1));
+            assert!(action.expose().contains("giphy:ephemeral_preview"));
+        }
+    }
+
     #[test]
     fn retains_block_button_callback_in_memory_only() {
         let document = normalize_blocks_with_files(
@@ -844,7 +905,7 @@ mod tests {
         let [control] = actions.as_slice() else {
             panic!("expected one button");
         };
-        let Some(SlackControlAction::Block { action }) = control.action() else {
+        let Some(SlackControlAction::Block { action, .. }) = control.action() else {
             panic!("expected retained Block Kit callback");
         };
         assert!(action.expose().contains("private-action"));
