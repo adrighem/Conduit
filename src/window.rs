@@ -11981,7 +11981,7 @@ impl ConduitWindow {
             SecondaryAction::OpenThread {
                 channel_id,
                 thread_ts,
-            } => self.open_thread(&channel_id, &thread_ts),
+            } => self.open_thread_in_conversation(&channel_id, &thread_ts),
             SecondaryAction::LoadMoreThreads => {
                 let cursor = self
                     .imp()
@@ -12027,6 +12027,18 @@ impl ConduitWindow {
 
     /// Opens a message in its conversation (and thread), loading the
     /// surrounding history when it is not cached.
+    /// Lands the channel timeline on the thread root, then opens the thread.
+    fn open_thread_in_conversation(&self, channel_id: &str, thread_ts: &str) {
+        let Some(root) = crate::models::SearchMessageLocation::new(channel_id, thread_ts, None)
+        else {
+            return;
+        };
+        self.open_message_context(root);
+        if self.visible_channel_id().as_deref() == Some(channel_id) {
+            self.open_thread(channel_id, thread_ts);
+        }
+    }
+
     fn open_message_context(&self, location: crate::models::SearchMessageLocation) {
         let channel_id = location.channel_id().to_string();
         // Replies are not part of the channel timeline: land it on the thread

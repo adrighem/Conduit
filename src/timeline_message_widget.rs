@@ -1160,6 +1160,7 @@ impl NativeTimelineView {
         let list_view = self.list_view.clone();
         let n_items = items.len() as u32;
         let vadj = self.scrolled_window.vadjustment();
+        let bound_items = self.bound_items.clone();
         let recheck_read_visibility = self.recheck_read_visibility.clone();
         glib::idle_add_local_once(move || {
             // FOCUS also moves GTK's remembered row (otherwise the oldest
@@ -1169,6 +1170,11 @@ impl NativeTimelineView {
                 list_view.scroll_to(index, gtk::ListScrollFlags::FOCUS, None);
                 if had_focus {
                     list_view.grab_focus();
+                }
+                // A focused message lands mid-viewport so its context shows
+                // on both sides; without one, the newest row just comes into view.
+                if focus_index.is_some() {
+                    center_row_after_layout(&list_view, vadj, bound_items, index);
                 }
             } else {
                 vadj.set_value(vadj.upper() - vadj.page_size());
@@ -1193,6 +1199,46 @@ impl NativeTimelineView {
     pub fn widget(&self) -> &Widget {
         self.container.upcast_ref()
     }
+}
+
+/// `scroll_to` only brings a row to the nearest edge and `ScrollInfo` cannot
+/// center, so recenter once the scrolled layout is in place: tick callbacks
+/// run before layout, hence the second frame.
+fn center_row_after_layout(
+    list_view: &gtk::ListView,
+    vadj: gtk::Adjustment,
+    bound_items: BoundItems,
+    index: u32,
+) {
+    let frames = Cell::new(0_u8);
+    list_view.add_tick_callback(move |list_view, _| {
+        frames.set(frames.get() + 1);
+        if frames.get() < 2 {
+            return glib::ControlFlow::Continue;
+        }
+        center_row(list_view, &vadj, &bound_items, index);
+        glib::ControlFlow::Break
+    });
+}
+
+fn center_row(
+    list_view: &gtk::ListView,
+    vadj: &gtk::Adjustment,
+    bound_items: &BoundItems,
+    index: u32,
+) {
+    let row = bound_items
+        .borrow()
+        .iter()
+        .filter_map(glib::WeakRef::upgrade)
+        .find(|item| item.position() == index)
+        .and_then(|item| item.child());
+    let Some(bounds) = row.and_then(|row| row.compute_bounds(list_view)) else {
+        return;
+    };
+    let offset = f64::from(bounds.y() + bounds.height() / 2.0) - vadj.page_size() / 2.0;
+    let max = (vadj.upper() - vadj.page_size()).max(vadj.lower());
+    vadj.set_value((vadj.value() + offset).clamp(vadj.lower(), max));
 }
 
 const EXTENSIONS: &[&str] = &[
@@ -3844,7 +3890,29 @@ pub(crate) mod tests {
                 .filter_map(|item| item.item().and_downcast::<TimelineMessageObject>())
                 .map(|obj| obj.message().ts)
                 .collect::<Vec<_>>();
-            assert_eq!(highlighted, vec![target]);
+            assert_eq!(highlighted, vec![target.clone()]);
+
+            let row = view
+                .bound_items
+                .borrow()
+                .iter()
+                .filter_map(glib::WeakRef::upgrade)
+                .find(|item| {
+                    item.item()
+                        .and_downcast::<TimelineMessageObject>()
+                        .is_some_and(|obj| !obj.is_day_separator() && obj.message().ts == target)
+                })
+                .and_then(|item| item.child())
+                .expect("focused row should be bound");
+            let bounds = row
+                .compute_bounds(&view.list_view)
+                .expect("focused row should be laid out");
+            let page = view.scrolled_window.vadjustment().page_size();
+            let row_center = f64::from(bounds.y() + bounds.height() / 2.0);
+            assert!(
+                (row_center - page / 2.0).abs() <= f64::from(bounds.height()),
+                "row center {row_center} should sit mid-viewport (page {page})"
+            );
             window.destroy();
         });
     }
