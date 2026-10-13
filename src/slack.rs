@@ -40,6 +40,7 @@ const MAX_RETRY_AFTER_SECONDS: u64 = 300;
 pub(crate) const CHANNEL_HISTORY_PAGE_LIMIT: usize = 30;
 pub(crate) const MESSAGE_CONTEXT_LIMIT: usize = 15;
 const THREAD_HISTORY_PAGE_LIMIT: usize = 50;
+const FOLLOWED_THREADS_PAGE_LIMIT: usize = 50;
 /// Upper bound on pages fetched to reach a search hit deep in a thread.
 const THREAD_CONTEXT_MAX_PAGES: usize = 20;
 const DEFAULT_DEBUG_CONVERSATION_PROPERTY_LIMIT: usize = 20;
@@ -947,6 +948,26 @@ impl SlackApi {
             )
             .await?;
         Ok(())
+    }
+
+    /// One page of the followed-threads inbox the official client shows under
+    /// Threads (`subscriptions.thread.getView`, undocumented). Pass the previous
+    /// page's `next_cursor` to continue.
+    pub async fn followed_threads_page(&self, cursor: Option<&str>) -> Result<FollowedThreadsPage> {
+        let cursor = cursor
+            .map(|cursor| cursor.trim().to_string())
+            .filter(|cursor| !cursor.is_empty());
+        let mut params = vec![
+            ("limit", FOLLOWED_THREADS_PAGE_LIMIT.to_string()),
+            ("priority_mode", "all".to_string()),
+        ];
+        if let Some(cursor) = cursor.as_ref() {
+            params.push(("current_ts", cursor.clone()));
+        }
+        let response: ThreadViewResponse = self
+            .post_form("subscriptions.thread.getView", &params)
+            .await?;
+        Ok(followed_threads_page(response, cursor.as_deref()))
     }
 
     /// Read-state baseline for every conversation (`client.counts`).
@@ -2128,6 +2149,37 @@ fn conversation_text_params(
     ])
 }
 
+/// Builds a page from a `subscriptions.thread.getView` response. The cursor is
+/// the last root's latest activity; `max_ts` is a future watermark, not a cursor.
+/// A cursor that does not move ends paging instead of re-serving the same page.
+fn followed_threads_page(
+    response: ThreadViewResponse,
+    requested_cursor: Option<&str>,
+) -> FollowedThreadsPage {
+    let threads = response
+        .threads
+        .into_iter()
+        .filter_map(|thread| {
+            let channel_id = thread.root_msg.get("channel")?.as_str()?.trim().to_string();
+            if channel_id.is_empty() {
+                return None;
+            }
+            let root = deserialize_message(thread.root_msg).ok()?;
+            Some((channel_id, root))
+        })
+        .collect::<Vec<_>>();
+    let next_cursor = response
+        .has_more
+        .then(|| threads.last())
+        .flatten()
+        .map(|(_, root)| root.latest_reply.as_deref().unwrap_or(&root.ts).to_string())
+        .filter(|cursor| Some(cursor.as_str()) != requested_cursor);
+    FollowedThreadsPage {
+        threads,
+        next_cursor,
+    }
+}
+
 fn next_cursor(metadata: Option<ResponseMetadata>) -> Option<String> {
     metadata
         .and_then(|metadata| metadata.next_cursor)
@@ -2219,6 +2271,13 @@ fn merge_thread_pages(pages: Vec<SlackMessagePage>) -> SlackMessagePage {
         has_more,
         next_cursor,
     }
+}
+
+/// Followed thread roots keyed by channel, newest activity first.
+#[derive(Debug, Clone, Default)]
+pub struct FollowedThreadsPage {
+    pub threads: Vec<(String, SlackMessage)>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2854,6 +2913,22 @@ struct StarsListResponse {
     response_metadata: Option<ResponseMetadata>,
 }
 impl_slack_response!(StarsListResponse);
+
+#[derive(Debug, Deserialize)]
+struct ThreadViewResponse {
+    ok: bool,
+    error: Option<String>,
+    #[serde(default)]
+    threads: Vec<ThreadViewEntry>,
+    #[serde(default)]
+    has_more: bool,
+}
+impl_slack_response!(ThreadViewResponse);
+
+#[derive(Debug, Deserialize)]
+struct ThreadViewEntry {
+    root_msg: Value,
+}
 
 #[derive(Debug, Deserialize)]
 struct FilesListResponse {
@@ -5083,6 +5158,111 @@ mod tests {
         assert_eq!(form.get("thread_ts").map(String::as_str), Some("1234.0001"));
         assert_eq!(form.get("ts").map(String::as_str), Some("1234.0002"));
         assert_eq!(form.get("read").map(String::as_str), Some("1"));
+    }
+
+    fn thread_view_response(value: Value) -> ThreadViewResponse {
+        serde_json::from_value(value).expect("thread view response should parse")
+    }
+
+    #[test]
+    fn followed_threads_page_keys_roots_by_channel_and_cursors_on_latest_reply() {
+        let response = thread_view_response(json!({
+            "ok": true,
+            "has_more": true,
+            "threads": [
+                {"root_msg": {"type": "message", "ts": "3.0", "text": "a", "channel": "C1",
+                    "latest_reply": "9.0", "reply_count": 2, "subscribed": true}},
+                {"root_msg": {"type": "message", "ts": "1.0", "text": "no channel"}},
+                {"root_msg": {"type": "message", "ts": "2.0", "text": "b", "channel": "C2",
+                    "latest_reply": "8.0", "reply_count": 1}}
+            ]
+        }));
+
+        let page = followed_threads_page(response, None);
+
+        let keys = page
+            .threads
+            .iter()
+            .map(|(channel_id, root)| (channel_id.as_str(), root.ts.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, [("C1", "3.0"), ("C2", "2.0")]);
+        assert_eq!(page.threads[0].1.subscribed, Some(true));
+        assert_eq!(page.next_cursor.as_deref(), Some("8.0"));
+    }
+
+    #[test]
+    fn followed_threads_page_stops_without_more_or_when_cursor_stalls() {
+        let root =
+            json!({"root_msg": {"type": "message", "ts": "2.0", "text": "b", "channel": "C2"}});
+        let last = followed_threads_page(
+            thread_view_response(json!({"ok": true, "has_more": false, "threads": [root.clone()]})),
+            None,
+        );
+        assert_eq!(last.next_cursor, None);
+
+        let fallback = followed_threads_page(
+            thread_view_response(json!({"ok": true, "has_more": true, "threads": [root.clone()]})),
+            None,
+        );
+        assert_eq!(fallback.next_cursor.as_deref(), Some("2.0"));
+
+        let stalled = followed_threads_page(
+            thread_view_response(json!({"ok": true, "has_more": true, "threads": [root]})),
+            Some("2.0"),
+        );
+        assert_eq!(stalled.next_cursor, None);
+    }
+
+    #[test]
+    fn followed_threads_page_request_formatting() {
+        let server = Server::http(("127.0.0.1", 0)).expect("mock Slack server should bind");
+        let address = server
+            .server_addr()
+            .to_ip()
+            .expect("mock Slack server should use an IP address");
+        let received = thread::spawn(move || {
+            let mut request = server.recv().expect("mock Slack request should arrive");
+            let path = request.url().to_string();
+            let mut body = String::new();
+            request
+                .as_reader()
+                .read_to_string(&mut body)
+                .expect("mock Slack request body should be readable");
+            request
+                .respond(
+                    Response::from_string(
+                        r#"{"ok":true,"has_more":false,"threads":[{"root_msg":{"type":"message","ts":"1.0","text":"hi","channel":"C1"},"latest_replies":[]}]}"#,
+                    )
+                    .with_header(
+                        Header::from_bytes("Content-Type", "application/json")
+                            .expect("content type header should be valid"),
+                    ),
+                )
+                .expect("mock Slack response should be sent");
+            (path, body)
+        });
+
+        let mut api = SlackApi::new(user_test_token());
+        api.api_base_url = format!("http://{address}/api");
+        let page = tokio::runtime::Runtime::new()
+            .expect("test runtime should start")
+            .block_on(api.followed_threads_page(Some(" 1234.0001 ")))
+            .expect("followed threads page should load");
+
+        let (path, body) = received.join().expect("mock Slack server should finish");
+        assert_eq!(path, "/api/subscriptions.thread.getView");
+        let form = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            form.get("current_ts").map(String::as_str),
+            Some("1234.0001")
+        );
+        assert_eq!(form.get("limit").map(String::as_str), Some("50"));
+        assert_eq!(form.get("priority_mode").map(String::as_str), Some("all"));
+        assert_eq!(page.threads.len(), 1);
+        assert_eq!(page.threads[0].0, "C1");
+        assert_eq!(page.next_cursor, None);
     }
 
     #[test]

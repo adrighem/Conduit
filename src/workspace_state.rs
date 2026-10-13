@@ -759,6 +759,10 @@ pub(crate) struct WorkspaceViewState {
     search_loading: bool,
     files_loading: bool,
     saved_loading: bool,
+    /// Followed-thread order as Slack serves it; `None` until the first page.
+    followed_thread_keys: Option<Vec<(String, String)>>,
+    followed_threads_cursor: Option<String>,
+    followed_threads_loading: bool,
 }
 
 impl WorkspaceViewState {
@@ -855,6 +859,18 @@ impl WorkspaceViewState {
         self.saved_loading
     }
 
+    pub(crate) fn followed_thread_keys(&self) -> Option<&[(String, String)]> {
+        self.followed_thread_keys.as_deref()
+    }
+
+    pub(crate) fn followed_threads_loading(&self) -> bool {
+        self.followed_threads_loading
+    }
+
+    pub(crate) fn followed_threads_cursor(&self) -> Option<&str> {
+        self.followed_threads_cursor.as_deref()
+    }
+
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
@@ -884,21 +900,6 @@ impl WorkspaceViewState {
 
     pub(crate) fn show_threads(&mut self) {
         self.navigate_to(MainMessageView::Threads);
-    }
-
-    pub(crate) fn observed_threads(&self) -> Vec<(String, SlackMessage)> {
-        let mut threads = self
-            .channels
-            .iter()
-            .flat_map(|(channel_id, history)| {
-                history.messages.iter().filter_map(move |message| {
-                    (message.thread_ts.is_none() && message.has_thread())
-                        .then_some((channel_id.clone(), message.clone()))
-                })
-            })
-            .collect::<Vec<_>>();
-        threads.sort_by(|left, right| right.1.ts.cmp(&left.1.ts));
-        threads
     }
 
     pub(crate) fn show_search(&mut self) {
@@ -1337,6 +1338,44 @@ impl WorkspaceViewState {
         }
     }
 
+    /// Claims the followed-threads fetch; false while a page is in flight.
+    pub(crate) fn start_followed_threads(&mut self) -> bool {
+        !std::mem::replace(&mut self.followed_threads_loading, true)
+    }
+
+    /// Records a fetched page. A first page replaces the order, later pages
+    /// append. Returns whether the Threads view is visible.
+    pub(crate) fn apply_followed_threads(
+        &mut self,
+        keys: Vec<(String, String)>,
+        next_cursor: Option<String>,
+        append: bool,
+    ) -> bool {
+        self.followed_threads_loading = false;
+        let order = self.followed_thread_keys.get_or_insert_with(Vec::new);
+        if !append {
+            order.clear();
+        }
+        for key in keys {
+            if !order.contains(&key) {
+                order.push(key);
+            }
+        }
+        self.followed_threads_cursor = next_cursor;
+        self.main_view == MainMessageView::Threads
+    }
+
+    pub(crate) fn fail_followed_threads(&mut self) -> WorkspaceFailureOutcome {
+        self.followed_threads_loading = false;
+        WorkspaceFailureOutcome {
+            active: self.main_view == MainMessageView::Threads,
+            has_content: self
+                .followed_thread_keys
+                .as_ref()
+                .is_some_and(|keys| !keys.is_empty()),
+        }
+    }
+
     pub(crate) fn fail_saved(&mut self) -> WorkspaceFailureOutcome {
         self.saved_loading = false;
         WorkspaceFailureOutcome {
@@ -1579,7 +1618,8 @@ impl WorkspaceViewState {
             MainMessageView::Search => self.search_loading = false,
             MainMessageView::Files => self.files_loading = false,
             MainMessageView::Saved => self.saved_loading = false,
-            MainMessageView::Placeholder | MainMessageView::Threads => {}
+            MainMessageView::Threads => self.followed_threads_loading = false,
+            MainMessageView::Placeholder => {}
         }
     }
 
@@ -2092,21 +2132,29 @@ mod tests {
     }
 
     #[test]
-    fn observed_threads_collect_roots_across_loaded_channels_newest_first() {
+    fn followed_threads_first_page_replaces_order_and_later_pages_append() {
         let mut state = WorkspaceViewState::default();
-        let mut older = message("1", "older thread");
-        older.reply_count = Some(2);
-        let mut newer = message("3", "newer thread");
-        newer.reply_count = Some(1);
-        apply_fresh(&mut state, "C1", vec![older, message("2", "plain")]);
-        apply_fresh(&mut state, "C2", vec![newer]);
+        state.show_threads();
+        assert!(state.start_followed_threads());
+        assert!(!state.start_followed_threads());
+        let key = |channel: &str, ts: &str| (channel.to_string(), ts.to_string());
 
-        let threads = state.observed_threads();
+        assert!(state.apply_followed_threads(
+            vec![key("C1", "2.0"), key("C2", "1.0")],
+            Some("1.5".into()),
+            false,
+        ));
+        state.apply_followed_threads(vec![key("C2", "1.0"), key("C3", "0.5")], None, true);
+        assert_eq!(
+            state.followed_thread_keys(),
+            Some(&[key("C1", "2.0"), key("C2", "1.0"), key("C3", "0.5")][..])
+        );
+        assert_eq!(state.followed_threads_cursor(), None);
 
-        assert_eq!(threads.len(), 2);
-        assert_eq!(threads[0].0, "C2");
-        assert_eq!(threads[0].1.ts, "3");
-        assert_eq!(threads[1].0, "C1");
+        state.apply_followed_threads(vec![key("C9", "9.0")], None, false);
+        assert_eq!(state.followed_thread_keys(), Some(&[key("C9", "9.0")][..]));
+        assert!(state.start_followed_threads());
+        assert!(state.fail_followed_threads().has_content);
     }
 
     #[test]

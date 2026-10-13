@@ -3,12 +3,10 @@
 //! Everything here is GTK-free so ordering, grouping, labels and empty
 //! states can be unit tested without a display.
 
-use std::cmp::Ordering;
-
 use gettextrs::gettext;
 
 use crate::message_html::MessageHtmlContext;
-use crate::models::{slack_timestamp_is_after, SavedItem, SearchMessageLocation, SlackMessage};
+use crate::models::{SavedItem, SearchMessageLocation, SlackMessage};
 
 /// Participant names shown on a thread card before collapsing into "+N".
 const MAX_PARTICIPANT_NAMES: usize = 3;
@@ -147,6 +145,8 @@ pub(crate) enum SecondaryAction {
         channel_id: String,
         thread_ts: String,
     },
+    /// The Threads list scrolled to its end; fetch the next page.
+    LoadMoreThreads,
     OpenMessage(SearchMessageLocation),
     OpenExternal(String),
     OpenMedia {
@@ -267,28 +267,14 @@ pub(super) fn plain_text(text: &str, context: &MessageHtmlContext) -> String {
     plain.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn compare_ts_desc(left: &str, right: &str) -> Ordering {
-    if slack_timestamp_is_after(left, right) {
-        Ordering::Less
-    } else if slack_timestamp_is_after(right, left) {
-        Ordering::Greater
-    } else {
-        Ordering::Equal
-    }
-}
-
-fn thread_activity_ts(root: &SlackMessage) -> &str {
-    root.latest_reply.as_deref().unwrap_or(&root.ts)
-}
-
-/// Thread inbox rows, most recent activity first.
+/// Thread inbox rows, in the order given (Slack's followed-threads order).
 pub(crate) fn thread_rows(
     roots: Vec<(String, SlackMessage)>,
     state: &dyn Fn(&str, &str) -> ThreadState,
     channel_title: &dyn Fn(&str) -> String,
     context: &MessageHtmlContext,
 ) -> Vec<ThreadRow> {
-    let mut rows = roots
+    roots
         .into_iter()
         .map(|(channel_id, root)| {
             let state = state(&channel_id, &root.ts);
@@ -308,14 +294,7 @@ pub(crate) fn thread_rows(
                 root,
             }
         })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        compare_ts_desc(
-            thread_activity_ts(&left.root),
-            thread_activity_ts(&right.root),
-        )
-    });
-    rows
+        .collect()
 }
 
 /// "Alice, Bob, Carol +2": known names only; unresolved ids are counted.
@@ -396,7 +375,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn thread_rows_sort_by_latest_activity_and_carry_unread_state() {
+    fn thread_rows_keep_server_order_and_carry_unread_state() {
         let roots = vec![
             ("C1".to_string(), root("100.0", Some("150.0"), 2)),
             ("C2".to_string(), root("120.0", None, 1)),
@@ -413,12 +392,12 @@ pub(super) mod tests {
             .iter()
             .map(|row| row.channel_id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(order, ["C3", "C1", "C2"]);
-        assert!(rows[0].unread);
-        assert_eq!(rows[0].unread_count, 2);
-        assert_eq!(rows[0].reply_count, 5);
-        assert_eq!(rows[0].channel_title, "#C3");
-        assert!(!rows[1].unread);
+        assert_eq!(order, ["C1", "C2", "C3"]);
+        assert!(rows[2].unread);
+        assert_eq!(rows[2].unread_count, 2);
+        assert_eq!(rows[2].reply_count, 5);
+        assert_eq!(rows[2].channel_title, "#C3");
+        assert!(!rows[0].unread);
     }
 
     #[test]

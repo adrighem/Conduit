@@ -416,6 +416,10 @@ impl RuntimeCommand {
                 workspace(RuntimeOperation::SavedItems),
                 NavigationSlot::Main,
             ),
+            Self::LoadFollowedThreads { .. } => RuntimeCommandDescriptor::navigation(
+                workspace(RuntimeOperation::FollowedThreads),
+                NavigationSlot::Main,
+            ),
             Self::LoadUser { user_id } => RuntimeCommandDescriptor::request(
                 OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone())),
                 RuntimeTaskLane::Background,
@@ -857,6 +861,12 @@ pub enum RuntimeEventKind {
         share_requested: bool,
     },
     SavedItemsLoaded(Vec<SavedItem>),
+    /// One followed-threads page; its roots already reached the thread catalog.
+    FollowedThreadsLoaded {
+        keys: Vec<(String, String)>,
+        next_cursor: Option<String>,
+        append: bool,
+    },
     UserProfileLoadCompleted {
         user_id: String,
     },
@@ -1022,6 +1032,9 @@ impl RuntimeEventKind {
             ),
             Self::SavedItemsLoaded(_) => {
                 OperationContext::new(RuntimeOperation::SavedItems, RuntimeTarget::Workspace)
+            }
+            Self::FollowedThreadsLoaded { .. } => {
+                OperationContext::new(RuntimeOperation::FollowedThreads, RuntimeTarget::Workspace)
             }
             Self::UserProfileLoadCompleted { user_id } => {
                 OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone()))
@@ -6163,6 +6176,29 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             context
                 .events
                 .send_event(RuntimeEventKind::SavedItemsLoaded(items));
+        }
+        RuntimeCommand::LoadFollowedThreads { cursor } => {
+            let api = require_slack(context.slack)?;
+            let page = api.followed_threads_page(cursor.as_deref()).await?;
+            let keys = page
+                .threads
+                .iter()
+                .map(|(channel_id, root)| (channel_id.clone(), root.ts.clone()))
+                .collect();
+            context
+                .workspace
+                .apply_persisted_and_publish_with_completion(
+                    context.workspace_store.as_ref(),
+                    context.events,
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::FollowedThreadsObserved(page.threads),
+                    RuntimeEventKind::FollowedThreadsLoaded {
+                        keys,
+                        next_cursor: page.next_cursor,
+                        append: cursor.is_some(),
+                    },
+                )
+                .await?;
         }
         RuntimeCommand::LoadUser { user_id } => {
             if !context.user_cache.contains_key(&user_id) {
@@ -16847,7 +16883,8 @@ mod tests {
             | RuntimeCommand::SearchMessages { .. }
             | RuntimeCommand::LoadFiles
             | RuntimeCommand::LoadFile { .. }
-            | RuntimeCommand::LoadSavedItems => RuntimeAdmissionPolicy::supersedable(
+            | RuntimeCommand::LoadSavedItems
+            | RuntimeCommand::LoadFollowedThreads { .. } => RuntimeAdmissionPolicy::supersedable(
                 RuntimeAdmissionKey::Navigation(NavigationSlot::Main),
             ),
             RuntimeCommand::LoadThread { .. } | RuntimeCommand::LoadOlderThread { .. } => {
@@ -16922,7 +16959,8 @@ mod tests {
             | RuntimeCommand::SearchMessages { .. }
             | RuntimeCommand::LoadFiles
             | RuntimeCommand::LoadFile { .. }
-            | RuntimeCommand::LoadSavedItems => (
+            | RuntimeCommand::LoadSavedItems
+            | RuntimeCommand::LoadFollowedThreads { .. } => (
                 true,
                 Some(NavigationSlot::Main),
                 RuntimeTaskLane::Navigation,
@@ -17056,6 +17094,7 @@ mod tests {
                 share_requested: false,
             },
             RuntimeCommand::LoadSavedItems,
+            RuntimeCommand::LoadFollowedThreads { cursor: None },
             RuntimeCommand::LoadUser {
                 user_id: "U1".to_string(),
             },
@@ -17165,7 +17204,7 @@ mod tests {
     #[test]
     fn runtime_command_admission_metadata_is_exhaustive_and_behavior_neutral() {
         let commands = runtime_command_fixtures();
-        assert_eq!(commands.len(), 45);
+        assert_eq!(commands.len(), 46);
 
         for command in commands {
             let descriptor = command.descriptor();

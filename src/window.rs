@@ -2082,6 +2082,7 @@ enum RuntimeFailureRecovery {
     Search,
     Files,
     SavedItems,
+    FollowedThreads,
     User(String),
     ConversationDetails(String),
     Image(String),
@@ -2144,6 +2145,9 @@ fn runtime_failure_recovery(context: &OperationContext) -> RuntimeFailureRecover
         }
         (RuntimeOperation::SavedItems, RuntimeTarget::Workspace) => {
             RuntimeFailureRecovery::SavedItems
+        }
+        (RuntimeOperation::FollowedThreads, RuntimeTarget::Workspace) => {
+            RuntimeFailureRecovery::FollowedThreads
         }
         (RuntimeOperation::User, RuntimeTarget::User(user_id)) => {
             RuntimeFailureRecovery::User(user_id.clone())
@@ -2399,6 +2403,7 @@ enum PlaceholderSurface {
     SearchResults,
     Files,
     SavedItems,
+    Threads,
 }
 
 impl PlaceholderSurface {
@@ -2408,6 +2413,7 @@ impl PlaceholderSurface {
             Self::SearchResults => gettext("Search results"),
             Self::Files => gettext("Files"),
             Self::SavedItems => gettext("Later"),
+            Self::Threads => gettext("Threads"),
         }
     }
 
@@ -2417,6 +2423,7 @@ impl PlaceholderSurface {
             Self::SearchResults => gettext("Could not load search results. Try again. {error}"),
             Self::Files => gettext("Could not load files. Try again. {error}"),
             Self::SavedItems => gettext("Could not load saved items. Try again. {error}"),
+            Self::Threads => gettext("Could not load threads. Try again. {error}"),
         };
         template.replace("{error}", error)
     }
@@ -2428,6 +2435,7 @@ impl PlaceholderSurface {
             Self::SearchResults => Some(SecondaryKind::Search),
             Self::Files => Some(SecondaryKind::Files),
             Self::SavedItems => Some(SecondaryKind::Saved),
+            Self::Threads => Some(SecondaryKind::Threads),
         }
     }
 }
@@ -7111,6 +7119,21 @@ impl ConduitWindow {
                     }
                 }
             }
+            RuntimeEventKind::FollowedThreadsLoaded {
+                keys,
+                next_cursor,
+                append,
+            } => {
+                let visible = self
+                    .imp()
+                    .workspace
+                    .view
+                    .borrow_mut()
+                    .apply_followed_threads(keys, next_cursor, append);
+                if visible {
+                    self.populate_threads();
+                }
+            }
             RuntimeEventKind::SavedItemsLoaded(items) => {
                 let visible = self.imp().workspace.view.borrow_mut().apply_saved(items);
                 if visible {
@@ -7733,8 +7756,22 @@ impl ConduitWindow {
         self.record_navigation(&MainNavigationTarget::Threads);
         self.imp().workspace.view.borrow_mut().show_threads();
         self.render_closed_thread();
+        self.load_followed_threads(None);
         self.populate_threads();
         self.imp().workspace_split.set_show_content(true);
+    }
+
+    /// Fetches a followed-threads page unless one is already in flight.
+    fn load_followed_threads(&self, cursor: Option<String>) {
+        if self
+            .imp()
+            .workspace
+            .view
+            .borrow_mut()
+            .start_followed_threads()
+        {
+            self.send_command(RuntimeCommand::LoadFollowedThreads { cursor });
+        }
     }
 
     fn show_files(&self) {
@@ -9003,6 +9040,20 @@ impl ConduitWindow {
                     }
                 }
             }
+            RuntimeFailureRecovery::FollowedThreads => {
+                let outcome = self
+                    .imp()
+                    .workspace
+                    .view
+                    .borrow_mut()
+                    .fail_followed_threads();
+                if outcome.active {
+                    self.set_status(error);
+                    if !outcome.has_content {
+                        self.show_main_surface_error(PlaceholderSurface::Threads, error);
+                    }
+                }
+            }
             RuntimeFailureRecovery::SavedItems => {
                 let outcome = self.imp().workspace.view.borrow_mut().fail_saved();
                 if outcome.active {
@@ -9831,7 +9882,7 @@ impl ConduitWindow {
                 messages_use_user(state.channel_messages(channel_id), user_id)
             }),
             MainMessageView::Threads => {
-                let observed = state.observed_threads();
+                let observed = self.followed_thread_roots();
                 observed.iter().any(|(_, message)| {
                     messages_use_user(std::slice::from_ref(message), user_id)
                         || messages_use_user_in_reactions(std::slice::from_ref(message), user_id)
@@ -9883,7 +9934,7 @@ impl ConduitWindow {
             MainMessageView::Conversation => state.visible_channel_id().is_some_and(|channel_id| {
                 messages_use_image_asset(state.channel_messages(channel_id), custom_emojis, key)
             }),
-            MainMessageView::Threads => state.observed_threads().iter().any(|(_, message)| {
+            MainMessageView::Threads => self.followed_thread_roots().iter().any(|(_, message)| {
                 messages_use_image_asset(std::slice::from_ref(message), custom_emojis, key)
             }),
             MainMessageView::Saved => state.saved_items().iter().any(|item| {
@@ -11755,14 +11806,19 @@ impl ConduitWindow {
         }
     }
 
-    fn populate_threads(&self) {
-        let observed = self.imp().workspace.view.borrow().observed_threads();
-        let observed = self
-            .imp()
+    /// Followed thread roots in server order, or the cached ones before the
+    /// first page arrives.
+    fn followed_thread_roots(&self) -> Vec<(String, SlackMessage)> {
+        let view = self.imp().workspace.view.borrow();
+        self.imp()
             .workspace
             .threads
             .borrow()
-            .inbox_projection(observed);
+            .followed_roots(view.followed_thread_keys())
+    }
+
+    fn populate_threads(&self) {
+        let observed = self.followed_thread_roots();
         let roots = observed
             .iter()
             .map(|(_, message)| message.clone())
@@ -11805,6 +11861,20 @@ impl ConduitWindow {
                 )
                 .collect(),
         );
+        if observed.is_empty()
+            && self
+                .imp()
+                .workspace
+                .view
+                .borrow()
+                .followed_threads_loading()
+        {
+            self.show_secondary_loading(
+                crate::secondary_views::SecondaryKind::Threads,
+                &gettext("Loading threads"),
+            );
+            return;
+        }
         let context = self.message_html_context(None);
         let rows = crate::secondary_views::thread_rows(
             observed,
@@ -11912,6 +11982,18 @@ impl ConduitWindow {
                 channel_id,
                 thread_ts,
             } => self.open_thread(&channel_id, &thread_ts),
+            SecondaryAction::LoadMoreThreads => {
+                let cursor = self
+                    .imp()
+                    .workspace
+                    .view
+                    .borrow()
+                    .followed_threads_cursor()
+                    .map(ToString::to_string);
+                if cursor.is_some() {
+                    self.load_followed_threads(cursor);
+                }
+            }
             SecondaryAction::OpenMessage(location) => self.open_message_context(location),
             SecondaryAction::OpenExternal(url) => self.open_external_link(&url),
             SecondaryAction::OpenMedia { url, name, video } => {
@@ -14703,6 +14785,11 @@ mod tests {
                 RuntimeFailureRecovery::SavedItems,
             ),
             (
+                RuntimeOperation::FollowedThreads,
+                RuntimeTarget::Workspace,
+                RuntimeFailureRecovery::FollowedThreads,
+            ),
+            (
                 RuntimeOperation::User,
                 RuntimeTarget::User("U123".to_string()),
                 RuntimeFailureRecovery::User("U123".to_string()),
@@ -15118,6 +15205,11 @@ mod tests {
                 PlaceholderSurface::SavedItems,
                 "Later",
                 "Could not load saved items. Try again. token <expired>",
+            ),
+            (
+                PlaceholderSurface::Threads,
+                "Threads",
+                "Could not load threads. Try again. token <expired>",
             ),
         ] {
             assert_eq!(surface.title(), title);

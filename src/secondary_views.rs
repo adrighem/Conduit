@@ -172,6 +172,18 @@ impl SecondaryView {
             .hexpand(true)
             .child(&list_view)
             .build();
+        let kind: Rc<Cell<Option<SecondaryKind>>> = Rc::new(Cell::new(None));
+        {
+            let kind = kind.clone();
+            let on_action = on_action.clone();
+            scrolled_window.connect_edge_reached(move |_, position| {
+                if position == gtk::PositionType::Bottom
+                    && kind.get() == Some(SecondaryKind::Threads)
+                {
+                    dispatch_action(&on_action, SecondaryAction::LoadMoreThreads);
+                }
+            });
+        }
         let status_page = adw::StatusPage::builder().vexpand(true).build();
         let stack = gtk::Stack::builder()
             .vexpand(true)
@@ -190,7 +202,7 @@ impl SecondaryView {
             store,
             context,
             on_action,
-            kind: Rc::new(Cell::new(None)),
+            kind,
         }
     }
 

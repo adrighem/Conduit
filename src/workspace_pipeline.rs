@@ -191,8 +191,10 @@ pub(crate) enum WorkspaceMutation {
         added: bool,
     },
     ThreadCatalogChanged(Vec<ThreadRecord>),
-    /// Local-only: marks a thread fully read up to its latest known reply.
-    /// No Slack API backs thread-level read state.
+    /// Roots from Slack's followed-threads list (`subscriptions.thread.getView`).
+    FollowedThreadsObserved(Vec<(String, SlackMessage)>),
+    /// Marks a thread fully read up to its latest known reply. The runtime
+    /// syncs it to Slack with `subscriptions.thread.mark`.
     ThreadRead {
         channel_id: String,
         root_ts: String,
@@ -613,6 +615,9 @@ impl WorkspaceCoordinator {
                 added,
             } => self.apply_reaction(&channel_id, &message_ts, &name, &user_id, added, origin),
             WorkspaceMutation::ThreadCatalogChanged(records) => self.apply_thread_catalog(records),
+            WorkspaceMutation::FollowedThreadsObserved(roots) => {
+                self.apply_followed_threads(&roots, origin)
+            }
             WorkspaceMutation::ThreadRead {
                 channel_id,
                 root_ts,
@@ -2036,6 +2041,33 @@ impl WorkspaceCoordinator {
             revision,
             vec![WorkspaceChange::ThreadCatalogChanged(records.clone())],
             vec![StoreChange::ThreadCatalogReplaced(records)],
+        )
+    }
+
+    fn apply_followed_threads(
+        &mut self,
+        roots: &[(String, SlackMessage)],
+        origin: MutationOrigin,
+    ) -> Option<WorkspaceReduction> {
+        let delta = roots
+            .iter()
+            .filter_map(|(channel_id, root)| {
+                self.thread_catalog.observe_followed_root(channel_id, root)
+            })
+            .collect::<Vec<_>>();
+        if delta.is_empty() {
+            return None;
+        }
+        let revision = self.next_revision();
+        let store_changes = if origin == MutationOrigin::Cache {
+            Vec::new()
+        } else {
+            vec![StoreChange::ThreadRecordsUpserted(delta.clone())]
+        };
+        self.commit(
+            revision,
+            vec![WorkspaceChange::ThreadCatalogChanged(delta)],
+            store_changes,
         )
     }
 

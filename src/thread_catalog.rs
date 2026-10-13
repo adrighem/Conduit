@@ -88,9 +88,9 @@ impl ThreadRecord {
         self.reply_count.saturating_sub(self.read_reply_count)
     }
 
-    /// Marks every reply seen so far as read. Local-only: no Slack API backs
-    /// thread read-state. `last_read` and `read_reply_count` are always set
-    /// together; they're one "I've seen everything up to here" operation.
+    /// Marks every reply seen so far as read; Slack learns it through
+    /// `subscriptions.thread.mark`. `last_read` and `read_reply_count` are always
+    /// set together; they're one "I've seen everything up to here" operation.
     pub(crate) fn mark_read(&mut self) {
         self.last_read = self.latest_reply.clone();
         self.read_reply_count = self.reply_count;
@@ -185,35 +185,31 @@ impl ThreadCatalog {
         }
     }
 
-    /// Build the thread-inbox projection from locally observed roots and persisted Slack
-    /// metadata. Catalog records win because they carry the most complete reply data.
-    pub(crate) fn inbox_projection(
+    /// Thread inbox roots in Slack's followed-threads order. Before the first
+    /// fetch (`order` is `None`), cached followed roots stand in, newest
+    /// activity first. Threads unfollowed since are dropped either way.
+    pub(crate) fn followed_roots(
         &self,
-        observed: impl IntoIterator<Item = (String, SlackMessage)>,
+        order: Option<&[(String, String)]>,
     ) -> Vec<(String, SlackMessage)> {
-        let mut roots = observed
-            .into_iter()
-            .map(|(channel_id, root)| ((channel_id, root.ts.clone()), root))
-            .collect::<HashMap<_, _>>();
-
-        for record in self.records.values() {
-            if record.subscribed == Some(false) {
-                continue;
-            }
-            let Some(root) = record.root.as_ref() else {
-                continue;
-            };
-            let mut root = root.clone();
+        let inbox_root = |record: &ThreadRecord| {
+            let mut root = record.root.clone()?;
             root.reply_count = Some(record.reply_count);
-            roots.insert(
-                (record.key.channel_id.clone(), record.key.root_ts.clone()),
-                root,
-            );
+            Some((record.key.channel_id.clone(), root))
+        };
+        if let Some(order) = order {
+            return order
+                .iter()
+                .filter_map(|(channel_id, root_ts)| self.get(channel_id, root_ts))
+                .filter(|record| record.subscribed != Some(false))
+                .filter_map(inbox_root)
+                .collect();
         }
-
-        let mut roots = roots
-            .into_iter()
-            .map(|((channel_id, _), root)| (channel_id, root))
+        let mut roots = self
+            .records
+            .values()
+            .filter(|record| record.subscribed == Some(true))
+            .filter_map(inbox_root)
             .collect::<Vec<_>>();
         roots.sort_by(|(left_channel, left), (right_channel, right)| {
             right
@@ -225,6 +221,18 @@ impl ThreadCatalog {
                 .then_with(|| left.ts.cmp(&right.ts))
         });
         roots
+    }
+
+    /// Records a root from Slack's followed-threads list as subscribed.
+    pub(crate) fn observe_followed_root(
+        &mut self,
+        channel_id: &str,
+        root: &SlackMessage,
+    ) -> Option<ThreadRecord> {
+        let mut root = root.clone();
+        root.subscribed = Some(true);
+        let root_ts = root.ts.clone();
+        self.observe_thread(channel_id, &root_ts, &[root], false)
     }
 
     /// Additively discovers roots and orphan replies in any history page.
@@ -580,19 +588,38 @@ mod tests {
     }
 
     #[test]
-    fn inbox_projection_merges_observed_roots_with_authoritative_catalog_metadata() {
+    fn followed_roots_follow_server_order_and_drop_unfollowed() {
         let mut catalog = ThreadCatalog::default();
-        let mut catalog_root = root("1.0", 3);
-        catalog_root.latest_reply = Some("4.0".into());
-        catalog.observe_thread("C1", "1.0", &[catalog_root], false);
+        let mut followed = root("1.0", 3);
+        followed.latest_reply = Some("4.0".into());
+        catalog.observe_followed_root("C1", &followed);
+        catalog.observe_followed_root("C2", &root("2.0", 1));
+        let mut unfollowed = root("3.0", 1);
+        unfollowed.subscribed = Some(false);
+        catalog.observe_thread("C3", "3.0", &[unfollowed], false);
+        catalog.observe_thread("C4", "5.0", &[root("5.0", 1)], false);
 
-        let mut observed_root = root("1.0", 1);
-        observed_root.latest_reply = Some("2.0".into());
-        let projection = catalog.inbox_projection(vec![("C1".into(), observed_root)]);
-
-        assert_eq!(projection.len(), 1);
-        assert_eq!(projection[0].1.reply_count, Some(3));
-        assert_eq!(projection[0].1.latest_reply.as_deref(), Some("4.0"));
+        let order = [
+            ("C2".to_string(), "2.0".to_string()),
+            ("C3".to_string(), "3.0".to_string()),
+            ("C1".to_string(), "1.0".to_string()),
+        ];
+        let keys = |roots: Vec<(String, SlackMessage)>| {
+            roots
+                .into_iter()
+                .map(|(channel_id, root)| (channel_id, root.ts))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(catalog.followed_roots(Some(&order))),
+            [("C2".into(), "2.0".into()), ("C1".into(), "1.0".into())]
+        );
+        let cached = catalog.followed_roots(None);
+        assert_eq!(cached[0].1.reply_count, Some(3));
+        assert_eq!(
+            keys(cached),
+            [("C1".into(), "1.0".into()), ("C2".into(), "2.0".into())]
+        );
     }
 
     #[test]

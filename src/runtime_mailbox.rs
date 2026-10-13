@@ -108,6 +108,9 @@ pub enum RuntimeCommand {
         share_requested: bool,
     },
     LoadSavedItems,
+    LoadFollowedThreads {
+        cursor: Option<String>,
+    },
     LoadUser {
         user_id: String,
     },
@@ -242,6 +245,7 @@ pub enum RuntimeOperation {
     Search,
     Files,
     SavedItems,
+    FollowedThreads,
     User,
     Emoji,
     ImageAsset,
