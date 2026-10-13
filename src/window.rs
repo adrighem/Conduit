@@ -7999,6 +7999,10 @@ impl ConduitWindow {
                 self.set_status(&format!("Unsupported slash command: /{}", name));
                 return;
             }
+            SlashCommandValidation::MissingArguments { usage } => {
+                self.set_status(&format!("Usage: {usage}"));
+                return;
+            }
             SlashCommandValidation::Supported(cmd) => Some(cmd),
             SlashCommandValidation::NotACommand => None,
         };

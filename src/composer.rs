@@ -121,6 +121,10 @@ pub struct HydratedComposerText {
 /// regular or ephemeral messages, rendered like any other message.
 pub const SUPPORTED_SLASH_COMMANDS: &[&str] = &["giphy", "teams-calls"];
 
+/// Supported commands that do nothing useful without arguments, with the
+/// usage hint shown instead of running them.
+const SLASH_COMMAND_USAGE: &[(&str, &str)] = &[("giphy", "/giphy [search terms]")];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlashCommand {
     pub name: String,
@@ -131,6 +135,7 @@ pub struct SlashCommand {
 pub enum SlashCommandValidation {
     Supported(SlashCommand),
     Unsupported { name: String, arguments: String },
+    MissingArguments { usage: &'static str },
     NotACommand,
 }
 
@@ -183,6 +188,12 @@ pub fn validate_slash_command(text: &str) -> SlashCommandValidation {
     match parse_slash_command(trimmed) {
         Some(cmd) => {
             if let Some(name) = resolve_slash_command(&cmd.name) {
+                if let Some((_, usage)) = SLASH_COMMAND_USAGE
+                    .iter()
+                    .find(|(command, _)| *command == name && cmd.arguments.is_empty())
+                {
+                    return SlashCommandValidation::MissingArguments { usage };
+                }
                 SlashCommandValidation::Supported(SlashCommand {
                     name: name.to_string(),
                     arguments: cmd.arguments,
@@ -2922,6 +2933,18 @@ mod tests {
                 name: "giphy".to_string(),
                 arguments: "cat".to_string(),
             })
+        );
+        assert_eq!(
+            validate_slash_command("/giphy"),
+            SlashCommandValidation::MissingArguments {
+                usage: "/giphy [search terms]"
+            }
+        );
+        assert_eq!(
+            validate_slash_command("/gi   "),
+            SlashCommandValidation::MissingArguments {
+                usage: "/giphy [search terms]"
+            }
         );
         assert_eq!(
             validate_slash_command("/teams standup"),
