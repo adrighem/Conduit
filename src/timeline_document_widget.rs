@@ -239,10 +239,10 @@ impl<'a> DocumentRenderer<'a> {
             card.add_css_class(&class);
         }
         if let Some(author) = attachment.author.as_ref() {
-            card.append(&linked_label(author, "small", false));
+            card.append(&self.linked_label(author, "small", false));
         }
         if let Some(title) = attachment.title.as_ref() {
-            card.append(&linked_label(title, "medium", true));
+            card.append(&self.linked_label(title, "medium", true));
         }
         if let Some(text) = attachment.text.as_deref() {
             render_text_content(text, &card, self.context, self.on_action);
@@ -291,7 +291,7 @@ impl<'a> DocumentRenderer<'a> {
         }
         if let Some(footer) = attachment.footer.as_deref() {
             let pango = crate::message_html::mrkdwn_to_pango(footer, self.context);
-            let label = markup_label(&format!("<span size=\"small\">{pango}</span>"));
+            let label = self.link_label(&format!("<span size=\"small\">{pango}</span>"));
             label.add_css_class("dim-label");
             row.append(&label);
         }
@@ -354,7 +354,7 @@ impl<'a> DocumentRenderer<'a> {
                 glib::markup_escape_text(channel.trim_start_matches('#'))
             ));
         }
-        header.append(&markup_label(&header_markup));
+        header.append(&self.link_label(&header_markup));
         card.append(&header);
 
         self.render(&quote.body, &card);
@@ -375,7 +375,7 @@ impl<'a> DocumentRenderer<'a> {
                     glib::markup_escape_text(footer)
                 ),
             };
-            let label = markup_label(&markup);
+            let label = self.link_label(&markup);
             label.add_css_class("dim-label");
             card.append(&label);
         }
@@ -459,20 +459,6 @@ fn markup_label(markup: &str) -> Label {
     label
 }
 
-fn linked_label(linked: &MessageLinkedText, size: &str, bold: bool) -> Label {
-    let text = glib::markup_escape_text(&linked.text);
-    let text = if bold {
-        format!("<b>{text}</b>")
-    } else {
-        text.to_string()
-    };
-    let text = match linked.url.as_deref().filter(|url| is_http_url(url)) {
-        Some(url) => format!("<a href=\"{}\">{text}</a>", glib::markup_escape_text(url)),
-        None => text,
-    };
-    markup_label(&format!("<span size=\"{size}\">{text}</span>"))
-}
-
 fn two_column_grid(widgets: Vec<Widget>) -> Grid {
     let grid = Grid::new();
     grid.set_column_spacing(12);
@@ -484,6 +470,28 @@ fn two_column_grid(widgets: Vec<Widget>) -> Grid {
 }
 
 impl<'a> DocumentRenderer<'a> {
+    /// A label whose links go through the timeline action handler, so Slack
+    /// message permalinks open in Conduit instead of the browser.
+    fn link_label(&self, markup: &str) -> Label {
+        let label = markup_label(markup);
+        crate::timeline_message_widget::attach_label_links(&label, self.context, self.on_action);
+        label
+    }
+
+    fn linked_label(&self, linked: &MessageLinkedText, size: &str, bold: bool) -> Label {
+        let text = glib::markup_escape_text(&linked.text);
+        let text = if bold {
+            format!("<b>{text}</b>")
+        } else {
+            text.to_string()
+        };
+        let text = match linked.url.as_deref().filter(|url| is_http_url(url)) {
+            Some(url) => format!("<a href=\"{}\">{text}</a>", glib::markup_escape_text(url)),
+            None => text,
+        };
+        self.link_label(&format!("<span size=\"{size}\">{text}</span>"))
+    }
+
     fn controls_row(&self, controls: &[MessageControl]) -> adw::WrapBox {
         let row = adw::WrapBox::builder()
             .child_spacing(6)
@@ -501,8 +509,13 @@ impl<'a> DocumentRenderer<'a> {
         if let Some(url) = control.url().filter(|url| is_http_url(url)) {
             let url = url.to_string();
             button.set_tooltip_text(Some(&url));
+            let on_action = self.on_action.cloned();
             button.connect_clicked(move |_| {
-                if let Err(error) = gtk::gio::AppInfo::launch_default_for_uri(
+                if let Some(on_action) = on_action.as_ref() {
+                    on_action(crate::timeline_message_widget::TimelineAction::OpenLink(
+                        url.clone(),
+                    ));
+                } else if let Err(error) = gtk::gio::AppInfo::launch_default_for_uri(
                     &url,
                     None::<&gtk::gio::AppLaunchContext>,
                 ) {

@@ -1451,6 +1451,25 @@ impl SearchMessageLocation {
         )
     }
 
+    /// Message a `conduit://message?channel=..&ts=..[&thread_ts=..]` link
+    /// points at, as rich text message mentions render.
+    pub fn from_message_target_url(url: &str) -> Option<Self> {
+        let link = url::Url::parse(url).ok()?;
+        if link.scheme() != "conduit" || link.host_str() != Some("message") {
+            return None;
+        }
+        let param = |name: &str| {
+            link.query_pairs()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.into_owned())
+        };
+        Self::new(
+            &param("channel")?,
+            &param("ts")?,
+            param("thread_ts").as_deref(),
+        )
+    }
+
     pub fn channel_id(&self) -> &str {
         &self.channel_id
     }
@@ -1715,6 +1734,25 @@ impl SlackUserProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_target_url_location_reads_channel_message_and_thread() {
+        let location = SearchMessageLocation::from_message_target_url(
+            "conduit://message?channel=C1&ts=1700000002.000200&thread_ts=1700000001.000100",
+        )
+        .expect("message target should parse");
+        assert_eq!(location.channel_id(), "C1");
+        assert_eq!(location.message_ts(), "1700000002.000200");
+        assert_eq!(location.thread_ts(), Some("1700000001.000100"));
+        assert_eq!(
+            SearchMessageLocation::from_message_target_url("conduit://channel?channel=C1"),
+            None
+        );
+        assert_eq!(
+            SearchMessageLocation::from_message_target_url("https://acme.slack.com/archives/C1"),
+            None
+        );
+    }
 
     #[test]
     fn permalink_location_reads_message_and_thread_from_slack_hosts_only() {

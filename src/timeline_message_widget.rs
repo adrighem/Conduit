@@ -1448,7 +1448,7 @@ fn strip_anchor_tags(markup: &str) -> (String, Vec<MarkupLink>) {
     (out, links)
 }
 
-fn attach_label_links(
+pub(crate) fn attach_label_links(
     label: &Label,
     context: &MessageHtmlContext,
     on_action: Option<&ActionHandler>,
@@ -4056,6 +4056,95 @@ pub(crate) mod tests {
                 "{actions:?}"
             );
         });
+    }
+
+    #[test]
+    fn rich_message_links_and_quote_footer_dispatch_open_link() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let permalink = "https://acme.slack.com/archives/C1/p1700000002000200?thread_ts=1700000001.000100&cid=C1";
+            let mut msg: SlackMessage = serde_json::from_value(serde_json::json!({
+                "type": "message",
+                "ts": "1700000000.000980",
+                "user": "U123",
+                "text": "see",
+                "blocks": [{
+                    "type": "rich_text",
+                    "elements": [{
+                        "type": "rich_text_section",
+                        "elements": [
+                            {"type": "text", "text": "see "},
+                            {
+                                "type": "message_mention",
+                                "channel_id": "C1",
+                                "message_ts": "1700000002.000200",
+                                "thread_ts": "1700000001.000100",
+                                "url": permalink
+                            }
+                        ]
+                    }]
+                }],
+                "attachments": [{
+                    "is_msg_unfurl": true,
+                    "is_reply_unfurl": true,
+                    "ts": "1700000002.000200",
+                    "author_name": "Alice",
+                    "channel_id": "C1",
+                    "from_url": permalink,
+                    "text": "quoted reply",
+                    "footer": "Thread in Slack conversation"
+                }]
+            }))
+            .expect("message deserializes");
+            msg.refresh_canonical_content();
+
+            let received: Rc<RefCell<Vec<TimelineAction>>> = Rc::new(RefCell::new(Vec::new()));
+            let sink = received.clone();
+            let on_action: ActionHandler = Rc::new(move |action| sink.borrow_mut().push(action));
+            let widget =
+                build_timeline_message_widget(&msg, &ctx, None, None, None, None, Some(&on_action));
+
+            let mut labels = Vec::new();
+            collect_link_labels(&widget.upcast(), &mut labels);
+            let hrefs = labels
+                .iter()
+                .map(|label| {
+                    let markup = label.label();
+                    let start = markup.find("href=\"").expect("link label has an href") + 6;
+                    let end = start + markup[start..].find('"').expect("href is closed");
+                    let href = markup[start..end].replace("&amp;", "&");
+                    let handled: bool = label.emit_by_name("activate-link", &[&href]);
+                    assert!(handled, "{href} should be handled in Conduit");
+                    href
+                })
+                .collect::<Vec<_>>();
+            assert!(hrefs
+                .iter()
+                .any(|href| href.starts_with("conduit://message?")));
+            assert!(hrefs.iter().any(|href| href == permalink));
+            let opened = received
+                .borrow()
+                .iter()
+                .filter_map(|action| match action {
+                    TimelineAction::OpenLink(uri) => Some(uri.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(opened, hrefs);
+        });
+    }
+
+    fn collect_link_labels(widget: &Widget, labels: &mut Vec<Label>) {
+        if let Some(label) = widget.downcast_ref::<Label>() {
+            if label.label().contains("<a href=") {
+                labels.push(label.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            collect_link_labels(&current, labels);
+            child = current.next_sibling();
+        }
     }
 
     #[test]

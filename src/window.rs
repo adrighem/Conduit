@@ -8600,6 +8600,10 @@ impl ConduitWindow {
     /// link's host, decides: permalinks use the workspace domain, which need
     /// not match the URL `auth.test` reports.
     fn open_link(&self, uri: &str) {
+        if let Some(location) = crate::models::SearchMessageLocation::from_message_target_url(uri) {
+            self.open_message_context(location);
+            return;
+        }
         let location =
             crate::models::SearchMessageLocation::from_permalink(uri).filter(|location| {
                 self.imp()

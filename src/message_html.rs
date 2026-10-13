@@ -3211,6 +3211,10 @@ pub fn user_profile_action_url(user_id: &str) -> String {
     format!("conduit://user-profile?user={}", encode_query(user_id))
 }
 
+/// Prefix of [`message_target_action_url`] links, which stay clickable in
+/// message text; the window opens them in Conduit.
+pub const MESSAGE_TARGET_URL_PREFIX: &str = "conduit://message?";
+
 pub fn message_target_action_url(channel_id: &str, ts: &str, thread_ts: Option<&str>) -> String {
     let mut url = format!(
         "conduit://message?channel={}&ts={}",
@@ -3460,7 +3464,7 @@ fn render_slack_entity_pango(text: &str, context: &MessageHtmlContext) -> Option
         };
         mention_pill_pango(prefix, display)
     } else if let Some((url, label)) = raw.split_once('|') {
-        if is_http_url(url) {
+        if is_http_url(url) || url.starts_with(MESSAGE_TARGET_URL_PREFIX) {
             external_link_pango(url, label)
         } else {
             escape_pango(label)
