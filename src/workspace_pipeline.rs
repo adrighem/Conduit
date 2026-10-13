@@ -1224,7 +1224,10 @@ impl WorkspaceCoordinator {
                 .messages
                 .iter()
                 .filter(|(message_ts, entry)| {
-                    !incoming.contains_key(*message_ts) && entry.revision <= base_revision
+                    // History never returns ephemerals, so absence is no deletion.
+                    !incoming.contains_key(*message_ts)
+                        && entry.revision <= base_revision
+                        && entry.value.is_ephemeral != Some(true)
                 })
                 .map(|(message_ts, _)| message_ts.clone())
                 .collect::<Vec<_>>();
@@ -3573,6 +3576,38 @@ mod tests {
         let history = coordinator.history("C1");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].text.as_deref(), Some("giphy preview two"));
+    }
+
+    #[test]
+    fn complete_history_page_keeps_ephemeral_messages() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut preview = message("10.0", "giphy preview");
+        preview.is_ephemeral = Some(true);
+        posted(
+            &mut coordinator,
+            "C1",
+            preview,
+            MessageMutationKind::Posted,
+            MutationOrigin::Realtime,
+        )
+        .expect("ephemeral is shown");
+
+        coordinator.apply(WorkspaceMutation::HistoryPage {
+            channel_id: "C1".into(),
+            page: MessagePage {
+                messages: vec![message("9.0", "older")],
+                complete: true,
+                ..Default::default()
+            },
+        });
+
+        let history = coordinator.history("C1");
+        let texts = history
+            .iter()
+            .map(|message| message.text.as_deref().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts.contains(&"giphy preview"));
     }
 
     #[test]

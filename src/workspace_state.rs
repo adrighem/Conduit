@@ -1872,11 +1872,17 @@ fn merge_channel_message_pages(
     normalize_channel_messages(page.iter().chain(existing).cloned().collect::<Vec<_>>())
 }
 
+/// The server page replaces the list, except ephemeral messages (a /giphy
+/// preview): history never returns them, so they live only in memory.
 fn merge_channel_message_refresh(
-    _existing: &[SlackMessage],
+    existing: &[SlackMessage],
     snapshot: &[SlackMessage],
 ) -> Vec<SlackMessage> {
-    normalize_channel_messages(snapshot.to_vec())
+    let ephemerals = existing
+        .iter()
+        .filter(|message| message.is_ephemeral == Some(true))
+        .cloned();
+    normalize_channel_messages(snapshot.iter().cloned().chain(ephemerals).collect())
 }
 
 #[cfg(test)]
@@ -2155,6 +2161,34 @@ mod tests {
         assert_eq!(state.followed_thread_keys(), Some(&[key("C9", "9.0")][..]));
         assert!(state.start_followed_threads());
         assert!(state.fail_followed_threads().has_content);
+    }
+
+    #[test]
+    fn history_refresh_keeps_ephemeral_messages() {
+        let mut state = WorkspaceViewState::default();
+        let mut preview = message("1700000010.000100", "giphy preview");
+        preview.is_ephemeral = Some(true);
+        apply_fresh(
+            &mut state,
+            "C1",
+            vec![message("1700000009.000100", "older"), preview],
+        );
+
+        apply_fresh(
+            &mut state,
+            "C1",
+            vec![
+                message("1700000009.000100", "older"),
+                message("1700000008.000100", "oldest"),
+            ],
+        );
+
+        let texts = state
+            .channel_messages("C1")
+            .iter()
+            .map(|message| message.text.as_deref().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["giphy preview", "older", "oldest"]);
     }
 
     #[test]
