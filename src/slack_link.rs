@@ -20,6 +20,9 @@ impl SlackUri {
 pub enum SlackUriTarget {
     Open,
     Channel(String),
+    /// `slack://channel?...&message=<ts>[&thread_ts=<ts>]`, as the browser
+    /// hands a permalink over to the desktop app.
+    Message(crate::models::SearchMessageLocation),
     User(String),
     File {
         file_id: String,
@@ -147,7 +150,21 @@ pub fn parse_slack_uri(value: &str) -> Result<SlackUri, SlackUriParseError> {
         "channel" => {
             require_team(&team_id)?;
             let id = require_id(id, &['C', 'G', 'D'])?;
-            SlackUriTarget::Channel(id)
+            // Undocumented: seen as `message=<ts>` and as `ts=p<digits>`.
+            let message = match single_query_parameter(&url, "message")? {
+                Some(message) => Some(message),
+                None => single_query_parameter(&url, "ts")?,
+            };
+            let message = optional_ts(message)?;
+            let thread_ts = optional_ts(single_query_parameter(&url, "thread_ts")?)?;
+            match message {
+                Some(message) => {
+                    crate::models::SearchMessageLocation::new(&id, &message, thread_ts.as_deref())
+                        .map(SlackUriTarget::Message)
+                        .ok_or(SlackUriParseError::Invalid)?
+                }
+                None => SlackUriTarget::Channel(id),
+            }
         }
         "user" => {
             require_team(&team_id)?;
@@ -198,6 +215,12 @@ fn single_query_parameter(
         return Err(SlackUriParseError::Invalid);
     }
     Ok(value)
+}
+
+fn optional_ts(value: Option<String>) -> Result<Option<String>, SlackUriParseError> {
+    value
+        .map(|ts| crate::models::slack_ts_from_link(&ts).ok_or(SlackUriParseError::Invalid))
+        .transpose()
 }
 
 fn require_team(team_id: &Option<String>) -> Result<(), SlackUriParseError> {
@@ -254,6 +277,31 @@ mod tests {
             (
                 "slack://channel?team=T123&id=D456",
                 SlackUriTarget::Channel("D456".into()),
+            ),
+            (
+                "slack://channel?team=T123&id=C456&message=1700000002.000200&thread_ts=1700000001.000100",
+                SlackUriTarget::Message(
+                    crate::models::SearchMessageLocation::new(
+                        "C456",
+                        "1700000002.000200",
+                        Some("1700000001.000100"),
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                "slack://channel?team=T123&id=D456&ts=p1700000002000200",
+                SlackUriTarget::Message(
+                    crate::models::SearchMessageLocation::new("D456", "1700000002.000200", None)
+                        .unwrap(),
+                ),
+            ),
+            (
+                "slack://channel?team=T123&id=C456&message=1700000002.000200",
+                SlackUriTarget::Message(
+                    crate::models::SearchMessageLocation::new("C456", "1700000002.000200", None)
+                        .unwrap(),
+                ),
             ),
             (
                 "slack://user?team=T123&id=U456",

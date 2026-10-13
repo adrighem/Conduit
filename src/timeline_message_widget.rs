@@ -4023,6 +4023,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn message_text_links_dispatch_open_link() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let permalink = "https://acme.slack.com/archives/C1/p1700000002000200?thread_ts=1700000001.000100&cid=C1";
+            let msg = SlackMessage {
+                ts: "1700000000.000970".to_string(),
+                user: Some("U123".to_string()),
+                text: Some(format!(
+                    "look\n<{}|{}>",
+                    permalink.replace('&', "&amp;"),
+                    "here"
+                )),
+                ..Default::default()
+            };
+            let received: Rc<RefCell<Vec<TimelineAction>>> = Rc::new(RefCell::new(Vec::new()));
+            let sink = received.clone();
+            let on_action: ActionHandler = Rc::new(move |action| sink.borrow_mut().push(action));
+            let widget =
+                build_timeline_message_widget(&msg, &ctx, None, None, None, None, Some(&on_action));
+            let label = find_descendant(&widget.upcast(), &|w| {
+                w.downcast_ref::<Label>()
+                    .is_some_and(|label| label.label().contains("<a href="))
+            })
+            .and_downcast::<Label>()
+            .expect("message text label with a link");
+            let handled: bool = label.emit_by_name("activate-link", &[&permalink]);
+            assert!(handled);
+            let actions = received.borrow();
+            assert!(
+                matches!(actions.as_slice(), [TimelineAction::OpenLink(uri)] if uri == permalink),
+                "{actions:?}"
+            );
+        });
+    }
+
+    #[test]
     fn file_card_download_dispatches_download_action() {
         run_gtk_test(|| {
             let ctx = test_context();

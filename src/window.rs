@@ -8595,17 +8595,28 @@ impl ConduitWindow {
         });
     }
 
-    /// Opens permalinks to this workspace's messages in Conduit, anything else
-    /// in the default handler.
+    /// Opens Slack message permalinks into a known conversation in Conduit,
+    /// anything else in the default handler. Conversation membership, not the
+    /// link's host, decides: permalinks use the workspace domain, which need
+    /// not match the URL `auth.test` reports.
     fn open_link(&self, uri: &str) {
-        let location = self
-            .imp()
-            .workspace_url
-            .borrow()
-            .as_deref()
-            .and_then(|workspace_url| {
-                crate::models::SearchMessageLocation::from_permalink(uri, workspace_url)
+        let location =
+            crate::models::SearchMessageLocation::from_permalink(uri).filter(|location| {
+                self.imp()
+                    .workspace
+                    .conversations
+                    .borrow()
+                    .get(location.channel_id())
+                    .is_some()
             });
+        crate::debug::log(
+            "links",
+            &format!(
+                "open_link url={} in_app={}",
+                crate::debug::url_for_log(uri),
+                location.is_some()
+            ),
+        );
         match location {
             Some(location) => self.open_message_context(location),
             None => self.open_external_link(uri),
@@ -12833,6 +12844,10 @@ impl ConduitWindow {
         match uri.target().clone() {
             SlackUriTarget::Open => {
                 self.present();
+                true
+            }
+            SlackUriTarget::Message(location) => {
+                self.open_message_context(location);
                 true
             }
             SlackUriTarget::Channel(channel_id) => {

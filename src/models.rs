@@ -1367,6 +1367,21 @@ impl SearchMatch {
     }
 }
 
+/// Slack timestamp from a link: `1700000002.000200`, or the permalink form
+/// with the dot dropped (`1700000002000200`, optionally `p`-prefixed).
+pub(crate) fn slack_ts_from_link(value: &str) -> Option<String> {
+    let value = value.strip_prefix('p').unwrap_or(value);
+    let digits = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit());
+    if let Some((seconds, fraction)) = value.split_once('.') {
+        return (digits(seconds) && digits(fraction)).then(|| value.to_string());
+    }
+    if value.len() <= 6 || !digits(value) {
+        return None;
+    }
+    let (seconds, fraction) = value.split_at(value.len() - 6);
+    Some(format!("{seconds}.{fraction}"))
+}
+
 /// `search.messages` matches omit `thread_ts`; a reply's permalink carries
 /// it as the `thread_ts` query parameter instead.
 fn permalink_thread_ts(permalink: &str) -> Option<String> {
@@ -1404,14 +1419,14 @@ impl SearchMessageLocation {
         })
     }
 
-    /// Message a permalink of this workspace points at, e.g.
+    /// Message a Slack permalink points at, e.g.
     /// `https://acme.slack.com/archives/C1/p1700000002000200?thread_ts=1700000001.000100`.
-    /// Links to other hosts or to anything but a message yield `None`.
-    pub fn from_permalink(permalink: &str, workspace_url: &str) -> Option<Self> {
+    /// Non-Slack hosts and links to anything but a message yield `None`; the
+    /// caller decides whether the conversation belongs to this workspace.
+    pub fn from_permalink(permalink: &str) -> Option<Self> {
         let link = url::Url::parse(permalink).ok()?;
-        let workspace = url::Url::parse(workspace_url).ok()?;
-        if link.scheme() != "https" || !link.host_str()?.eq_ignore_ascii_case(workspace.host_str()?)
-        {
+        let host = link.host_str()?.to_ascii_lowercase();
+        if link.scheme() != "https" || !host.ends_with(".slack.com") {
             return None;
         }
         let mut segments = link.path_segments()?.filter(|segment| !segment.is_empty());
@@ -1428,12 +1443,7 @@ impl SearchMessageLocation {
         {
             return None;
         }
-        let digits = message.strip_prefix('p')?;
-        if digits.len() <= 6 || !digits.chars().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        let (seconds, fraction) = digits.split_at(digits.len() - 6);
-        let message_ts = format!("{seconds}.{fraction}");
+        let message_ts = slack_ts_from_link(message.strip_prefix('p')?)?;
         Self::new(
             channel_id,
             &message_ts,
@@ -1707,11 +1717,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn permalink_location_reads_message_and_thread_for_own_workspace_only() {
-        let workspace = "https://acme.slack.com/";
+    fn permalink_location_reads_message_and_thread_from_slack_hosts_only() {
         let reply = SearchMessageLocation::from_permalink(
             "https://ACME.slack.com/archives/C032HRKUBHQ/p1791894081258499?thread_ts=1791383959.911829&cid=C032HRKUBHQ",
-            workspace,
         )
         .expect("reply permalink should parse");
         assert_eq!(reply.channel_id(), "C032HRKUBHQ");
@@ -1720,14 +1728,14 @@ mod tests {
 
         let top_level = SearchMessageLocation::from_permalink(
             "https://acme.slack.com/archives/D1/p1700000002000200",
-            workspace,
         )
         .expect("top-level permalink should parse");
         assert_eq!(top_level.message_ts(), "1700000002.000200");
         assert_eq!(top_level.thread_ts(), None);
 
         for other in [
-            "https://other.slack.com/archives/C1/p1700000002000200",
+            "https://evil.example/archives/C1/p1700000002000200",
+            "https://slack.com.evil.example/archives/C1/p1700000002000200",
             "http://acme.slack.com/archives/C1/p1700000002000200",
             "https://acme.slack.com/archives/C1",
             "https://acme.slack.com/archives/U1/p1700000002000200",
@@ -1736,7 +1744,7 @@ mod tests {
             "https://acme.slack.com/files/U1/F1/report.pdf",
         ] {
             assert_eq!(
-                SearchMessageLocation::from_permalink(other, workspace),
+                SearchMessageLocation::from_permalink(other),
                 None,
                 "{other}"
             );

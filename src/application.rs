@@ -514,9 +514,31 @@ where
 {
     values
         .into_iter()
-        .filter_map(|value| parse_slack_uri(&value).ok())
+        .filter_map(|value| {
+            let parsed = parse_slack_uri(&value);
+            if value.starts_with("slack:") {
+                crate::debug::log("links", &slack_uri_for_log(&value, parsed.is_ok()));
+            }
+            parsed.ok()
+        })
         .take(MAX_EXTERNAL_SLACK_URIS)
         .collect()
+}
+
+/// Action and parameter names only: enough to learn undocumented link shapes.
+fn slack_uri_for_log(value: &str, parsed: bool) -> String {
+    let Ok(url) = url::Url::parse(value) else {
+        return format!("slack_uri unparsable parsed={parsed}");
+    };
+    let keys = url
+        .query_pairs()
+        .map(|(key, _)| key.into_owned())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "slack_uri action={} params={keys} parsed={parsed}",
+        url.host_str().unwrap_or_default()
+    )
 }
 
 fn command_line_slack_uris(arguments: Vec<OsString>) -> Vec<SlackUri> {
