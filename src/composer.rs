@@ -117,7 +117,9 @@ pub struct HydratedComposerText {
     pub mentions: Vec<MentionSpan>,
 }
 
-pub const SUPPORTED_SLASH_COMMANDS: &[&str] = &["giphy"];
+/// Slash commands Conduit runs through `chat.command`. Apps answer with
+/// regular or ephemeral messages, rendered like any other message.
+pub const SUPPORTED_SLASH_COMMANDS: &[&str] = &["giphy", "teams-calls"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlashCommand {
@@ -151,9 +153,26 @@ pub fn parse_slash_command(text: &str) -> Option<SlashCommand> {
     Some(SlashCommand { name, arguments })
 }
 
-pub fn is_supported_slash_command(name: &str) -> bool {
+/// Canonical supported command for `name`: an exact match, or the only
+/// command `name` is a prefix of (`/teams` runs `/teams-calls`).
+pub fn resolve_slash_command(name: &str) -> Option<&'static str> {
     let normalized = name.strip_prefix('/').unwrap_or(name).to_lowercase();
-    SUPPORTED_SLASH_COMMANDS.contains(&normalized.as_str())
+    if normalized.is_empty() {
+        return None;
+    }
+    if let Some(exact) = SUPPORTED_SLASH_COMMANDS
+        .iter()
+        .find(|command| **command == normalized)
+    {
+        return Some(exact);
+    }
+    let mut matches = SUPPORTED_SLASH_COMMANDS
+        .iter()
+        .filter(|command| command.starts_with(normalized.as_str()));
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
 }
 
 pub fn validate_slash_command(text: &str) -> SlashCommandValidation {
@@ -163,8 +182,11 @@ pub fn validate_slash_command(text: &str) -> SlashCommandValidation {
     }
     match parse_slash_command(trimmed) {
         Some(cmd) => {
-            if is_supported_slash_command(&cmd.name) {
-                SlashCommandValidation::Supported(cmd)
+            if let Some(name) = resolve_slash_command(&cmd.name) {
+                SlashCommandValidation::Supported(SlashCommand {
+                    name: name.to_string(),
+                    arguments: cmd.arguments,
+                })
             } else {
                 SlashCommandValidation::Unsupported {
                     name: cmd.name,
@@ -2883,17 +2905,29 @@ mod tests {
         assert_eq!(parse_slash_command("not a command /giphy"), None);
         assert_eq!(parse_slash_command("//comment"), None);
 
-        assert!(is_supported_slash_command("giphy"));
-        assert!(is_supported_slash_command("/giphy"));
-        assert!(is_supported_slash_command("/GIPHY"));
-        assert!(!is_supported_slash_command("unknown"));
-        assert!(!is_supported_slash_command("/shrug"));
+        assert_eq!(resolve_slash_command("giphy"), Some("giphy"));
+        assert_eq!(resolve_slash_command("/giphy"), Some("giphy"));
+        assert_eq!(resolve_slash_command("/GIPHY"), Some("giphy"));
+        assert_eq!(resolve_slash_command("gi"), Some("giphy"));
+        assert_eq!(resolve_slash_command("teams"), Some("teams-calls"));
+        assert_eq!(resolve_slash_command("/teams-calls"), Some("teams-calls"));
+        assert_eq!(resolve_slash_command("unknown"), None);
+        assert_eq!(resolve_slash_command("/shrug"), None);
+        assert_eq!(resolve_slash_command("teams-callsx"), None);
+        assert_eq!(resolve_slash_command("/"), None);
 
         assert_eq!(
             validate_slash_command("/giphy cat"),
             SlashCommandValidation::Supported(SlashCommand {
                 name: "giphy".to_string(),
                 arguments: "cat".to_string(),
+            })
+        );
+        assert_eq!(
+            validate_slash_command("/teams standup"),
+            SlashCommandValidation::Supported(SlashCommand {
+                name: "teams-calls".to_string(),
+                arguments: "standup".to_string(),
             })
         );
         assert_eq!(
