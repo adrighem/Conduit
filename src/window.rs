@@ -3207,6 +3207,7 @@ impl ConduitWindow {
             TimelineAction::MessageUser(user_id) => {
                 self.send_command(RuntimeCommand::OpenDirectMessage { user_id });
             }
+            TimelineAction::OpenLink(uri) => self.open_link(&uri),
             TimelineAction::ShowProfile(user_id) => self.show_profile_dialog(&user_id),
             TimelineAction::AutoMarkRead {
                 channel_id,
@@ -8594,6 +8595,23 @@ impl ConduitWindow {
         });
     }
 
+    /// Opens permalinks to this workspace's messages in Conduit, anything else
+    /// in the default handler.
+    fn open_link(&self, uri: &str) {
+        let location = self
+            .imp()
+            .workspace_url
+            .borrow()
+            .as_deref()
+            .and_then(|workspace_url| {
+                crate::models::SearchMessageLocation::from_permalink(uri, workspace_url)
+            });
+        match location {
+            Some(location) => self.open_message_context(location),
+            None => self.open_external_link(uri),
+        }
+    }
+
     fn open_external_link(&self, uri: &str) {
         if let Err(error) = open::that(uri) {
             self.set_status(&format!("Failed to open link: {error}"));
@@ -11995,7 +12013,7 @@ impl ConduitWindow {
                 }
             }
             SecondaryAction::OpenMessage(location) => self.open_message_context(location),
-            SecondaryAction::OpenExternal(url) => self.open_external_link(&url),
+            SecondaryAction::OpenExternal(url) => self.open_link(&url),
             SecondaryAction::OpenMedia { url, name, video } => {
                 self.open_media_viewer(MediaGalleryItem {
                     url,

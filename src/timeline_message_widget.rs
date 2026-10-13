@@ -410,6 +410,8 @@ pub(crate) enum TimelineAction {
     CopyMessageText(String),
     /// Open (or create) the direct message with this user.
     MessageUser(String),
+    /// A link in message text; Slack message permalinks open in Conduit.
+    OpenLink(String),
     /// Show the native profile dialog for this user.
     ShowProfile(String),
     /// Fired by the visibility-based auto-read-marking mechanism once a
@@ -1465,6 +1467,9 @@ fn attach_label_links(
                 );
             }
             glib::Propagation::Stop
+        } else if let Some(on_action) = on_action.as_ref() {
+            on_action(TimelineAction::OpenLink(uri.to_string()));
+            glib::Propagation::Stop
         } else {
             glib::Propagation::Proceed
         }
@@ -1521,6 +1526,8 @@ fn attach_text_view_links(
                             Some(rect),
                         );
                     }
+                } else if let Some(on_action) = on_action.as_ref() {
+                    on_action(TimelineAction::OpenLink(href.clone()));
                 } else {
                     let _ = gtk::gio::AppInfo::launch_default_for_uri(
                         href,

@@ -1404,6 +1404,43 @@ impl SearchMessageLocation {
         })
     }
 
+    /// Message a permalink of this workspace points at, e.g.
+    /// `https://acme.slack.com/archives/C1/p1700000002000200?thread_ts=1700000001.000100`.
+    /// Links to other hosts or to anything but a message yield `None`.
+    pub fn from_permalink(permalink: &str, workspace_url: &str) -> Option<Self> {
+        let link = url::Url::parse(permalink).ok()?;
+        let workspace = url::Url::parse(workspace_url).ok()?;
+        if link.scheme() != "https" || !link.host_str()?.eq_ignore_ascii_case(workspace.host_str()?)
+        {
+            return None;
+        }
+        let mut segments = link.path_segments()?.filter(|segment| !segment.is_empty());
+        let (Some("archives"), Some(channel_id), Some(message), None) = (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ) else {
+            return None;
+        };
+        if !channel_id.starts_with(['C', 'G', 'D'])
+            || !channel_id.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        let digits = message.strip_prefix('p')?;
+        if digits.len() <= 6 || !digits.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let (seconds, fraction) = digits.split_at(digits.len() - 6);
+        let message_ts = format!("{seconds}.{fraction}");
+        Self::new(
+            channel_id,
+            &message_ts,
+            permalink_thread_ts(permalink).as_deref(),
+        )
+    }
+
     pub fn channel_id(&self) -> &str {
         &self.channel_id
     }
@@ -1668,6 +1705,43 @@ impl SlackUserProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permalink_location_reads_message_and_thread_for_own_workspace_only() {
+        let workspace = "https://acme.slack.com/";
+        let reply = SearchMessageLocation::from_permalink(
+            "https://ACME.slack.com/archives/C032HRKUBHQ/p1791894081258499?thread_ts=1791383959.911829&cid=C032HRKUBHQ",
+            workspace,
+        )
+        .expect("reply permalink should parse");
+        assert_eq!(reply.channel_id(), "C032HRKUBHQ");
+        assert_eq!(reply.message_ts(), "1791894081.258499");
+        assert_eq!(reply.thread_ts(), Some("1791383959.911829"));
+
+        let top_level = SearchMessageLocation::from_permalink(
+            "https://acme.slack.com/archives/D1/p1700000002000200",
+            workspace,
+        )
+        .expect("top-level permalink should parse");
+        assert_eq!(top_level.message_ts(), "1700000002.000200");
+        assert_eq!(top_level.thread_ts(), None);
+
+        for other in [
+            "https://other.slack.com/archives/C1/p1700000002000200",
+            "http://acme.slack.com/archives/C1/p1700000002000200",
+            "https://acme.slack.com/archives/C1",
+            "https://acme.slack.com/archives/U1/p1700000002000200",
+            "https://acme.slack.com/archives/C1/p123456",
+            "https://acme.slack.com/archives/C1/p1700000002000200/extra",
+            "https://acme.slack.com/files/U1/F1/report.pdf",
+        ] {
+            assert_eq!(
+                SearchMessageLocation::from_permalink(other, workspace),
+                None,
+                "{other}"
+            );
+        }
+    }
 
     #[test]
     fn search_reply_location_takes_thread_from_permalink() {
