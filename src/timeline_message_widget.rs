@@ -471,6 +471,9 @@ pub struct NativeTimelineView {
     latest_message_ts: Rc<RefCell<Option<String>>>,
     read_candidate: Rc<RefCell<Option<String>>>,
     read_generation: Rc<Cell<u64>>,
+    /// True while a dwell timer for `read_candidate` is in flight, so a
+    /// recheck keeps that dwell instead of restarting it.
+    dwell_pending: Rc<Cell<bool>>,
     recheck_read_visibility: Rc<dyn Fn()>,
     /// Reads only count while the user can see them: auto-marking pauses
     /// while the window is unfocused and re-evaluates on refocus.
@@ -823,6 +826,7 @@ impl NativeTimelineView {
         let latest_message_ts: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let read_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let read_candidate: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let dwell_pending = Rc::new(Cell::new(false));
         let window_active = Rc::new(Cell::new(true));
 
         let recheck_read_visibility: Rc<dyn Fn()> = {
@@ -832,11 +836,15 @@ impl NativeTimelineView {
             let latest_message_ts = latest_message_ts.clone();
             let read_generation = read_generation.clone();
             let read_candidate = read_candidate.clone();
+            let dwell_pending = dwell_pending.clone();
             let window_active = window_active.clone();
             let on_action = on_action.clone();
             Rc::new(move || {
+                // A hidden stack page keeps its stale allocation, so the
+                // height alone does not prove the rows are on screen.
                 let viewport_height = f64::from(scrolled_window.height());
-                if viewport_height <= 0.0 || !window_active.get() {
+                if viewport_height <= 0.0 || !window_active.get() || !scrolled_window.is_drawable()
+                {
                     return;
                 }
                 let mut best: Option<String> = None;
@@ -884,6 +892,7 @@ impl NativeTimelineView {
                 // candidate - a changed or vanished candidate resets the
                 // dwell clock rather than pausing it.
                 read_generation.set(read_generation.get().wrapping_add(1));
+                dwell_pending.set(false);
                 let expected = read_generation.get();
 
                 let Some(candidate_ts) = best else {
@@ -902,9 +911,23 @@ impl NativeTimelineView {
                     return;
                 }
                 let read_generation = read_generation.clone();
+                let read_candidate = read_candidate.clone();
+                let dwell_pending = dwell_pending.clone();
+                let scrolled_window = scrolled_window.downgrade();
                 let on_action = on_action.clone();
+                dwell_pending.set(true);
                 glib::timeout_add_local_once(READ_DWELL, move || {
                     if read_generation.get() != expected {
+                        return;
+                    }
+                    dwell_pending.set(false);
+                    // Hidden mid-dwell: forget the candidate so the rows
+                    // dwell afresh once they are shown again.
+                    if !scrolled_window
+                        .upgrade()
+                        .is_some_and(|scrolled_window| scrolled_window.is_drawable())
+                    {
+                        *read_candidate.borrow_mut() = None;
                         return;
                     }
                     dispatch_timeline_action(
@@ -1015,6 +1038,7 @@ impl NativeTimelineView {
             latest_message_ts,
             read_candidate,
             read_generation,
+            dwell_pending,
             recheck_read_visibility,
             window_active,
             opens_threads,
@@ -1087,14 +1111,20 @@ impl NativeTimelineView {
     pub(crate) fn set_read_mark_target(&self, channel_id: &str, thread_ts: Option<&str>) {
         *self.read_mark_target.borrow_mut() =
             Some((channel_id.to_string(), thread_ts.map(ToString::to_string)));
-        self.recheck_read();
+        // The pending dwell carries the old target, so always restart it.
+        self.reset_read_candidate();
+        (self.recheck_read_visibility)();
     }
 
     /// Forgets the dwelling candidate and re-evaluates visible rows, so rows
     /// already on screen are marked again, e.g. after read state changed
-    /// elsewhere or the window regained focus.
+    /// elsewhere or the window regained focus. A dwell still pending for the
+    /// same candidate is kept: rechecks arriving faster than the dwell would
+    /// otherwise restart it forever and never mark anything.
     pub(crate) fn recheck_read(&self) {
-        self.reset_read_candidate();
+        if !self.dwell_pending.get() {
+            self.reset_read_candidate();
+        }
         (self.recheck_read_visibility)();
     }
 
@@ -1116,6 +1146,7 @@ impl NativeTimelineView {
         *self.read_candidate.borrow_mut() = None;
         self.read_generation
             .set(self.read_generation.get().wrapping_add(1));
+        self.dwell_pending.set(false);
     }
 
     pub(crate) fn set_on_action<F: Fn(TimelineAction) + 'static>(&self, f: F) {
@@ -4059,6 +4090,104 @@ pub(crate) mod tests {
                 *marks.borrow(),
                 vec![newest.clone(), newest.clone(), newest]
             );
+            window.destroy();
+        });
+    }
+
+    fn read_test_messages() -> Vec<SlackMessage> {
+        (0..3)
+            .rev()
+            .map(|i| SlackMessage {
+                ts: format!("1700000{i:03}.000100"),
+                user: Some("U123".to_string()),
+                text: Some(format!("message {i}")),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn pump_main_context(ms: u64) {
+        let context = glib::MainContext::default();
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < end {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn record_auto_marks(view: &NativeTimelineView) -> Rc<RefCell<Vec<String>>> {
+        let marks: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded = marks.clone();
+        view.set_on_action(move |action| {
+            if let TimelineAction::AutoMarkRead { ts, .. } = action {
+                recorded.borrow_mut().push(ts);
+            }
+        });
+        marks
+    }
+
+    #[test]
+    fn repeated_rechecks_within_the_dwell_do_not_starve_the_mark() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let messages = read_test_messages();
+            let view = NativeTimelineView::new();
+            let marks = record_auto_marks(&view);
+            let window = gtk::Window::new();
+            window.set_default_size(400, 500);
+            window.set_child(Some(view.widget()));
+            window.present();
+            view.set_read_mark_target("C1", None);
+            view.set_messages(&messages, &ctx, None);
+            pump_main_context(500);
+            assert_eq!(marks.borrow().len(), 1);
+
+            // Rechecks arriving faster than the dwell (e.g. a busy thread
+            // catalog) must not keep restarting the pending dwell.
+            for _ in 0..10 {
+                view.recheck_read();
+                pump_main_context(30);
+            }
+            assert!(
+                marks.borrow().len() >= 2,
+                "a dwell should complete while rechecks keep arriving"
+            );
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn hidden_stack_page_does_not_auto_mark_read() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let messages = read_test_messages();
+            let view = NativeTimelineView::new();
+            let marks = record_auto_marks(&view);
+            let stack = gtk::Stack::new();
+            stack.set_transition_type(gtk::StackTransitionType::None);
+            stack.add_named(view.widget(), Some("timeline"));
+            stack.add_named(&gtk::Label::new(Some("media")), Some("media"));
+            let window = gtk::Window::new();
+            window.set_default_size(400, 500);
+            window.set_child(Some(&stack));
+            window.present();
+            view.set_read_mark_target("C1", None);
+            view.set_messages(&messages, &ctx, None);
+            pump_main_context(500);
+            assert_eq!(marks.borrow().len(), 1);
+
+            // A dwell started while visible must not fire once hidden.
+            view.recheck_read();
+            stack.set_visible_child_name("media");
+            pump_main_context(400);
+            assert_eq!(marks.borrow().len(), 1);
+
+            // Refocus while another page shows: still nothing to mark.
+            view.set_window_active(false);
+            view.set_window_active(true);
+            view.recheck_read();
+            pump_main_context(400);
+            assert_eq!(marks.borrow().len(), 1);
             window.destroy();
         });
     }

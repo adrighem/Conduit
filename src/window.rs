@@ -3313,7 +3313,7 @@ impl ConduitWindow {
                 ts,
             } => match thread_ts {
                 Some(thread_ts) => {
-                    self.mark_thread_read(&channel_id, &thread_ts);
+                    self.mark_thread_read(&channel_id, &thread_ts, &ts);
                 }
                 None => {
                     self.mark_conversation_read(&channel_id, &ts);
@@ -4044,19 +4044,14 @@ impl ConduitWindow {
         let advanced = read_states
             .update(channel_id, |state| state.mark_read(ts))
             .is_some();
-        // Even when this copy had nothing to clear, a lingering badge means
-        // the coordinator's copy may disagree; let it reconcile and re-mark.
-        let still_unread = read_states
-            .get(channel_id)
-            .is_some_and(|state| state.has_unreads());
         drop(read_states);
         crate::debug::log(
             "readstate",
             &format!(
-                "mark_conversation_read channel_id={channel_id} ts={ts} existing_last_read={existing_last_read:?} advanced={advanced} still_unread={still_unread}"
+                "mark_conversation_read channel_id={channel_id} ts={ts} existing_last_read={existing_last_read:?} advanced={advanced}"
             ),
         );
-        if !advanced && !still_unread {
+        if !advanced {
             return;
         }
         self.send_command(RuntimeCommand::MarkConversationRead {
@@ -4067,10 +4062,12 @@ impl ConduitWindow {
         self.queue_unread_separator_refresh();
     }
 
-    fn mark_thread_read(&self, channel_id: &str, thread_ts: &str) {
+    /// `seen_ts` is the newest message on screen; the thread is only marked
+    /// once that covers the catalog's latest reply.
+    fn mark_thread_read(&self, channel_id: &str, thread_ts: &str, seen_ts: &str) {
         let (advanced, target_ts) = {
             let mut threads = self.imp().workspace.threads.borrow_mut();
-            let advanced = threads.mark_read(channel_id, thread_ts);
+            let advanced = threads.mark_read(channel_id, thread_ts, seen_ts);
             let target_ts = threads
                 .get(channel_id, thread_ts)
                 .and_then(|r| r.last_read.clone())
@@ -4080,7 +4077,7 @@ impl ConduitWindow {
         crate::debug::log(
             "readstate",
             &format!(
-                "mark_thread_read channel_id={channel_id} thread_ts={thread_ts} advanced={advanced}"
+                "mark_thread_read channel_id={channel_id} thread_ts={thread_ts} seen_ts={seen_ts} advanced={advanced}"
             ),
         );
         if !advanced {

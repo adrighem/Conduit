@@ -173,16 +173,26 @@ impl ThreadCatalog {
         ThreadKey::new(channel_id, root_ts).and_then(|key| self.records.get(&key))
     }
 
-    pub(crate) fn mark_read(&mut self, channel_id: &str, root_ts: &str) -> bool {
+    /// Marks the thread read once `seen_ts` (the newest message the user
+    /// saw) covers its latest reply. Returns whether the record actually
+    /// changed, so callers skip redundant Slack marks and UI refreshes.
+    pub(crate) fn mark_read(&mut self, channel_id: &str, root_ts: &str, seen_ts: &str) -> bool {
         let Some(key) = ThreadKey::new(channel_id, root_ts) else {
             return false;
         };
-        if let Some(record) = self.records.get_mut(&key) {
-            record.mark_read();
-            true
-        } else {
-            false
+        let Some(record) = self.records.get_mut(&key) else {
+            return false;
+        };
+        if record
+            .latest_reply
+            .as_deref()
+            .is_some_and(|latest| slack_timestamp_is_after(latest, seen_ts))
+        {
+            return false;
         }
+        let before = (record.last_read.clone(), record.read_reply_count);
+        record.mark_read();
+        before != (record.last_read.clone(), record.read_reply_count)
     }
 
     /// Thread inbox roots in Slack's followed-threads order. Before the first
@@ -550,6 +560,36 @@ mod tests {
         record.reply_count = 6;
         record.latest_reply = Some("6.0".into());
         assert_eq!(record.unread_reply_count(), 1);
+    }
+
+    #[test]
+    fn catalog_mark_read_reports_only_real_changes() {
+        let mut catalog = ThreadCatalog::default();
+        let mut record = ThreadRecord::placeholder(ThreadKey::new("C1", "1.0").unwrap());
+        record.reply_count = 2;
+        record.latest_reply = Some("3.0".into());
+        catalog.upsert_records([record]);
+
+        assert!(catalog.mark_read("C1", "1.0", "3.0"));
+        // Already read: nothing changed, so nothing to send or refresh.
+        assert!(!catalog.mark_read("C1", "1.0", "3.0"));
+        assert!(!catalog.mark_read("C9", "1.0", "3.0"));
+    }
+
+    #[test]
+    fn catalog_mark_read_skips_replies_newer_than_what_was_seen() {
+        let mut catalog = ThreadCatalog::default();
+        let mut record = ThreadRecord::placeholder(ThreadKey::new("C1", "1.0").unwrap());
+        record.reply_count = 2;
+        record.latest_reply = Some("3.0".into());
+        catalog.upsert_records([record]);
+
+        // The pane only rendered up to 2.0; reply 3.0 has not been seen.
+        assert!(!catalog.mark_read("C1", "1.0", "2.0"));
+        assert_eq!(catalog.get("C1", "1.0").unwrap().unread_reply_count(), 2);
+
+        assert!(catalog.mark_read("C1", "1.0", "3.0"));
+        assert_eq!(catalog.get("C1", "1.0").unwrap().unread_reply_count(), 0);
     }
 
     #[test]
