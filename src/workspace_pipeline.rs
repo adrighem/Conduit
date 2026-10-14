@@ -21,7 +21,8 @@ use crate::attention::{
 use crate::models::{slack_timestamp_is_after, SlackConversation, SlackMessage, SlackUser};
 use crate::thread_catalog::{ThreadCatalog, ThreadKey, ThreadRecord};
 use crate::unread_ledger::{
-    message_signal, ConversationReadState, MessageSignal, ServerReadCounts, UnreadLedger,
+    message_signal, own_post_reads_conversation, ConversationReadState, MessageSignal,
+    ServerReadCounts, UnreadLedger,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -354,8 +355,14 @@ pub(crate) struct MessageAttentionEffect {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum WorkspaceEffect {
     MessageAttention(MessageAttentionEffect),
+    /// The ledger was marked read through `ts`; Slack should be told too.
+    ConversationReadMarked {
+        channel_id: String,
+        ts: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1627,9 +1634,11 @@ impl WorkspaceCoordinator {
         if patch_changes.is_empty() {
             return None;
         }
-        let read_state = (!ephemeral)
-            .then(|| self.observe_message_read_state(channel_id, &message, kind, origin))
-            .flatten();
+        let (read_state, read_mark) = if ephemeral {
+            (None, None)
+        } else {
+            self.observe_message_read_state(channel_id, &message, kind, origin)
+        };
         if let Some(state) = read_state {
             let changed = vec![(channel_id.to_string(), state)];
             patch_changes.push(WorkspaceChange::ReadStatesChanged(changed.clone()));
@@ -1638,34 +1647,51 @@ impl WorkspaceCoordinator {
         let effects = attention_effect
             .map(WorkspaceEffect::MessageAttention)
             .into_iter()
+            .chain(read_mark)
             .collect();
         self.commit_with_effects(revision, patch_changes, store_changes, effects)
     }
 
     /// Feeds one message mutation into the unread ledger. Only realtime and
     /// local mutations are live; history may never add inside the baseline.
+    /// A live post by the current user reads the conversation through it and
+    /// returns the mark Slack should receive.
     fn observe_message_read_state(
         &mut self,
         channel_id: &str,
         message: &SlackMessage,
         kind: MessageMutationKind,
         origin: MutationOrigin,
-    ) -> Option<ConversationReadState> {
+    ) -> (Option<ConversationReadState>, Option<WorkspaceEffect>) {
         let is_direct_message = self.conversation(channel_id).map_or_else(
             || channel_id.starts_with('D'),
             SlackConversation::is_direct_message,
         );
+        let current_user_id = self.attention_context.current_user_id.as_deref();
+        let live = matches!(origin, MutationOrigin::Realtime | MutationOrigin::Local);
+        if live
+            && kind == MessageMutationKind::Posted
+            && own_post_reads_conversation(message, current_user_id)
+        {
+            let state = self
+                .unread_ledger
+                .update(channel_id, |state| state.mark_read(&message.ts));
+            let mark = WorkspaceEffect::ConversationReadMarked {
+                channel_id: channel_id.to_string(),
+                ts: message.ts.clone(),
+            };
+            return (state, Some(mark));
+        }
         let signal = match kind {
             MessageMutationKind::Deleted => MessageSignal::Ignore,
-            MessageMutationKind::Posted | MessageMutationKind::Changed => message_signal(
-                message,
-                is_direct_message,
-                self.attention_context.current_user_id.as_deref(),
-            ),
+            MessageMutationKind::Posted | MessageMutationKind::Changed => {
+                message_signal(message, is_direct_message, current_user_id)
+            }
         };
-        let live = matches!(origin, MutationOrigin::Realtime | MutationOrigin::Local);
-        self.unread_ledger
-            .update(channel_id, |state| state.observe(&message.ts, signal, live))
+        let state = self
+            .unread_ledger
+            .update(channel_id, |state| state.observe(&message.ts, signal, live));
+        (state, None)
     }
 
     fn commit_read_states(
@@ -3243,14 +3269,7 @@ mod tests {
             "D1", "1.0", "1.0", 0,
         )]));
 
-        posted(
-            &mut coordinator,
-            "D1",
-            message("2.0", "hi"),
-            MessageMutationKind::Posted,
-            MutationOrigin::Realtime,
-        );
-        let mut own = message("3.0", "note to self <@U_SELF>");
+        let mut own = message("1.5", "note to self <@U_SELF>");
         own.user = Some("U_SELF".to_string());
         posted(
             &mut coordinator,
@@ -3259,7 +3278,81 @@ mod tests {
             MessageMutationKind::Posted,
             MutationOrigin::Realtime,
         );
+        posted(
+            &mut coordinator,
+            "D1",
+            message("2.0", "hi"),
+            MessageMutationKind::Posted,
+            MutationOrigin::Realtime,
+        );
         assert_eq!(badge(&coordinator, "D1"), 1);
+    }
+
+    #[test]
+    fn own_live_post_marks_the_conversation_read_through_it() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        let mut dm = conversation("D1", "ada");
+        dm.is_channel = Some(false);
+        dm.is_im = Some(true);
+        coordinator.apply(WorkspaceMutation::ConversationUpsert(dm));
+        coordinator.apply(WorkspaceMutation::CountsSnapshot(vec![counts(
+            "D1", "1.0", "1.0", 0,
+        )]));
+        for ts in ["2.0", "3.0"] {
+            posted(
+                &mut coordinator,
+                "D1",
+                message(ts, "hi"),
+                MessageMutationKind::Posted,
+                MutationOrigin::Realtime,
+            );
+        }
+        assert_eq!(badge(&coordinator, "D1"), 2);
+
+        // A reply only inside a thread does not read the channel timeline.
+        let mut thread_reply = message("3.5", "in thread");
+        thread_reply.user = Some("U_SELF".to_string());
+        thread_reply.thread_ts = Some("2.0".to_string());
+        let reduction = posted(
+            &mut coordinator,
+            "D1",
+            thread_reply,
+            MessageMutationKind::Posted,
+            MutationOrigin::Realtime,
+        )
+        .expect("thread reply is a change");
+        assert!(!reduction
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, WorkspaceEffect::ConversationReadMarked { .. })));
+        assert_eq!(badge(&coordinator, "D1"), 2);
+
+        let mut own = message("4.0", "on it");
+        own.user = Some("U_SELF".to_string());
+        let reduction = posted(
+            &mut coordinator,
+            "D1",
+            own,
+            MessageMutationKind::Posted,
+            MutationOrigin::Local,
+        )
+        .expect("own post is a change");
+
+        let state = coordinator.read_state("D1").unwrap();
+        assert_eq!(state.badge_count(), 0);
+        assert_eq!(state.last_read.as_deref(), Some("4.0"));
+        assert!(reduction.patch().changes().iter().any(|change| matches!(
+            change,
+            WorkspaceChange::ReadStatesChanged(states)
+                if states.iter().any(|(id, state)| id == "D1" && state.badge_count() == 0)
+        )));
+        assert!(reduction
+            .effects()
+            .contains(&WorkspaceEffect::ConversationReadMarked {
+                channel_id: "D1".to_string(),
+                ts: "4.0".to_string(),
+            }));
     }
 
     #[test]
@@ -3862,9 +3955,11 @@ mod tests {
             history
                 .effects()
                 .iter()
-                .map(|effect| {
-                    let WorkspaceEffect::MessageAttention(effect) = effect;
-                    (effect.message.ts.as_str(), effect.delivery)
+                .filter_map(|effect| match effect {
+                    WorkspaceEffect::MessageAttention(effect) => {
+                        Some((effect.message.ts.as_str(), effect.delivery))
+                    }
+                    WorkspaceEffect::ConversationReadMarked { .. } => None,
                 })
                 .collect::<Vec<_>>(),
             vec![

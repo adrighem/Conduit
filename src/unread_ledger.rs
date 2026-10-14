@@ -76,16 +76,10 @@ pub(crate) fn message_signal(
     is_direct_message: bool,
     current_user_id: Option<&str>,
 ) -> MessageSignal {
-    let self_authored = message
-        .user
-        .as_deref()
-        .zip(current_user_id)
-        .is_some_and(|(author, current)| author == current);
-    let silent = message
-        .subtype
-        .as_deref()
-        .is_some_and(|subtype| SILENT_SUBTYPES.contains(&subtype));
-    if self_authored || silent || !message.belongs_in_channel_timeline() {
+    if is_self_authored(message, current_user_id)
+        || is_silent(message)
+        || !message.belongs_in_channel_timeline()
+    {
         MessageSignal::Ignore
     } else if is_direct_message || contains_direct_mention(&message.visible_text(), current_user_id)
     {
@@ -93,6 +87,32 @@ pub(crate) fn message_signal(
     } else {
         MessageSignal::Unread
     }
+}
+
+/// Posting in a conversation reads it through the new message, as in
+/// Slack. Thread-only replies leave the channel's read state alone.
+pub(crate) fn own_post_reads_conversation(
+    message: &SlackMessage,
+    current_user_id: Option<&str>,
+) -> bool {
+    is_self_authored(message, current_user_id)
+        && !is_silent(message)
+        && message.belongs_in_channel_timeline()
+}
+
+fn is_self_authored(message: &SlackMessage, current_user_id: Option<&str>) -> bool {
+    message
+        .user
+        .as_deref()
+        .zip(current_user_id)
+        .is_some_and(|(author, current)| author == current)
+}
+
+fn is_silent(message: &SlackMessage) -> bool {
+    message
+        .subtype
+        .as_deref()
+        .is_some_and(|subtype| SILENT_SUBTYPES.contains(&subtype))
 }
 
 fn is_after_watermark(ts: &str, watermark: Option<&str>) -> bool {
@@ -168,22 +188,25 @@ impl ConversationReadState {
         changed
     }
 
-    /// Advances the read watermark. Stale (older or equal) marks are ignored.
+    /// Marks everything at or below `ts` read. The watermark only moves
+    /// forward, but a stale mark still clears counts it covers, so a copy
+    /// that picked up a badge behind its watermark heals. Returns whether
+    /// state changed.
     pub(crate) fn mark_read(&mut self, ts: &str) -> bool {
         let Some(ts) = non_empty(ts) else {
             return false;
         };
-        if !is_after_watermark(ts, self.last_read.as_deref()) {
-            return false;
+        let before = self.clone();
+        if is_after_watermark(ts, self.last_read.as_deref()) {
+            self.last_read = Some(ts.to_string());
         }
-        self.last_read = Some(ts.to_string());
         if is_at_or_after(ts, self.server_latest.as_deref()) {
             self.server_mention_count = 0;
             self.server_unread_count = 0;
             self.server_has_unreads = false;
         }
         self.prune_live_through(ts);
-        true
+        *self != before
     }
 
     /// Moves the watermark backwards on an explicit "mark unread". The
@@ -468,6 +491,18 @@ mod tests {
         assert!(state.mark_read("7.0"));
         assert_eq!(state.badge_count(), 0);
         assert!(!state.has_unreads());
+    }
+
+    #[test]
+    fn stale_mark_still_prunes_live_mentions_it_covers() {
+        let mut state = baseline("5.0", "5.0", 0);
+        state.live_mentions.insert("4.0".to_string());
+        state.live_mentions.insert("6.0".to_string());
+
+        assert!(state.mark_read("5.0"));
+        assert_eq!(state.last_read.as_deref(), Some("5.0"));
+        assert_eq!(state.live_mentions.iter().collect::<Vec<_>>(), vec!["6.0"]);
+        assert!(!state.mark_read("5.0"));
     }
 
     #[test]

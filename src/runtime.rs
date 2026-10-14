@@ -1963,6 +1963,7 @@ struct WorkspaceReducerAdapter {
     attention_metrics: Arc<AttentionMetrics>,
     store_batch_admission: Arc<tokio::sync::Mutex<()>>,
     pending_writes: Arc<Mutex<std::collections::VecDeque<PendingWorkspaceWrite>>>,
+    read_flusher: Option<ReadFlusherHandle>,
     #[cfg(test)]
     history_completion_send_gate: Arc<Mutex<Option<Arc<TestWorkspacePatchSendGate>>>>,
 }
@@ -2044,14 +2045,37 @@ impl WorkspaceReducerAdapter {
             .expect("workspace coordinator lock poisoned")
             .apply_from(origin, mutation);
         self.observe_reduction(origin, reduction.as_ref());
+        if let Some(reduction) = reduction.as_ref() {
+            self.dispatch_read_marks(reduction);
+        }
         reduction
+    }
+
+    fn with_read_flusher(mut self, read_flusher: ReadFlusherHandle) -> Self {
+        self.read_flusher = Some(read_flusher);
+        self
+    }
+
+    /// Hands ledger marks the reducer made on its own (posting reads the
+    /// conversation) to the flusher, so Slack agrees with every window.
+    fn dispatch_read_marks(&self, reduction: &WorkspaceReduction) {
+        let Some(read_flusher) = self.read_flusher.as_ref() else {
+            return;
+        };
+        for effect in reduction.effects() {
+            if let WorkspaceEffect::ConversationReadMarked { channel_id, ts } = effect {
+                read_flusher.enqueue(channel_id, ts);
+            }
+        }
     }
 
     fn observe_reduction(&self, origin: MutationOrigin, reduction: Option<&WorkspaceReduction>) {
         if let Some(reduction) = reduction {
             let revision = reduction.patch().revision().value();
             for effect in reduction.effects() {
-                let WorkspaceEffect::MessageAttention(effect) = effect;
+                let WorkspaceEffect::MessageAttention(effect) = effect else {
+                    continue;
+                };
                 self.attention_metrics.record_decision(
                     revision,
                     origin,
@@ -4674,7 +4698,12 @@ fn spawn_authentication_task<F>(
                             send_lifecycle_failure(&events, &error);
                             return;
                         }
-                        let workspace = WorkspaceReducerAdapter::default();
+                        let read_flusher = ReadFlusherHandle::new(
+                            Arc::new(Mutex::new(ReadFlusherQueue::new())),
+                            Arc::new(Notify::new()),
+                        );
+                        let workspace = WorkspaceReducerAdapter::default()
+                            .with_read_flusher(read_flusher.clone());
                         workspace.update_attention_context(
                             runtime_state.attention_context(auth.user_id.clone()),
                         );
@@ -4701,10 +4730,7 @@ fn spawn_authentication_task<F>(
                             user_status_sync: UserStatusSync::default(),
                             team_id: auth.team_id.clone(),
                             huddles,
-                            read_flusher: ReadFlusherHandle::new(
-                                Arc::new(Mutex::new(ReadFlusherQueue::new())),
-                                Arc::new(Notify::new()),
-                            ),
+                            read_flusher,
                             scheduler: Arc::new(Mutex::new(SyncScheduler::new(
                                 SchedulerConfig::new(256, 8, 5).unwrap(),
                             ))),
@@ -7238,13 +7264,10 @@ fn realtime_workspace_mutation(event: &SocketModeEvent) -> Option<WorkspaceMutat
 }
 
 fn reduction_message_attention(reduction: &WorkspaceReduction) -> Option<MessageAttentionEffect> {
-    reduction
-        .effects()
-        .iter()
-        .map(|effect| match effect {
-            WorkspaceEffect::MessageAttention(effect) => effect.clone(),
-        })
-        .next()
+    reduction.effects().iter().find_map(|effect| match effect {
+        WorkspaceEffect::MessageAttention(effect) => Some(effect.clone()),
+        WorkspaceEffect::ConversationReadMarked { .. } => None,
+    })
 }
 
 fn preview_realtime_workspace_attention(
@@ -7975,15 +7998,7 @@ async fn persist_socket_message(
         MutationOrigin::Realtime,
         realtime_message_mutation(&message_event, delivery),
     );
-    let applied_attention = current.as_ref().and_then(|reduction| {
-        reduction
-            .effects()
-            .iter()
-            .map(|effect| match effect {
-                WorkspaceEffect::MessageAttention(effect) => effect.clone(),
-            })
-            .next()
-    });
+    let applied_attention = current.as_ref().and_then(reduction_message_attention);
     let notification = claimed_notification_candidate(
         attention_persistence.notification_claimed,
         applied_attention.as_ref(),
@@ -8881,44 +8896,59 @@ impl ReadFlusherQueue {
         self.pending_threads.insert(key, target_ts.to_string());
     }
 
+    /// Drains pending marks. `last_marked` only advances once the caller
+    /// reports success through [`Self::mark_succeeded`].
     pub fn flush(&mut self) -> Vec<PendingReadMark> {
-        let mut flushed = Vec::with_capacity(self.pending.len());
-        for (channel_id, target_ts) in self.pending.drain() {
-            self.last_marked
-                .insert(channel_id.clone(), target_ts.clone());
-            flushed.push(PendingReadMark {
+        self.pending
+            .drain()
+            .map(|(channel_id, target_ts)| PendingReadMark {
                 channel_id,
                 target_ts,
-            });
-        }
-        flushed
+            })
+            .collect()
     }
 
     pub fn flush_channel(&mut self, channel_id: &str) -> Option<PendingReadMark> {
-        if let Some(target_ts) = self.pending.remove(channel_id) {
-            self.last_marked
-                .insert(channel_id.to_string(), target_ts.clone());
-            Some(PendingReadMark {
+        self.pending
+            .remove(channel_id)
+            .map(|target_ts| PendingReadMark {
                 channel_id: channel_id.to_string(),
                 target_ts,
             })
-        } else {
-            None
-        }
+    }
+
+    pub fn mark_succeeded(&mut self, mark: &PendingReadMark) {
+        self.set_last_marked(mark.channel_id.as_str(), mark.target_ts.as_str());
+    }
+
+    /// Puts a failed mark back unless a newer target superseded it meanwhile.
+    pub fn mark_failed(&mut self, mark: &PendingReadMark) {
+        self.enqueue(&mark.channel_id, &mark.target_ts);
     }
 
     pub fn flush_threads(&mut self) -> Vec<PendingThreadReadMark> {
-        let mut flushed = Vec::with_capacity(self.pending_threads.len());
-        for ((channel_id, thread_ts), target_ts) in self.pending_threads.drain() {
-            self.last_marked_threads
-                .insert((channel_id.clone(), thread_ts.clone()), target_ts.clone());
-            flushed.push(PendingThreadReadMark {
-                channel_id,
-                thread_ts,
-                target_ts,
-            });
-        }
-        flushed
+        self.pending_threads
+            .drain()
+            .map(
+                |((channel_id, thread_ts), target_ts)| PendingThreadReadMark {
+                    channel_id,
+                    thread_ts,
+                    target_ts,
+                },
+            )
+            .collect()
+    }
+
+    pub fn thread_mark_succeeded(&mut self, mark: &PendingThreadReadMark) {
+        self.set_last_marked_thread(
+            mark.channel_id.as_str(),
+            mark.thread_ts.as_str(),
+            mark.target_ts.as_str(),
+        );
+    }
+
+    pub fn thread_mark_failed(&mut self, mark: &PendingThreadReadMark) {
+        self.enqueue_thread(&mark.channel_id, &mark.thread_ts, &mark.target_ts);
     }
 }
 
@@ -9000,6 +9030,10 @@ impl ReadFlusherHandle {
         let mut q = self.queue.lock().expect("read flusher queue lock poisoned");
         q.flush_threads()
     }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReadFlusherQueue> {
+        self.queue.lock().expect("read flusher queue lock poisoned")
+    }
 }
 
 pub async fn execute_read_flusher_mark(api: &SlackApi, mark: &PendingReadMark) -> Result<()> {
@@ -9045,46 +9079,20 @@ pub async fn execute_read_flusher_thread_mark(
     }
 }
 
-pub async fn run_read_flusher_loop(
-    handle: ReadFlusherHandle,
-    api: SlackApi,
-    debounce_delay: Duration,
-    mut shutdown: oneshot::Receiver<()>,
-) {
-    loop {
-        if wait_for_realtime_or_shutdown(&mut shutdown, handle.notify.notified())
-            .await
-            .is_none()
-        {
-            let marks = handle.flush();
-            for mark in marks {
-                let _ = execute_read_flusher_mark(&api, &mark).await;
-            }
-            let thread_marks = handle.flush_threads();
-            for thread_mark in thread_marks {
-                let _ = execute_read_flusher_thread_mark(&api, &thread_mark).await;
-            }
-            break;
-        }
+/// First retry delay after a failed mark; doubles per failed round.
+const READ_FLUSHER_RETRY_INITIAL: Duration = Duration::from_secs(2);
+const READ_FLUSHER_RETRY_MAX: Duration = Duration::from_secs(60);
 
-        if wait_for_realtime_or_shutdown(&mut shutdown, tokio::time::sleep(debounce_delay))
-            .await
-            .is_none()
-        {
-            let marks = handle.flush();
-            for mark in marks {
-                let _ = execute_read_flusher_mark(&api, &mark).await;
-            }
-            let thread_marks = handle.flush_threads();
-            for thread_mark in thread_marks {
-                let _ = execute_read_flusher_thread_mark(&api, &thread_mark).await;
-            }
-            break;
-        }
-
-        let marks = handle.flush();
-        for mark in marks {
-            if let Err(error) = execute_read_flusher_mark(&api, &mark).await {
+/// Sends every pending mark once. Failed marks go back into the queue and
+/// `last_marked` only advances on success. Returns whether any mark failed.
+async fn flush_read_marks(handle: &ReadFlusherHandle, api: &SlackApi) -> bool {
+    let mut failed = false;
+    for mark in handle.flush() {
+        match execute_read_flusher_mark(api, &mark).await {
+            Ok(()) => handle.lock().mark_succeeded(&mark),
+            Err(error) => {
+                failed = true;
+                handle.lock().mark_failed(&mark);
                 crate::debug::log(
                     "read_flusher",
                     &format!(
@@ -9094,9 +9102,13 @@ pub async fn run_read_flusher_loop(
                 );
             }
         }
-        let thread_marks = handle.flush_threads();
-        for thread_mark in thread_marks {
-            if let Err(error) = execute_read_flusher_thread_mark(&api, &thread_mark).await {
+    }
+    for thread_mark in handle.flush_threads() {
+        match execute_read_flusher_thread_mark(api, &thread_mark).await {
+            Ok(()) => handle.lock().thread_mark_succeeded(&thread_mark),
+            Err(error) => {
+                failed = true;
+                handle.lock().thread_mark_failed(&thread_mark);
                 crate::debug::log(
                     "read_flusher",
                     &format!(
@@ -9106,6 +9118,56 @@ pub async fn run_read_flusher_loop(
                 );
             }
         }
+    }
+    failed
+}
+
+pub async fn run_read_flusher_loop(
+    handle: ReadFlusherHandle,
+    api: SlackApi,
+    debounce_delay: Duration,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let mut retry_delay: Option<Duration> = None;
+    loop {
+        // Requeued failures retry after a backoff even without new marks.
+        let woken = match retry_delay {
+            Some(delay) => {
+                let mut notified = std::pin::pin!(handle.notify.notified());
+                let mut retry = std::pin::pin!(tokio::time::sleep(delay));
+                let either = std::future::poll_fn(|context| {
+                    if notified.as_mut().poll(context).is_ready()
+                        || retry.as_mut().poll(context).is_ready()
+                    {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                });
+                wait_for_realtime_or_shutdown(&mut shutdown, either).await
+            }
+            None => wait_for_realtime_or_shutdown(&mut shutdown, handle.notify.notified()).await,
+        };
+        if woken.is_none() {
+            flush_read_marks(&handle, &api).await;
+            break;
+        }
+
+        if wait_for_realtime_or_shutdown(&mut shutdown, tokio::time::sleep(debounce_delay))
+            .await
+            .is_none()
+        {
+            flush_read_marks(&handle, &api).await;
+            break;
+        }
+
+        retry_delay = if flush_read_marks(&handle, &api).await {
+            Some(retry_delay.map_or(READ_FLUSHER_RETRY_INITIAL, |delay| {
+                (delay * 2).min(READ_FLUSHER_RETRY_MAX)
+            }))
+        } else {
+            None
+        };
     }
 }
 
@@ -13039,13 +13101,10 @@ mod tests {
                 },
             )
             .expect("message should be applied after persistence");
-        let live_attention = reduction
-            .effects()
-            .iter()
-            .map(|effect| match effect {
-                WorkspaceEffect::MessageAttention(effect) => effect,
-            })
-            .next();
+        let live_attention = reduction.effects().iter().find_map(|effect| match effect {
+            WorkspaceEffect::MessageAttention(effect) => Some(effect),
+            WorkspaceEffect::ConversationReadMarked { .. } => None,
+        });
 
         assert!(
             live_attention.is_some_and(|effect| !effect.decision.send_notification),
@@ -20121,7 +20180,11 @@ mod tests {
             target_ts: "200.000000".to_string(),
         }));
 
-        // After flush, last_marked updated and pending emptied
+        // last_marked only advances once Slack confirmed the mark
+        assert_eq!(queue.last_marked("C1"), None);
+        for mark in &flushed {
+            queue.mark_succeeded(mark);
+        }
         assert_eq!(queue.last_marked("C1"), Some("150.000000"));
         assert_eq!(queue.last_marked("C2"), Some("200.000000"));
         assert!(queue.flush().is_empty());
@@ -20141,10 +20204,41 @@ mod tests {
                 target_ts: "100.000000".to_string(),
             })
         );
+        assert_eq!(queue.last_marked("C1"), None);
+        queue.mark_succeeded(c1_mark.as_ref().unwrap());
         assert_eq!(queue.last_marked("C1"), Some("100.000000"));
 
         // C2 remains pending
         assert_eq!(queue.pending_mark("C2"), Some("200.000000"));
+    }
+
+    #[test]
+    fn read_flusher_queue_retries_failed_mark() {
+        let mut queue = ReadFlusherQueue::new();
+        assert!(queue.enqueue("C1", "150.000000"));
+        let flushed = queue.flush();
+        assert_eq!(flushed.len(), 1);
+
+        // A failed mark goes back into the queue and is sent again.
+        queue.mark_failed(&flushed[0]);
+        assert_eq!(queue.last_marked("C1"), None);
+        assert_eq!(queue.flush(), flushed);
+
+        // While unconfirmed, re-reading the same message enqueues it again.
+        queue.mark_failed(&flushed[0]);
+        queue.flush();
+        assert!(queue.enqueue("C1", "150.000000"));
+
+        // A newer pending target supersedes the failed one.
+        queue.flush();
+        assert!(queue.enqueue("C1", "200.000000"));
+        queue.mark_failed(&flushed[0]);
+        assert_eq!(queue.pending_mark("C1"), Some("200.000000"));
+
+        let retried = queue.flush();
+        queue.mark_succeeded(&retried[0]);
+        assert_eq!(queue.last_marked("C1"), Some("200.000000"));
+        assert!(!queue.enqueue("C1", "200.000000"));
     }
 
     #[test]
@@ -20200,6 +20294,10 @@ mod tests {
             target_ts: "210.000000".to_string(),
         }));
 
+        assert_eq!(queue.last_marked_thread("C1", "100.000000"), None);
+        for mark in &flushed {
+            queue.thread_mark_succeeded(mark);
+        }
         assert_eq!(
             queue.last_marked_thread("C1", "100.000000"),
             Some("110.000000")

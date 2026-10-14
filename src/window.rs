@@ -3421,9 +3421,48 @@ impl ConduitWindow {
             &self.imp().thread_view_box.get(),
         );
         *self.imp().thread_pane_controller.borrow_mut() = Some(thread_pane);
+        self.connect_is_active_notify(|window| window.sync_timelines_window_active());
+        self.sync_timelines_window_active();
 
         self.show_message_placeholder(&gettext("Select a conversation"));
         self.close_thread_pane();
+    }
+
+    /// Auto-read follows focus: timelines only mark while this window is
+    /// active, and recheck what is on screen once it is active again.
+    fn sync_timelines_window_active(&self) {
+        let active = self.is_active();
+        let main = self.imp().native_timeline_view.borrow().clone();
+        let thread = self.thread_pane().native_timeline_view.borrow().clone();
+        for timeline in main.iter().chain(thread.iter()) {
+            timeline.set_window_active(active);
+        }
+    }
+
+    /// Read state changed under the visible timelines (a mark from another
+    /// client, a reconnect snapshot, a stale patch): rows already on screen
+    /// would never dwell again, so evaluate them afresh.
+    fn recheck_visible_reads(&self, main: bool, thread: bool) {
+        if main {
+            let timeline = self.imp().native_timeline_view.borrow().clone();
+            if let Some(timeline) = timeline {
+                timeline.recheck_read();
+            }
+        }
+        if thread
+            && self
+                .imp()
+                .workspace
+                .view
+                .borrow()
+                .selected_thread_target()
+                .is_some()
+        {
+            let timeline = self.thread_pane().native_timeline_view.borrow().clone();
+            if let Some(timeline) = timeline {
+                timeline.recheck_read();
+            }
+        }
     }
 
     fn create_media_viewer(
@@ -3950,14 +3989,19 @@ impl ConduitWindow {
         let advanced = read_states
             .update(channel_id, |state| state.mark_read(ts))
             .is_some();
+        // Even when this copy had nothing to clear, a lingering badge means
+        // the coordinator's copy may disagree; let it reconcile and re-mark.
+        let still_unread = read_states
+            .get(channel_id)
+            .is_some_and(|state| state.has_unreads());
         drop(read_states);
         crate::debug::log(
             "readstate",
             &format!(
-                "mark_conversation_read channel_id={channel_id} ts={ts} existing_last_read={existing_last_read:?} advanced={advanced}"
+                "mark_conversation_read channel_id={channel_id} ts={ts} existing_last_read={existing_last_read:?} advanced={advanced} still_unread={still_unread}"
             ),
         );
-        if !advanced {
+        if !advanced && !still_unread {
             return;
         }
         self.send_command(RuntimeCommand::MarkConversationRead {
@@ -9497,6 +9541,10 @@ impl ConduitWindow {
                 self.render_conversations();
             }
             self.refresh_unread_separators();
+            let visible_changed = self
+                .visible_channel_id()
+                .is_some_and(|visible| application.read_state_changed_ids().contains(&visible));
+            self.recheck_visible_reads(visible_changed, false);
         }
         if application.thread_catalog_changed() {
             self.refresh_threads_badge();
@@ -9505,6 +9553,7 @@ impl ConduitWindow {
             // main view is active, so they need their own invalidation here.
             self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
             self.refresh_unread_separators();
+            self.recheck_visible_reads(false, true);
             if self.current_main_view() == MainMessageView::Threads {
                 self.populate_threads();
             }
@@ -11956,6 +12005,7 @@ impl ConduitWindow {
                     window.handle_timeline_action(action);
                 }
             });
+            thread_native_timeline.set_window_active(self.is_active());
             thread_native_timeline.set_read_mark_target(channel_id, Some(ts));
             thread_native_timeline.set_messages(&messages, &context, focus_message_ts.as_deref());
             self.thread_pane().ensure_open();

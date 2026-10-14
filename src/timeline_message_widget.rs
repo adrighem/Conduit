@@ -77,6 +77,13 @@ type BoundItems = Rc<RefCell<Vec<glib::WeakRef<gtk::ListItem>>>>;
 
 const FOCUS_TARGET_CLASS: &str = "timeline-focus-target";
 const FOCUS_TARGET_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long a row must stay visible before it counts as read. Short under
+/// test so dwell-driven tests run quickly.
+const READ_DWELL: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(100)
+} else {
+    std::time::Duration::from_secs(2)
+};
 type ReadMarkTarget = Rc<RefCell<Option<(String, Option<String>)>>>;
 type ToggleReactionCallback = Rc<dyn Fn(String, String, bool)>;
 type CacheEntry = (Option<gdk_pixbuf::PixbufAnimation>, gtk::gdk::Texture);
@@ -463,6 +470,9 @@ pub struct NativeTimelineView {
     read_candidate: Rc<RefCell<Option<String>>>,
     read_generation: Rc<Cell<u64>>,
     recheck_read_visibility: Rc<dyn Fn()>,
+    /// Reads only count while the user can see them: auto-marking pauses
+    /// while the window is unfocused and re-evaluates on refocus.
+    window_active: Rc<Cell<bool>>,
     /// False inside the thread pane: the root message is already the open
     /// thread, so it gets no "N replies" footer linking to itself.
     opens_threads: Rc<Cell<bool>>,
@@ -811,6 +821,7 @@ impl NativeTimelineView {
         let latest_message_ts: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let read_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let read_candidate: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let window_active = Rc::new(Cell::new(true));
 
         let recheck_read_visibility: Rc<dyn Fn()> = {
             let list_view = list_view.clone();
@@ -819,10 +830,11 @@ impl NativeTimelineView {
             let latest_message_ts = latest_message_ts.clone();
             let read_generation = read_generation.clone();
             let read_candidate = read_candidate.clone();
+            let window_active = window_active.clone();
             let on_action = on_action.clone();
             Rc::new(move || {
                 let viewport_height = f64::from(scrolled_window.height());
-                if viewport_height <= 0.0 {
+                if viewport_height <= 0.0 || !window_active.get() {
                     return;
                 }
                 let mut best: Option<String> = None;
@@ -889,7 +901,7 @@ impl NativeTimelineView {
                 }
                 let read_generation = read_generation.clone();
                 let on_action = on_action.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+                glib::timeout_add_local_once(READ_DWELL, move || {
                     if read_generation.get() != expected {
                         return;
                     }
@@ -1002,6 +1014,7 @@ impl NativeTimelineView {
             read_candidate,
             read_generation,
             recheck_read_visibility,
+            window_active,
             opens_threads,
             bind_row,
             bound_items,
@@ -1072,10 +1085,35 @@ impl NativeTimelineView {
     pub(crate) fn set_read_mark_target(&self, channel_id: &str, thread_ts: Option<&str>) {
         *self.read_mark_target.borrow_mut() =
             Some((channel_id.to_string(), thread_ts.map(ToString::to_string)));
+        self.recheck_read();
+    }
+
+    /// Forgets the dwelling candidate and re-evaluates visible rows, so rows
+    /// already on screen are marked again, e.g. after read state changed
+    /// elsewhere or the window regained focus.
+    pub(crate) fn recheck_read(&self) {
+        self.reset_read_candidate();
+        (self.recheck_read_visibility)();
+    }
+
+    /// Pauses auto-marking while the window is unfocused; regaining focus
+    /// restarts the dwell for whatever is visible.
+    pub(crate) fn set_window_active(&self, active: bool) {
+        if self.window_active.replace(active) == active {
+            return;
+        }
+        if active {
+            self.recheck_read();
+        } else {
+            self.reset_read_candidate();
+        }
+    }
+
+    /// Clears the candidate and cancels its in-flight dwell timer.
+    fn reset_read_candidate(&self) {
         *self.read_candidate.borrow_mut() = None;
         self.read_generation
             .set(self.read_generation.get().wrapping_add(1));
-        (self.recheck_read_visibility)();
     }
 
     pub(crate) fn set_on_action<F: Fn(TimelineAction) + 'static>(&self, f: F) {
@@ -1140,9 +1178,7 @@ impl NativeTimelineView {
         self.scrolled_window.set_visible(true);
         *self.context.borrow_mut() = Some(context.clone());
         *self.latest_message_ts.borrow_mut() = messages.first().map(|msg| msg.ts.clone());
-        *self.read_candidate.borrow_mut() = None;
-        self.read_generation
-            .set(self.read_generation.get().wrapping_add(1));
+        self.reset_read_candidate();
         // Removing the focused row would hand focus to GTK's fallback, which
         // scrolls the list to its first item. Park focus and restore it on the
         // target row instead.
@@ -3938,6 +3974,69 @@ pub(crate) mod tests {
             assert!(
                 (row_center - page / 2.0).abs() <= f64::from(bounds.height()),
                 "row center {row_center} should sit mid-viewport (page {page})"
+            );
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn recheck_read_redispatches_visible_rows_and_pauses_while_inactive() {
+        run_gtk_test(|| {
+            fn pump(ms: u64) {
+                let context = glib::MainContext::default();
+                let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+                while std::time::Instant::now() < end {
+                    context.iteration(false);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            let ctx = test_context();
+            let messages = (0..3)
+                .rev()
+                .map(|i| SlackMessage {
+                    ts: format!("1700000{i:03}.000100"),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("message {i}")),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let marks: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+            let view = NativeTimelineView::new();
+            {
+                let marks = marks.clone();
+                view.set_on_action(move |action| {
+                    if let TimelineAction::AutoMarkRead { ts, .. } = action {
+                        marks.borrow_mut().push(ts);
+                    }
+                });
+            }
+            let window = gtk::Window::new();
+            window.set_default_size(400, 500);
+            window.set_child(Some(view.widget()));
+            window.present();
+            view.set_read_mark_target("C1", None);
+            view.set_messages(&messages, &ctx, None);
+            pump(500);
+            let newest = messages[0].ts.clone();
+            assert_eq!(*marks.borrow(), vec![newest.clone()]);
+
+            // Same rows, no scroll: only an explicit recheck marks again.
+            view.recheck_read();
+            pump(400);
+            assert_eq!(marks.borrow().len(), 2);
+
+            // An unfocused window never marks, even when rechecked.
+            view.set_window_active(false);
+            view.recheck_read();
+            pump(400);
+            assert_eq!(marks.borrow().len(), 2);
+
+            // Regaining focus restarts the dwell for the visible rows.
+            view.set_window_active(true);
+            pump(400);
+            assert_eq!(
+                *marks.borrow(),
+                vec![newest.clone(), newest.clone(), newest]
             );
             window.destroy();
         });
