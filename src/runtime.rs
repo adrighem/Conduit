@@ -8793,6 +8793,8 @@ pub struct ReadFlusherQueue {
     pending: HashMap<String, String>,
     last_marked_threads: HashMap<(String, String), String>,
     pending_threads: HashMap<(String, String), String>,
+    in_flight: HashMap<String, String>,
+    in_flight_threads: HashMap<(String, String), String>,
 }
 
 impl ReadFlusherQueue {
@@ -8831,6 +8833,11 @@ impl ReadFlusherQueue {
         }
         if let Some(p_ts) = self.pending.get(channel_id) {
             if !slack_timestamp_is_after(target_ts, p_ts) {
+                return false;
+            }
+        }
+        if let Some(f_ts) = self.in_flight.get(channel_id) {
+            if !slack_timestamp_is_after(target_ts, f_ts) {
                 return false;
             }
         }
@@ -8886,6 +8893,11 @@ impl ReadFlusherQueue {
                 return false;
             }
         }
+        if let Some(f_ts) = self.in_flight_threads.get(&key) {
+            if !slack_timestamp_is_after(target_ts, f_ts) {
+                return false;
+            }
+        }
         self.pending_threads.insert(key, target_ts.to_string());
         true
     }
@@ -8897,37 +8909,59 @@ impl ReadFlusherQueue {
     }
 
     /// Drains pending marks. `last_marked` only advances once the caller
-    /// reports success through [`Self::mark_succeeded`].
+    /// reports success through [`Self::mark_succeeded`]. Drained marks stay
+    /// in flight until settled so the same target is not enqueued again.
     pub fn flush(&mut self) -> Vec<PendingReadMark> {
-        self.pending
+        let marks: Vec<PendingReadMark> = self
+            .pending
             .drain()
             .map(|(channel_id, target_ts)| PendingReadMark {
                 channel_id,
                 target_ts,
             })
-            .collect()
+            .collect();
+        for mark in &marks {
+            self.begin_in_flight(mark);
+        }
+        marks
     }
 
     pub fn flush_channel(&mut self, channel_id: &str) -> Option<PendingReadMark> {
-        self.pending
+        let mark = self
+            .pending
             .remove(channel_id)
             .map(|target_ts| PendingReadMark {
                 channel_id: channel_id.to_string(),
                 target_ts,
-            })
+            })?;
+        self.begin_in_flight(&mark);
+        Some(mark)
+    }
+
+    fn begin_in_flight(&mut self, mark: &PendingReadMark) {
+        self.in_flight
+            .insert(mark.channel_id.clone(), mark.target_ts.clone());
     }
 
     pub fn mark_succeeded(&mut self, mark: &PendingReadMark) {
+        self.in_flight.remove(&mark.channel_id);
         self.set_last_marked(mark.channel_id.as_str(), mark.target_ts.as_str());
     }
 
     /// Puts a failed mark back unless a newer target superseded it meanwhile.
     pub fn mark_failed(&mut self, mark: &PendingReadMark) {
+        self.in_flight.remove(&mark.channel_id);
         self.enqueue(&mark.channel_id, &mark.target_ts);
     }
 
+    /// Gives up on a mark that can never succeed; it is not requeued.
+    pub fn mark_dropped(&mut self, mark: &PendingReadMark) {
+        self.in_flight.remove(&mark.channel_id);
+    }
+
     pub fn flush_threads(&mut self) -> Vec<PendingThreadReadMark> {
-        self.pending_threads
+        let marks: Vec<PendingThreadReadMark> = self
+            .pending_threads
             .drain()
             .map(
                 |((channel_id, thread_ts), target_ts)| PendingThreadReadMark {
@@ -8936,10 +8970,19 @@ impl ReadFlusherQueue {
                     target_ts,
                 },
             )
-            .collect()
+            .collect();
+        for mark in &marks {
+            self.in_flight_threads.insert(
+                (mark.channel_id.clone(), mark.thread_ts.clone()),
+                mark.target_ts.clone(),
+            );
+        }
+        marks
     }
 
     pub fn thread_mark_succeeded(&mut self, mark: &PendingThreadReadMark) {
+        self.in_flight_threads
+            .remove(&(mark.channel_id.clone(), mark.thread_ts.clone()));
         self.set_last_marked_thread(
             mark.channel_id.as_str(),
             mark.thread_ts.as_str(),
@@ -8948,7 +8991,14 @@ impl ReadFlusherQueue {
     }
 
     pub fn thread_mark_failed(&mut self, mark: &PendingThreadReadMark) {
+        self.in_flight_threads
+            .remove(&(mark.channel_id.clone(), mark.thread_ts.clone()));
         self.enqueue_thread(&mark.channel_id, &mark.thread_ts, &mark.target_ts);
+    }
+
+    pub fn thread_mark_dropped(&mut self, mark: &PendingThreadReadMark) {
+        self.in_flight_threads
+            .remove(&(mark.channel_id.clone(), mark.thread_ts.clone()));
     }
 }
 
@@ -9083,6 +9133,28 @@ pub async fn execute_read_flusher_thread_mark(
 const READ_FLUSHER_RETRY_INITIAL: Duration = Duration::from_secs(2);
 const READ_FLUSHER_RETRY_MAX: Duration = Duration::from_secs(60);
 
+/// Whether retrying a failed mark can never succeed (bad channel, auth,
+/// scope, timestamp). Connectivity, rate limits and server errors are transient.
+fn read_mark_error_is_permanent(error: &anyhow::Error) -> bool {
+    let Some(slack_error) = error.downcast_ref::<SlackError>() else {
+        return false;
+    };
+    match slack_error {
+        SlackError::Api { code, .. } => !matches!(
+            code.as_str(),
+            "internal_error"
+                | "fatal_error"
+                | "service_unavailable"
+                | "request_timeout"
+                | "ratelimited"
+                | "rate_limited"
+        ),
+        SlackError::Validation { .. } | SlackError::InvalidParameters => true,
+        SlackError::RateLimited { .. } => false,
+        SlackError::Other(_) => slack_error.category() == SlackErrorCategory::Authentication,
+    }
+}
+
 /// Sends every pending mark once. Failed marks go back into the queue and
 /// `last_marked` only advances on success. Returns whether any mark failed.
 async fn flush_read_marks(handle: &ReadFlusherHandle, api: &SlackApi) -> bool {
@@ -9090,6 +9162,16 @@ async fn flush_read_marks(handle: &ReadFlusherHandle, api: &SlackApi) -> bool {
     for mark in handle.flush() {
         match execute_read_flusher_mark(api, &mark).await {
             Ok(()) => handle.lock().mark_succeeded(&mark),
+            Err(error) if read_mark_error_is_permanent(&error) => {
+                handle.lock().mark_dropped(&mark);
+                crate::debug::log(
+                    "read_flusher",
+                    &format!(
+                        "conversations_mark dropped channel={} error={error}",
+                        mark.channel_id
+                    ),
+                );
+            }
             Err(error) => {
                 failed = true;
                 handle.lock().mark_failed(&mark);
@@ -9106,6 +9188,16 @@ async fn flush_read_marks(handle: &ReadFlusherHandle, api: &SlackApi) -> bool {
     for thread_mark in handle.flush_threads() {
         match execute_read_flusher_thread_mark(api, &thread_mark).await {
             Ok(()) => handle.lock().thread_mark_succeeded(&thread_mark),
+            Err(error) if read_mark_error_is_permanent(&error) => {
+                handle.lock().thread_mark_dropped(&thread_mark);
+                crate::debug::log(
+                    "read_flusher",
+                    &format!(
+                        "subscriptions_thread_mark dropped channel={} thread={} error={error}",
+                        thread_mark.channel_id, thread_mark.thread_ts,
+                    ),
+                );
+            }
             Err(error) => {
                 failed = true;
                 handle.lock().thread_mark_failed(&thread_mark);
@@ -20222,23 +20314,92 @@ mod tests {
         // A failed mark goes back into the queue and is sent again.
         queue.mark_failed(&flushed[0]);
         assert_eq!(queue.last_marked("C1"), None);
-        assert_eq!(queue.flush(), flushed);
+        let retry = queue.flush();
+        assert_eq!(retry, flushed);
 
-        // While unconfirmed, re-reading the same message enqueues it again.
-        queue.mark_failed(&flushed[0]);
-        queue.flush();
-        assert!(queue.enqueue("C1", "150.000000"));
+        // While the retry is in flight, the same target is not enqueued again.
+        assert!(!queue.enqueue("C1", "150.000000"));
 
         // A newer pending target supersedes the failed one.
-        queue.flush();
         assert!(queue.enqueue("C1", "200.000000"));
-        queue.mark_failed(&flushed[0]);
+        queue.mark_failed(&retry[0]);
         assert_eq!(queue.pending_mark("C1"), Some("200.000000"));
 
         let retried = queue.flush();
         queue.mark_succeeded(&retried[0]);
         assert_eq!(queue.last_marked("C1"), Some("200.000000"));
         assert!(!queue.enqueue("C1", "200.000000"));
+    }
+
+    #[test]
+    fn read_flusher_queue_rejects_targets_already_in_flight() {
+        let mut queue = ReadFlusherQueue::new();
+        assert!(queue.enqueue("C1", "150.000000"));
+        let flushed = queue.flush();
+        assert!(!queue.enqueue("C1", "150.000000"));
+        assert!(!queue.enqueue("C1", "100.000000"));
+        assert!(queue.enqueue("C1", "160.000000"));
+
+        // A failed transient mark is requeued, then superseded by the newer one.
+        queue.mark_failed(&flushed[0]);
+        assert_eq!(queue.pending_mark("C1"), Some("160.000000"));
+
+        let flushed = queue.flush();
+        queue.mark_succeeded(&flushed[0]);
+        assert!(!queue.enqueue("C1", "160.000000"));
+
+        let mut queue = ReadFlusherQueue::new();
+        assert!(queue.enqueue_thread("C1", "1.0", "5.0"));
+        let flushed = queue.flush_threads();
+        assert!(!queue.enqueue_thread("C1", "1.0", "5.0"));
+        queue.thread_mark_failed(&flushed[0]);
+        assert_eq!(queue.pending_thread_mark("C1", "1.0"), Some("5.0"));
+    }
+
+    #[test]
+    fn read_flusher_queue_drops_permanent_failures() {
+        let mut queue = ReadFlusherQueue::new();
+        queue.enqueue("C1", "150.000000");
+        let flushed = queue.flush();
+        queue.mark_dropped(&flushed[0]);
+        assert_eq!(queue.pending_mark("C1"), None);
+        assert!(queue.flush().is_empty());
+    }
+
+    #[test]
+    fn read_mark_errors_are_classified_permanent_or_transient() {
+        let api = |code: &str| {
+            anyhow::Error::from(SlackError::Api {
+                method: "conversations.mark".to_string(),
+                code: code.to_string(),
+            })
+        };
+        for code in [
+            "not_in_channel",
+            "channel_not_found",
+            "is_archived",
+            "invalid_auth",
+            "not_authed",
+            "missing_scope",
+            "invalid_ts",
+            "thread_not_found",
+        ] {
+            assert!(read_mark_error_is_permanent(&api(code)), "{code}");
+        }
+        for code in ["internal_error", "service_unavailable", "ratelimited"] {
+            assert!(!read_mark_error_is_permanent(&api(code)), "{code}");
+        }
+        assert!(read_mark_error_is_permanent(&anyhow::Error::from(
+            SlackError::InvalidParameters
+        )));
+        assert!(!read_mark_error_is_permanent(&anyhow::Error::from(
+            SlackError::RateLimited {
+                method: "conversations.mark".to_string()
+            }
+        )));
+        assert!(!read_mark_error_is_permanent(&anyhow::anyhow!(
+            "connection reset"
+        )));
     }
 
     #[test]

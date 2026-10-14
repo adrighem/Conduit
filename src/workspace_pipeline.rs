@@ -1676,11 +1676,13 @@ impl WorkspaceCoordinator {
             let state = self
                 .unread_ledger
                 .update(channel_id, |state| state.mark_read(&message.ts));
-            let mark = WorkspaceEffect::ConversationReadMarked {
-                channel_id: channel_id.to_string(),
-                ts: message.ts.clone(),
-            };
-            return (state, Some(mark));
+            let mark = state
+                .is_some()
+                .then(|| WorkspaceEffect::ConversationReadMarked {
+                    channel_id: channel_id.to_string(),
+                    ts: message.ts.clone(),
+                });
+            return (state, mark);
         }
         let signal = match kind {
             MessageMutationKind::Deleted => MessageSignal::Ignore,
@@ -3353,6 +3355,44 @@ mod tests {
                 channel_id: "D1".to_string(),
                 ts: "4.0".to_string(),
             }));
+    }
+
+    #[test]
+    fn own_post_that_does_not_move_the_ledger_emits_no_read_mark() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        configure_attention(&mut coordinator);
+        coordinator.apply(WorkspaceMutation::CountsSnapshot(vec![counts(
+            "D1", "1.0", "1.0", 0,
+        )]));
+        let mut own = message("4.0", "on it");
+        own.user = Some("U_SELF".to_string());
+        let first = posted(
+            &mut coordinator,
+            "D1",
+            own,
+            MessageMutationKind::Posted,
+            MutationOrigin::Local,
+        )
+        .expect("local echo is a change");
+        assert!(first
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, WorkspaceEffect::ConversationReadMarked { .. })));
+
+        // An older own post arriving afterwards does not move the ledger.
+        let mut server_echo = message("3.5", "earlier");
+        server_echo.user = Some("U_SELF".to_string());
+        let echo = posted(
+            &mut coordinator,
+            "D1",
+            server_echo,
+            MessageMutationKind::Posted,
+            MutationOrigin::Realtime,
+        );
+        assert!(echo.is_none_or(|reduction| !reduction
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, WorkspaceEffect::ConversationReadMarked { .. }))));
     }
 
     #[test]
