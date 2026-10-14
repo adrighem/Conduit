@@ -325,6 +325,8 @@ pub(crate) fn register_timeline_css() {
             r#"
             .blockquote { border-left: 3px solid #888888; padding-left: 8px; margin-left: 4px; }
             .author-menu-button { padding: 2px; margin: -2px; min-width: 0; min-height: 0; }
+            listview.conduit-timeline > row { padding: 6px 12px; }
+            .timeline-avatar { border-radius: 8px; }
             .reaction-pill { padding: 2px 6px; min-width: 0; min-height: 0; border-radius: 12px; }
             .reaction-pill label { min-width: 0; }
             .reaction-emoji-unicode { font-size: 32px; line-height: 1; }
@@ -778,6 +780,7 @@ impl NativeTimelineView {
         let list_view = ListView::new(Some(selection), Some(factory));
         // Tab into the list lands on the remembered row, not on the oldest message.
         list_view.set_tab_behavior(gtk::ListTabBehavior::Item);
+        list_view.add_css_class("conduit-timeline");
 
         let scrolled_window = ScrolledWindow::new();
         scrolled_window.set_hexpand(true);
@@ -2045,6 +2048,8 @@ fn build_avatar_widget(message: &SlackMessage, context: &MessageHtmlContext) -> 
             };
             picture.set_size_request(36, 36);
             picture.set_content_fit(gtk::ContentFit::Cover);
+            picture.set_overflow(gtk::Overflow::Hidden);
+            picture.add_css_class("timeline-avatar");
             return picture.upcast::<Widget>();
         }
     }
@@ -2711,7 +2716,12 @@ pub(crate) fn build_timeline_message_widget(
         root_box.append(&broadcast_box);
     }
 
-    // Header
+    // Avatar column beside a body column holding header, content, reactions
+    // and the thread footer.
+    let columns = Box::new(Orientation::Horizontal, 10);
+    columns.add_css_class("timeline-message-columns");
+    let body_box = Box::new(Orientation::Vertical, 4);
+    body_box.set_hexpand(true);
     let header_box = Box::new(Orientation::Horizontal, 8);
 
     let avatar_widget = build_avatar_widget(message, context);
@@ -2740,19 +2750,25 @@ pub(crate) fn build_timeline_message_widget(
         context.current_user_id.as_deref(),
         &context.bot_user_ids,
     );
+    avatar_widget.set_valign(gtk::Align::Start);
     match (on_author_action, author_user_id) {
         (Some(on_action), Some(user_id)) if menu_access.any() => {
-            header_box.append(&crate::author_menu::author_menu_button(
-                &avatar_widget,
-                &author_label,
-                user_id,
-                &author_name,
-                menu_access,
-                on_action.clone(),
-            ));
+            let menu_button = |child: &Widget| {
+                let button = crate::author_menu::author_menu_button(
+                    child,
+                    user_id,
+                    &author_name,
+                    menu_access,
+                    on_action.clone(),
+                );
+                button.set_valign(gtk::Align::Start);
+                button
+            };
+            columns.append(&menu_button(&avatar_widget));
+            header_box.append(&menu_button(author_label.upcast_ref()));
         }
         _ => {
-            header_box.append(&avatar_widget);
+            columns.append(&avatar_widget);
             header_box.append(&author_label);
         }
     }
@@ -2767,12 +2783,15 @@ pub(crate) fn build_timeline_message_widget(
         timestamp_label.set_text(&message.ts);
     }
     timestamp_label.add_css_class("dim-label");
+    timestamp_label.add_css_class("caption");
     timestamp_label.set_xalign(0.0);
     header_box.append(&timestamp_label);
 
-    root_box.append(&header_box);
+    body_box.append(&header_box);
+    columns.append(&body_box);
+    root_box.append(&columns);
 
-    render_message_content(message, context, on_open_media, on_author_action, &root_box);
+    render_message_content(message, context, on_open_media, on_author_action, &body_box);
 
     // Reactions
     if let Some(reactions) = message.reactions.as_deref().filter(|r| !r.is_empty()) {
@@ -2878,7 +2897,7 @@ pub(crate) fn build_timeline_message_widget(
 
         wrap_box.append(&add_btn);
 
-        root_box.append(&wrap_box);
+        body_box.append(&wrap_box);
     }
 
     // Thread footer: only where it can open the thread (not in the thread pane).
@@ -2922,7 +2941,7 @@ pub(crate) fn build_timeline_message_widget(
             cb(ts.clone());
         });
         thread_footer.append(&reply_button);
-        root_box.append(&thread_footer);
+        body_box.append(&thread_footer);
     }
 
     if let Some(cb) = on_hover {

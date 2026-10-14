@@ -63,17 +63,12 @@ fn author_menu_label(display_name: &str) -> String {
 /// Wraps `avatar` and `name` in a flat menu button offering "Message…" and
 /// "Profile". `on_action` is invoked with the chosen [`TimelineAction`].
 pub(crate) fn author_menu_button(
-    avatar: &gtk::Widget,
-    name: &gtk::Label,
+    child: &impl IsA<gtk::Widget>,
     user_id: &str,
     display_name: &str,
     access: AuthorMenuAccess,
     on_action: Rc<dyn Fn(TimelineAction)>,
 ) -> gtk::MenuButton {
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    content.append(avatar);
-    content.append(name);
-
     let group = gio::SimpleActionGroup::new();
     let menu = gio::Menu::new();
     let entries: [MenuEntry; 2] = [
@@ -101,7 +96,7 @@ pub(crate) fn author_menu_button(
     }
 
     let button = gtk::MenuButton::new();
-    button.set_child(Some(&content));
+    button.set_child(Some(child));
     button.set_menu_model(Some(&menu));
     button.set_has_frame(false);
     button.set_focus_on_click(false);
