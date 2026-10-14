@@ -901,18 +901,25 @@ label.mention-badge-pill {
   background: none;
   box-shadow: none;
 }
-.conduit-navigation-rail toggle-group > button.toggle {
+.conduit-navigation-rail toggle-group > toggle {
   background: none;
   box-shadow: none;
   color: inherit;
   min-width: 52px;
-  padding: 6px 2px;
+  padding: 0;
+  margin: 10px 0;
+}
+.conduit-navigation-rail toggle-group > separator {
+  opacity: 0;
+}
+.conduit-navigation-rail image.navigation-rail-icon {
+  padding: 6px 10px;
   border-radius: 10px;
 }
-.conduit-navigation-rail toggle-group > button.toggle:hover {
+.conduit-navigation-rail toggle-group > toggle:hover image.navigation-rail-icon {
   background-color: color-mix(in srgb, currentColor 12%, transparent);
 }
-.conduit-navigation-rail toggle-group > button.toggle:checked {
+.conduit-navigation-rail toggle-group > toggle:checked image.navigation-rail-icon {
   background-color: color-mix(in srgb, currentColor 22%, transparent);
 }
 .conduit-navigation-rail label.navigation-rail-badge {
