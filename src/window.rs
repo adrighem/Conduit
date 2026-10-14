@@ -5568,14 +5568,17 @@ impl ConduitWindow {
                  color: {};\n\
              }}\n\
              .conduit-themed-sidebar row {{ color: {}; }}\n\
-             .conduit-themed-sidebar row:hover {{ background-color: {}; }}\n\
-             .conduit-themed-sidebar row.active-conversation,\n\
-             .conduit-themed-sidebar row:selected {{ background-color: {}; color: {}; }}\n\
-             .conduit-themed-sidebar row.active-conversation label,\n\
-             .conduit-themed-sidebar row:selected label {{ color: {}; }}\n\
+             .conduit-themed-sidebar row:hover,\n\
+             .conduit-themed-sidebar row:selected {{ background-color: {}; }}\n\
+             .conduit-themed-sidebar .sidebar-row-content.active-conversation,\n\
+             .conduit-themed-sidebar row:selected .sidebar-row-content.active-conversation {{\n\
+                 background-color: {}; color: {}; border-radius: 6px;\n\
+             }}\n\
+             .conduit-themed-sidebar .sidebar-row-content.active-conversation label {{ color: {}; }}\n\
              .mention-badge-pill {{ background-color: {mention_badge}; }}\n\
              .conduit-themed-sidebar row label.mention-badge-pill,\n\
-             .conduit-themed-sidebar row:selected label.mention-badge-pill {{ color: #ffffff; }}\n\
+             .conduit-themed-sidebar row:selected label.mention-badge-pill,\n\
+             .conduit-themed-sidebar .sidebar-row-content.active-conversation label.mention-badge-pill {{ color: #ffffff; }}\n\
              .unread-separator-line {{ background-color: {}; }}\n\
              .unread-separator-label {{ color: {}; }}\n\
              .thread-reply-pill {{ background-color: {pill_bg}; color: {}; }}\n\
