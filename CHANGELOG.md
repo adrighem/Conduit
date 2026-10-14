@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.1](https://github.com/adrighem/Conduit/compare/v0.7.0...v0.7.1) (2026-10-14)
+
+
+### Bug Fixes
+
+* **build:** allow release-mode cargo tests 30 minutes ([716b5df](https://github.com/adrighem/Conduit/commit/716b5dff684e76f9121aa9b8add469a0d57a1b50))
+* harden HTTP client redirect SSRF policy, emoji cache bounds, and add huddles state tests ([ed4fb7e](https://github.com/adrighem/Conduit/commit/ed4fb7e44b08b6815b56cada497cd9023067d5db))
+* **timeline:** forward quick action bar scroll events to timeline ([68c8f90](https://github.com/adrighem/Conduit/commit/68c8f90983387c19f2817340230feeaa41b4e345))
+
 ## [0.7.0](https://github.com/adrighem/Conduit/compare/v0.6.0...v0.7.0) (2026-10-14)
 
 
