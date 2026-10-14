@@ -4115,6 +4115,15 @@ pub(crate) mod tests {
         }
     }
 
+    /// Pumps until `done` holds or `ms` elapse, so a loaded test run still
+    /// gets the first layout and dwell in.
+    fn pump_main_context_until(ms: u64, done: impl Fn() -> bool) {
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while !done() && std::time::Instant::now() < end {
+            pump_main_context(10);
+        }
+    }
+
     fn record_auto_marks(view: &NativeTimelineView) -> Rc<RefCell<Vec<String>>> {
         let marks: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let recorded = marks.clone();
@@ -4139,7 +4148,7 @@ pub(crate) mod tests {
             window.present();
             view.set_read_mark_target("C1", None);
             view.set_messages(&messages, &ctx, None);
-            pump_main_context(500);
+            pump_main_context_until(5000, || !marks.borrow().is_empty());
             assert_eq!(marks.borrow().len(), 1);
 
             // Rechecks arriving faster than the dwell (e.g. a busy thread
@@ -4173,7 +4182,7 @@ pub(crate) mod tests {
             window.present();
             view.set_read_mark_target("C1", None);
             view.set_messages(&messages, &ctx, None);
-            pump_main_context(500);
+            pump_main_context_until(5000, || !marks.borrow().is_empty());
             assert_eq!(marks.borrow().len(), 1);
 
             // A dwell started while visible must not fire once hidden.
