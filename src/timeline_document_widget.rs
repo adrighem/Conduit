@@ -31,6 +31,10 @@ thread_local! {
     static ACCENT_CLASSES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
+pub fn clear_document_accent_cache() {
+    ACCENT_CLASSES.with(|seen| seen.borrow_mut().clear());
+}
+
 /// True when the document carries the message body itself. Attachments and
 /// quote unfurls alone do not: Slack then shows `text` above them, while
 /// block-based messages treat `text` as a notification fallback only.
@@ -672,5 +676,17 @@ mod tests {
 
         assert!(!document_replaces_text(&quote_only));
         assert!(document_replaces_text(&image));
+    }
+
+    #[test]
+    fn clear_document_accent_cache_empties_registered_classes() {
+        assert_eq!(
+            accent_class("#112233").as_deref(),
+            Some("attachment-accent-112233")
+        );
+        assert!(ACCENT_CLASSES.with(|seen| seen.borrow().contains("attachment-accent-112233")));
+
+        clear_document_accent_cache();
+        assert!(ACCENT_CLASSES.with(|seen| seen.borrow().is_empty()));
     }
 }

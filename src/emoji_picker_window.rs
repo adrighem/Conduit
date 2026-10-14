@@ -38,59 +38,89 @@ pub(crate) struct EmojiPickerWindow {
     window: adw::Window,
 }
 
-static RESOLVED_CACHE_MAP: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+const MAX_CUSTOM_EMOJI_BYTES: usize = 8 * 1024 * 1024;
+const CUSTOM_EMOJI_EXTENSIONS: &[&str] = &["png", "gif", "jpg", "jpeg", "webp"];
 
-fn resolved_cache_map() -> &'static Mutex<HashMap<String, Option<PathBuf>>> {
+static RESOLVED_CACHE_MAP: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+
+fn resolved_cache_map() -> &'static Mutex<HashMap<String, PathBuf>> {
     RESOLVED_CACHE_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn custom_emoji_cache_dir() -> PathBuf {
+    let image_cache_dir = crate::config::image_asset_cache_dir();
+    image_cache_dir.parent().map_or_else(
+        || image_cache_dir.join("custom-emoji"),
+        |parent| parent.join("custom-emoji"),
+    )
+}
+
+fn is_non_empty_file(path: &Path) -> bool {
+    path.is_file() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
 }
 
 pub(crate) fn invalidate_or_set_custom_emoji_cached_file(url: &str, path: PathBuf) {
     if let Ok(mut map) = resolved_cache_map().lock() {
-        map.insert(url.to_string(), Some(path));
+        if is_non_empty_file(&path) {
+            map.insert(url.to_string(), path);
+        } else {
+            map.remove(url);
+        }
     }
 }
 
 pub(crate) fn resolve_custom_emoji_cached_file(url: &str) -> Option<PathBuf> {
-    if let Ok(map) = resolved_cache_map().lock() {
+    if let Ok(mut map) = resolved_cache_map().lock() {
         if let Some(cached) = map.get(url) {
-            return cached.clone();
+            if is_non_empty_file(cached) {
+                return Some(cached.clone());
+            }
+            map.remove(url);
         }
     }
 
     let resolved = resolve_custom_emoji_cached_file_disk(url);
-    if let Ok(mut map) = resolved_cache_map().lock() {
-        map.insert(url.to_string(), resolved.clone());
+    if let Some(ref path) = resolved {
+        if let Ok(mut map) = resolved_cache_map().lock() {
+            map.insert(url.to_string(), path.clone());
+        }
     }
     resolved
 }
 
-fn resolve_custom_emoji_cached_file_disk(url: &str) -> Option<PathBuf> {
-    if let Ok(path) = PathBuf::from(url).canonicalize() {
-        if path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-            return Some(path);
-        }
-    }
-    let cache_dir = crate::config::image_asset_cache_dir();
-    let hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(url.as_bytes());
-        format!("{:x}", hasher.finalize())
-    };
-    for ext in ["png", "gif", "jpg", "jpeg", "webp"] {
-        let p = cache_dir.join(format!("{hash}.{ext}"));
-        if p.exists() && p.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+fn custom_emoji_url_hash(url: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn find_hashed_emoji_in_dir(dir: &Path, hash: &str) -> Option<PathBuf> {
+    for ext in CUSTOM_EMOJI_EXTENSIONS {
+        let p = dir.join(format!("{hash}.{ext}"));
+        if is_non_empty_file(&p) {
             return Some(p);
         }
+    }
+    None
+}
+
+fn resolve_custom_emoji_cached_file_disk(url: &str) -> Option<PathBuf> {
+    let hash = custom_emoji_url_hash(url);
+    let emoji_dir = custom_emoji_cache_dir();
+    if let Some(found) = find_hashed_emoji_in_dir(&emoji_dir, &hash) {
+        return Some(found);
+    }
+
+    let cache_dir = crate::config::image_asset_cache_dir();
+    if let Some(found) = find_hashed_emoji_in_dir(&cache_dir, &hash) {
+        return Some(found);
     }
     if let Ok(entries) = std::fs::read_dir(&cache_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                for ext in ["png", "gif", "jpg", "jpeg", "webp"] {
-                    let p = path.join(format!("{hash}.{ext}"));
-                    if p.exists() && p.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-                        return Some(p);
-                    }
+                if let Some(found) = find_hashed_emoji_in_dir(&path, &hash) {
+                    return Some(found);
                 }
                 if let Some(workspace_dir_name) = entry.file_name().to_str() {
                     let ws_hash = {
@@ -100,11 +130,8 @@ fn resolve_custom_emoji_cached_file_disk(url: &str) -> Option<PathBuf> {
                         hasher.update(url.as_bytes());
                         format!("{:x}", hasher.finalize())
                     };
-                    for ext in ["png", "gif", "jpg", "jpeg", "webp"] {
-                        let p = path.join(format!("{ws_hash}.{ext}"));
-                        if p.exists() && p.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-                            return Some(p);
-                        }
+                    if let Some(found) = find_hashed_emoji_in_dir(&path, &ws_hash) {
+                        return Some(found);
                     }
                 }
             }
@@ -154,14 +181,7 @@ impl CustomEmojiLoader {
                     Err(_) => return,
                 };
 
-                let client = match crate::http_client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(10))
-                    .timeout(std::time::Duration::from_secs(15))
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
+                let client = crate::http_client::client().clone();
 
                 rt.block_on(async move {
                     const NUM_WORKERS: usize = 6;
@@ -296,14 +316,37 @@ impl CustomEmojiLoader {
     }
 }
 
-async fn download_custom_emoji_file(client: &reqwest::Client, url: &str) -> Option<PathBuf> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return None;
+fn is_valid_custom_emoji_url(url: &str) -> bool {
+    if crate::slack::supports_native_preview_asset_url(url) {
+        return true;
     }
-    let Ok(parsed) = url::Url::parse(url) else {
-        return None;
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
     };
-    if parsed.scheme() != "https" && parsed.scheme() != "http" {
+    parsed.scheme() == "https"
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && crate::http_client::is_public_domain(&parsed)
+}
+
+fn extension_for_content_type(content_type: Option<&str>) -> &'static str {
+    let Some(ct) = content_type else {
+        return "png";
+    };
+    let lower = ct.to_ascii_lowercase();
+    if lower.contains("gif") {
+        "gif"
+    } else if lower.contains("webp") {
+        "webp"
+    } else if lower.contains("jpeg") || lower.contains("jpg") {
+        "jpg"
+    } else {
+        "png"
+    }
+}
+
+async fn download_custom_emoji_file(client: &reqwest::Client, url: &str) -> Option<PathBuf> {
+    if !is_valid_custom_emoji_url(url) {
         return None;
     }
 
@@ -317,35 +360,38 @@ async fn download_custom_emoji_file(client: &reqwest::Client, url: &str) -> Opti
         );
     }
 
-    let resp = req.send().await.ok()?;
+    let mut resp = req.send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
-
-    let ext = match resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
+    if resp
+        .content_length()
+        .is_some_and(|len| len == 0 || len > MAX_CUSTOM_EMOJI_BYTES as u64)
     {
-        Some(ct) if ct.contains("gif") => "gif",
-        Some(ct) if ct.contains("webp") => "webp",
-        Some(ct) if ct.contains("jpeg") || ct.contains("jpg") => "jpg",
-        _ => "png",
-    };
-
-    let bytes = resp.bytes().await.ok()?;
-    if bytes.is_empty() || bytes.len() > 8 * 1024 * 1024 {
         return None;
     }
 
-    let cache_dir = crate::config::image_asset_cache_dir();
+    let ext = extension_for_content_type(
+        resp.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+    );
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_CUSTOM_EMOJI_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let cache_dir = custom_emoji_cache_dir();
     let _ = std::fs::create_dir_all(&cache_dir);
 
-    let hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(url.as_bytes());
-        format!("{:x}", hasher.finalize())
-    };
+    let hash = custom_emoji_url_hash(url);
 
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let tmp_name = format!(
@@ -770,5 +816,72 @@ impl EmojiPickerWindow {
 
     pub(crate) fn present(&self) {
         self.window.present();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_type_maps_to_expected_extension() {
+        assert_eq!(extension_for_content_type(Some("image/gif")), "gif");
+        assert_eq!(
+            extension_for_content_type(Some("image/webp; charset=binary")),
+            "webp"
+        );
+        assert_eq!(extension_for_content_type(Some("image/jpeg")), "jpg");
+        assert_eq!(extension_for_content_type(Some("image/jpg")), "jpg");
+        assert_eq!(extension_for_content_type(Some("image/png")), "png");
+        assert_eq!(extension_for_content_type(None), "png");
+    }
+
+    #[test]
+    fn custom_emoji_url_validation_blocks_ssrf_and_local_paths() {
+        assert!(is_valid_custom_emoji_url(
+            "https://emoji.slack-edge.com/T1/parrot/abc.gif"
+        ));
+        assert!(is_valid_custom_emoji_url(
+            "https://cdn.example.com/emoji/custom.png"
+        ));
+        assert!(!is_valid_custom_emoji_url(
+            "http://emoji.slack-edge.com/T1/parrot/abc.gif"
+        ));
+        assert!(!is_valid_custom_emoji_url(
+            "http://127.0.0.1:8080/emoji.png"
+        ));
+        assert!(!is_valid_custom_emoji_url(
+            "https://169.254.169.254/latest/meta-data/"
+        ));
+        assert!(!is_valid_custom_emoji_url("https://localhost/emoji.png"));
+        assert!(!is_valid_custom_emoji_url(
+            "https://token@emoji.slack-edge.com/T1/parrot/abc.gif"
+        ));
+        assert!(!is_valid_custom_emoji_url("/etc/passwd"));
+    }
+
+    #[test]
+    fn resolve_custom_emoji_does_not_negative_cache_missing_files() {
+        let url = format!(
+            "https://emoji.slack-edge.com/T_TEST/non_negative_{}/emoji.gif",
+            std::process::id()
+        );
+        assert!(resolve_custom_emoji_cached_file(&url).is_none());
+        assert!(!resolved_cache_map()
+            .lock()
+            .unwrap()
+            .contains_key(url.as_str()));
+
+        let dir = custom_emoji_cache_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let hash = custom_emoji_url_hash(&url);
+        let file_path = dir.join(format!("{hash}.gif"));
+        std::fs::write(&file_path, b"GIF89a").unwrap();
+
+        let resolved = resolve_custom_emoji_cached_file(&url);
+        assert_eq!(resolved.as_deref(), Some(file_path.as_path()));
+
+        std::fs::remove_file(&file_path).unwrap();
+        assert!(resolve_custom_emoji_cached_file(&url).is_none());
     }
 }

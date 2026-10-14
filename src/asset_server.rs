@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::message_html::CachedAssetSource;
 use crate::runtime::CachedAssetDescriptor;
@@ -12,6 +12,7 @@ pub const IMAGE_ASSET_KEY_SET_MAX_ENTRIES: usize = 2_048;
 #[derive(Debug, Default)]
 pub struct BoundedImageAssetKeys {
     entries: HashMap<String, u64>,
+    order: BTreeSet<(u64, String)>,
     total_bytes: usize,
     clock: u64,
 }
@@ -28,6 +29,7 @@ impl BoundedImageAssetKeys {
         }
         self.clock = self.clock.saturating_add(1);
         self.total_bytes = self.total_bytes.saturating_add(key.len());
+        self.order.insert((self.clock, key.clone()));
         self.entries.insert(key, self.clock);
         true
     }
@@ -42,23 +44,17 @@ impl BoundedImageAssetKeys {
         }
         self.clock = self.clock.saturating_add(1);
         self.total_bytes = self.total_bytes.saturating_add(key.len());
+        self.order.insert((self.clock, key.clone()));
         self.entries.insert(key.clone(), self.clock);
         while self.entries.len() > IMAGE_ASSET_KEY_SET_MAX_ENTRIES
             || self.total_bytes > IMAGE_ASSET_KEY_SET_MAX_BYTES
         {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by(|(left_key, left_clock), (right_key, right_clock)| {
-                    left_clock
-                        .cmp(right_clock)
-                        .then_with(|| left_key.cmp(right_key))
-                })
-                .map(|(key, _)| key.clone())
-            else {
+            let Some((_, oldest)) = self.order.pop_first() else {
                 break;
             };
-            self.remove(&oldest);
+            if let Some((removed_key, _)) = self.entries.remove_entry(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed_key.len());
+            }
         }
         self.entries.contains_key(&key)
     }
@@ -68,15 +64,17 @@ impl BoundedImageAssetKeys {
     }
 
     pub fn remove(&mut self, key: &str) -> bool {
-        let Some((key, _)) = self.entries.remove_entry(key) else {
+        let Some((removed_key, clock)) = self.entries.remove_entry(key) else {
             return false;
         };
-        self.total_bytes = self.total_bytes.saturating_sub(key.len());
+        self.total_bytes = self.total_bytes.saturating_sub(removed_key.len());
+        self.order.remove(&(clock, removed_key));
         true
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.order.clear();
         self.total_bytes = 0;
         self.clock = 0;
     }
@@ -100,6 +98,7 @@ pub struct ConduitAssetEntry {
 pub struct BoundedConduitAssets {
     workspace_key: Option<String>,
     entries: HashMap<String, ConduitAssetEntry>,
+    order: BTreeSet<(u64, String)>,
     total_bytes: u64,
     max_bytes: u64,
     max_entries: usize,
@@ -120,6 +119,7 @@ impl BoundedConduitAssets {
         Self {
             workspace_key: None,
             entries: HashMap::new(),
+            order: BTreeSet::new(),
             total_bytes: 0,
             max_bytes,
             max_entries,
@@ -149,8 +149,10 @@ impl BoundedConduitAssets {
         self.clock = self.clock.saturating_add(1);
         if let Some(replaced) = self.entries.remove(&cache_key) {
             self.total_bytes = self.total_bytes.saturating_sub(replaced.descriptor.size());
+            self.order.remove(&(replaced.last_used, cache_key.clone()));
         }
         self.total_bytes = self.total_bytes.saturating_add(descriptor.size());
+        self.order.insert((self.clock, cache_key.clone()));
         self.entries.insert(
             cache_key,
             ConduitAssetEntry {
@@ -161,16 +163,7 @@ impl BoundedConduitAssets {
 
         let mut evicted = Vec::new();
         while self.total_bytes > self.max_bytes || self.entries.len() > self.max_entries {
-            let Some(oldest_key) = self
-                .entries
-                .iter()
-                .min_by(|(left_key, left), (right_key, right)| {
-                    left.last_used
-                        .cmp(&right.last_used)
-                        .then_with(|| left_key.cmp(right_key))
-                })
-                .map(|(key, _)| key.clone())
-            else {
+            let Some((_, oldest_key)) = self.order.pop_first() else {
                 break;
             };
             if let Some(entry) = self.entries.remove(&oldest_key) {
@@ -188,19 +181,25 @@ impl BoundedConduitAssets {
         if entry.descriptor.workspace_key() != workspace_key {
             return None;
         }
+        let previous = entry.last_used;
         self.clock = self.clock.saturating_add(1);
         entry.last_used = self.clock;
-        Some(entry.descriptor.clone())
+        let descriptor = entry.descriptor.clone();
+        self.order.remove(&(previous, cache_key.to_string()));
+        self.order.insert((self.clock, cache_key.to_string()));
+        Some(descriptor)
     }
 
     pub fn remove(&mut self, cache_key: &str) -> Option<CachedAssetDescriptor> {
         let entry = self.entries.remove(cache_key)?;
         self.total_bytes = self.total_bytes.saturating_sub(entry.descriptor.size());
+        self.order.remove(&(entry.last_used, cache_key.to_string()));
         Some(entry.descriptor)
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.order.clear();
         self.total_bytes = 0;
         self.clock = 0;
     }
@@ -245,4 +244,23 @@ pub fn cached_asset_source_is_registered(
     assets: &BoundedConduitAssets,
 ) -> bool {
     conduit_asset_request_key(source.uri()).is_some_and(|key| assets.contains_key(&key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_image_asset_keys_evicts_oldest_in_clock_order() {
+        let mut keys = BoundedImageAssetKeys::default();
+        for idx in 0..=IMAGE_ASSET_KEY_SET_MAX_ENTRIES {
+            assert!(keys.insert_evicting(format!("https://files.slack.com/{idx}")));
+        }
+        assert_eq!(keys.len(), IMAGE_ASSET_KEY_SET_MAX_ENTRIES);
+        assert!(!keys.contains("https://files.slack.com/0"));
+        assert!(keys.contains("https://files.slack.com/1"));
+        assert!(keys.contains(&format!(
+            "https://files.slack.com/{IMAGE_ASSET_KEY_SET_MAX_ENTRIES}"
+        )));
+    }
 }

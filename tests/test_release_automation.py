@@ -378,7 +378,11 @@ def test_generated_release_pull_requests_use_verified_dispatched_ci() -> None:
     ci_workflow = read(".github/workflows/ci.yml")
     pull_request = workflow_event(ci_workflow, "pull_request")
     ignored_paths = set(re.findall(r"^      - (.+)$", pull_request, re.MULTILINE))
-    assert ignored_paths == RELEASE_PR_FILES
+    assert ignored_paths == {
+        ".release-please-manifest.json",
+        "CHANGELOG.md",
+        f"data/{APP_ID}.metainfo.xml.in",
+    }
     workflow_dispatch = workflow_event(ci_workflow, "workflow_dispatch")
     assert "      commit_sha:" in workflow_dispatch
     assert "        required: true" in workflow_dispatch
