@@ -229,6 +229,7 @@
                                           <object class="GtkImage">
                                             <property name="icon-name">view-list-symbolic</property>
                                             <property name="pixel-size">22</property>
+                                            <property name="halign">center</property>
                                             <style>
                                               <class name="navigation-rail-icon"/>
                                             </style>
@@ -260,6 +261,7 @@
                                           <object class="GtkImage">
                                             <property name="icon-name">mail-replied-symbolic</property>
                                             <property name="pixel-size">22</property>
+                                            <property name="halign">center</property>
                                             <style>
                                               <class name="navigation-rail-icon"/>
                                             </style>
@@ -302,6 +304,7 @@
                                           <object class="GtkImage">
                                             <property name="icon-name">folder-documents-symbolic</property>
                                             <property name="pixel-size">22</property>
+                                            <property name="halign">center</property>
                                             <style>
                                               <class name="navigation-rail-icon"/>
                                             </style>
@@ -331,6 +334,7 @@
                                           <object class="GtkImage">
                                             <property name="icon-name">starred-symbolic</property>
                                             <property name="pixel-size">22</property>
+                                            <property name="halign">center</property>
                                             <style>
                                               <class name="navigation-rail-icon"/>
                                             </style>

@@ -671,9 +671,6 @@ impl SlackApi {
             }
         }
 
-        if let Some(prefs) = prefs.as_ref() {
-            prefs.log_theme_prefs();
-        }
         let theme = prefs.as_ref().and_then(|p| {
             p.sidebar_theme_custom
                 .as_ref()
@@ -2777,35 +2774,6 @@ struct ClientUserBootSelf {
 struct ClientUserBootPrefs {
     sidebar_theme: Option<Value>,
     sidebar_theme_custom: Option<Value>,
-    /// Other prefs, kept so `--debug` can show every theme-related one.
-    #[serde(flatten)]
-    other: HashMap<String, Value>,
-}
-
-impl ClientUserBootPrefs {
-    fn log_theme_prefs(&self) {
-        if !crate::debug::enabled() {
-            return;
-        }
-        let mut entries = [
-            ("sidebar_theme", self.sidebar_theme.as_ref()),
-            ("sidebar_theme_custom", self.sidebar_theme_custom.as_ref()),
-        ]
-        .into_iter()
-        .filter_map(|(key, value)| Some((key.to_string(), value?.to_string())))
-        .chain(
-            self.other
-                .iter()
-                .filter(|(key, _)| key.contains("theme") || key.contains("dark_mode"))
-                .map(|(key, value)| (key.clone(), value.to_string())),
-        )
-        .collect::<Vec<_>>();
-        entries.sort();
-        for (key, value) in entries {
-            let value = value.chars().take(400).collect::<String>();
-            crate::debug::log("theme", &format!("pref {key}={value}"));
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]

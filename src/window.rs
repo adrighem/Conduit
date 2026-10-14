@@ -6897,6 +6897,8 @@ impl ConduitWindow {
                 if !self.imp().connect_requested.get() {
                     self.show_workspace(auth);
                     self.send_command(RuntimeCommand::DiscoverConversations);
+                    // Feeds the Threads rail pill before the view is opened.
+                    self.load_followed_threads(None);
                 }
             }
             RuntimeEventKind::WorkspacePatch(patch) => {
@@ -7205,9 +7207,12 @@ impl ConduitWindow {
             RuntimeEventKind::EmojiCatalogLoaded(emojis) => self.replace_custom_emojis(emojis),
             RuntimeEventKind::WorkspaceThemeLoaded(theme) => self.apply_workspace_theme(&theme),
             RuntimeEventKind::WorkspaceIconLoaded(url) => {
-                *self.imp().workspace_icon_url.borrow_mut() = Some(url.clone());
-                self.send_image_asset_requests(vec![(url.clone(), url.clone())]);
-                self.patch_image_asset(&url);
+                // Skips a late result from a workspace that was reset meanwhile.
+                if self.imp().workspace_name.borrow().is_some() {
+                    *self.imp().workspace_icon_url.borrow_mut() = Some(url.clone());
+                    self.send_image_asset_requests(vec![(url.clone(), url.clone())]);
+                    self.patch_image_asset(&url);
+                }
             }
             RuntimeEventKind::ImageAssetLoaded { key, asset } => {
                 crate::debug::log(
@@ -8914,6 +8919,7 @@ impl ConduitWindow {
         *imp.workspace_url.borrow_mut() = None;
         *imp.workspace_icon_url.borrow_mut() = None;
         imp.workspace_avatar.set_text(None);
+        self.refresh_threads_badge();
         imp.workspace_avatar
             .set_custom_image(None::<&gtk::gdk::Paintable>);
         *imp.sidebar_error.borrow_mut() = None;
@@ -9012,15 +9018,12 @@ impl ConduitWindow {
     /// unread replies.
     fn refresh_threads_badge(&self) {
         let unread = {
-            let catalog = self.imp().workspace.threads.borrow();
-            self.followed_thread_roots()
-                .iter()
-                .filter(|(channel_id, root)| {
-                    catalog
-                        .get(channel_id, &root.ts)
-                        .is_some_and(|record| record.has_unread_replies())
-                })
-                .count()
+            let view = self.imp().workspace.view.borrow();
+            self.imp()
+                .workspace
+                .threads
+                .borrow()
+                .unread_followed_count(view.followed_thread_keys())
         };
         let badge = &self.imp().threads_unread_badge;
         badge.set_visible(unread > 0);
@@ -9029,6 +9032,14 @@ impl ConduitWindow {
         } else {
             unread.to_string()
         });
+        if let Some(toggle) = self.imp().navigation_toggle_group.toggle_by_name("threads") {
+            let tooltip = if unread > 0 {
+                gettext("Threads, {count} unread").replace("{count}", &unread.to_string())
+            } else {
+                gettext("Threads")
+            };
+            toggle.set_tooltip(&tooltip);
+        }
     }
 
     fn set_status(&self, status: &str) {

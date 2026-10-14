@@ -197,20 +197,13 @@ impl ThreadCatalog {
             root.reply_count = Some(record.reply_count);
             Some((record.key.channel_id.clone(), root))
         };
-        if let Some(order) = order {
-            return order
-                .iter()
-                .filter_map(|(channel_id, root_ts)| self.get(channel_id, root_ts))
-                .filter(|record| record.subscribed != Some(false))
-                .filter_map(inbox_root)
-                .collect();
-        }
         let mut roots = self
-            .records
-            .values()
-            .filter(|record| record.subscribed == Some(true))
+            .followed_records(order)
             .filter_map(inbox_root)
             .collect::<Vec<_>>();
+        if order.is_some() {
+            return roots;
+        }
         roots.sort_by(|(left_channel, left), (right_channel, right)| {
             right
                 .latest_reply
@@ -221,6 +214,33 @@ impl ThreadCatalog {
                 .then_with(|| left.ts.cmp(&right.ts))
         });
         roots
+    }
+
+    /// Number of followed threads with unread replies, counting the same
+    /// threads `followed_roots` lists.
+    pub(crate) fn unread_followed_count(&self, order: Option<&[(String, String)]>) -> usize {
+        self.followed_records(order)
+            .filter(|record| record.root.is_some() && record.has_unread_replies())
+            .count()
+    }
+
+    fn followed_records<'a>(
+        &'a self,
+        order: Option<&'a [(String, String)]>,
+    ) -> Box<dyn Iterator<Item = &'a ThreadRecord> + 'a> {
+        match order {
+            Some(order) => Box::new(
+                order
+                    .iter()
+                    .filter_map(|(channel_id, root_ts)| self.get(channel_id, root_ts))
+                    .filter(|record| record.subscribed != Some(false)),
+            ),
+            None => Box::new(
+                self.records
+                    .values()
+                    .filter(|record| record.subscribed == Some(true)),
+            ),
+        }
     }
 
     /// Records a root from Slack's followed-threads list as subscribed.
@@ -588,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn followed_roots_follow_server_order_and_drop_unfollowed() {
+    fn followed_roots_and_unread_count_follow_server_order_and_drop_unfollowed() {
         let mut catalog = ThreadCatalog::default();
         let mut followed = root("1.0", 3);
         followed.latest_reply = Some("4.0".into());
@@ -596,6 +616,7 @@ mod tests {
         catalog.observe_followed_root("C2", &root("2.0", 1));
         let mut unfollowed = root("3.0", 1);
         unfollowed.subscribed = Some(false);
+        unfollowed.latest_reply = Some("6.0".into());
         catalog.observe_thread("C3", "3.0", &[unfollowed], false);
         catalog.observe_thread("C4", "5.0", &[root("5.0", 1)], false);
 
@@ -614,6 +635,8 @@ mod tests {
             keys(catalog.followed_roots(Some(&order))),
             [("C2".into(), "2.0".into()), ("C1".into(), "1.0".into())]
         );
+        assert_eq!(catalog.unread_followed_count(Some(&order)), 1);
+        assert_eq!(catalog.unread_followed_count(None), 1);
         let cached = catalog.followed_roots(None);
         assert_eq!(cached[0].1.reply_count, Some(3));
         assert_eq!(
