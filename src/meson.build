@@ -103,7 +103,9 @@ test('Cargo tests',
   args: cargo_test_args,
   env: cargo_env,
   suite: 'rust',
-  timeout: 300,
+  # Release-mode test builds compile the crate again with cfg(test), which
+  # takes over five minutes on hosted packaging runners.
+  timeout: 1800,
   depends: cargo_build,
 )
 
