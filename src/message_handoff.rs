@@ -79,6 +79,7 @@ impl MessageControlHandle {
         Ok(Self(token))
     }
 
+    #[cfg(test)]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -341,16 +342,6 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
             self.entries.remove(&handle);
             self.claimed.remove(&handle);
         }
-    }
-
-    pub(crate) fn active_handle(
-        &self,
-        surface: TimelineSurfaceId,
-        message: &MessageRef,
-    ) -> Option<MessageControlHandle> {
-        self.active
-            .get(&MessageControlTarget::handoff(surface, message.clone()))
-            .map(|(_, handle)| handle.clone())
     }
 
     pub(crate) fn active_control_handle(

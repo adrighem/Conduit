@@ -69,7 +69,6 @@ mod thread_pane;
 mod timeline_document_widget;
 mod timeline_media;
 pub mod timeline_message_widget;
-mod timeline_presenter;
 mod unread_ledger;
 mod window;
 mod workspace_pipeline;

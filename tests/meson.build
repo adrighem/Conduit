@@ -111,6 +111,7 @@ if not headless_tests_option.disabled() and xvfb_run.found() and xfwm4.found() a
     depends: [cargo_build],
     suite: 'headless',
     timeout: 90,
+    is_parallel: false,
   )
 
 
@@ -136,6 +137,7 @@ if not headless_tests_option.disabled() and xvfb_run.found() and xfwm4.found() a
     depends: [cargo_build],
     suite: 'headless',
     timeout: 90,
+    is_parallel: false,
   )
 
   if xdotool.found() and xprop.found()
@@ -160,6 +162,7 @@ if not headless_tests_option.disabled() and xvfb_run.found() and xfwm4.found() a
       depends: [cargo_build],
       suite: 'headless',
       timeout: 90,
+      is_parallel: false,
     )
   endif
 
@@ -185,6 +188,7 @@ if not headless_tests_option.disabled() and xvfb_run.found() and xfwm4.found() a
       depends: [cargo_build],
       suite: ['headless', 'huddle-ui'],
       timeout: 90,
+      is_parallel: false,
     )
 
     test(
@@ -208,6 +212,7 @@ if not headless_tests_option.disabled() and xvfb_run.found() and xfwm4.found() a
       depends: [cargo_build],
       suite: ['headless', 'status-ui'],
       timeout: 90,
+      is_parallel: false,
     )
   endif
 endif

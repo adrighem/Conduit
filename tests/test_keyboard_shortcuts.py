@@ -513,14 +513,16 @@ def verify_thread_message_edit_shortcut(
 def stop_process(process: subprocess.Popen[str]) -> None:
     process.terminate()
     try:
-        process.wait(timeout=5)
+        _, stderr = process.communicate(timeout=5)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait(timeout=5)
+        _, stderr = process.communicate(timeout=5)
 
     if process.returncode not in (0, -15):
-        _, stderr = process.communicate()
         raise AssertionError(f"Conduit exited with {process.returncode}:\n{stderr}")
+    for marker in ("Gtk-ERROR", "Gtk-CRITICAL", "GLib-GObject-CRITICAL"):
+        if marker in stderr:
+            raise AssertionError(f"Unexpected {marker} in stderr:\n{stderr}")
 
 
 def main() -> None:
