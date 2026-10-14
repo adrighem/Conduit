@@ -872,6 +872,8 @@ pub enum RuntimeEventKind {
     },
     EmojiCatalogLoaded(HashMap<String, String>),
     WorkspaceThemeLoaded(crate::slack::SidebarTheme),
+    /// Workspace icon URL from `team.info`, shown at the top of the navigation rail.
+    WorkspaceIconLoaded(String),
     ImageAssetLoaded {
         key: String,
         asset: CachedAssetDescriptor,
@@ -1087,7 +1089,8 @@ impl RuntimeEventKind {
             | Self::AttachmentDownloadProgress { .. }
             | Self::FileUploadProgress { .. }
             | Self::FileUploaded(_)
-            | Self::WorkspaceThemeLoaded(_) => fallback.clone(),
+            | Self::WorkspaceThemeLoaded(_)
+            | Self::WorkspaceIconLoaded(_) => fallback.clone(),
         }
     }
 }
@@ -4718,6 +4721,20 @@ fn spawn_authentication_task<F>(
                         WorkspaceLifecycleEvent::Authenticated,
                     ));
                     events.send_event(RuntimeEventKind::Authenticated(auth));
+                    let icon_api = connection.slack.clone();
+                    let icon_events = events.clone();
+                    tokio::spawn(async move {
+                        match icon_api.team_icon_url().await {
+                            Ok(Some(url)) => {
+                                icon_events.send_event(RuntimeEventKind::WorkspaceIconLoaded(url));
+                            }
+                            Ok(None) => {}
+                            Err(error) => crate::debug::log(
+                                "runtime",
+                                &format!("WorkspaceIconLoadFailed error={error:#}"),
+                            ),
+                        }
+                    });
                     let theme_api = connection.slack.clone();
                     let theme_events = events.clone();
                     let theme_store = connection.workspace_store.clone();

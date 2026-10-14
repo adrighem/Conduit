@@ -625,6 +625,22 @@ impl SlackApi {
         })
     }
 
+    /// The workspace icon (`team.info`), largest square variant first; `None`
+    /// when the workspace uses Slack's default icon.
+    pub(crate) async fn team_icon_url(&self) -> Result<Option<String>> {
+        let response: TeamInfoResponse = self.post_form("team.info", &[]).await?;
+        let Some(icon) = response.team.and_then(|team| team.icon) else {
+            return Ok(None);
+        };
+        if icon.image_default == Some(true) {
+            return Ok(None);
+        }
+        Ok([icon.image_132, icon.image_88, icon.image_68]
+            .into_iter()
+            .flatten()
+            .find(|url| url.starts_with("https://")))
+    }
+
     pub(crate) async fn fetch_sidebar_theme(&self) -> Result<Option<SidebarTheme>> {
         let mut prefs = None;
         match self
@@ -2721,6 +2737,27 @@ struct AuthTestResponse {
     user_id: Option<String>,
 }
 impl_slack_response!(AuthTestResponse);
+
+#[derive(Debug, Deserialize)]
+struct TeamInfoResponse {
+    ok: bool,
+    error: Option<String>,
+    team: Option<TeamInfo>,
+}
+impl_slack_response!(TeamInfoResponse);
+
+#[derive(Debug, Deserialize)]
+struct TeamInfo {
+    icon: Option<TeamIcon>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamIcon {
+    image_68: Option<String>,
+    image_88: Option<String>,
+    image_132: Option<String>,
+    image_default: Option<bool>,
+}
 
 #[derive(Debug, Deserialize)]
 struct ClientUserBootResponse {

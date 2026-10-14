@@ -187,6 +187,10 @@ mod imp {
         #[template_child]
         pub navigation_toggle_group: TemplateChild<adw::ToggleGroup>,
         #[template_child]
+        pub workspace_avatar: TemplateChild<adw::Avatar>,
+        #[template_child]
+        pub threads_unread_badge: TemplateChild<gtk::Label>,
+        #[template_child]
         pub refresh_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub sidebar_filter_entry: TemplateChild<gtk::SearchEntry>,
@@ -332,6 +336,8 @@ mod imp {
         pub workspace_team_id: RefCell<Option<String>>,
         pub workspace_name: RefCell<Option<String>>,
         pub workspace_url: RefCell<Option<String>>,
+        /// Workspace icon source, loaded through the image asset cache.
+        pub workspace_icon_url: RefCell<Option<String>>,
         pub workspace_ready: Cell<bool>,
         // Cached data can make the workspace ready for routing before the initial live sync ends.
         pub initial_sync_complete: Cell<bool>,
@@ -882,6 +888,36 @@ label.mention-badge-pill {
   min-width: 10px;
   font-weight: bold;
   font-size: 0.8em;
+}
+.conduit-navigation-rail {
+  background-color: var(--headerbar-bg-color);
+  color: var(--headerbar-fg-color);
+  padding: 12px 6px;
+}
+.conduit-navigation-rail avatar.workspace-icon {
+  border-radius: 10px;
+}
+.conduit-navigation-rail toggle-group {
+  background: none;
+  box-shadow: none;
+}
+.conduit-navigation-rail toggle-group > button.toggle {
+  background: none;
+  box-shadow: none;
+  color: inherit;
+  min-width: 52px;
+  padding: 6px 2px;
+  border-radius: 10px;
+}
+.conduit-navigation-rail toggle-group > button.toggle:hover {
+  background-color: color-mix(in srgb, currentColor 12%, transparent);
+}
+.conduit-navigation-rail toggle-group > button.toggle:checked {
+  background-color: color-mix(in srgb, currentColor 22%, transparent);
+}
+.conduit-navigation-rail label.navigation-rail-badge {
+  margin-top: -4px;
+  margin-right: -4px;
 }
 "#;
 const MAX_COMPOSER_ATTACHMENTS: usize = 10;
@@ -3944,6 +3980,7 @@ impl ConduitWindow {
         if !advanced {
             return;
         }
+        self.refresh_threads_badge();
         self.send_command(RuntimeCommand::MarkThreadRead {
             channel_id: channel_id.to_string(),
             thread_ts: thread_ts.to_string(),
@@ -7131,6 +7168,7 @@ impl ConduitWindow {
                     .view
                     .borrow_mut()
                     .apply_followed_threads(keys, next_cursor, append);
+                self.refresh_threads_badge();
                 if visible {
                     self.populate_threads();
                 }
@@ -7159,6 +7197,11 @@ impl ConduitWindow {
             }
             RuntimeEventKind::EmojiCatalogLoaded(emojis) => self.replace_custom_emojis(emojis),
             RuntimeEventKind::WorkspaceThemeLoaded(theme) => self.apply_workspace_theme(&theme),
+            RuntimeEventKind::WorkspaceIconLoaded(url) => {
+                *self.imp().workspace_icon_url.borrow_mut() = Some(url.clone());
+                self.send_image_asset_requests(vec![(url.clone(), url.clone())]);
+                self.patch_image_asset(&url);
+            }
             RuntimeEventKind::ImageAssetLoaded { key, asset } => {
                 crate::debug::log(
                     "ui",
@@ -8862,6 +8905,10 @@ impl ConduitWindow {
         imp.pending_user_ids.borrow_mut().clear();
         *imp.workspace_name.borrow_mut() = None;
         *imp.workspace_url.borrow_mut() = None;
+        *imp.workspace_icon_url.borrow_mut() = None;
+        imp.workspace_avatar.set_text(None);
+        imp.workspace_avatar
+            .set_custom_image(None::<&gtk::gdk::Paintable>);
         *imp.sidebar_error.borrow_mut() = None;
         imp.image_assets.borrow_mut().clear();
         imp.conduit_assets.borrow_mut().set_workspace(None);
@@ -8918,6 +8965,10 @@ impl ConduitWindow {
             .or(auth.team_id)
             .unwrap_or_else(|| "Slack".to_string());
         *self.imp().workspace_name.borrow_mut() = Some(workspace_name.clone());
+        self.imp().workspace_avatar.set_text(Some(&workspace_name));
+        self.imp()
+            .workspace_avatar
+            .set_tooltip_text(Some(&workspace_name));
         self.refresh_workspace_title_status();
         self.set_status("");
         self.imp().content_stack.set_visible_child_name("workspace");
@@ -8925,6 +8976,52 @@ impl ConduitWindow {
         self.sync_workspace_chrome();
         self.render_workspace_lifecycle();
         self.activate_pending_navigation_intents();
+    }
+
+    /// Shows the workspace icon once its asset is cached; initials until then.
+    fn sync_workspace_icon(&self, key: &str) {
+        let imp = self.imp();
+        if imp.workspace_icon_url.borrow().as_deref() != Some(key) {
+            return;
+        }
+        let texture = imp
+            .image_assets
+            .borrow()
+            .get(key)
+            .and_then(|source| {
+                crate::timeline_message_widget::resolve_cached_asset_path(
+                    source.uri(),
+                    &MessageHtmlContext::default(),
+                )
+            })
+            .and_then(|path| crate::timeline_message_widget::get_or_load_texture(&path));
+        if let Some(texture) = texture {
+            imp.workspace_avatar
+                .set_custom_image(Some(texture.upcast_ref::<gtk::gdk::Paintable>()));
+        }
+    }
+
+    /// Unread-thread count on the Threads rail button: followed threads with
+    /// unread replies.
+    fn refresh_threads_badge(&self) {
+        let unread = {
+            let catalog = self.imp().workspace.threads.borrow();
+            self.followed_thread_roots()
+                .iter()
+                .filter(|(channel_id, root)| {
+                    catalog
+                        .get(channel_id, &root.ts)
+                        .is_some_and(|record| record.has_unread_replies())
+                })
+                .count()
+        };
+        let badge = &self.imp().threads_unread_badge;
+        badge.set_visible(unread > 0);
+        badge.set_label(&if unread > 99 {
+            "99+".to_string()
+        } else {
+            unread.to_string()
+        });
     }
 
     fn set_status(&self, status: &str) {
@@ -9270,6 +9367,7 @@ impl ConduitWindow {
     /// emoji or preview). Timelines re-render the affected rows in place, so
     /// scroll position and focus are kept; assets nothing shows are ignored.
     fn patch_image_asset(&self, key: &str) {
+        self.sync_workspace_icon(key);
         let avatar_user_ids = self
             .imp()
             .user_avatar_urls
@@ -9380,6 +9478,7 @@ impl ConduitWindow {
             self.refresh_unread_separators();
         }
         if application.thread_catalog_changed() {
+            self.refresh_threads_badge();
             // Sidebar thread sub-rows ("Thread (N responses) (M unread)")
             // are derived from the thread catalog independently of which
             // main view is active, so they need their own invalidation here.
