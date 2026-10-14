@@ -133,6 +133,11 @@ impl BoundedTextureCache {
             self.order.push_back(path);
         }
     }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
 }
 
 thread_local! {
@@ -147,6 +152,13 @@ thread_local! {
     // so this state cannot live on the transient widget - it must survive here,
     // keyed by a stable ts+index pair.
     static COLLAPSED_MEDIA: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+pub fn clear_timeline_view_caches() {
+    COLLAPSED_MEDIA.with(|set| set.borrow_mut().clear());
+    TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
+    REACTION_TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
+    crate::timeline_document_widget::clear_document_accent_cache();
 }
 
 /// Invokes the timeline action handler without holding the `RefCell` borrow:
@@ -815,6 +827,54 @@ impl NativeTimelineView {
                         bar.set_visible(false);
                     }
                 });
+        }
+
+        {
+            let scrolled_window_weak = scrolled_window.downgrade();
+            let bar_scroll = gtk::EventControllerScroll::new(
+                gtk::EventControllerScrollFlags::BOTH_AXES
+                    | gtk::EventControllerScrollFlags::DISCRETE
+                    | gtk::EventControllerScrollFlags::KINETIC,
+            );
+            bar_scroll.connect_scroll(move |controller, dx, dy| {
+                let Some(scroller) = scrolled_window_weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+
+                let unit = controller.unit();
+                let vadj = scroller.vadjustment();
+                let hadj = scroller.hadjustment();
+
+                let step_v = if unit == gtk::gdk::ScrollUnit::Wheel {
+                    vadj.step_increment().max(20.0)
+                } else {
+                    1.0
+                };
+                let step_h = if unit == gtk::gdk::ScrollUnit::Wheel {
+                    hadj.step_increment().max(20.0)
+                } else {
+                    1.0
+                };
+
+                if dy != 0.0 {
+                    let new_v = (vadj.value() + dy * step_v).clamp(
+                        vadj.lower(),
+                        (vadj.upper() - vadj.page_size()).max(vadj.lower()),
+                    );
+                    vadj.set_value(new_v);
+                }
+
+                if dx != 0.0 {
+                    let new_h = (hadj.value() + dx * step_h).clamp(
+                        hadj.lower(),
+                        (hadj.upper() - hadj.page_size()).max(hadj.lower()),
+                    );
+                    hadj.set_value(new_h);
+                }
+
+                glib::Propagation::Stop
+            });
+            quick_bar.add_controller(bar_scroll);
         }
 
         // --- Visibility-based automatic read-marking ---
@@ -3411,13 +3471,36 @@ pub(crate) mod tests {
         });
     }
 
+    struct TempTestDir(PathBuf);
+
+    impl TempTestDir {
+        fn new(prefix: &str) -> Self {
+            static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "conduit-media-test-{prefix}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn downloaded_document_image_renders_picture_fitted_to_media_box() {
         run_gtk_test(|| {
-            let dir =
-                std::env::temp_dir().join(format!("conduit-media-test-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            let path = dir.join("wide.png");
+            let temp_dir = TempTestDir::new("wide");
+            let path = temp_dir.path().join("wide.png");
             gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 960, 540)
                 .expect("pixbuf")
                 .savev(&path, "png", &[])
@@ -3449,8 +3532,6 @@ pub(crate) mod tests {
                 .expect("downloaded image renders a picture");
             assert_eq!(picture.size_request(), (480, 270));
             assert!(picture.has_css_class("timeline-media-image"));
-
-            let _ = std::fs::remove_dir_all(dir);
         });
     }
 
@@ -4580,6 +4661,32 @@ pub(crate) mod tests {
                 label.is_some(),
                 "expected Label for standard mention markup"
             );
+        });
+    }
+
+    #[test]
+    fn clear_timeline_view_caches_resets_thread_local_caches() {
+        run_gtk_test(|| {
+            set_media_collapsed("1700000000.000100", "file:0", true);
+            assert!(is_media_collapsed("1700000000.000100", "file:0"));
+
+            let pixbuf =
+                gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 8, 8).unwrap();
+            let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+            let path = PathBuf::from("/tmp/conduit-cache-test.png");
+            TEXTURE_CACHE.with(|cache| {
+                cache
+                    .borrow_mut()
+                    .insert(path.clone(), (None, texture.clone()))
+            });
+            REACTION_TEXTURE_CACHE
+                .with(|cache| cache.borrow_mut().insert(path.clone(), (None, texture)));
+
+            clear_timeline_view_caches();
+
+            assert!(!is_media_collapsed("1700000000.000100", "file:0"));
+            assert!(TEXTURE_CACHE.with(|cache| cache.borrow_mut().get(&path).is_none()));
+            assert!(REACTION_TEXTURE_CACHE.with(|cache| cache.borrow_mut().get(&path).is_none()));
         });
     }
 }
