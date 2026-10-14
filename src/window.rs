@@ -233,7 +233,17 @@ mod imp {
         #[template_child]
         pub thread_resize_handle: TemplateChild<gtk::Separator>,
         #[template_child]
-        pub message_composer_resize_handle: TemplateChild<gtk::Separator>,
+        pub message_format_revealer: TemplateChild<gtk::Revealer>,
+        #[template_child]
+        pub message_format_toggle: TemplateChild<gtk::ToggleButton>,
+        #[template_child]
+        pub message_emoji_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub message_mention_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub message_slash_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub message_placeholder: TemplateChild<gtk::Label>,
         #[template_child]
         pub message_scrolled_window: TemplateChild<gtk::ScrolledWindow>,
         #[template_child]
@@ -279,7 +289,17 @@ mod imp {
         #[template_child]
         pub thread_view_box: TemplateChild<gtk::Box>,
         #[template_child]
-        pub thread_composer_resize_handle: TemplateChild<gtk::Separator>,
+        pub thread_format_revealer: TemplateChild<gtk::Revealer>,
+        #[template_child]
+        pub thread_format_toggle: TemplateChild<gtk::ToggleButton>,
+        #[template_child]
+        pub thread_emoji_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub thread_mention_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub thread_slash_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub thread_placeholder: TemplateChild<gtk::Label>,
         #[template_child]
         pub thread_scrolled_window: TemplateChild<gtk::ScrolledWindow>,
         #[template_child]
@@ -433,7 +453,7 @@ mod imp {
             obj.setup_settings();
             obj.setup_sidebar_list();
             obj.setup_callbacks();
-            obj.setup_composer_resizing();
+            obj.setup_composer_cards();
             if std::env::var_os("CONDUIT_TEST_WORKSPACE").is_some() {
                 let huddle_test = std::env::var_os("CONDUIT_TEST_HUDDLE").is_some();
                 let status_test = std::env::var_os("CONDUIT_TEST_STATUS_DIALOG").is_some();
@@ -839,8 +859,9 @@ const COMPOSER_BULLETED_LIST_TAG: &str = "composer-bulleted-list";
 const COMPOSER_NUMBERED_LIST_TAG: &str = "composer-numbered-list";
 const COMPOSER_QUOTE_TAG: &str = "composer-quote";
 const COMPOSER_PREFORMATTED_TAG: &str = "composer-preformatted";
-const COMPOSER_DEFAULT_MIN_HEIGHT: i32 = 42;
-const COMPOSER_DEFAULT_MAX_HEIGHT: i32 = 132;
+const COMPOSER_MIN_CONTENT_HEIGHT: i32 = 34;
+/// Cap used until the hosting pane has been allocated.
+const COMPOSER_FALLBACK_MAX_HEIGHT: i32 = 132;
 const COMPOSER_FORMAT_CONTROL_SIZE: i32 = 34;
 const COMPOSER_FORMAT_CONTROL_SPACING: i32 = 2;
 const COMPOSER_FORMAT_CONTROL_CSS: &str = r#"
@@ -851,14 +872,47 @@ menubutton.composer-format-control > button {
   min-height: 0;
   padding: 0;
 }
-separator.composer-resize-handle {
-  min-height: 6px;
-  margin-top: 2px;
-  margin-bottom: 2px;
-  border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+.composer-card {
+  background-color: @view_bg_color;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: 8px;
+  padding: 6px 6px 4px 6px;
 }
-separator.composer-resize-handle:hover {
-  border-top: 2px solid @accent_color;
+.composer-card:focus-within {
+  border-color: @accent_color;
+}
+.composer-card scrolledwindow,
+.composer-card textview,
+.composer-card textview > text {
+  background: transparent;
+  color: inherit;
+}
+.composer-card button.composer-action {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 6px;
+}
+.composer-card button.composer-send {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 6px;
+  background: transparent;
+  color: color-mix(in srgb, currentColor 40%, transparent);
+}
+.composer-card button.composer-send.composer-send-ready {
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
+}
+.composer-card button.composer-send.message-edit-action {
+  background-color: @success_bg_color;
+  color: @success_fg_color;
+}
+.composer-card progressbar.composer-progress {
+  margin-top: 4px;
+}
+.composer-card progressbar.composer-progress trough,
+.composer-card progressbar.composer-progress progress {
+  min-height: 3px;
 }
 button.message-edit-action {
   background-color: @success_bg_color;
@@ -1028,7 +1082,6 @@ enum ComposerFormatAction {
     NumberedList,
     Quote,
     CodeBlock,
-    Emoji,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1084,11 +1137,6 @@ fn composer_format_controls() -> &'static [ComposerFormatControl] {
             action: ComposerFormatAction::CodeBlock,
             label: "```",
             accessible_name: "Code block",
-        },
-        ComposerFormatControl {
-            action: ComposerFormatAction::Emoji,
-            label: "☺",
-            accessible_name: "Emoji",
         },
     ]
 }
@@ -3130,10 +3178,6 @@ impl ConduitWindow {
             .update_property(&[gtk::accessible::Property::Label("Reply")]);
         imp.thread_resize_handle
             .update_property(&[gtk::accessible::Property::Label("Resize thread pane")]);
-        imp.message_composer_resize_handle
-            .update_property(&[gtk::accessible::Property::Label("Resize composer")]);
-        imp.thread_composer_resize_handle
-            .update_property(&[gtk::accessible::Property::Label("Resize reply composer")]);
         imp.message_search_entry
             .update_property(&[gtk::accessible::Property::Label(
                 "Search workspace messages",
@@ -4922,115 +4966,189 @@ impl ConduitWindow {
         }
     }
 
-    fn reset_composer_height(&self, target: ComposerTarget) {
-        let scrolled = self.composer_scrolled_window(target);
-        scrolled.set_min_content_height(COMPOSER_DEFAULT_MIN_HEIGHT);
-        scrolled.set_max_content_height(COMPOSER_DEFAULT_MAX_HEIGHT);
-    }
-
-    fn reset_all_composer_heights(&self) {
-        self.reset_composer_height(ComposerTarget::Message);
-        self.reset_composer_height(ComposerTarget::Thread);
-    }
-
-    fn setup_composer_resizing(&self) {
-        self.setup_single_composer_resizing(ComposerTarget::Message);
-        self.setup_single_composer_resizing(ComposerTarget::Thread);
-    }
-
-    fn set_composer_fixed_height(scrolled: &gtk::ScrolledWindow, height: i32) {
-        if height > scrolled.max_content_height() {
-            scrolled.set_max_content_height(height);
-            scrolled.set_min_content_height(height);
-        } else {
-            scrolled.set_min_content_height(height);
-            scrolled.set_max_content_height(height);
+    fn composer_pane(&self, target: ComposerTarget) -> gtk::Box {
+        match target {
+            ComposerTarget::Message => self.imp().message_pane.get(),
+            ComposerTarget::Thread => self.imp().thread_pane.get(),
         }
     }
 
-    fn setup_single_composer_resizing(&self, target: ComposerTarget) {
-        let (handle, scrolled) = match target {
+    fn composer_placeholder(&self, target: ComposerTarget) -> gtk::Label {
+        match target {
+            ComposerTarget::Message => self.imp().message_placeholder.get(),
+            ComposerTarget::Thread => self.imp().thread_placeholder.get(),
+        }
+    }
+
+    fn setup_composer_cards(&self) {
+        self.setup_composer_card(ComposerTarget::Message);
+        self.setup_composer_card(ComposerTarget::Thread);
+        self.setup_composer_height_cap();
+        let weak_window = self.downgrade();
+        self.imp().message_title.connect_title_notify(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.refresh_composer_placeholders();
+            }
+        });
+        self.refresh_composer_placeholders();
+    }
+
+    fn setup_composer_card(&self, target: ComposerTarget) {
+        let imp = self.imp();
+        let (toggle, revealer, emoji, mention, slash) = match target {
             ComposerTarget::Message => (
-                self.imp().message_composer_resize_handle.get(),
-                self.imp().message_scrolled_window.get(),
+                imp.message_format_toggle.get(),
+                imp.message_format_revealer.get(),
+                imp.message_emoji_button.get(),
+                imp.message_mention_button.get(),
+                imp.message_slash_button.get(),
             ),
             ComposerTarget::Thread => (
-                self.imp().thread_composer_resize_handle.get(),
-                self.imp().thread_scrolled_window.get(),
+                imp.thread_format_toggle.get(),
+                imp.thread_format_revealer.get(),
+                imp.thread_emoji_button.get(),
+                imp.thread_mention_button.get(),
+                imp.thread_slash_button.get(),
             ),
         };
+        toggle
+            .bind_property("active", &revealer, "reveal-child")
+            .sync_create()
+            .build();
+        toggle.update_property(&[gtk::accessible::Property::Label(&gettext("Formatting"))]);
+        emoji.update_property(&[gtk::accessible::Property::Label(&gettext("Emoji"))]);
+        mention.update_property(&[gtk::accessible::Property::Label(&gettext("Mention"))]);
+        slash.update_property(&[gtk::accessible::Property::Label(&gettext("Slash command"))]);
 
-        handle.set_cursor_from_name(Some("row-resize"));
-
-        let initial_height = Rc::new(Cell::new(0));
-        let initial_win_y = Rc::new(Cell::new(0.0));
-        let drag = gtk::GestureDrag::new();
-        let begin_initial_height = initial_height.clone();
-        let begin_initial_win_y = initial_win_y.clone();
-        let target_scrolled = scrolled.clone();
-        let begin_handle = handle.clone();
-        let weak_window_begin = self.downgrade();
-
-        drag.connect_drag_begin(move |_, start_x, start_y| {
-            let Some(window) = weak_window_begin.upgrade() else {
-                return;
-            };
-            begin_initial_height.set(target_scrolled.height());
-            let point = gtk::graphene::Point::new(start_x as f32, start_y as f32);
-            if let Some(win_point) = begin_handle.compute_point(&window, &point) {
-                begin_initial_win_y.set(f64::from(win_point.y()));
+        let weak_window = self.downgrade();
+        emoji.connect_clicked(move |button| {
+            if let Some(window) = weak_window.upgrade() {
+                window.popup_composer_emoji(target, button);
+            }
+        });
+        let weak_window = self.downgrade();
+        mention.connect_clicked(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.insert_composer_trigger(target, '@');
+            }
+        });
+        let weak_window = self.downgrade();
+        slash.connect_clicked(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                window.insert_composer_trigger(target, '/');
             }
         });
 
-        let weak_window_update = self.downgrade();
-        let update_initial_height = initial_height;
-        let update_initial_win_y = initial_win_y;
-        let update_scrolled = scrolled.clone();
-        let update_handle = handle.clone();
-        drag.connect_drag_update(move |gesture, _, offset_y| {
-            let Some(window) = weak_window_update.upgrade() else {
-                return;
-            };
-            let start_h = update_initial_height.get();
-            let start_win_y = update_initial_win_y.get();
-            let delta_y =
-                if let Some((cur_x, cur_y)) = gesture.point(gesture.current_sequence().as_ref()) {
-                    let cur_point = gtk::graphene::Point::new(cur_x as f32, cur_y as f32);
-                    if let Some(win_point) = update_handle.compute_point(&window, &cur_point) {
-                        f64::from(win_point.y()) - start_win_y
-                    } else {
-                        offset_y
-                    }
-                } else {
-                    offset_y
-                };
-            let new_h = (f64::from(start_h) - delta_y).round() as i32;
-            let max_h = (window.height() * 3 / 4).max(COMPOSER_DEFAULT_MAX_HEIGHT);
-            let clamped = new_h.clamp(COMPOSER_DEFAULT_MIN_HEIGHT, max_h);
-            Self::set_composer_fixed_height(&update_scrolled, clamped);
-        });
+        let weak_window = self.downgrade();
+        self.composer_text_view(target)
+            .buffer()
+            .connect_changed(move |_| {
+                if let Some(window) = weak_window.upgrade() {
+                    window.refresh_composer_card(target);
+                }
+            });
+        self.refresh_composer_card(target);
+    }
 
-        handle.add_controller(drag);
+    /// Inserts a completion trigger (`@` or `/`) at the caret and refocuses the
+    /// composer so the existing completion popover takes over.
+    fn insert_composer_trigger(&self, target: ComposerTarget, trigger: char) {
+        let text_view = self.composer_text_view(target);
+        let buffer = text_view.buffer();
+        match trigger {
+            '/' => {
+                if buffer.char_count() == 0 {
+                    buffer.insert_at_cursor("/");
+                }
+            }
+            _ => {
+                let mut previous = buffer.iter_at_offset(buffer.cursor_position());
+                let needs_space = previous.backward_char() && !previous.char().is_whitespace();
+                if needs_space {
+                    buffer.insert_at_cursor(" ");
+                }
+                buffer.insert_at_cursor(&trigger.to_string());
+            }
+        }
+        text_view.grab_focus();
+    }
 
-        let keys = gtk::EventControllerKey::new();
-        let weak_window_keys = self.downgrade();
-        let key_scrolled = scrolled;
-        keys.connect_key_pressed(move |_, key, _, _| {
-            let step = match key {
-                gtk::gdk::Key::Up => 24,
-                gtk::gdk::Key::Down => -24,
-                _ => return glib::Propagation::Proceed,
+    /// Syncs the placeholder visibility and the send button's "ready" look with
+    /// the draft contents.
+    fn refresh_composer_card(&self, target: ComposerTarget) {
+        let has_text = self.composer_text_view(target).buffer().char_count() > 0;
+        self.composer_placeholder(target).set_visible(!has_text);
+        let has_attachments = !self.composer_attachments(target).borrow().is_empty();
+        let send_button = self.composer_send_button(target);
+        if has_text || has_attachments {
+            send_button.add_css_class("composer-send-ready");
+        } else {
+            send_button.remove_css_class("composer-send-ready");
+        }
+    }
+
+    fn refresh_composer_placeholders(&self) {
+        let message = if self.message_edit_target() == Some(ComposerTarget::Message) {
+            gettext("Edit message")
+        } else if self.current_main_view() == MainMessageView::Conversation {
+            match self.visible_channel_id() {
+                Some(channel_id) => gettext("Message {name}")
+                    .replace("{name}", &self.conversation_title(&channel_id)),
+                None => gettext("Message"),
+            }
+        } else {
+            gettext("Message")
+        };
+        self.composer_placeholder(ComposerTarget::Message)
+            .set_text(&message);
+        let reply = if self.message_edit_target() == Some(ComposerTarget::Thread) {
+            gettext("Edit reply")
+        } else {
+            gettext("Reply...")
+        };
+        self.composer_placeholder(ComposerTarget::Thread)
+            .set_text(&reply);
+    }
+
+    /// Caps each composer at two thirds of its hosting pane. The cap is
+    /// applied from an idle, after layout, so it never changes during the
+    /// composer's own allocation.
+    fn setup_composer_height_cap(&self) {
+        let weak_window = self.downgrade();
+        let schedule = move || {
+            let weak_window = weak_window.clone();
+            glib::idle_add_local_full(glib::Priority::DEFAULT_IDLE, move || {
+                if let Some(window) = weak_window.upgrade() {
+                    window.update_composer_max_heights();
+                }
+                glib::ControlFlow::Break
+            });
+        };
+        let notify = schedule.clone();
+        self.connect_default_height_notify(move |_| notify());
+        let notify = schedule.clone();
+        self.connect_maximized_notify(move |_| notify());
+        let notify = schedule.clone();
+        self.connect_fullscreened_notify(move |_| notify());
+        for target in [ComposerTarget::Message, ComposerTarget::Thread] {
+            let notify = schedule.clone();
+            self.composer_pane(target).connect_map(move |_| notify());
+        }
+    }
+
+    fn update_composer_max_heights(&self) {
+        for target in [ComposerTarget::Message, ComposerTarget::Thread] {
+            let pane_height = self.composer_pane(target).height();
+            let cap = if pane_height > 0 {
+                (pane_height * 2 / 3).max(COMPOSER_MIN_CONTENT_HEIGHT)
+            } else {
+                COMPOSER_FALLBACK_MAX_HEIGHT
             };
-            let Some(window) = weak_window_keys.upgrade() else {
-                return glib::Propagation::Proceed;
-            };
-            let current = key_scrolled.height();
-            let max_h = (window.height() * 3 / 4).max(COMPOSER_DEFAULT_MAX_HEIGHT);
-            let clamped = (current + step).clamp(COMPOSER_DEFAULT_MIN_HEIGHT, max_h);
-            Self::set_composer_fixed_height(&key_scrolled, clamped);
-            glib::Propagation::Stop
-        });
-        handle.add_controller(keys);
+            let scrolled = self.composer_scrolled_window(target);
+            if scrolled.max_content_height() != cap {
+                scrolled.set_max_content_height(cap);
+            }
+        }
     }
 
     fn composer_attachments(
@@ -5113,6 +5231,7 @@ impl ConduitWindow {
     }
 
     fn sync_message_edit_presentation(&self, target: ComposerTarget, editing: bool) {
+        self.refresh_composer_placeholders();
         let imp = self.imp();
         match target {
             ComposerTarget::Message => {
@@ -5416,6 +5535,7 @@ impl ConduitWindow {
         }
         let attachments = self.composer_attachments(target).borrow().clone();
         host.set_visible(!attachments.is_empty());
+        self.refresh_composer_card(target);
         for attachment in attachments {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             row.add_css_class("card");
@@ -5517,7 +5637,6 @@ impl ConduitWindow {
             ComposerFormatAction::NumberedList => Some(COMPOSER_NUMBERED_LIST_TAG),
             ComposerFormatAction::Quote => Some(COMPOSER_QUOTE_TAG),
             ComposerFormatAction::CodeBlock => Some(COMPOSER_PREFORMATTED_TAG),
-            ComposerFormatAction::Emoji => None,
         }
     }
 
@@ -5538,7 +5657,6 @@ impl ConduitWindow {
                 | ComposerFormatAction::NumberedList
                 | ComposerFormatAction::Quote
                 | ComposerFormatAction::CodeBlock
-                | ComposerFormatAction::Emoji
         )
     }
 
@@ -5686,27 +5804,6 @@ impl ConduitWindow {
         host.remove(&overflow);
 
         for control in composer_format_controls() {
-            if control.action == ComposerFormatAction::Emoji {
-                let button = gtk::Button::with_label(control.label);
-                configure_composer_format_control(&button);
-                button.add_css_class("flat");
-                button.set_tooltip_text(Some(&gettext(control.accessible_name)));
-                button.update_property(&[gtk::accessible::Property::Label(&gettext(
-                    control.accessible_name,
-                ))]);
-                let weak_window = self.downgrade();
-                button.connect_clicked(move |button| {
-                    if let Some(window) = weak_window.upgrade() {
-                        window.popup_composer_emoji(target, button);
-                    }
-                });
-                host.append(&button);
-                if Self::composer_overflow_action(control.action) {
-                    collapsed_widgets.push(button.upcast::<gtk::Widget>());
-                }
-                continue;
-            }
-
             let button = gtk::ToggleButton::with_label(control.label);
             configure_composer_format_control(&button);
             button.add_css_class("flat");
@@ -5751,14 +5848,7 @@ impl ConduitWindow {
             button.update_property(&[gtk::accessible::Property::Label(&gettext(
                 control.accessible_name,
             ))]);
-            if control.action == ComposerFormatAction::Emoji {
-                let weak_window = self.downgrade();
-                button.connect_clicked(move |button| {
-                    if let Some(window) = weak_window.upgrade() {
-                        window.popup_composer_emoji(target, button);
-                    }
-                });
-            } else {
+            {
                 let weak_window = self.downgrade();
                 let popover = overflow_popover.clone();
                 let action = control.action;
@@ -5977,7 +6067,6 @@ impl ConduitWindow {
                 }
                 ComposerFormatAction::Quote => block == Some(ComposerBlockKind::Quote),
                 ComposerFormatAction::CodeBlock => block == Some(ComposerBlockKind::Preformatted),
-                ComposerFormatAction::Emoji => false,
             };
             button.set_active(active);
         }
@@ -8377,7 +8466,6 @@ impl ConduitWindow {
             .view
             .borrow_mut()
             .open_thread(channel_id, ts);
-        self.reset_all_composer_heights();
         self.restore_thread_draft(channel_id, ts);
         match outcome {
             ThreadOpenOutcome::RenderCurrent => {
@@ -11757,7 +11845,6 @@ impl ConduitWindow {
         self.sync_message_title_profile_action();
         self.restore_channel_draft(channel_id);
         self.set_composer_canonical_text(ComposerTarget::Thread, "");
-        self.reset_all_composer_heights();
         self.close_thread_pane();
         imp.workspace_split.set_show_content(true);
         self.render_conversations();
@@ -13223,7 +13310,6 @@ impl ConduitWindow {
     }
 
     fn close_thread_pane(&self) {
-        self.reset_all_composer_heights();
         self.timeline_presenter(TimelineSurface::Thread)
             .borrow_mut()
             .reset();
@@ -16476,7 +16562,6 @@ mod tests {
                 "Numbered list",
                 "Quote",
                 "Code block",
-                "Emoji",
             ]
         );
 
@@ -16627,55 +16712,61 @@ mod tests {
     }
 
     #[test]
-    fn composer_supports_resizing_and_resets_on_navigation_or_thread_lifecycle() {
+    fn composer_is_a_card_with_auto_height_and_no_resize_handle() {
         let template = include_str!("window.ui");
         for required in [
-            "GtkSeparator\" id=\"message_composer_resize_handle",
-            "GtkSeparator\" id=\"thread_composer_resize_handle",
+            "GtkRevealer\" id=\"message_format_revealer",
+            "GtkRevealer\" id=\"thread_format_revealer",
+            "GtkToggleButton\" id=\"message_format_toggle",
+            "GtkToggleButton\" id=\"thread_format_toggle",
+            "GtkButton\" id=\"message_emoji_button",
+            "GtkButton\" id=\"message_mention_button",
+            "GtkButton\" id=\"message_slash_button",
+            "GtkButton\" id=\"thread_emoji_button",
+            "GtkButton\" id=\"thread_mention_button",
+            "GtkButton\" id=\"thread_slash_button",
+            "GtkLabel\" id=\"message_placeholder",
+            "GtkLabel\" id=\"thread_placeholder",
             "GtkScrolledWindow\" id=\"message_scrolled_window",
             "GtkScrolledWindow\" id=\"thread_scrolled_window",
-            "class name=\"composer-resize-handle\"",
+            "class name=\"composer-card\"",
+            "property name=\"propagate-natural-height\">True",
         ] {
             assert!(
                 template.contains(required),
-                "missing composer resize UI {required}"
+                "missing composer card UI {required}"
             );
         }
+        assert!(!template.contains("composer_resize_handle"));
+        assert!(!template.contains("composer-resize-handle"));
 
-        assert_eq!(COMPOSER_DEFAULT_MIN_HEIGHT, 42);
-        assert_eq!(COMPOSER_DEFAULT_MAX_HEIGHT, 132);
+        let revealer = template
+            .find("id=\"message_format_revealer")
+            .expect("format revealer should exist");
+        let toolbar = template
+            .find("id=\"message_format_toolbar")
+            .expect("format toolbar should exist");
+        let entry = template
+            .find("id=\"message_entry")
+            .expect("message entry should exist");
+        assert!(revealer < toolbar && toolbar < entry);
+
+        assert_eq!(COMPOSER_MIN_CONTENT_HEIGHT, 34);
+        assert_eq!(COMPOSER_FALLBACK_MAX_HEIGHT, 132);
+        assert!(COMPOSER_FORMAT_CONTROL_CSS.contains(".composer-card:focus-within"));
+        assert!(!COMPOSER_FORMAT_CONTROL_CSS.contains("composer-resize-handle"));
 
         let source = include_str!("window.rs");
-        let resize_setup = source
-            .split_once("fn setup_single_composer_resizing")
+        assert!(!source.contains(concat!("fn setup_single", "_composer_resizing")));
+        assert!(!source.contains(concat!("fn reset_all", "_composer_heights")));
+
+        let cap = source
+            .split_once("fn update_composer_max_heights")
             .and_then(|(_, source)| source.split_once("fn composer_attachments"))
             .map(|(source, _)| source)
-            .expect("composer resize setup should be bounded");
-        assert!(resize_setup.contains("row-resize"));
-        assert!(resize_setup.contains("connect_drag_update"));
-        assert!(resize_setup.contains("connect_drag_begin"));
-        assert!(resize_setup.contains("COMPOSER_DEFAULT_MIN_HEIGHT"));
-
-        let select_conv = source
-            .split_once("fn select_conversation_target")
-            .and_then(|(_, source)| source.split_once("match outcome.decision"))
-            .map(|(source, _)| source)
-            .expect("select_conversation_target should be bounded");
-        assert!(select_conv.contains("self.reset_all_composer_heights()"));
-
-        let open_thread = source
-            .split_once("fn open_thread")
-            .and_then(|(_, source)| source.split_once("match outcome"))
-            .map(|(source, _)| source)
-            .expect("open_thread should be bounded");
-        assert!(open_thread.contains("self.reset_all_composer_heights()"));
-
-        let close_pane = source
-            .split_once("fn close_thread_pane")
-            .and_then(|(_, source)| source.split_once("fn show_thread_placeholder"))
-            .map(|(source, _)| source)
-            .expect("close_thread_pane should be bounded");
-        assert!(close_pane.contains("self.reset_all_composer_heights()"));
+            .expect("composer height cap should be bounded");
+        assert!(cap.contains("* 2 / 3"));
+        assert!(cap.contains("max_content_height() != cap"));
     }
 
     #[test]

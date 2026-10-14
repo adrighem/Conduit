@@ -680,37 +680,35 @@
                                     <child>
                                       <object class="GtkBox" id="message_composer">
                                         <property name="orientation">vertical</property>
-                                        <property name="spacing">4</property>
+                                        <property name="spacing">0</property>
                                         <property name="visible">False</property>
+                                        <style>
+                                          <class name="composer-card"/>
+                                        </style>
                                         <child>
-                                          <object class="GtkSeparator" id="message_composer_resize_handle">
-                                            <property name="orientation">horizontal</property>
-                                            <property name="valign">start</property>
-                                            <property name="focusable">True</property>
-                                            <property name="tooltip-text" translatable="yes">Resize Composer</property>
-                                            <style>
-                                              <class name="composer-resize-handle"/>
-                                            </style>
-                                          </object>
-                                        </child>
-                                        <child>
-                                          <object class="AdwBreakpointBin" id="message_format_breakpoint">
+                                          <object class="GtkRevealer" id="message_format_revealer">
+                                            <property name="reveal-child">False</property>
+                                            <property name="transition-type">slide-down</property>
                                             <property name="child">
-                                              <object class="GtkBox" id="message_format_toolbar">
-                                                <property name="orientation">horizontal</property>
-                                                <property name="spacing">2</property>
-                                                <property name="halign">start</property>
-                                                <property name="accessible-role">toolbar</property>
-                                                <child>
-                                                  <object class="GtkMenuButton" id="message_format_overflow">
-                                                    <property name="icon-name">view-more-symbolic</property>
-                                                    <property name="tooltip-text" translatable="yes">More formatting</property>
-                                                    <property name="visible">False</property>
-                                                    <style>
-                                                      <class name="flat"/>
-                                                    </style>
+                                              <object class="AdwBreakpointBin" id="message_format_breakpoint">
+                                                <property name="child">
+                                                  <object class="GtkBox" id="message_format_toolbar">
+                                                    <property name="orientation">horizontal</property>
+                                                    <property name="spacing">2</property>
+                                                    <property name="halign">start</property>
+                                                    <property name="accessible-role">toolbar</property>
+                                                    <child>
+                                                      <object class="GtkMenuButton" id="message_format_overflow">
+                                                        <property name="icon-name">view-more-symbolic</property>
+                                                        <property name="tooltip-text" translatable="yes">More formatting</property>
+                                                        <property name="visible">False</property>
+                                                        <style>
+                                                          <class name="flat"/>
+                                                        </style>
+                                                      </object>
+                                                    </child>
                                                   </object>
-                                                </child>
+                                                </property>
                                               </object>
                                             </property>
                                           </object>
@@ -726,13 +724,13 @@
                                           </object>
                                         </child>
                                         <child>
-                                          <object class="GtkBox">
-                                            <property name="orientation">horizontal</property>
-                                            <property name="spacing">6</property>
-                                            <child>
+                                          <object class="GtkOverlay">
+                                            <property name="child">
                                               <object class="GtkScrolledWindow" id="message_scrolled_window">
                                                 <property name="hexpand">True</property>
-                                                <property name="min-content-height">42</property>
+                                                <property name="hscrollbar-policy">never</property>
+                                                <property name="propagate-natural-height">True</property>
+                                                <property name="min-content-height">34</property>
                                                 <property name="max-content-height">132</property>
                                                 <property name="child">
                                                   <object class="GtkTextView" id="message_entry">
@@ -748,18 +746,86 @@
                                                   </object>
                                                 </property>
                                               </object>
+                                            </property>
+                                            <child type="overlay">
+                                              <object class="GtkLabel" id="message_placeholder">
+                                                <property name="halign">start</property>
+                                                <property name="valign">start</property>
+                                                <property name="margin-top">7</property>
+                                                <property name="margin-start">8</property>
+                                                <property name="can-target">False</property>
+                                                <property name="ellipsize">end</property>
+                                                <style>
+                                                  <class name="dim-label"/>
+                                                </style>
+                                              </object>
                                             </child>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkBox">
+                                            <property name="orientation">horizontal</property>
+                                            <property name="spacing">2</property>
+                                            <property name="margin-top">2</property>
                                             <child>
                                               <object class="GtkButton" id="upload_button">
-                                                <property name="icon-name">mail-attachment-symbolic</property>
+                                                <property name="icon-name">list-add-symbolic</property>
                                                 <property name="tooltip-text" translatable="yes">Add Attachment</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-action"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkToggleButton" id="message_format_toggle">
+                                                <property name="label">Aa</property>
+                                                <property name="tooltip-text" translatable="yes">Show Formatting</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-action"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkButton" id="message_emoji_button">
+                                                <property name="icon-name">face-smile-symbolic</property>
+                                                <property name="tooltip-text" translatable="yes">Emoji</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-action"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkButton" id="message_mention_button">
+                                                <property name="label">@</property>
+                                                <property name="tooltip-text" translatable="yes">Mention Someone</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-action"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkButton" id="message_slash_button">
+                                                <property name="label">/</property>
+                                                <property name="tooltip-text" translatable="yes">Slash Command</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-action"/>
+                                                </style>
                                               </object>
                                             </child>
                                             <child>
                                               <object class="GtkButton" id="send_button">
+                                                <property name="hexpand">True</property>
+                                                <property name="halign">end</property>
                                                 <property name="icon-name">mail-send-symbolic</property>
                                                 <property name="tooltip-text" translatable="yes">Send Message</property>
                                                 <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-send"/>
                                                   <class name="suggested-action"/>
                                                 </style>
                                               </object>
@@ -769,7 +835,10 @@
                                         <child>
                                           <object class="GtkProgressBar" id="upload_progress">
                                             <property name="visible">False</property>
-                                            <property name="show-text">True</property>
+                                            <property name="show-text">False</property>
+                                            <style>
+                                              <class name="composer-progress"/>
+                                            </style>
                                           </object>
                                         </child>
                                       </object>
@@ -817,36 +886,34 @@
                                     <child>
                                       <object class="GtkBox" id="thread_composer">
                                         <property name="orientation">vertical</property>
-                                        <property name="spacing">4</property>
+                                        <property name="spacing">0</property>
+                                        <style>
+                                          <class name="composer-card"/>
+                                        </style>
                                         <child>
-                                          <object class="GtkSeparator" id="thread_composer_resize_handle">
-                                            <property name="orientation">horizontal</property>
-                                            <property name="valign">start</property>
-                                            <property name="focusable">True</property>
-                                            <property name="tooltip-text" translatable="yes">Resize Reply Composer</property>
-                                            <style>
-                                              <class name="composer-resize-handle"/>
-                                            </style>
-                                          </object>
-                                        </child>
-                                        <child>
-                                          <object class="AdwBreakpointBin" id="thread_format_breakpoint">
+                                          <object class="GtkRevealer" id="thread_format_revealer">
+                                            <property name="reveal-child">False</property>
+                                            <property name="transition-type">slide-down</property>
                                             <property name="child">
-                                              <object class="GtkBox" id="thread_format_toolbar">
-                                                <property name="orientation">horizontal</property>
-                                                <property name="spacing">2</property>
-                                                <property name="halign">start</property>
-                                                <property name="accessible-role">toolbar</property>
-                                                <child>
-                                                  <object class="GtkMenuButton" id="thread_format_overflow">
-                                                    <property name="icon-name">view-more-symbolic</property>
-                                                    <property name="tooltip-text" translatable="yes">More formatting</property>
-                                                    <property name="visible">False</property>
-                                                    <style>
-                                                      <class name="flat"/>
-                                                    </style>
+                                              <object class="AdwBreakpointBin" id="thread_format_breakpoint">
+                                                <property name="child">
+                                                  <object class="GtkBox" id="thread_format_toolbar">
+                                                    <property name="orientation">horizontal</property>
+                                                    <property name="spacing">2</property>
+                                                    <property name="halign">start</property>
+                                                    <property name="accessible-role">toolbar</property>
+                                                    <child>
+                                                      <object class="GtkMenuButton" id="thread_format_overflow">
+                                                        <property name="icon-name">view-more-symbolic</property>
+                                                        <property name="tooltip-text" translatable="yes">More formatting</property>
+                                                        <property name="visible">False</property>
+                                                        <style>
+                                                          <class name="flat"/>
+                                                        </style>
+                                                      </object>
+                                                    </child>
                                                   </object>
-                                                </child>
+                                                </property>
                                               </object>
                                             </property>
                                           </object>
@@ -862,13 +929,13 @@
                                           </object>
                                         </child>
                                         <child>
-                                          <object class="GtkBox">
-                                            <property name="orientation">horizontal</property>
-                                            <property name="spacing">6</property>
-                                            <child>
+                                          <object class="GtkOverlay">
+                                            <property name="child">
                                               <object class="GtkScrolledWindow" id="thread_scrolled_window">
                                                 <property name="hexpand">True</property>
-                                                <property name="min-content-height">42</property>
+                                                <property name="hscrollbar-policy">never</property>
+                                                <property name="propagate-natural-height">True</property>
+                                                <property name="min-content-height">34</property>
                                                 <property name="max-content-height">132</property>
                                                 <property name="child">
                                                   <object class="GtkTextView" id="thread_entry">
@@ -884,18 +951,86 @@
                                                   </object>
                                                 </property>
                                               </object>
+                                            </property>
+                                            <child type="overlay">
+                                              <object class="GtkLabel" id="thread_placeholder">
+                                                <property name="halign">start</property>
+                                                <property name="valign">start</property>
+                                                <property name="margin-top">7</property>
+                                                <property name="margin-start">8</property>
+                                                <property name="can-target">False</property>
+                                                <property name="ellipsize">end</property>
+                                                <style>
+                                                  <class name="dim-label"/>
+                                                </style>
+                                              </object>
                                             </child>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkBox">
+                                            <property name="orientation">horizontal</property>
+                                            <property name="spacing">2</property>
+                                            <property name="margin-top">2</property>
                                             <child>
                                               <object class="GtkButton" id="thread_upload_button">
-                                                <property name="icon-name">mail-attachment-symbolic</property>
+                                                <property name="icon-name">list-add-symbolic</property>
                                                 <property name="tooltip-text" translatable="yes">Add Attachment</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-action"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkToggleButton" id="thread_format_toggle">
+                                                <property name="label">Aa</property>
+                                                <property name="tooltip-text" translatable="yes">Show Formatting</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-action"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkButton" id="thread_emoji_button">
+                                                <property name="icon-name">face-smile-symbolic</property>
+                                                <property name="tooltip-text" translatable="yes">Emoji</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-action"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkButton" id="thread_mention_button">
+                                                <property name="label">@</property>
+                                                <property name="tooltip-text" translatable="yes">Mention Someone</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-action"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkButton" id="thread_slash_button">
+                                                <property name="label">/</property>
+                                                <property name="tooltip-text" translatable="yes">Slash Command</property>
+                                                <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-action"/>
+                                                </style>
                                               </object>
                                             </child>
                                             <child>
                                               <object class="GtkButton" id="thread_send_button">
+                                                <property name="hexpand">True</property>
+                                                <property name="halign">end</property>
                                                 <property name="icon-name">mail-send-symbolic</property>
                                                 <property name="tooltip-text" translatable="yes">Send Reply</property>
                                                 <style>
+                                                  <class name="flat"/>
+                                                  <class name="composer-send"/>
                                                   <class name="suggested-action"/>
                                                 </style>
                                               </object>
@@ -905,7 +1040,10 @@
                                         <child>
                                           <object class="GtkProgressBar" id="thread_upload_progress">
                                             <property name="visible">False</property>
-                                            <property name="show-text">True</property>
+                                            <property name="show-text">False</property>
+                                            <style>
+                                              <class name="composer-progress"/>
+                                            </style>
                                           </object>
                                         </child>
                                       </object>
