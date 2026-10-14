@@ -11,13 +11,15 @@
 //! the returned outcomes to their views and translate request decisions into runtime commands.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
     slack_timestamp_is_after, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation,
     SlackFile, SlackMessage, SlackUser,
 };
+use crate::sidebar::{UserSearchAliases, UserStatuses};
 use crate::thread_catalog::ThreadCatalog;
 use crate::unread_ledger::UnreadLedger;
 use crate::workspace_pipeline::{
@@ -83,6 +85,47 @@ impl WorkspaceLifecycle {
     }
 }
 
+/// Consolidated user and user-group directory projections derived from the workspace session.
+#[derive(Debug, Default)]
+pub(crate) struct UserDirectoryState {
+    pub(crate) discovered_users: RefCell<Vec<SlackUser>>,
+    pub(crate) user_names: RefCell<Arc<HashMap<String, String>>>,
+    pub(crate) user_full_names: RefCell<Arc<HashMap<String, String>>>,
+    pub(crate) user_avatar_urls: RefCell<Arc<HashMap<String, String>>>,
+    pub(crate) bot_user_ids: RefCell<Arc<HashSet<String>>>,
+    pub(crate) user_search_aliases: RefCell<UserSearchAliases>,
+    pub(crate) user_statuses: RefCell<Arc<UserStatuses>>,
+    pub(crate) user_group_names: RefCell<Arc<HashMap<String, String>>>,
+    pub(crate) user_group_members: RefCell<Arc<HashMap<String, Vec<String>>>>,
+    pub(crate) pending_user_ids: RefCell<HashSet<String>>,
+}
+
+impl UserDirectoryState {
+    pub(crate) fn reset(&self) {
+        self.discovered_users.borrow_mut().clear();
+        self.reset_projections();
+        *self.user_group_names.borrow_mut() = Arc::default();
+        *self.user_group_members.borrow_mut() = Arc::default();
+        self.pending_user_ids.borrow_mut().clear();
+    }
+
+    pub(crate) fn reset_projections(&self) -> HashSet<String> {
+        let mut affected_user_ids = HashSet::new();
+        affected_user_ids.extend(self.user_names.borrow().keys().cloned());
+        affected_user_ids.extend(self.user_full_names.borrow().keys().cloned());
+        affected_user_ids.extend(self.user_avatar_urls.borrow().keys().cloned());
+        affected_user_ids.extend(self.user_search_aliases.borrow().keys().cloned());
+        affected_user_ids.extend(self.user_statuses.borrow().keys().cloned());
+        *self.user_names.borrow_mut() = Arc::default();
+        *self.user_full_names.borrow_mut() = Arc::default();
+        *self.user_avatar_urls.borrow_mut() = Arc::default();
+        *self.bot_user_ids.borrow_mut() = Arc::default();
+        self.user_search_aliases.borrow_mut().clear();
+        *self.user_statuses.borrow_mut() = Arc::default();
+        affected_user_ids
+    }
+}
+
 /// Canonical workspace-domain state owned by the window controller.
 ///
 /// Keeping the catalogs and navigation state behind one owner makes session reset explicit and
@@ -92,6 +135,7 @@ pub(crate) struct WorkspaceSessionState {
     lifecycle: Cell<WorkspaceLifecycle>,
     pub(crate) conversations: RefCell<ConversationCatalog>,
     pub(crate) users: RefCell<HashMap<String, SlackUser>>,
+    pub(crate) user_directory: UserDirectoryState,
     pub(crate) view: RefCell<WorkspaceViewState>,
     pub(crate) threads: RefCell<ThreadCatalog>,
     pub(crate) read_states: RefCell<UnreadLedger>,
@@ -261,6 +305,7 @@ impl WorkspaceSessionState {
     pub(crate) fn reset(&self) {
         *self.conversations.borrow_mut() = ConversationCatalog::default();
         self.users.borrow_mut().clear();
+        self.user_directory.reset();
         self.view.borrow_mut().reset();
         *self.threads.borrow_mut() = ThreadCatalog::default();
         *self.read_states.borrow_mut() = UnreadLedger::default();
@@ -3401,5 +3446,60 @@ mod tests {
             &ops[2],
             TimelineProjectionOperation::Remove { message_ts } if message_ts == "2.0"
         ));
+    }
+
+    #[test]
+    fn session_reset_clears_user_directory_state() {
+        let session = WorkspaceSessionState::default();
+        session
+            .user_directory
+            .discovered_users
+            .borrow_mut()
+            .push(SlackUser {
+                id: Some("U1".into()),
+                ..Default::default()
+            });
+        Arc::make_mut(&mut session.user_directory.user_names.borrow_mut())
+            .insert("U1".into(), "Ada".into());
+        Arc::make_mut(&mut session.user_directory.user_full_names.borrow_mut())
+            .insert("U1".into(), "Ada Lovelace".into());
+        Arc::make_mut(&mut session.user_directory.user_avatar_urls.borrow_mut())
+            .insert("U1".into(), "https://example.com/a.png".into());
+        Arc::make_mut(&mut session.user_directory.bot_user_ids.borrow_mut()).insert("U1".into());
+        session
+            .user_directory
+            .user_search_aliases
+            .borrow_mut()
+            .insert("U1".into(), vec!["ada".into()]);
+        Arc::make_mut(&mut session.user_directory.user_group_names.borrow_mut())
+            .insert("S1".into(), "eng".into());
+        Arc::make_mut(&mut session.user_directory.user_group_members.borrow_mut())
+            .insert("S1".into(), vec!["U1".into()]);
+        session
+            .user_directory
+            .pending_user_ids
+            .borrow_mut()
+            .insert("U2".into());
+
+        session.reset();
+
+        assert!(session.user_directory.discovered_users.borrow().is_empty());
+        assert!(session.user_directory.user_names.borrow().is_empty());
+        assert!(session.user_directory.user_full_names.borrow().is_empty());
+        assert!(session.user_directory.user_avatar_urls.borrow().is_empty());
+        assert!(session.user_directory.bot_user_ids.borrow().is_empty());
+        assert!(session
+            .user_directory
+            .user_search_aliases
+            .borrow()
+            .is_empty());
+        assert!(session.user_directory.user_statuses.borrow().is_empty());
+        assert!(session.user_directory.user_group_names.borrow().is_empty());
+        assert!(session
+            .user_directory
+            .user_group_members
+            .borrow()
+            .is_empty());
+        assert!(session.user_directory.pending_user_ids.borrow().is_empty());
     }
 }
