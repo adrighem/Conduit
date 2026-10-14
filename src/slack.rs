@@ -587,6 +587,105 @@ fn parse_sidebar_theme_value(val: &Value) -> Option<SidebarTheme> {
     }
 }
 
+/// Slack's current theme pref (`ia_theme`): four picked colours plus the
+/// "darker sidebars" switch. The sidebar is a light or dark tint of the
+/// primary colour; the gradient setting is ignored.
+fn parse_ia_theme(val: &Value) -> Option<SidebarTheme> {
+    let parsed;
+    let map = match val {
+        Value::String(raw) => {
+            parsed = serde_json::from_str::<Value>(raw).ok()?;
+            parsed.as_object()?
+        }
+        Value::Object(map) => map,
+        _ => return None,
+    };
+    let use_custom = map
+        .get("useCustomHex")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let color = |key: &str| -> Option<String> {
+        let entry = map.get(key)?;
+        let custom = || {
+            entry
+                .get("custom")
+                .and_then(Value::as_str)
+                .and_then(normalize_sidebar_theme_hex)
+        };
+        let palette = || {
+            entry
+                .get("palette")
+                .and_then(Value::as_str)
+                .and_then(ia_theme_palette_hex)
+                .map(str::to_string)
+        };
+        if use_custom {
+            custom().or_else(palette)
+        } else {
+            palette().or_else(custom)
+        }
+    };
+    let primary = color("primary")?;
+    let selected = color("highlight1").unwrap_or_else(|| primary.clone());
+    let presence = color("highlight2").unwrap_or_else(|| "#2BAC76".to_string());
+    let important = color("important");
+    let darker = map
+        .get("sidebarInverted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let (column_bg, text_color) = if darker {
+        (mix_hex(&primary, "#FFFFFF", 0.1)?, "#FFFFFF".to_string())
+    } else {
+        (
+            mix_hex(&primary, "#FFFFFF", 0.9)?,
+            mix_hex(&primary, "#000000", 0.5)?,
+        )
+    };
+    let hover = mix_hex(&column_bg, &text_color, 0.1)?;
+    Some(SidebarTheme {
+        menu_bg_hover: hover.clone(),
+        hover_item: hover,
+        active_item_text: contrast_text_hex(&selected)?,
+        active_item: selected,
+        text_color,
+        column_bg,
+        active_presence: presence,
+        mention_badge: important,
+        top_nav_text: Some(contrast_text_hex(&primary)?),
+        top_nav_bg: Some(primary),
+    })
+}
+
+/// Hex values of Slack's named theme palettes, where known. Unknown names
+/// fall back to the entry's `custom` hex.
+fn ia_theme_palette_hex(name: &str) -> Option<&'static str> {
+    match name {
+        "aubergine" => Some("#4A154B"),
+        _ => None,
+    }
+}
+
+fn hex_rgb(hex: &str) -> Option<[f64; 3]> {
+    let hex = normalize_sidebar_theme_hex(hex)?;
+    let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).ok().map(f64::from);
+    Some([channel(1)?, channel(3)?, channel(5)?])
+}
+
+/// `base` moved `amount` (0..=1) of the way towards `toward`.
+fn mix_hex(base: &str, toward: &str, amount: f64) -> Option<String> {
+    let (base, toward) = (hex_rgb(base)?, hex_rgb(toward)?);
+    let mixed = |i: usize| (base[i] + (toward[i] - base[i]) * amount).round() as u8;
+    Some(format!("#{:02X}{:02X}{:02X}", mixed(0), mixed(1), mixed(2)))
+}
+
+/// White or near-black text, whichever reads better on `background`.
+fn contrast_text_hex(background: &str) -> Option<String> {
+    let [r, g, b] = hex_rgb(background)?;
+    let luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+    Some(if luma > 0.6 { "#1D1C1D" } else { "#FFFFFF" }.to_string())
+}
+
 impl SlackApi {
     pub fn access_token(&self) -> &str {
         &self.access_token
@@ -671,12 +770,7 @@ impl SlackApi {
             }
         }
 
-        let theme = prefs.as_ref().and_then(|p| {
-            p.sidebar_theme_custom
-                .as_ref()
-                .and_then(parse_sidebar_theme_value)
-                .or_else(|| p.sidebar_theme.as_ref().and_then(parse_sidebar_theme_value))
-        });
+        let theme = prefs.as_ref().and_then(ClientUserBootPrefs::sidebar_theme);
 
         if let Some(theme) = theme {
             return Ok(Some(theme));
@@ -2772,8 +2866,26 @@ struct ClientUserBootSelf {
 
 #[derive(Debug, Deserialize)]
 struct ClientUserBootPrefs {
+    ia_theme: Option<Value>,
     sidebar_theme: Option<Value>,
+    sidebar_theme_custom_values: Option<Value>,
     sidebar_theme_custom: Option<Value>,
+}
+
+impl ClientUserBootPrefs {
+    /// Current `ia_theme` first, then the legacy sidebar theme prefs.
+    fn sidebar_theme(&self) -> Option<SidebarTheme> {
+        self.ia_theme.as_ref().and_then(parse_ia_theme).or_else(|| {
+            [
+                &self.sidebar_theme_custom_values,
+                &self.sidebar_theme_custom,
+                &self.sidebar_theme,
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(parse_sidebar_theme_value)
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3117,6 +3229,52 @@ mod tests {
             bytes.extend_from_slice(*brand);
         }
         bytes
+    }
+
+    #[test]
+    fn ia_theme_uses_custom_hexes_and_light_sidebar_by_default() {
+        let raw = r##"{"primary":{"palette":"aubergine","custom":"#2A0062"},"highlight1":{"palette":"aubergine","custom":"#190147"},"highlight2":{"palette":"jade","custom":"#41FFD1"},"important":{"palette":"rose","custom":"#FF8F8F"},"brightness":6,"windowBackgroundGradients":true,"useCustomHex":true}"##;
+        let theme = parse_ia_theme(&Value::String(raw.into())).expect("theme parses");
+        assert_eq!(theme.top_nav_bg.as_deref(), Some("#2A0062"));
+        assert_eq!(theme.top_nav_text.as_deref(), Some("#FFFFFF"));
+        assert_eq!(theme.column_bg, "#EAE6EF");
+        assert_eq!(theme.text_color, "#150031");
+        assert_eq!(theme.active_item, "#190147");
+        assert_eq!(theme.active_item_text, "#FFFFFF");
+        assert_eq!(theme.active_presence, "#41FFD1");
+        assert_eq!(theme.mention_badge.as_deref(), Some("#FF8F8F"));
+    }
+
+    #[test]
+    fn ia_theme_darker_sidebars_tint_primary_with_white_text() {
+        let theme = parse_ia_theme(&serde_json::json!({
+            "primary": {"palette": "aubergine", "custom": "#2A0062"},
+            "useCustomHex": true,
+            "sidebarInverted": true,
+        }))
+        .expect("theme parses");
+        assert_eq!(theme.column_bg, "#3F1A72");
+        assert_eq!(theme.text_color, "#FFFFFF");
+    }
+
+    #[test]
+    fn ia_theme_prefers_palette_unless_custom_hex_is_on() {
+        let theme = parse_ia_theme(&serde_json::json!({
+            "primary": {"palette": "aubergine", "custom": "#2A0062"},
+            "useCustomHex": false,
+        }))
+        .expect("theme parses");
+        assert_eq!(theme.top_nav_bg.as_deref(), Some("#4A154B"));
+    }
+
+    #[test]
+    fn user_boot_prefs_fall_back_to_legacy_custom_values() {
+        let prefs: ClientUserBootPrefs = serde_json::from_value(serde_json::json!({
+            "sidebar_theme": "eggplant_theme",
+            "sidebar_theme_custom_values": "{\"column_bg\":\"#111111\",\"menu_bg\":\"#222222\",\"active_item\":\"#333333\",\"active_item_text\":\"#FFFFFF\",\"hover_item\":\"#444444\",\"text_color\":\"#FFFFFF\",\"active_presence\":\"#00FF00\"}",
+        }))
+        .unwrap();
+        assert_eq!(prefs.sidebar_theme().unwrap().column_bg, "#111111");
     }
 
     #[test]
