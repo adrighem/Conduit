@@ -95,6 +95,8 @@ HTML, custom URLs, diagnostics, or fixtures copied from a real workspace.
 
 ## Pull Requests
 
+Use Conventional Commits (`feat(scope): ...`, `fix(scope): ...`) and reference related issues (`fixes #XX` or `refs #XX`) in commit messages and PR descriptions so Release Please can generate changelogs and close issues on release. If `Cargo.lock` changes, regenerate `packaging/flatpak/cargo-sources.json` (see `docs/releases.md`).
+
 Before opening a pull request, run:
 
 ```sh

@@ -9,10 +9,7 @@ on:
     paths-ignore:
       - .release-please-manifest.json
       - CHANGELOG.md
-      - Cargo.lock
-      - Cargo.toml
       - data/eu.vanadrighem.conduit.metainfo.xml.in
-      - meson.build
   workflow_dispatch:
     inputs:
       commit_sha:

@@ -12,6 +12,8 @@ Describe the change and the user-facing problem it solves.
 
 ## Checklist
 
+- [ ] PR title follows Conventional Commits (`feat(scope): ...`, `fix(scope): ...`) and body links related issues (`fixes #XX`, `refs #XX`).
+- [ ] If `Cargo.lock` changed, I regenerated `packaging/flatpak/cargo-sources.json`.
 - [ ] I did not include Slack tokens, OAuth codes, cookies, workspace secrets, or private message contents.
 - [ ] I added or updated tests for behavior changes where practical.
 - [ ] I updated documentation for setup, packaging, or user-visible workflow changes.

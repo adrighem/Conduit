@@ -3,6 +3,9 @@
 debug
 target
 _build
+_build*
+.pytest_cache/
+uninstall/
 __pycache__/
 *.py[cod]
 
