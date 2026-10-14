@@ -2797,7 +2797,18 @@ pub(crate) fn build_timeline_message_widget(
                 button.set_valign(gtk::Align::Start);
                 button
             };
-            columns.append(&menu_button(&avatar_widget));
+            // The name button is the keyboard and screen reader entry point;
+            // the avatar one is a pointer-only duplicate.
+            let avatar_button = menu_button(&avatar_widget);
+            avatar_button.set_can_focus(false);
+            avatar_button.set_focusable(false);
+            if let Some(inner) = avatar_button.first_child() {
+                // MenuButton delegates focus to its inner toggle.
+                inner.set_can_focus(false);
+                inner.set_focusable(false);
+            }
+            avatar_button.update_state(&[gtk::accessible::State::Hidden(true)]);
+            columns.append(&avatar_button);
             header_box.append(&menu_button(author_label.upcast_ref()));
         }
         _ => {
@@ -3539,6 +3550,19 @@ pub(crate) mod tests {
             );
             let button = find_menu_button(widget.upcast_ref()).expect("author menu button");
             assert!(button.menu_model().is_some());
+            let mut focusable = 0;
+            let mut stack = vec![widget.clone().upcast::<Widget>()];
+            while let Some(current) = stack.pop() {
+                if current.is::<gtk::ToggleButton>() && current.is_focusable() {
+                    focusable += 1;
+                }
+                let mut child = current.first_child();
+                while let Some(next) = child {
+                    child = next.next_sibling();
+                    stack.push(next);
+                }
+            }
+            assert_eq!(focusable, 1, "only the name button is focusable");
             button.activate_action("author.profile", None).unwrap();
             button.activate_action("author.message", None).unwrap();
             assert_eq!(

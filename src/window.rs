@@ -399,6 +399,10 @@ mod imp {
         pub(super) message_entities: RefCell<Vec<ComposerEntityMark>>,
         pub(super) thread_entities: RefCell<Vec<ComposerEntityMark>>,
         pub(super) message_attachments: RefCell<Vec<ComposerAttachmentDraft>>,
+        /// True while an input method preedit is shown, per composer (message, thread).
+        pub(super) composer_preedit_active: Cell<[bool; 2]>,
+        /// True while a composer height-cap pass is already queued.
+        pub(super) composer_cap_pending: Cell<bool>,
         pub(super) thread_attachments: RefCell<Vec<ComposerAttachmentDraft>>,
         pub(super) message_edit: RefCell<Option<MessageEditState>>,
         pub(super) pending_ui_invalidations: Cell<UiInvalidations>,
@@ -5054,6 +5058,17 @@ impl ConduitWindow {
                     window.refresh_composer_card(target);
                 }
             });
+        let weak_window = self.downgrade();
+        self.composer_text_view(target)
+            .connect_preedit_changed(move |_, preedit| {
+                if let Some(window) = weak_window.upgrade() {
+                    let flags = &window.imp().composer_preedit_active;
+                    let mut active = flags.get();
+                    active[target as usize] = !preedit.is_empty();
+                    flags.set(active);
+                    window.refresh_composer_card(target);
+                }
+            });
         self.refresh_composer_card(target);
     }
 
@@ -5084,7 +5099,10 @@ impl ConduitWindow {
     /// the draft contents.
     fn refresh_composer_card(&self, target: ComposerTarget) {
         let has_text = self.composer_text_view(target).buffer().char_count() > 0;
-        self.composer_placeholder(target).set_visible(!has_text);
+        let preedit = self.imp().composer_preedit_active.get()[target as usize];
+        self.composer_placeholder(target)
+            .set_visible(!has_text && !preedit);
+        self.refresh_composer_tool_sensitivity(target);
         let has_attachments = !self.composer_attachments(target).borrow().is_empty();
         let send_button = self.composer_send_button(target);
         if has_text || has_attachments {
@@ -5092,6 +5110,35 @@ impl ConduitWindow {
         } else {
             send_button.remove_css_class("composer-send-ready");
         }
+    }
+
+    /// Emoji, mention, Aa and slash buttons follow the draft state: all are off
+    /// while an edit is being submitted, and the slash button only makes sense
+    /// on an empty draft outside edit mode.
+    fn refresh_composer_tool_sensitivity(&self, target: ComposerTarget) {
+        let imp = self.imp();
+        let (toggle, emoji, mention, slash) = match target {
+            ComposerTarget::Message => (
+                imp.message_format_toggle.get(),
+                imp.message_emoji_button.get(),
+                imp.message_mention_button.get(),
+                imp.message_slash_button.get(),
+            ),
+            ComposerTarget::Thread => (
+                imp.thread_format_toggle.get(),
+                imp.thread_emoji_button.get(),
+                imp.thread_mention_button.get(),
+                imp.thread_slash_button.get(),
+            ),
+        };
+        let text_view = self.composer_text_view(target);
+        let idle = text_view.is_editable();
+        let editing = self.message_edit_target() == Some(target);
+        let empty = text_view.buffer().char_count() == 0;
+        toggle.set_sensitive(idle);
+        emoji.set_sensitive(idle);
+        mention.set_sensitive(idle);
+        slash.set_sensitive(idle && !editing && empty);
     }
 
     fn refresh_composer_placeholders(&self) {
@@ -5119,17 +5166,14 @@ impl ConduitWindow {
 
     /// Caps each composer at two thirds of its hosting pane. The cap is
     /// applied from an idle, after layout, so it never changes during the
-    /// composer's own allocation.
+    /// composer's own allocation. Window state changes and surface relayouts
+    /// (tiling, snapping, interactive resize) all queue a pass.
     fn setup_composer_height_cap(&self) {
         let weak_window = self.downgrade();
         let schedule = move || {
-            let weak_window = weak_window.clone();
-            glib::idle_add_local_full(glib::Priority::DEFAULT_IDLE, move || {
-                if let Some(window) = weak_window.upgrade() {
-                    window.update_composer_max_heights();
-                }
-                glib::ControlFlow::Break
-            });
+            if let Some(window) = weak_window.upgrade() {
+                window.schedule_composer_cap_update();
+            }
         };
         let notify = schedule.clone();
         self.connect_default_height_notify(move |_| notify());
@@ -5137,18 +5181,65 @@ impl ConduitWindow {
         self.connect_maximized_notify(move |_| notify());
         let notify = schedule.clone();
         self.connect_fullscreened_notify(move |_| notify());
+        let notify = schedule.clone();
+        self.connect_realize(move |window| {
+            if let Some(surface) = window.native().and_then(|native| native.surface()) {
+                let notify = notify.clone();
+                surface.connect_layout(move |_, _, _| notify());
+            }
+            notify();
+        });
         for target in [ComposerTarget::Message, ComposerTarget::Thread] {
             let notify = schedule.clone();
             self.composer_pane(target).connect_map(move |_| notify());
         }
     }
 
-    fn update_composer_max_heights(&self) {
+    /// Queues one cap pass from an idle; repeated requests coalesce. When a
+    /// pane has no height yet the pass retries on the next frame.
+    fn schedule_composer_cap_update(&self) {
+        let imp = self.imp();
+        if imp.composer_cap_pending.replace(true) {
+            return;
+        }
+        let weak_window = self.downgrade();
+        glib::idle_add_local_full(glib::Priority::DEFAULT_IDLE, move || {
+            if let Some(window) = weak_window.upgrade() {
+                window.imp().composer_cap_pending.set(false);
+                if !window.update_composer_max_heights() {
+                    window.retry_composer_cap_next_frame();
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn retry_composer_cap_next_frame(&self) {
+        let imp = self.imp();
+        if imp.composer_cap_pending.replace(true) {
+            return;
+        }
+        self.add_tick_callback(|window, _| {
+            window.imp().composer_cap_pending.set(false);
+            if !window.update_composer_max_heights() && window.is_mapped() {
+                window.schedule_composer_cap_update();
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Applies the cap to both composers. Returns false when a pane was not
+    /// laid out yet (the fallback cap was used), so the caller should retry.
+    fn update_composer_max_heights(&self) -> bool {
+        let mut measured = true;
         for target in [ComposerTarget::Message, ComposerTarget::Thread] {
             let pane_height = self.composer_pane(target).height();
             let cap = if pane_height > 0 {
                 (pane_height * 2 / 3).max(COMPOSER_MIN_CONTENT_HEIGHT)
             } else {
+                // A hidden pane legitimately has no height; only a mapped one
+                // that is still unmeasured warrants a retry.
+                measured &= !self.composer_pane(target).is_mapped();
                 COMPOSER_FALLBACK_MAX_HEIGHT
             };
             let scrolled = self.composer_scrolled_window(target);
@@ -5156,6 +5247,7 @@ impl ConduitWindow {
                 scrolled.set_max_content_height(cap);
             }
         }
+        measured
     }
 
     fn composer_attachments(
@@ -5235,10 +5327,12 @@ impl ConduitWindow {
             .is_some_and(|edit| edit.uses_rich_blocks);
         format_toolbar.set_sensitive(!submitted && formatting_supported);
         format_overflow.set_sensitive(!submitted && formatting_supported);
+        self.refresh_composer_tool_sensitivity(target);
     }
 
     fn sync_message_edit_presentation(&self, target: ComposerTarget, editing: bool) {
         self.refresh_composer_placeholders();
+        self.refresh_composer_tool_sensitivity(target);
         let imp = self.imp();
         match target {
             ComposerTarget::Message => {
@@ -16581,6 +16675,28 @@ mod tests {
         assert!(setup.contains("connect_changed"));
         assert!(!setup.contains("idle_add_local_once"));
         assert!(setup.contains("configure_composer_format_control"));
+    }
+
+    #[test]
+    fn composer_tools_follow_submission_edit_and_draft_state() {
+        let source = include_str!("window.rs");
+        let body = source
+            .split_once("fn refresh_composer_tool_sensitivity")
+            .and_then(|(_, rest)| rest.split_once("fn refresh_composer_placeholders"))
+            .map(|(body, _)| body)
+            .expect("tool sensitivity should be bounded");
+        assert!(body.contains("slash.set_sensitive(idle && !editing && empty)"));
+        for control in ["toggle", "emoji", "mention"] {
+            assert!(body.contains(&format!("{control}.set_sensitive(idle)")));
+        }
+        let submission = source
+            .split_once("fn set_message_edit_submission_state")
+            .and_then(|(_, rest)| rest.split_once("fn sync_message_edit_presentation"))
+            .map(|(body, _)| body)
+            .expect("submission state should be bounded");
+        assert!(submission.contains("refresh_composer_tool_sensitivity(target)"));
+        assert!(source.contains("connect_preedit_changed"));
+        assert!(source.contains("surface.connect_layout"));
     }
 
     #[test]
