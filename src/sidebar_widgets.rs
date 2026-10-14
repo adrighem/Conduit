@@ -35,10 +35,12 @@ pub struct SidebarRowLayout {
 impl SidebarRowLayout {
     pub fn sidebar() -> Self {
         Self {
-            margin_top: 1,
-            margin_bottom: 1,
-            margin_start: 6,
-            margin_end: 6,
+            // Spacing comes from CSS padding (`.conduit-sidebar-list`), so the
+            // open-conversation highlight fills the row like the hover one.
+            margin_top: 0,
+            margin_bottom: 0,
+            margin_start: 0,
+            margin_end: 0,
             show_avatars: false,
         }
     }

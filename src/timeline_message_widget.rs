@@ -76,6 +76,7 @@ type ActionSlot = Rc<RefCell<Option<ActionHandler>>>;
 type BoundItems = Rc<RefCell<Vec<glib::WeakRef<gtk::ListItem>>>>;
 
 const FOCUS_TARGET_CLASS: &str = "timeline-focus-target";
+const TIMELINE_AVATAR_SIZE: i32 = 36;
 const FOCUS_TARGET_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
 /// How long a row must stay visible before it counts as read. Short under
 /// test so dwell-driven tests run quickly.
@@ -333,7 +334,8 @@ pub(crate) fn register_timeline_css() {
             .blockquote { border-left: 3px solid #888888; padding-left: 8px; margin-left: 4px; }
             .author-menu-button { padding: 2px; margin: -2px; min-width: 0; min-height: 0; }
             listview.conduit-timeline > row { padding: 6px 12px; }
-            .timeline-avatar { border-radius: 8px; }
+            avatar.timeline-avatar { border-radius: 8px; }
+            .author-menu-button > button { padding: 0; min-width: 0; min-height: 0; }
             .reaction-pill { padding: 2px 6px; min-width: 0; min-height: 0; border-radius: 12px; }
             .reaction-pill label { min-width: 0; }
             .reaction-emoji-unicode { font-size: 32px; line-height: 1; }
@@ -2066,6 +2068,10 @@ fn render_files(
 }
 
 fn build_avatar_widget(message: &SlackMessage, context: &MessageHtmlContext) -> Widget {
+    // A fixed-size avatar: a bare Picture would grow to the image's natural
+    // size in the row.
+    let avatar = adw::Avatar::new(TIMELINE_AVATAR_SIZE, None, false);
+    avatar.add_css_class("timeline-avatar");
     let user_avatar_url = context
         .display_user_id(message)
         .and_then(|user_id| context.user_avatar_urls.get(user_id));
@@ -2076,23 +2082,14 @@ fn build_avatar_widget(message: &SlackMessage, context: &MessageHtmlContext) -> 
     if let Some(url) = avatar_source_url {
         let local_path = resolve_cached_asset_path(url, context)
             .or_else(|| Path::new(url).exists().then(|| PathBuf::from(url)));
-        if let Some(path) = local_path {
-            let picture = if let Some(tex) = get_or_load_texture(&path) {
-                Picture::for_paintable(&tex)
-            } else {
-                Picture::for_filename(&path)
-            };
-            picture.set_size_request(36, 36);
-            picture.set_content_fit(gtk::ContentFit::Cover);
-            picture.set_overflow(gtk::Overflow::Hidden);
-            picture.add_css_class("timeline-avatar");
-            return picture.upcast::<Widget>();
+        let texture = local_path.and_then(|path| {
+            get_or_load_texture(&path).or_else(|| gtk::gdk::Texture::from_filename(&path).ok())
+        });
+        if let Some(texture) = texture {
+            avatar.set_custom_image(Some(texture.upcast_ref::<gtk::gdk::Paintable>()));
         }
     }
-
-    let fallback = Image::from_icon_name("avatar-default-symbolic");
-    fallback.set_pixel_size(36);
-    fallback.upcast::<Widget>()
+    avatar.upcast::<Widget>()
 }
 
 /// Scales `pixbuf` so its longest side is `REACTION_EMOJI_SIZE`, keeping the

@@ -929,7 +929,14 @@ listview.navigation-sidebar row:selected .sidebar-row-content.active-conversatio
 }
 listview.navigation-sidebar row:not(:selected) .sidebar-row-content.active-conversation {
   background-color: color-mix(in srgb, currentColor 12%, transparent);
-  border-radius: 6px;
+  border-radius: 9px;
+}
+listview.conduit-sidebar-list > row {
+  padding: 0;
+}
+listview.conduit-sidebar-list .sidebar-row-content {
+  padding: 1px 14px;
+  border-radius: 9px;
 }
 listview.navigation-sidebar label.status-emoji {
   line-height: 1;
@@ -5734,7 +5741,7 @@ impl ConduitWindow {
              .conduit-themed-sidebar row:selected {{ background-color: {}; }}\n\
              .conduit-themed-sidebar .sidebar-row-content.active-conversation,\n\
              .conduit-themed-sidebar row:selected .sidebar-row-content.active-conversation {{\n\
-                 background-color: {}; color: {}; border-radius: 6px;\n\
+                 background-color: {}; color: {}; border-radius: 9px;\n\
              }}\n\
              .conduit-themed-sidebar .sidebar-row-content.active-conversation label {{ color: {}; }}\n\
              .mention-badge-pill {{ background-color: {mention_badge}; }}\n\

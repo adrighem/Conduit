@@ -430,6 +430,7 @@
                                         <property name="single-click-activate">True</property>
                                         <style>
                                           <class name="navigation-sidebar"/>
+                                          <class name="conduit-sidebar-list"/>
                                         </style>
                                       </object>
                                     </property>
