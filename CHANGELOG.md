@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.7.0](https://github.com/adrighem/Conduit/compare/v0.6.0...v0.7.0) (2026-10-14)
+
+
+### Features
+
+* **composer:** Slack-style card composer with auto height ([02e3fe5](https://github.com/adrighem/Conduit/commit/02e3fe54b95eb5dc57ce8d56a5cc107afb501e50))
+* **links:** open Slack message permalinks in Conduit ([d259061](https://github.com/adrighem/Conduit/commit/d259061dac1beb5d9575073d45a3a0efa83f578c))
+* **navigation:** move workspace navigation into a vertical rail ([4f42aff](https://github.com/adrighem/Conduit/commit/4f42affb904887c60be0a6c81361f9dd5f566315))
+* **picker:** rank conversation picker by attention and recency ([367e083](https://github.com/adrighem/Conduit/commit/367e083e473f0cc4f871a238d07cb7171318265f))
+* **sidebar:** rank drafts and attention in conversation lists ([986048b](https://github.com/adrighem/Conduit/commit/986048b33b40db14194d6680321286e03dde9db6))
+* **slash:** add /giphy support ([d0c7cdc](https://github.com/adrighem/Conduit/commit/d0c7cdce2c429598760af1c9901e689cbf3598d6))
+* **slash:** add /teams-calls with unique-prefix resolution ([58eb405](https://github.com/adrighem/Conduit/commit/58eb4059fe4308e5fe44ff63b9c06ab046bd46ba))
+* **slash:** show usage for /giphy without search terms ([a28676a](https://github.com/adrighem/Conduit/commit/a28676acfac012b08fff83e6398996101b74dc12))
+* **theme:** follow Slack's ia_theme colours ([d234a60](https://github.com/adrighem/Conduit/commit/d234a6098982f69068fbc66f1a23593ab4e054e2))
+* **threads:** list Slack's followed threads in the Threads view ([cabab30](https://github.com/adrighem/Conduit/commit/cabab3019d959ad45cbdee92bf6f1388758d30ea))
+* **threads:** open threads in the conversation at their root ([2d6650a](https://github.com/adrighem/Conduit/commit/2d6650af8bc9f3bdea6d7d47fc7753dd9d27d459))
+* **timeline:** two-column message rows ([39bcfaa](https://github.com/adrighem/Conduit/commit/39bcfaae447960bbac920ec481740a4637e1476f))
+
+
+### Bug Fixes
+
+* **composer:** lock tools during edit submit, IME placeholder, robust height cap ([7b952f1](https://github.com/adrighem/Conduit/commit/7b952f162d3650bd86d09feaa7417194154d67e2))
+* **files:** make file card download button work ([ff94fac](https://github.com/adrighem/Conduit/commit/ff94fac533501104c61690c98707aebb9af7baa6))
+* **giphy:** keep ephemeral previews across history refreshes ([171dda8](https://github.com/adrighem/Conduit/commit/171dda881d6d8fa98e1cdec4079a37c51370ad65))
+* **links:** keep message links in rich messages inside Conduit ([e9edd35](https://github.com/adrighem/Conduit/commit/e9edd35a2b07c28c47787634306ef04142550e8d))
+* **links:** open message permalinks without relying on the workspace URL ([fd6a296](https://github.com/adrighem/Conduit/commit/fd6a2963a9736f32a8fd83f157324225f19ed9ff))
+* **navigation:** harden rail badge and icon, center icon highlight ([a7f5aa6](https://github.com/adrighem/Conduit/commit/a7f5aa62c180c752cdbaa07f7588d3d2364676b1))
+* **navigation:** space rail toggles and highlight icon only ([a280207](https://github.com/adrighem/Conduit/commit/a28020704fbef763bef66d50505c7f13e343e796))
+* **reactions:** size custom emoji reactions correctly ([77b00ae](https://github.com/adrighem/Conduit/commit/77b00ae5dcf0256f0bd3e67329ec40d9aad59b57))
+* **read-state:** classify mark errors, track in-flight marks, emit only on change ([451a473](https://github.com/adrighem/Conduit/commit/451a473049a865b1c11266f353b2389c14479911))
+* **read-state:** keep dwells alive and mark only what was seen ([766da90](https://github.com/adrighem/Conduit/commit/766da9040ad1632cfc8ba8c66a3a7332aa439f7e))
+* **read-state:** keep unread badges and separators in sync ([f44b220](https://github.com/adrighem/Conduit/commit/f44b220f6848526fb98056b9bff38d06cbbf27e7))
+* **rich-message:** keep mrkdwn tokens in rich text plain text ([9ad1ea0](https://github.com/adrighem/Conduit/commit/9ad1ea009ab39da26c2d524e89eb82129e535d1f))
+* **search:** open search results in conversation and thread ([c001fe2](https://github.com/adrighem/Conduit/commit/c001fe2682e84ac1efeadac2e5373d16a24d41a6))
+* **theme:** colour the open conversation, not the hovered row ([49ca2c7](https://github.com/adrighem/Conduit/commit/49ca2c72943e001d9bfcd31fe0dedf92b4d01235))
+* **thread-pane:** hide reply footer on thread root ([d663317](https://github.com/adrighem/Conduit/commit/d6633176645cf66502a31a58ecd31eda68d310d1))
+* **timeline:** keep scroll position when rows update ([d7f468f](https://github.com/adrighem/Conduit/commit/d7f468f5edc3f1c16a8f446fbfa81752f74a8f8f))
+* **ui:** fixed-size message avatars, full-row sidebar highlight ([4686ca6](https://github.com/adrighem/Conduit/commit/4686ca65fb631f0f36121a6e8740420dd5547ba5))
+
+
+### Performance Improvements
+
+* **emoji-picker:** virtualize emoji grid ([747a937](https://github.com/adrighem/Conduit/commit/747a9375fb6dfba1de7ac6c1feb49bd8bc324f85))
+
 ## [0.6.0](https://github.com/adrighem/Conduit/compare/v0.5.0...v0.6.0) (2026-10-08)
 
 
