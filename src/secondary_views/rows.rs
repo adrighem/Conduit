@@ -157,6 +157,7 @@ fn message_widget(
         None,
         None,
         Some(&author),
+        true,
     )
     .upcast()
 }

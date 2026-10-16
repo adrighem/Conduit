@@ -22,6 +22,7 @@ mod imp {
         /// True for a day-separator row; `message` is then the first message
         /// of the day it introduces (only its `ts` is used).
         pub day_separator: std::cell::Cell<bool>,
+        pub hide_header: std::cell::Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -62,6 +63,14 @@ impl TimelineMessageObject {
 
     pub fn is_day_separator(&self) -> bool {
         self.imp().day_separator.get()
+    }
+
+    pub fn hide_header(&self) -> bool {
+        self.imp().hide_header.get()
+    }
+
+    pub fn set_hide_header(&self, hide: bool) {
+        self.imp().hide_header.set(hide);
     }
 
     pub fn message(&self) -> SlackMessage {
@@ -765,6 +774,7 @@ impl NativeTimelineView {
                         }
                     })
                 };
+                let show_header = !msg_obj.hide_header();
                 let msg_widget = build_timeline_message_widget(
                     &msg,
                     ctx,
@@ -773,6 +783,7 @@ impl NativeTimelineView {
                     Some(&cb_reaction),
                     Some(&cb_hover),
                     Some(&cb_author),
+                    show_header,
                 );
                 if highlight_ts_for_bind.borrow().as_deref() == Some(msg.ts.as_str()) {
                     msg_widget.add_css_class(FOCUS_TARGET_CLASS);
@@ -1237,6 +1248,41 @@ impl NativeTimelineView {
         });
     }
 
+    fn update_store_grouping(&self, unread_separator_ts: Option<&str>) -> HashSet<String> {
+        let mut changed = HashSet::new();
+        let n = self.store.n_items();
+        let mut prev_msg: Option<SlackMessage> = None;
+        for i in 0..n {
+            let Some(obj) = self
+                .store
+                .item(i)
+                .and_then(|o| o.downcast::<TimelineMessageObject>().ok())
+            else {
+                continue;
+            };
+            if obj.is_day_separator() {
+                prev_msg = None;
+                continue;
+            }
+            let msg = obj.message();
+            let is_unread = unread_separator_ts == Some(msg.ts.as_str());
+            let group = !is_unread
+                && prev_msg
+                    .as_ref()
+                    .is_some_and(|prev| can_group_messages(prev, &msg));
+            if obj.hide_header() != group {
+                obj.set_hide_header(group);
+                changed.insert(msg.ts.clone());
+            }
+            if is_system_subtype(&msg) || is_thread_broadcast(&msg) {
+                prev_msg = None;
+            } else {
+                prev_msg = Some(msg);
+            }
+        }
+        changed
+    }
+
     /// Moves the "New" unread separator to `anchor_ts`, rebuilding only the
     /// rows that gain or lose it so the list keeps its scroll position.
     pub fn set_unread_separator(&self, anchor_ts: Option<String>) {
@@ -1250,6 +1296,7 @@ impl NativeTimelineView {
             }
             std::mem::replace(&mut context.unread_separator_ts, anchor_ts.clone())
         };
+        let changed = self.update_store_grouping(anchor_ts.as_deref());
         // Rows scrolled out of view pick the new anchor up from the context
         // when they are bound again.
         self.rebind_rows(|obj| {
@@ -1257,7 +1304,9 @@ impl NativeTimelineView {
                 return false;
             }
             let ts = obj.message().ts;
-            previous.as_deref() == Some(ts.as_str()) || anchor_ts.as_deref() == Some(ts.as_str())
+            changed.contains(&ts)
+                || previous.as_deref() == Some(ts.as_str())
+                || anchor_ts.as_deref() == Some(ts.as_str())
         });
     }
 
@@ -1288,7 +1337,8 @@ impl NativeTimelineView {
             self.set_highlight(ts);
         }
         self.store.remove_all();
-        let (items, focus_index) = build_store_items(messages, focus_ts);
+        let unread_ts = context.unread_separator_ts.as_deref();
+        let (items, focus_index) = build_store_items(messages, focus_ts, unread_ts);
         self.store.splice(0, 0, &items);
 
         let list_view = self.list_view.clone();
@@ -2627,9 +2677,64 @@ fn row_message_ts(widget: &Widget) -> Option<String> {
 /// re-spliced item-for-item (`update_image_asset`), so separators are derived
 /// here once and can never drift out of sync with inserts or prepends.
 /// Also returns the index of `focus_ts` within the resulting items.
+fn is_system_subtype(message: &SlackMessage) -> bool {
+    message.subtype.as_deref().is_some_and(|subtype| {
+        matches!(
+            subtype,
+            "channel_join" | "channel_leave" | "channel_topic" | "channel_purpose"
+        )
+    })
+}
+
+fn is_thread_broadcast(message: &SlackMessage) -> bool {
+    message.is_thread_broadcast == Some(true)
+        || matches!(
+            message.subtype.as_deref(),
+            Some("thread_broadcast" | "reply_broadcast")
+        )
+}
+
+fn sender_key(message: &SlackMessage) -> &str {
+    message
+        .user
+        .as_deref()
+        .or(message.username.as_deref())
+        .or(message.bot_id.as_deref())
+        .unwrap_or("Slack")
+}
+
+pub(crate) fn can_group_messages(previous: &SlackMessage, current: &SlackMessage) -> bool {
+    if is_system_subtype(previous) || is_system_subtype(current) {
+        return false;
+    }
+    if is_thread_broadcast(previous) || is_thread_broadcast(current) {
+        return false;
+    }
+    if sender_key(previous) != sender_key(current) {
+        return false;
+    }
+
+    let Some(previous_ts) = previous.ts.parse::<f64>().ok() else {
+        return false;
+    };
+    let Some(current_ts) = current.ts.parse::<f64>().ok() else {
+        return false;
+    };
+    let delta = current_ts - previous_ts;
+
+    (0.0..180.0).contains(&delta)
+}
+
+/// Chronological store items for `messages` (newest first on input): a day
+/// separator is inserted wherever the local calendar day changes. The store
+/// is only ever rebuilt wholesale from the message list (`set_messages`) or
+/// re-spliced item-for-item (`update_image_asset`), so separators are derived
+/// here once and can never drift out of sync with inserts or prepends.
+/// Also returns the index of `focus_ts` within the resulting items.
 fn build_store_items(
     messages: &[SlackMessage],
     focus_ts: Option<&str>,
+    unread_separator_ts: Option<&str>,
 ) -> (Vec<TimelineMessageObject>, Option<u32>) {
     let days: Vec<Option<i64>> = messages
         .iter()
@@ -2641,14 +2746,27 @@ fn build_store_items(
         .collect();
     let mut items = Vec::with_capacity(messages.len() + 4);
     let mut focus_index = None;
+    let mut prev_msg: Option<&SlackMessage> = None;
     for (i, msg) in messages.iter().rev().enumerate() {
         if crate::day_label::separator_before(&days, i) {
             items.push(TimelineMessageObject::day_separator(msg.clone()));
+            prev_msg = None;
         }
         if focus_ts == Some(msg.ts.as_str()) && focus_index.is_none() {
             focus_index = Some(items.len() as u32);
         }
-        items.push(TimelineMessageObject::new(msg.clone()));
+        let is_unread = unread_separator_ts == Some(msg.ts.as_str());
+        let can_group = !is_unread && prev_msg.is_some_and(|prev| can_group_messages(prev, msg));
+        let obj = TimelineMessageObject::new(msg.clone());
+        if can_group {
+            obj.set_hide_header(true);
+        }
+        items.push(obj);
+        if is_system_subtype(msg) || is_thread_broadcast(msg) {
+            prev_msg = None;
+        } else {
+            prev_msg = Some(msg);
+        }
     }
     (items, focus_index)
 }
@@ -2782,6 +2900,7 @@ fn render_message_content(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_timeline_message_widget(
     message: &SlackMessage,
     context: &MessageHtmlContext,
@@ -2790,6 +2909,7 @@ pub(crate) fn build_timeline_message_widget(
     on_toggle_reaction: Option<&ToggleReactionCallback>,
     on_hover: Option<&Rc<dyn Fn(HoverEvent)>>,
     on_author_action: Option<&ActionHandler>,
+    show_header: bool,
 ) -> Box {
     register_timeline_css();
     if let Some(subtype) = message.subtype.as_deref() {
@@ -2846,83 +2966,95 @@ pub(crate) fn build_timeline_message_widget(
     columns.add_css_class("timeline-message-columns");
     let body_box = Box::new(Orientation::Vertical, 4);
     body_box.set_hexpand(true);
-    let header_box = Box::new(Orientation::Horizontal, 8);
 
-    let avatar_widget = build_avatar_widget(message, context);
+    if show_header {
+        let header_box = Box::new(Orientation::Horizontal, 8);
+        let avatar_widget = build_avatar_widget(message, context);
 
-    let author_name = context
-        .display_user_id(message)
-        .and_then(|user_id| {
-            context
-                .user_full_names
-                .get(user_id)
-                .cloned()
-                .or_else(|| context.user_names.get(user_id).cloned())
-        })
-        .unwrap_or_else(|| message.author_label());
+        let author_name = context
+            .display_user_id(message)
+            .and_then(|user_id| {
+                context
+                    .user_full_names
+                    .get(user_id)
+                    .cloned()
+                    .or_else(|| context.user_names.get(user_id).cloned())
+            })
+            .unwrap_or_else(|| message.author_label());
 
-    let author_label = Label::new(None);
-    author_label.set_markup(&format!(
-        "<b>{}</b>",
-        glib::markup_escape_text(&author_name)
-    ));
-    author_label.set_xalign(0.0);
+        let author_label = Label::new(None);
+        author_label.set_markup(&format!(
+            "<b>{}</b>",
+            glib::markup_escape_text(&author_name)
+        ));
+        author_label.set_xalign(0.0);
 
-    let author_user_id = context.display_user_id(message);
-    let menu_access = crate::author_menu::author_menu_access(
-        author_user_id,
-        context.current_user_id.as_deref(),
-        &context.bot_user_ids,
-    );
-    avatar_widget.set_valign(gtk::Align::Start);
-    match (on_author_action, author_user_id) {
-        (Some(on_action), Some(user_id)) if menu_access.any() => {
-            let menu_button = |child: &Widget| {
-                let button = crate::author_menu::author_menu_button(
-                    child,
-                    user_id,
-                    &author_name,
-                    menu_access,
-                    on_action.clone(),
-                );
-                button.set_valign(gtk::Align::Start);
-                button
-            };
-            // The name button is the keyboard and screen reader entry point;
-            // the avatar one is a pointer-only duplicate.
-            let avatar_button = menu_button(&avatar_widget);
-            avatar_button.set_can_focus(false);
-            avatar_button.set_focusable(false);
-            if let Some(inner) = avatar_button.first_child() {
-                // MenuButton delegates focus to its inner toggle.
-                inner.set_can_focus(false);
-                inner.set_focusable(false);
+        let author_user_id = context.display_user_id(message);
+        let menu_access = crate::author_menu::author_menu_access(
+            author_user_id,
+            context.current_user_id.as_deref(),
+            &context.bot_user_ids,
+        );
+        avatar_widget.set_valign(gtk::Align::Start);
+        match (on_author_action, author_user_id) {
+            (Some(on_action), Some(user_id)) if menu_access.any() => {
+                let menu_button = |child: &Widget| {
+                    let button = crate::author_menu::author_menu_button(
+                        child,
+                        user_id,
+                        &author_name,
+                        menu_access,
+                        on_action.clone(),
+                    );
+                    button.set_valign(gtk::Align::Start);
+                    button
+                };
+                // The name button is the keyboard and screen reader entry point;
+                // the avatar one is a pointer-only duplicate.
+                let avatar_button = menu_button(&avatar_widget);
+                avatar_button.set_can_focus(false);
+                avatar_button.set_focusable(false);
+                if let Some(inner) = avatar_button.first_child() {
+                    // MenuButton delegates focus to its inner toggle.
+                    inner.set_can_focus(false);
+                    inner.set_focusable(false);
+                }
+                avatar_button.update_state(&[gtk::accessible::State::Hidden(true)]);
+                columns.append(&avatar_button);
+                header_box.append(&menu_button(author_label.upcast_ref()));
             }
-            avatar_button.update_state(&[gtk::accessible::State::Hidden(true)]);
-            columns.append(&avatar_button);
-            header_box.append(&menu_button(author_label.upcast_ref()));
+            _ => {
+                columns.append(&avatar_widget);
+                header_box.append(&author_label);
+            }
         }
-        _ => {
-            columns.append(&avatar_widget);
-            header_box.append(&author_label);
-        }
-    }
 
-    let timestamp_label = Label::new(None);
-    if let Some((_machine, full, short)) =
-        crate::message_html::localized_timestamp_parts(&message.ts)
-    {
-        timestamp_label.set_text(&short);
-        timestamp_label.set_tooltip_text(Some(&full));
+        let timestamp_label = Label::new(None);
+        if let Some((_machine, full, short)) =
+            crate::message_html::localized_timestamp_parts(&message.ts)
+        {
+            timestamp_label.set_text(&short);
+            timestamp_label.set_tooltip_text(Some(&full));
+        } else {
+            timestamp_label.set_text(&message.ts);
+        }
+        timestamp_label.add_css_class("dim-label");
+        timestamp_label.add_css_class("caption");
+        timestamp_label.set_xalign(0.0);
+        header_box.append(&timestamp_label);
+
+        body_box.append(&header_box);
     } else {
-        timestamp_label.set_text(&message.ts);
+        root_box.add_css_class("timeline-grouped-message");
+        let spacer = Box::new(Orientation::Horizontal, 0);
+        spacer.set_width_request(TIMELINE_AVATAR_SIZE);
+        spacer.set_valign(gtk::Align::Start);
+        spacer.set_can_focus(false);
+        spacer.set_focusable(false);
+        spacer.update_state(&[gtk::accessible::State::Hidden(true)]);
+        columns.append(&spacer);
     }
-    timestamp_label.add_css_class("dim-label");
-    timestamp_label.add_css_class("caption");
-    timestamp_label.set_xalign(0.0);
-    header_box.append(&timestamp_label);
 
-    body_box.append(&header_box);
     columns.append(&body_box);
     root_box.append(&columns);
 
@@ -3398,7 +3530,7 @@ pub(crate) mod tests {
                 .insert("U04R5M67EBV".to_string(), "Robey Groeneweg".to_string());
 
             let widget =
-                build_timeline_message_widget(&message, &ctx, None, None, None, None, None)
+                build_timeline_message_widget(&message, &ctx, None, None, None, None, None, true)
                     .upcast::<Widget>();
             let texts = label_texts(&widget);
 
@@ -3456,6 +3588,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 None,
+                true,
             )
             .upcast::<Widget>();
 
@@ -3566,6 +3699,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 None,
+                true,
             )
             .upcast::<Widget>();
             let all = descendants(&widget);
@@ -3659,6 +3793,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 Some(&on_action),
+                true,
             );
             let button = find_menu_button(widget.upcast_ref()).expect("author menu button");
             assert!(button.menu_model().is_some());
@@ -3693,6 +3828,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 Some(&on_action),
+                true,
             );
             let button = find_menu_button(widget.upcast_ref()).expect("author menu button");
             seen.borrow_mut().clear();
@@ -3712,6 +3848,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 Some(&on_action),
+                true,
             );
             assert!(find_menu_button(widget.upcast_ref()).is_none());
         });
@@ -3743,7 +3880,8 @@ pub(crate) mod tests {
                 ..Default::default()
             };
 
-            let widget1 = build_timeline_message_widget(&msg1, &ctx, None, None, None, None, None);
+            let widget1 =
+                build_timeline_message_widget(&msg1, &ctx, None, None, None, None, None, true);
             assert_eq!(widget1.orientation(), Orientation::Vertical);
 
             // 2. Section blocks and fields
@@ -3767,7 +3905,8 @@ pub(crate) mod tests {
                 ..Default::default()
             };
 
-            let widget2 = build_timeline_message_widget(&msg2, &ctx, None, None, None, None, None);
+            let widget2 =
+                build_timeline_message_widget(&msg2, &ctx, None, None, None, None, None, true);
             assert_eq!(widget2.orientation(), Orientation::Vertical);
 
             // 3. Divider, actions and context
@@ -3793,7 +3932,8 @@ pub(crate) mod tests {
                 ..Default::default()
             };
 
-            let widget3 = build_timeline_message_widget(&msg3, &ctx, None, None, None, None, None);
+            let widget3 =
+                build_timeline_message_widget(&msg3, &ctx, None, None, None, None, None, true);
             assert_eq!(widget3.orientation(), Orientation::Vertical);
 
             // 4. Attachments with color border
@@ -3816,7 +3956,8 @@ pub(crate) mod tests {
                 ..Default::default()
             };
 
-            let widget4 = build_timeline_message_widget(&msg4, &ctx, None, None, None, None, None);
+            let widget4 =
+                build_timeline_message_widget(&msg4, &ctx, None, None, None, None, None, true);
             assert_eq!(widget4.orientation(), Orientation::Vertical);
 
             // 5. Image file
@@ -3835,7 +3976,7 @@ pub(crate) mod tests {
             };
 
             let widget_img =
-                build_timeline_message_widget(&msg_img, &ctx, None, None, None, None, None);
+                build_timeline_message_widget(&msg_img, &ctx, None, None, None, None, None, true);
             assert_eq!(widget_img.orientation(), Orientation::Vertical);
 
             // 6. Video file
@@ -3854,7 +3995,7 @@ pub(crate) mod tests {
             };
 
             let widget_vid =
-                build_timeline_message_widget(&msg_vid, &ctx, None, None, None, None, None);
+                build_timeline_message_widget(&msg_vid, &ctx, None, None, None, None, None, true);
             assert_eq!(widget_vid.orientation(), Orientation::Vertical);
 
             // 7. Document file with size
@@ -3873,7 +4014,7 @@ pub(crate) mod tests {
             };
 
             let widget_doc =
-                build_timeline_message_widget(&msg_doc, &ctx, None, None, None, None, None);
+                build_timeline_message_widget(&msg_doc, &ctx, None, None, None, None, None, true);
             assert_eq!(widget_doc.orientation(), Orientation::Vertical);
 
             // 8. Rich text blocks
@@ -3925,7 +4066,7 @@ pub(crate) mod tests {
             };
 
             let widget_rich =
-                build_timeline_message_widget(&msg_rich, &ctx, None, None, None, None, None);
+                build_timeline_message_widget(&msg_rich, &ctx, None, None, None, None, None, true);
             assert_eq!(widget_rich.orientation(), Orientation::Vertical);
 
             // 9. Subtype system message
@@ -3938,7 +4079,7 @@ pub(crate) mod tests {
             };
 
             let widget_sys =
-                build_timeline_message_widget(&msg_sys, &ctx, None, None, None, None, None);
+                build_timeline_message_widget(&msg_sys, &ctx, None, None, None, None, None, true);
             assert_eq!(widget_sys.orientation(), Orientation::Horizontal);
 
             // 10. Thread broadcast banner
@@ -3951,7 +4092,7 @@ pub(crate) mod tests {
             };
 
             let widget_bc =
-                build_timeline_message_widget(&msg_bc, &ctx, None, None, None, None, None);
+                build_timeline_message_widget(&msg_bc, &ctx, None, None, None, None, None, true);
             assert_eq!(widget_bc.orientation(), Orientation::Vertical);
 
             // 11. Native timeline view & update_image_asset
@@ -4015,6 +4156,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 None,
+                true,
             );
             assert_eq!(widget_rx.orientation(), Orientation::Vertical);
 
@@ -4373,9 +4515,10 @@ pub(crate) mod tests {
                 None,
                 None,
                 None,
+                true,
             )));
             assert!(!has_footer(build_timeline_message_widget(
-                &msg, &ctx, None, None, None, None, None,
+                &msg, &ctx, None, None, None, None, None, true,
             )));
         });
     }
@@ -4398,8 +4541,16 @@ pub(crate) mod tests {
             let received: Rc<RefCell<Vec<TimelineAction>>> = Rc::new(RefCell::new(Vec::new()));
             let sink = received.clone();
             let on_action: ActionHandler = Rc::new(move |action| sink.borrow_mut().push(action));
-            let widget =
-                build_timeline_message_widget(&msg, &ctx, None, None, None, None, Some(&on_action));
+            let widget = build_timeline_message_widget(
+                &msg,
+                &ctx,
+                None,
+                None,
+                None,
+                None,
+                Some(&on_action),
+                true,
+            );
             let label = find_descendant(&widget.upcast(), &|w| {
                 w.downcast_ref::<Label>()
                     .is_some_and(|label| label.label().contains("<a href="))
@@ -4459,8 +4610,16 @@ pub(crate) mod tests {
             let received: Rc<RefCell<Vec<TimelineAction>>> = Rc::new(RefCell::new(Vec::new()));
             let sink = received.clone();
             let on_action: ActionHandler = Rc::new(move |action| sink.borrow_mut().push(action));
-            let widget =
-                build_timeline_message_widget(&msg, &ctx, None, None, None, None, Some(&on_action));
+            let widget = build_timeline_message_widget(
+                &msg,
+                &ctx,
+                None,
+                None,
+                None,
+                None,
+                Some(&on_action),
+                true,
+            );
 
             let mut labels = Vec::new();
             collect_link_labels(&widget.upcast(), &mut labels);
@@ -4527,8 +4686,16 @@ pub(crate) mod tests {
             let on_action: ActionHandler = Rc::new(move |action| {
                 *sink.borrow_mut() = Some(action);
             });
-            let widget =
-                build_timeline_message_widget(&msg, &ctx, None, None, None, None, Some(&on_action));
+            let widget = build_timeline_message_widget(
+                &msg,
+                &ctx,
+                None,
+                None,
+                None,
+                None,
+                Some(&on_action),
+                true,
+            );
             let button = find_descendant(&widget.upcast(), &|w| {
                 w.tooltip_text().as_deref() == Some("Download file")
             })
@@ -4572,7 +4739,8 @@ pub(crate) mod tests {
                 ]),
                 ..Default::default()
             };
-            let widget = build_timeline_message_widget(&msg, &ctx, None, None, None, None, None);
+            let widget =
+                build_timeline_message_widget(&msg, &ctx, None, None, None, None, None, true);
             let row = find_descendant(&widget.clone().upcast(), &|w| {
                 w.has_css_class("reaction-row")
             })
@@ -4687,6 +4855,154 @@ pub(crate) mod tests {
             assert!(!is_media_collapsed("1700000000.000100", "file:0"));
             assert!(TEXTURE_CACHE.with(|cache| cache.borrow_mut().get(&path).is_none()));
             assert!(REACTION_TEXTURE_CACHE.with(|cache| cache.borrow_mut().get(&path).is_none()));
+        });
+    }
+
+    #[test]
+    fn test_can_group_messages() {
+        let prev = SlackMessage {
+            ts: "1700000000.000100".to_string(),
+            user: Some("U123".to_string()),
+            text: Some("first".to_string()),
+            ..Default::default()
+        };
+        let curr_same = SlackMessage {
+            ts: "1700000050.000100".to_string(),
+            user: Some("U123".to_string()),
+            text: Some("second".to_string()),
+            ..Default::default()
+        };
+        assert!(can_group_messages(&prev, &curr_same));
+
+        // Different user
+        let curr_diff_user = SlackMessage {
+            ts: "1700000050.000100".to_string(),
+            user: Some("U456".to_string()),
+            text: Some("second".to_string()),
+            ..Default::default()
+        };
+        assert!(!can_group_messages(&prev, &curr_diff_user));
+
+        // >= 180 seconds apart
+        let curr_late = SlackMessage {
+            ts: "1700000181.000100".to_string(),
+            user: Some("U123".to_string()),
+            text: Some("too late".to_string()),
+            ..Default::default()
+        };
+        assert!(!can_group_messages(&prev, &curr_late));
+
+        // Negative delta (out of order)
+        let curr_before = SlackMessage {
+            ts: "1699999990.000100".to_string(),
+            user: Some("U123".to_string()),
+            text: Some("earlier".to_string()),
+            ..Default::default()
+        };
+        assert!(!can_group_messages(&prev, &curr_before));
+
+        // System message subtype
+        let curr_system = SlackMessage {
+            ts: "1700000050.000100".to_string(),
+            user: Some("U123".to_string()),
+            subtype: Some("channel_join".to_string()),
+            ..Default::default()
+        };
+        assert!(!can_group_messages(&prev, &curr_system));
+
+        // Thread broadcast
+        let curr_broadcast = SlackMessage {
+            ts: "1700000050.000100".to_string(),
+            user: Some("U123".to_string()),
+            is_thread_broadcast: Some(true),
+            ..Default::default()
+        };
+        assert!(!can_group_messages(&prev, &curr_broadcast));
+    }
+
+    #[test]
+    fn test_build_store_items_grouped_headers() {
+        run_gtk_test(|| {
+            let msg1 = SlackMessage {
+                ts: "1700000000.000100".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("msg 1".to_string()),
+                ..Default::default()
+            };
+            let msg2 = SlackMessage {
+                ts: "1700000010.000100".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("msg 2".to_string()),
+                ..Default::default()
+            };
+            let msg3 = SlackMessage {
+                ts: "1700000020.000100".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("msg 3".to_string()),
+                ..Default::default()
+            };
+
+            // Messages passed to timeline are newest-first (Slack API order).
+            // Without unread separator: msg1 has header, msg2 and msg3 hide header
+            let (items, _) =
+                build_store_items(&[msg3.clone(), msg2.clone(), msg1.clone()], None, None);
+            let msg_objs: Vec<TimelineMessageObject> = items
+                .into_iter()
+                .filter_map(|item| item.downcast::<TimelineMessageObject>().ok())
+                .filter(|obj| !obj.is_day_separator())
+                .collect();
+            assert_eq!(msg_objs.len(), 3);
+            assert_eq!(msg_objs[0].message().ts, "1700000000.000100");
+            assert!(!msg_objs[0].hide_header());
+            assert_eq!(msg_objs[1].message().ts, "1700000010.000100");
+            assert!(msg_objs[1].hide_header());
+            assert_eq!(msg_objs[2].message().ts, "1700000020.000100");
+            assert!(msg_objs[2].hide_header());
+
+            // With unread separator on msg2: msg2 must NOT hide header
+            let (items, _) = build_store_items(
+                &[msg3.clone(), msg2.clone(), msg1.clone()],
+                None,
+                Some("1700000010.000100"),
+            );
+            let msg_objs: Vec<TimelineMessageObject> = items
+                .into_iter()
+                .filter_map(|item| item.downcast::<TimelineMessageObject>().ok())
+                .filter(|obj| !obj.is_day_separator())
+                .collect();
+            assert_eq!(msg_objs.len(), 3);
+            assert!(!msg_objs[0].hide_header());
+            assert!(!msg_objs[1].hide_header());
+            assert!(msg_objs[2].hide_header());
+        });
+    }
+
+    #[test]
+    fn test_build_timeline_message_widget_grouped_hides_header() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let msg = SlackMessage {
+                ts: "1700000000.000100".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("grouped message body".to_string()),
+                ..Default::default()
+            };
+
+            // show_header = true
+            let normal_widget =
+                build_timeline_message_widget(&msg, &ctx, None, None, None, None, None, true);
+            assert!(!normal_widget.has_css_class("timeline-grouped-message"));
+            assert!(descendants(&normal_widget.clone().upcast())
+                .iter()
+                .any(|w| w.has_css_class("timeline-avatar")));
+
+            // show_header = false
+            let grouped_widget =
+                build_timeline_message_widget(&msg, &ctx, None, None, None, None, None, false);
+            assert!(grouped_widget.has_css_class("timeline-grouped-message"));
+            assert!(!descendants(&grouped_widget.clone().upcast())
+                .iter()
+                .any(|w| w.has_css_class("timeline-avatar")));
         });
     }
 }
