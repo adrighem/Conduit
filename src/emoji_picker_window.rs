@@ -5,7 +5,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -520,7 +520,68 @@ impl EmojiPickerWindow {
             std::cell::RefCell<HashMap<String, Vec<glib::WeakRef<gtk::Stack>>>>,
         > = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
 
-        fn apply_custom_emoji_image(stack: &gtk::Stack, path: &Path, expected_url: &str) {
+        let animated_emojis: Rc<RefCell<HashMap<String, (PathBuf, gtk::gdk::Texture)>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        fn start_slot_animation(
+            container: &gtk::Box,
+            stack: &gtk::Stack,
+            pic: &gtk::Picture,
+            path: &Path,
+            expected_url: &str,
+        ) {
+            if container.has_css_class("animating") {
+                return;
+            }
+            let Ok(anim) = gdk_pixbuf::PixbufAnimation::from_file(path) else {
+                return;
+            };
+            if anim.is_static_image() {
+                return;
+            }
+            container.add_css_class("animating");
+
+            let iter = anim.iter(None);
+            let last_update = Rc::new(Cell::new(std::time::Instant::now()));
+            let delay_ms = iter
+                .delay_time()
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(60)
+                .max(60);
+
+            let stack_weak = stack.downgrade();
+            let container_weak = container.downgrade();
+            let url_owned = expected_url.to_string();
+
+            pic.add_tick_callback(move |p, _frame_clock| {
+                let Some(stack) = stack_weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                let Some(container) = container_weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                if !container.has_css_class("hovered")
+                    || !p.is_mapped()
+                    || stack.widget_name() != url_owned
+                {
+                    container.remove_css_class("animating");
+                    return glib::ControlFlow::Break;
+                }
+                if last_update.get().elapsed().as_millis() as u64 >= delay_ms {
+                    last_update.set(std::time::Instant::now());
+                    iter.advance(std::time::SystemTime::now());
+                    p.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&iter.pixbuf())));
+                }
+                glib::ControlFlow::Continue
+            });
+        }
+
+        fn apply_custom_emoji_image(
+            stack: &gtk::Stack,
+            path: &Path,
+            expected_url: &str,
+            animated_emojis: &Rc<RefCell<HashMap<String, (PathBuf, gtk::gdk::Texture)>>>,
+        ) {
             let Some(pic) = stack.child_by_name("pic").and_downcast::<gtk::Picture>() else {
                 return;
             };
@@ -528,34 +589,20 @@ impl EmojiPickerWindow {
                 if !anim.is_static_image() {
                     let iter = anim.iter(None);
                     let first_pixbuf = iter.pixbuf();
-                    pic.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&first_pixbuf)));
-
-                    let last_update = Rc::new(Cell::new(std::time::Instant::now()));
-                    let delay_ms = iter
-                        .delay_time()
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(60)
-                        .max(60);
-
-                    let stack_weak = stack.downgrade();
-                    let url_owned = expected_url.to_string();
-
-                    pic.add_tick_callback(move |p, _frame_clock| {
-                        let Some(stack) = stack_weak.upgrade() else {
-                            return glib::ControlFlow::Break;
-                        };
-                        if !p.is_mapped() || stack.widget_name() != url_owned {
-                            return glib::ControlFlow::Break;
-                        }
-                        if last_update.get().elapsed().as_millis() as u64 >= delay_ms {
-                            last_update.set(std::time::Instant::now());
-                            iter.advance(std::time::SystemTime::now());
-                            p.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&iter.pixbuf())));
-                        }
-                        glib::ControlFlow::Continue
-                    });
-
+                    let first_texture = gtk::gdk::Texture::for_pixbuf(&first_pixbuf);
+                    pic.set_paintable(Some(&first_texture));
                     stack.set_visible_child_name("pic");
+
+                    animated_emojis.borrow_mut().insert(
+                        expected_url.to_string(),
+                        (path.to_path_buf(), first_texture),
+                    );
+
+                    if let Some(container) = stack.parent().and_downcast::<gtk::Box>() {
+                        if container.has_css_class("hovered") {
+                            start_slot_animation(&container, stack, &pic, path, expected_url);
+                        }
+                    }
                     return;
                 }
             }
@@ -566,13 +613,14 @@ impl EmojiPickerWindow {
 
         {
             let pending_widgets = pending_widgets.clone();
+            let animated_emojis = animated_emojis.clone();
             glib::spawn_future_local(async move {
                 while let Some((url, path)) = download_rx.recv().await {
                     if let Some(stacks) = pending_widgets.borrow_mut().remove(&url) {
                         for stack_weak in stacks {
                             if let Some(stack) = stack_weak.upgrade() {
                                 if stack.widget_name() == url {
-                                    apply_custom_emoji_image(&stack, &path, &url);
+                                    apply_custom_emoji_image(&stack, &path, &url, &animated_emojis);
                                 }
                             }
                         }
@@ -582,41 +630,97 @@ impl EmojiPickerWindow {
         }
 
         let factory = gtk::SignalListItemFactory::new();
-        factory.connect_setup(move |_, list_item| {
-            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+        {
+            let animated_emojis = animated_emojis.clone();
+            factory.connect_setup(move |_, list_item| {
+                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
 
-            let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            container.set_size_request(38, 38);
-            container.set_halign(gtk::Align::Center);
-            container.set_valign(gtk::Align::Center);
+                let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                container.set_size_request(38, 38);
+                container.set_halign(gtk::Align::Center);
+                container.set_valign(gtk::Align::Center);
 
-            let stack = gtk::Stack::new();
-            stack.set_size_request(36, 36);
-            stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+                let stack = gtk::Stack::new();
+                stack.set_size_request(36, 36);
+                stack.set_transition_type(gtk::StackTransitionType::Crossfade);
 
-            let lbl = gtk::Label::new(None);
-            lbl.add_css_class("title-3");
-            lbl.set_size_request(36, 36);
-            stack.add_named(&lbl, Some("text"));
+                let lbl = gtk::Label::new(None);
+                lbl.add_css_class("title-3");
+                lbl.set_size_request(36, 36);
+                stack.add_named(&lbl, Some("text"));
 
-            let pic = gtk::Picture::new();
-            pic.set_size_request(32, 32);
-            pic.set_can_shrink(true);
-            pic.set_content_fit(gtk::ContentFit::Cover);
-            stack.add_named(&pic, Some("pic"));
+                let pic = gtk::Picture::new();
+                pic.set_size_request(32, 32);
+                pic.set_can_shrink(true);
+                pic.set_content_fit(gtk::ContentFit::Cover);
+                stack.add_named(&pic, Some("pic"));
 
-            let placeholder = gtk::Label::new(Some("💬"));
-            placeholder.add_css_class("dim-label");
-            placeholder.set_size_request(36, 36);
-            stack.add_named(&placeholder, Some("placeholder"));
+                let placeholder = gtk::Label::new(Some("💬"));
+                placeholder.add_css_class("dim-label");
+                placeholder.set_size_request(36, 36);
+                stack.add_named(&placeholder, Some("placeholder"));
 
-            container.append(&stack);
-            list_item.set_child(Some(&container));
-        });
+                container.append(&stack);
+
+                let motion = gtk::EventControllerMotion::new();
+                {
+                    let stack_weak = stack.downgrade();
+                    let pic_weak = pic.downgrade();
+                    let container_weak = container.downgrade();
+                    let animated_emojis = animated_emojis.clone();
+                    motion.connect_enter(move |_, _, _| {
+                        let Some(container) = container_weak.upgrade() else {
+                            return;
+                        };
+                        let Some(stack) = stack_weak.upgrade() else {
+                            return;
+                        };
+                        let Some(pic) = pic_weak.upgrade() else {
+                            return;
+                        };
+                        container.add_css_class("hovered");
+                        let url = stack.widget_name().to_string();
+                        if url.is_empty() {
+                            return;
+                        }
+                        if let Some((path, _)) = animated_emojis.borrow().get(&url) {
+                            start_slot_animation(&container, &stack, &pic, path, &url);
+                        }
+                    });
+                }
+                {
+                    let stack_weak = stack.downgrade();
+                    let pic_weak = pic.downgrade();
+                    let container_weak = container.downgrade();
+                    let animated_emojis = animated_emojis.clone();
+                    motion.connect_leave(move |_| {
+                        let Some(container) = container_weak.upgrade() else {
+                            return;
+                        };
+                        let Some(stack) = stack_weak.upgrade() else {
+                            return;
+                        };
+                        let Some(pic) = pic_weak.upgrade() else {
+                            return;
+                        };
+                        container.remove_css_class("hovered");
+                        container.remove_css_class("animating");
+                        let url = stack.widget_name().to_string();
+                        if let Some((_, first_frame)) = animated_emojis.borrow().get(&url) {
+                            pic.set_paintable(Some(first_frame));
+                        }
+                    });
+                }
+                container.add_controller(motion);
+
+                list_item.set_child(Some(&container));
+            });
+        }
 
         {
             let pending_widgets = pending_widgets.clone();
             let download_tx = download_tx.clone();
+            let animated_emojis = animated_emojis.clone();
             factory.connect_bind(move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
                 let Some(boxed) = list_item.item().and_downcast::<glib::BoxedAnyObject>() else {
@@ -628,6 +732,8 @@ impl EmojiPickerWindow {
                 let Some(container) = list_item.child().and_downcast::<gtk::Box>() else {
                     return;
                 };
+                container.remove_css_class("hovered");
+                container.remove_css_class("animating");
                 container.set_tooltip_text(Some(&format!(":{}:", entry.name)));
                 container.update_property(&[gtk::accessible::Property::Label(&entry.label)]);
 
@@ -647,7 +753,7 @@ impl EmojiPickerWindow {
                     EmojiValue::CustomImage(url) => {
                         stack.set_widget_name(url);
                         if let Some(cached_path) = resolve_custom_emoji_cached_file(url) {
-                            apply_custom_emoji_image(&stack, &cached_path, url);
+                            apply_custom_emoji_image(&stack, &cached_path, url, &animated_emojis);
                         } else {
                             stack.set_visible_child_name("placeholder");
                             pending_widgets
@@ -670,6 +776,8 @@ impl EmojiPickerWindow {
         factory.connect_unbind(move |_, list_item| {
             let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
             if let Some(container) = list_item.child().and_downcast::<gtk::Box>() {
+                container.remove_css_class("hovered");
+                container.remove_css_class("animating");
                 if let Some(stack) = container.first_child().and_downcast::<gtk::Stack>() {
                     stack.set_widget_name("");
                     if let Some(pic) = stack.child_by_name("pic").and_downcast::<gtk::Picture>() {

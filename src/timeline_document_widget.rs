@@ -508,7 +508,17 @@ impl<'a> DocumentRenderer<'a> {
     }
 
     fn control_button(&self, control: &MessageControl) -> Button {
-        let button = Button::with_label(control.label());
+        let button = if control.is_call() {
+            let content = adw::ButtonContent::builder()
+                .icon_name("call-start-symbolic")
+                .label(control.label())
+                .build();
+            let button = Button::builder().child(&content).build();
+            button.add_css_class("suggested-action");
+            button
+        } else {
+            Button::with_label(control.label())
+        };
         button.set_focus_on_click(false);
         if let Some(url) = control.url().filter(|url| is_http_url(url)) {
             let url = url.to_string();
@@ -536,21 +546,66 @@ impl<'a> DocumentRenderer<'a> {
             if let Some(on_action) = self.on_action {
                 let on_action = on_action.clone();
                 let ts = self.ts.to_string();
+                let confirmation = control.confirmation.clone();
                 button.set_sensitive(true);
                 button.connect_clicked(move |button| {
-                    // Pending until the action completes or fails; the row is
-                    // then re-rendered with fresh, enabled controls.
-                    button.set_sensitive(false);
-                    let on_action = on_action.clone();
-                    let ts = ts.clone();
-                    glib::idle_add_local_once(move || {
-                        (on_action)(
-                            crate::timeline_message_widget::TimelineAction::ExecuteControlAction {
-                                ts,
-                                key,
-                            },
-                        );
-                    });
+                    if let Some(conf) = confirmation.as_ref() {
+                        let heading = conf.title.as_deref().unwrap_or("Confirm Action");
+                        let body = conf
+                            .text
+                            .as_deref()
+                            .unwrap_or("Are you sure you want to proceed?");
+                        let confirm_label = conf.confirm_label.as_deref().unwrap_or("Confirm");
+                        let deny_label = conf.deny_label.as_deref().unwrap_or("Cancel");
+
+                        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+                        dialog.add_response("cancel", deny_label);
+                        dialog.add_response("confirm", confirm_label);
+                        if conf.destructive {
+                            dialog.set_response_appearance(
+                                "confirm",
+                                adw::ResponseAppearance::Destructive,
+                            );
+                            dialog.set_default_response(Some("cancel"));
+                        } else {
+                            dialog.set_default_response(Some("confirm"));
+                        }
+                        dialog.set_close_response("cancel");
+
+                        let button_target = button.clone();
+                        let on_action = on_action.clone();
+                        let ts = ts.clone();
+                        dialog.connect_response(Some("confirm"), move |_, _| {
+                            // Pending until the action completes or fails; the row is
+                            // then re-rendered with fresh, enabled controls.
+                            button_target.set_sensitive(false);
+                            let on_action = on_action.clone();
+                            let ts = ts.clone();
+                            glib::idle_add_local_once(move || {
+                                (on_action)(
+                                    crate::timeline_message_widget::TimelineAction::ExecuteControlAction {
+                                        ts,
+                                        key,
+                                    },
+                                );
+                            });
+                        });
+                        dialog.present(Some(button));
+                    } else {
+                        // Pending until the action completes or fails; the row is
+                        // then re-rendered with fresh, enabled controls.
+                        button.set_sensitive(false);
+                        let on_action = on_action.clone();
+                        let ts = ts.clone();
+                        glib::idle_add_local_once(move || {
+                            (on_action)(
+                                crate::timeline_message_widget::TimelineAction::ExecuteControlAction {
+                                    ts,
+                                    key,
+                                },
+                            );
+                        });
+                    }
                 });
             } else {
                 button.set_sensitive(false);
@@ -688,5 +743,26 @@ mod tests {
 
         clear_document_accent_cache();
         assert!(ACCENT_CLASSES.with(|seen| seen.borrow().is_empty()));
+    }
+
+    #[test]
+    fn call_button_has_suggested_action() {
+        crate::timeline::tests::run_gtk_test(|| {
+            let context = MessageHtmlContext::default();
+            let sources = MediaSources {
+                resolve: &|_| None,
+                is_failed: &|_| false,
+            };
+            let renderer = DocumentRenderer::new(&context, sources, "123.456", None);
+
+            let call_control =
+                MessageControl::call("Join Huddle", Some("https://slack.com".into()));
+            let button = renderer.control_button(&call_control);
+            assert!(button.has_css_class("suggested-action"));
+
+            let regular_control = MessageControl::new("Regular", None);
+            let regular_button = renderer.control_button(&regular_control);
+            assert!(!regular_button.has_css_class("suggested-action"));
+        });
     }
 }

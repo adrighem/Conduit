@@ -26,6 +26,7 @@ src/secondary_views/search.rs
 src/shortcuts-dialog.ui
 src/status_dialog.rs
 src/thread_pane.rs
+src/timeline/row.rs
 src/timeline_message_widget.rs
 src/window.rs
 src/window.ui

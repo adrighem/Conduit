@@ -3327,6 +3327,11 @@ impl ConduitWindow {
                     self.copy_message_text(&channel_id, &ts);
                 }
             }
+            TimelineAction::CopyMessageWithMetadata(ts) => {
+                if let Some(channel_id) = self.visible_channel_id() {
+                    self.copy_message_with_metadata(&channel_id, &ts);
+                }
+            }
             TimelineAction::MessageUser(user_id) => {
                 self.send_command(RuntimeCommand::OpenDirectMessage { user_id });
             }
@@ -8899,6 +8904,21 @@ impl ConduitWindow {
         }
 
         self.copy_to_clipboard(&text, "Copied message");
+    }
+
+    fn copy_message_with_metadata(&self, channel_id: &str, ts: &str) {
+        let Some(message) = self.find_message(channel_id, ts) else {
+            self.set_status("Message is no longer loaded");
+            return;
+        };
+
+        let author = message.author_label();
+        let time_str = crate::message_html::localized_timestamp_parts(&message.ts)
+            .map(|(_, _, short)| short)
+            .unwrap_or_else(|| message.ts.clone());
+        let text = message.visible_text();
+        let formatted = format!("[{time_str}] {author}:\n{text}");
+        self.copy_to_clipboard(&formatted, "Copied message with details");
     }
 
     fn copy_message_link(&self, channel_id: &str, ts: &str) {

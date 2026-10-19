@@ -48,6 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 urlencoding = "2.1"
 unicode-normalization = "0.1"
+sourceview5 = "0.9"
 
 [dependencies.adw]
 package = "libadwaita"

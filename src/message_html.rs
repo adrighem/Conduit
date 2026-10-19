@@ -20,6 +20,9 @@ const CACHED_ASSET_URI_PREFIX: &str = "conduit-asset://";
 const QUICK_REACTION_LIMIT: usize = 4;
 static TIME_FORMAT_LOCALE: OnceLock<Option<String>> = OnceLock::new();
 
+/// Canonical render context for Slack message formatting and timeline display.
+pub type MessageRenderContext = MessageHtmlContext;
+
 #[derive(Debug, Clone, Default)]
 pub struct MessageHtmlContext {
     pub user_names: Arc<HashMap<String, String>>,

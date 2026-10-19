@@ -161,9 +161,14 @@ pub(crate) fn user_mention_popover(
     popover.insert_action_group("author", Some(&group));
     let popover_weak = popover.downgrade();
     popover.connect_closed(move |_| {
-        if let Some(p) = popover_weak.upgrade() {
-            p.unparent();
-        }
+        let popover_weak = popover_weak.clone();
+        gtk::glib::idle_add_local_once(move || {
+            if let Some(p) = popover_weak.upgrade() {
+                if p.parent().is_some() {
+                    p.unparent();
+                }
+            }
+        });
     });
     Some(popover)
 }
@@ -253,7 +258,10 @@ mod tests {
             };
             let popover = user_mention_popover(&label, "U_OTHER", &context, on_action, None);
             assert!(popover.is_some());
-            assert!(!action_taken.get());
+            let popover = popover.unwrap();
+            let res = popover.activate_action("author.message", None);
+            assert!(res.is_ok());
+            assert!(action_taken.get());
         });
     }
 }
