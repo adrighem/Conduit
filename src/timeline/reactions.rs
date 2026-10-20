@@ -1,6 +1,4 @@
-use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{glib, Box, Button, Image, Label, Orientation, Picture, Widget};
@@ -42,85 +40,24 @@ pub fn scale_reaction_pixbuf(pixbuf: &gdk_pixbuf::Pixbuf) -> gdk_pixbuf::Pixbuf 
 }
 
 pub fn load_custom_emoji_picture(path: &Path) -> Widget {
-    let cached = REACTION_TEXTURE_CACHE.with(|cache| {
-        let mut map = cache.borrow_mut();
-        if let Some(entry) = map.get(path) {
-            return Some(entry);
-        }
-        if let Ok(anim) = gdk_pixbuf::PixbufAnimation::from_file(path) {
-            if anim.is_static_image() {
-                if let Some(pixbuf) = anim.static_image() {
-                    let scaled = scale_reaction_pixbuf(&pixbuf);
-                    let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
-                    let entry = (None, texture);
-                    map.insert(path.to_path_buf(), entry.clone());
-                    return Some(entry);
+    let paintable =
+        crate::animated_image::animated_paintable(path, REACTION_EMOJI_SIZE).or_else(|| {
+            REACTION_TEXTURE_CACHE.with(|cache| {
+                let mut map = cache.borrow_mut();
+                if let Some(texture) = map.get(path) {
+                    return Some(texture.upcast());
                 }
-            } else {
-                let iter = anim.iter(None);
-                let initial_pixbuf = iter.pixbuf();
-                let scaled = scale_reaction_pixbuf(&initial_pixbuf);
+                let pixbuf = gdk_pixbuf::Pixbuf::from_file(path).ok()?;
+                let scaled = scale_reaction_pixbuf(&pixbuf);
                 let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
-                let entry = (Some(anim), texture);
-                map.insert(path.to_path_buf(), entry.clone());
-                return Some(entry);
-            }
-        } else if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file(path) {
-            let scaled = scale_reaction_pixbuf(&pixbuf);
-            let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
-            let entry = (None, texture);
-            map.insert(path.to_path_buf(), entry.clone());
-            return Some(entry);
-        }
-        None
-    });
-
-    if let Some((opt_anim, texture)) = cached {
-        let pic = Picture::for_paintable(&texture);
-        pic.set_size_request(32, 32);
-        pic.set_can_shrink(true);
-        pic.set_content_fit(gtk::ContentFit::Contain);
-        pic.add_css_class("reaction-emoji-image");
-
-        if let Some(anim) = opt_anim {
-            let start_animation = |p: &Picture, anim_obj: &gdk_pixbuf::PixbufAnimation| {
-                let iter = anim_obj.iter(None);
-                let last_update = Rc::new(Cell::new(std::time::Instant::now()));
-                let delay_ms = iter
-                    .delay_time()
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(60)
-                    .max(60);
-
-                p.add_tick_callback(move |p, _frame_clock| {
-                    if !p.is_mapped() {
-                        return glib::ControlFlow::Break;
-                    }
-                    if last_update.get().elapsed().as_millis() as u64 >= delay_ms {
-                        last_update.set(std::time::Instant::now());
-                        iter.advance(std::time::SystemTime::now());
-                        let pixbuf = iter.pixbuf();
-                        let scaled = scale_reaction_pixbuf(&pixbuf);
-                        p.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&scaled)));
-                    }
-                    glib::ControlFlow::Continue
-                });
-            };
-
-            let anim_for_map = anim.clone();
-            pic.connect_map(move |p| {
-                start_animation(p, &anim_for_map);
-            });
-
-            if pic.is_mapped() {
-                start_animation(&pic, &anim);
-            }
-        }
-
-        return pic.upcast::<Widget>();
-    }
-
-    let pic = Picture::for_filename(path);
+                map.insert(path.to_path_buf(), texture.clone());
+                Some(texture.upcast())
+            })
+        });
+    let pic = match paintable {
+        Some(paintable) => Picture::for_paintable(&paintable),
+        None => Picture::for_filename(path),
+    };
     pic.set_size_request(32, 32);
     pic.set_can_shrink(true);
     pic.set_content_fit(gtk::ContentFit::Contain);

@@ -1605,13 +1605,8 @@ fn clear_timeline_view_caches_resets_thread_local_caches() {
         let pixbuf = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 8, 8).unwrap();
         let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
         let path = PathBuf::from("/tmp/conduit-cache-test.png");
-        TEXTURE_CACHE.with(|cache| {
-            cache
-                .borrow_mut()
-                .insert(path.clone(), (None, texture.clone()))
-        });
-        REACTION_TEXTURE_CACHE
-            .with(|cache| cache.borrow_mut().insert(path.clone(), (None, texture)));
+        TEXTURE_CACHE.with(|cache| cache.borrow_mut().insert(path.clone(), texture.clone()));
+        REACTION_TEXTURE_CACHE.with(|cache| cache.borrow_mut().insert(path.clone(), texture));
 
         clear_timeline_view_caches();
 

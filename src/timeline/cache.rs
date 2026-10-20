@@ -6,7 +6,7 @@ use crate::message_html::MessageHtmlContext;
 
 pub(crate) const MAX_TEXTURE_CACHE_SIZE: usize = 256;
 
-pub(crate) type CacheEntry = (Option<gdk_pixbuf::PixbufAnimation>, gtk::gdk::Texture);
+pub(crate) type CacheEntry = gtk::gdk::Texture;
 
 pub(crate) struct BoundedTextureCache {
     entries: HashMap<PathBuf, CacheEntry>,
@@ -76,17 +76,18 @@ pub fn clear_timeline_view_caches() {
     COLLAPSED_MEDIA.with(|set| set.borrow_mut().clear());
     TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
     REACTION_TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
+    crate::animated_image::clear_caches();
     crate::timeline_document_widget::clear_document_accent_cache();
 }
 
 pub(crate) fn get_or_load_texture(path: &Path) -> Option<gtk::gdk::Texture> {
     TEXTURE_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
-        if let Some((_, tex)) = map.get(path) {
+        if let Some(tex) = map.get(path) {
             return Some(tex);
         }
         if let Ok(tex) = gtk::gdk::Texture::from_filename(path) {
-            map.insert(path.to_path_buf(), (None, tex.clone()));
+            map.insert(path.to_path_buf(), tex.clone());
             return Some(tex);
         }
         None

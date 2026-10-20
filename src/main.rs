@@ -18,6 +18,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+mod animated_image;
 mod application;
 mod asset_server;
 mod attention;

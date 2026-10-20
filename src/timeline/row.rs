@@ -1,11 +1,10 @@
-use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{
-    gdk_pixbuf, glib, pango, Box, Button, CssProvider, Image, Label, Orientation, Picture,
-    Separator, ToggleButton, Widget,
+    glib, pango, Box, Button, CssProvider, Image, Label, Orientation, Picture, Separator,
+    ToggleButton, Widget,
 };
 
 use crate::message_html::MessageHtmlContext;
@@ -184,52 +183,12 @@ pub fn load_animated_or_static_picture(
     height: i32,
     content_fit: gtk::ContentFit,
 ) -> Widget {
-    if let Ok(anim) = gdk_pixbuf::PixbufAnimation::from_file(path) {
-        if !anim.is_static_image() {
-            let iter = anim.iter(None);
-            let first_pixbuf = iter.pixbuf();
-            let pic = Picture::for_paintable(&gtk::gdk::Texture::for_pixbuf(&first_pixbuf));
-            pic.set_size_request(width, height);
-            pic.set_can_shrink(true);
-            pic.set_content_fit(content_fit);
-
-            let start_animation = move |p: &Picture, anim_obj: &gdk_pixbuf::PixbufAnimation| {
-                let iter = anim_obj.iter(None);
-                let last_update = Rc::new(Cell::new(std::time::Instant::now()));
-                let delay_ms = iter
-                    .delay_time()
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(60)
-                    .max(60);
-                p.add_tick_callback(move |p, _frame_clock| {
-                    if !p.is_mapped() {
-                        return glib::ControlFlow::Break;
-                    }
-                    if last_update.get().elapsed().as_millis() as u64 >= delay_ms {
-                        last_update.set(std::time::Instant::now());
-                        iter.advance(std::time::SystemTime::now());
-                        p.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&iter.pixbuf())));
-                    }
-                    glib::ControlFlow::Continue
-                });
-            };
-
-            let anim_for_map = anim.clone();
-            pic.connect_map(move |p| {
-                start_animation(p, &anim_for_map);
-            });
-            if pic.is_mapped() {
-                start_animation(&pic, &anim);
-            }
-
-            return pic.upcast::<Widget>();
-        }
-    }
-
-    let pic = if let Some(tex) = get_or_load_texture(path) {
-        Picture::for_paintable(&tex)
-    } else {
-        Picture::for_filename(path)
+    let longest_side = width.max(height);
+    let paintable = crate::animated_image::animated_paintable(path, longest_side)
+        .or_else(|| get_or_load_texture(path).map(|t| t.upcast()));
+    let pic = match paintable {
+        Some(paintable) => Picture::for_paintable(&paintable),
+        None => Picture::for_filename(path),
     };
     pic.set_size_request(width, height);
     pic.set_can_shrink(true);
@@ -887,10 +846,12 @@ pub(crate) fn build_timeline_message_widget(
         let cb_enter = cb.clone();
         let ts = message.ts.clone();
         let reactions = crate::message_html::recent_reactions(context);
-        let row_for_enter = root_box.clone().upcast::<Widget>();
-        motion.connect_enter(move |_, _, _| {
+        motion.connect_enter(move |motion, _, _| {
+            let Some(row) = motion.widget() else {
+                return;
+            };
             cb_enter(HoverEvent::Enter {
-                row: row_for_enter.clone(),
+                row,
                 ts: ts.clone(),
                 reactions: reactions.clone(),
             });
