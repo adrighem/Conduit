@@ -209,10 +209,13 @@ fn attach_text_view_links(
         hrefs.push((name, link.href));
     }
     let click = gtk::GestureClick::new();
-    let click_view = view.clone();
     let context = context.clone();
     let on_action = on_action.cloned();
-    click.connect_released(move |_, _, x, y| {
+    // Resolve view from gesture: capturing view form strong cycle and leak view.
+    click.connect_released(move |gesture, _, x, y| {
+        let Some(click_view) = gesture.widget().and_downcast::<TextView>() else {
+            return;
+        };
         let (bx, by) =
             click_view.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
         let Some(iter) = click_view.iter_at_location(bx, by) else {
