@@ -857,7 +857,7 @@ impl NativeTimelineView {
     ) {
         self.placeholder_label.set_visible(false);
         self.scrolled_window.set_visible(true);
-        *self.context.borrow_mut() = Some(context.clone());
+        let context_changed = self.context.replace(Some(context.clone())).as_ref() != Some(context);
         *self.latest_message_ts.borrow_mut() = messages.first().map(|msg| msg.ts.clone());
         self.reset_read_candidate();
         // Removing the focused row would hand focus to GTK's fallback, which
@@ -875,10 +875,13 @@ impl NativeTimelineView {
         if let Some(ts) = focus_ts {
             self.set_highlight(ts);
         }
-        self.store.remove_all();
         let unread_ts = context.unread_separator_ts.as_deref();
         let (items, focus_index) = build_store_items(messages, focus_ts, unread_ts);
-        self.store.splice(0, 0, &items);
+        let inserted = self.splice_changed_items(&items);
+        // Kept rows were built against the previous context.
+        if context_changed {
+            self.rebind_rows(|obj| !inserted.iter().any(|new| new == obj));
+        }
 
         let list_view = self.list_view.clone();
         let n_items = items.len() as u32;
@@ -911,6 +914,36 @@ impl NativeTimelineView {
         glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
             recheck_delayed();
         });
+    }
+
+    /// Replaces only run of store items differing from `items`, so
+    /// update to one message rebuilds one row instead of whole timeline.
+    /// Returns inserted items.
+    fn splice_changed_items<'a>(
+        &self,
+        items: &'a [TimelineMessageObject],
+    ) -> &'a [TimelineMessageObject] {
+        let old_len = self.store.n_items() as usize;
+        let old_at = |index: usize| {
+            self.store
+                .item(index as u32)
+                .and_downcast::<TimelineMessageObject>()
+        };
+        let max_common = old_len.min(items.len());
+        let prefix = (0..max_common)
+            .take_while(|&i| old_at(i).is_some_and(|old| old.same_row(&items[i])))
+            .count();
+        let suffix = (0..max_common - prefix)
+            .take_while(|&i| {
+                old_at(old_len - 1 - i).is_some_and(|old| old.same_row(&items[items.len() - 1 - i]))
+            })
+            .count();
+        let inserted = &items[prefix..items.len() - suffix];
+        let removed = old_len - prefix - suffix;
+        if removed > 0 || !inserted.is_empty() {
+            self.store.splice(prefix as u32, removed as u32, inserted);
+        }
+        inserted
     }
 
     /// Shows a plain-text placeholder (loading state, empty state, error message) in place of

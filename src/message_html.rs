@@ -23,7 +23,7 @@ static TIME_FORMAT_LOCALE: OnceLock<Option<String>> = OnceLock::new();
 /// Canonical render context for Slack message formatting and timeline display.
 pub type MessageRenderContext = MessageHtmlContext;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MessageHtmlContext {
     pub user_names: Arc<HashMap<String, String>>,
     pub user_full_names: Arc<HashMap<String, String>>,

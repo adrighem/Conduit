@@ -60,6 +60,13 @@ impl TimelineMessageObject {
     pub fn message(&self) -> SlackMessage {
         self.imp().message.borrow().clone()
     }
+
+    /// Whether both objects render the same row (kind, header, message).
+    pub(crate) fn same_row(&self, other: &Self) -> bool {
+        self.is_day_separator() == other.is_day_separator()
+            && self.hide_header() == other.hide_header()
+            && *self.imp().message.borrow() == *other.imp().message.borrow()
+    }
 }
 
 pub(crate) fn is_system_subtype(message: &SlackMessage) -> bool {
