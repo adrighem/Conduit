@@ -86,6 +86,9 @@ pub(crate) fn get_or_load_texture(path: &Path) -> Option<gtk::gdk::Texture> {
         if let Some(tex) = map.get(path) {
             return Some(tex);
         }
+        if !crate::animated_image::within_decode_budget(path) {
+            return None;
+        }
         if let Ok(tex) = gtk::gdk::Texture::from_filename(path) {
             map.insert(path.to_path_buf(), tex.clone());
             return Some(tex);

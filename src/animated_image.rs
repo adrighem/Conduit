@@ -25,6 +25,10 @@ const PAUSED_POLL: Duration = Duration::from_millis(500);
 /// Frames are scaled for this display scale so they stay sharp on HiDPI.
 const OVERSAMPLE: i32 = 2;
 const MAX_STATIC_FILES: usize = 4096;
+/// Most pixels (width x height x frames) one file may decode to: an 8192x8192
+/// still, 256 MiB as RGBA. Files are capped at 8 MiB on download, but a tiny
+/// GIF or PNG header can still declare a canvas that decodes to gigabytes.
+const MAX_DECODED_PIXELS: u64 = 8192 * 8192;
 
 thread_local! {
     static PLAYERS: RefCell<HashMap<(PathBuf, i32), glib::WeakRef<AnimatedImage>>> =
@@ -167,7 +171,10 @@ pub(crate) fn animated_paintable(path: &Path, display_size: i32) -> Option<gdk::
     if let Some(player) = existing {
         return Some(player.upcast());
     }
-    if STATIC_FILES.with(|files| files.borrow().contains(path)) || !may_be_animated(path) {
+    if STATIC_FILES.with(|files| files.borrow().contains(path))
+        || !may_be_animated(path)
+        || !within_decode_budget(path)
+    {
         return None;
     }
     let animation = gdk_pixbuf::PixbufAnimation::from_file(path).ok()?;
@@ -231,6 +238,54 @@ pub(crate) fn may_be_animated(path: &Path) -> bool {
         .is_some_and(|name| matches!(name.as_str(), "gif" | "webp"))
 }
 
+/// Whether `path` decodes to at most [`MAX_DECODED_PIXELS`], judged from its
+/// headers only. Unreadable or unrecognised files fail closed, so callers
+/// must not fall back to decoding them another way.
+pub(crate) fn within_decode_budget(path: &Path) -> bool {
+    let Some((format, width, height)) = gdk_pixbuf::Pixbuf::file_info(path) else {
+        return false;
+    };
+    let (Ok(width), Ok(height)) = (u64::try_from(width), u64::try_from(height)) else {
+        return false;
+    };
+    // The WebP loader decodes every frame up front; gdk-pixbuf keeps GIF
+    // frames compressed and composites them on demand, so they cost one.
+    let frames = if format.name().is_some_and(|name| name == "webp") {
+        let Some(frames) = std::fs::File::open(path)
+            .ok()
+            .and_then(|file| webp_frame_count(std::io::BufReader::new(file)))
+        else {
+            return false;
+        };
+        frames
+    } else {
+        1
+    };
+    let pixels = width.saturating_mul(height).saturating_mul(frames);
+    width > 0 && height > 0 && pixels <= MAX_DECODED_PIXELS
+}
+
+/// Number of frames in a RIFF WebP: its `ANMF` chunks, or 1 for a still.
+/// Walks chunk headers only. `None` when the stream is not a WebP.
+fn webp_frame_count(mut reader: impl std::io::Read + std::io::Seek) -> Option<u64> {
+    let mut header = [0u8; 12];
+    reader.read_exact(&mut header).ok()?;
+    if &header[..4] != b"RIFF" || &header[8..] != b"WEBP" {
+        return None;
+    }
+    let mut frames = 0u64;
+    let mut chunk = [0u8; 8];
+    while reader.read_exact(&mut chunk).is_ok() {
+        if &chunk[..4] == b"ANMF" {
+            frames += 1;
+        }
+        let size = i64::from(u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]));
+        // Chunk payloads are padded to an even length.
+        reader.seek_relative(size + (size & 1)).ok()?;
+    }
+    Some(frames.max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +329,69 @@ mod tests {
         assert!(animated_paintable(&path, 18).is_none());
         assert!(STATIC_FILES.with(|files| files.borrow().contains(&path)));
         std::fs::remove_file(path).ok();
+    }
+
+    /// [`ANIMATED_GIF`] whose header declares a 30000x30000 canvas: 50 bytes
+    /// that would decode to about 3.6 GB of RGBA.
+    fn oversized_gif() -> Vec<u8> {
+        let mut bytes = ANIMATED_GIF.to_vec();
+        bytes[6..10].copy_from_slice(&[0x30, 0x75, 0x30, 0x75]);
+        bytes
+    }
+
+    #[test]
+    fn oversized_image_is_rejected_before_decoding() {
+        let path = write_temp("bomb.gif", &oversized_gif());
+        assert_eq!(
+            gdk_pixbuf::Pixbuf::file_info(&path).map(|(_, w, h)| (w, h)),
+            Some((30000, 30000))
+        );
+        assert!(!within_decode_budget(&path));
+        assert!(animated_paintable(&path, 18).is_none());
+        assert!(!STATIC_FILES.with(|files| files.borrow().contains(&path)));
+        assert!(crate::timeline::cache::get_or_load_texture(&path).is_none());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn small_images_fit_decode_budget() {
+        let path = write_temp("budget.gif", ANIMATED_GIF);
+        assert!(within_decode_budget(&path));
+        std::fs::remove_file(path).ok();
+        let junk = write_temp("budget.bin", b"not an image");
+        assert!(!within_decode_budget(&junk));
+        std::fs::remove_file(junk).ok();
+    }
+
+    fn riff_webp(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut body = b"WEBP".to_vec();
+        for (tag, payload) in chunks {
+            body.extend_from_slice(*tag);
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(payload);
+            if payload.len() % 2 == 1 {
+                body.push(0);
+            }
+        }
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    #[test]
+    fn webp_frame_count_counts_anmf_chunks() {
+        let count = |bytes: Vec<u8>| webp_frame_count(std::io::Cursor::new(bytes));
+        let anim = riff_webp(&[
+            (b"VP8X", &[0; 10]),
+            (b"ANIM", &[0; 6]),
+            (b"ANMF", &[0; 3]),
+            (b"ANMF", &[0; 16]),
+            (b"ANMF", &[]),
+        ]);
+        assert_eq!(count(anim), Some(3));
+        assert_eq!(count(riff_webp(&[(b"VP8 ", &[0; 5])])), Some(1));
+        assert_eq!(count(ANIMATED_GIF.to_vec()), None);
     }
 
     #[test]

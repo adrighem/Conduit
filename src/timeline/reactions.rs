@@ -47,6 +47,9 @@ pub fn load_custom_emoji_picture(path: &Path) -> Widget {
                 if let Some(texture) = map.get(path) {
                     return Some(texture.upcast());
                 }
+                if !crate::animated_image::within_decode_budget(path) {
+                    return None;
+                }
                 let pixbuf = gdk_pixbuf::Pixbuf::from_file(path).ok()?;
                 let scaled = scale_reaction_pixbuf(&pixbuf);
                 let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
@@ -56,7 +59,8 @@ pub fn load_custom_emoji_picture(path: &Path) -> Widget {
         });
     let pic = match paintable {
         Some(paintable) => Picture::for_paintable(&paintable),
-        None => Picture::for_filename(path),
+        // Failed or over the decode budget: decoding again would not help.
+        None => Picture::new(),
     };
     pic.set_size_request(32, 32);
     pic.set_can_shrink(true);

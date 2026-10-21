@@ -530,7 +530,9 @@ impl EmojiPickerWindow {
             path: &Path,
             expected_url: &str,
         ) {
-            if container.has_css_class("animating") {
+            if container.has_css_class("animating")
+                || !crate::animated_image::within_decode_budget(path)
+            {
                 return;
             }
             let Ok(anim) = gdk_pixbuf::PixbufAnimation::from_file(path) else {
@@ -585,6 +587,9 @@ impl EmojiPickerWindow {
             let Some(pic) = stack.child_by_name("pic").and_downcast::<gtk::Picture>() else {
                 return;
             };
+            if !crate::animated_image::within_decode_budget(path) {
+                return;
+            }
             if let Ok(anim) = gdk_pixbuf::PixbufAnimation::from_file(path) {
                 if !anim.is_static_image() {
                     let iter = anim.iter(None);

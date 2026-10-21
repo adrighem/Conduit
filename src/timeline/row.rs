@@ -189,7 +189,8 @@ pub fn load_animated_or_static_picture(
         .or_else(|| get_or_load_texture(path).map(|t| t.upcast()));
     let pic = match paintable {
         Some(paintable) => Picture::for_paintable(&paintable),
-        None => Picture::for_filename(path),
+        // Failed or over the decode budget: decoding again would not help.
+        None => Picture::new(),
     };
     pic.set_size_request(width, height);
     pic.set_can_shrink(true);
@@ -278,10 +279,9 @@ fn render_files(
             let overlay = gtk::Overlay::new();
 
             if let Some(path) = local_thumb {
-                let pic = if let Some(tex) = get_or_load_texture(&path) {
-                    Picture::for_paintable(&tex)
-                } else {
-                    Picture::for_filename(&path)
+                let pic = match get_or_load_texture(&path) {
+                    Some(tex) => Picture::for_paintable(&tex),
+                    None => Picture::new(),
                 };
                 pic.set_content_fit(gtk::ContentFit::ScaleDown);
                 pic.set_size_request(600, 340);
