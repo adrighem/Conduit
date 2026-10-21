@@ -147,10 +147,32 @@ struct DownloadRequest {
     callback: Option<DownloadCallback>,
 }
 
+/// Caps how many distinct URLs the "don't retry this session" failure set
+/// can hold, so a workspace with many broken custom-emoji URLs over a long
+/// session can't grow it unboundedly. Mirrors the eviction style of
+/// `BoundedTextureCache` in `src/timeline/cache.rs`.
+const MAX_FAILED_EMOJI_URLS: usize = 256;
+
 struct LoaderState {
     queue: VecDeque<DownloadRequest>,
     in_flight: HashMap<String, Vec<DownloadCallback>>,
     failed: HashSet<String>,
+    failed_order: VecDeque<String>,
+}
+
+impl LoaderState {
+    /// Records a permanent-for-this-session download failure, evicting the
+    /// oldest entry once `MAX_FAILED_EMOJI_URLS` is exceeded.
+    fn mark_failed(&mut self, url: String) {
+        if self.failed.insert(url.clone()) {
+            self.failed_order.push_back(url);
+            if self.failed_order.len() > MAX_FAILED_EMOJI_URLS {
+                if let Some(oldest) = self.failed_order.pop_front() {
+                    self.failed.remove(&oldest);
+                }
+            }
+        }
+    }
 }
 
 struct CustomEmojiLoader {
@@ -164,6 +186,7 @@ impl CustomEmojiLoader {
             queue: VecDeque::new(),
             in_flight: HashMap::new(),
             failed: HashSet::new(),
+            failed_order: VecDeque::new(),
         }));
         let notify = Arc::new(tokio::sync::Notify::new());
 
@@ -195,38 +218,52 @@ impl CustomEmojiLoader {
                         handles.push(tokio::spawn(async move {
                             loop {
                                 let notified = notify.notified();
-                                let next_url = {
-                                    let mut s = state.lock().unwrap();
-                                    loop {
+                                // Dequeue under the lock, but do the (possibly
+                                // slow, disk-scanning) cache resolution below
+                                // with the lock released: `LoaderState`'s
+                                // mutex is shared with every other worker and
+                                // with `queue()` on the GTK main thread, so
+                                // holding it across filesystem I/O would
+                                // serialize all of them behind one scan.
+                                let next_url = loop {
+                                    let req = {
+                                        let mut s = state.lock().unwrap();
                                         let Some(req) = s.queue.pop_front() else {
                                             break None;
                                         };
-
-                                        if let Some(path) =
-                                            resolve_custom_emoji_cached_file(&req.url)
-                                        {
-                                            if let Some(cb) = req.callback {
-                                                cb(path);
-                                            }
+                                        if s.failed.contains(&req.url) {
+                                            // Marked failed after being
+                                            // queued (or re-queued before
+                                            // `queue()` learned of the
+                                            // failure): drop it rather than
+                                            // retry within this session.
                                             continue;
                                         }
+                                        req
+                                    };
 
-                                        s.failed.remove(&req.url);
+                                    if let Some(path) = resolve_custom_emoji_cached_file(&req.url) {
                                         if let Some(cb) = req.callback {
-                                            if let Some(cbs) = s.in_flight.get_mut(&req.url) {
-                                                cbs.push(cb);
-                                                continue;
-                                            } else {
-                                                s.in_flight.insert(req.url.clone(), vec![cb]);
-                                            }
-                                        } else if s.in_flight.contains_key(&req.url) {
+                                            cb(path);
+                                        }
+                                        continue;
+                                    }
+
+                                    let mut s = state.lock().unwrap();
+                                    if let Some(cb) = req.callback {
+                                        if let Some(cbs) = s.in_flight.get_mut(&req.url) {
+                                            cbs.push(cb);
                                             continue;
                                         } else {
-                                            s.in_flight.insert(req.url.clone(), Vec::new());
+                                            s.in_flight.insert(req.url.clone(), vec![cb]);
                                         }
-
-                                        break Some(req.url);
+                                    } else if s.in_flight.contains_key(&req.url) {
+                                        continue;
+                                    } else {
+                                        s.in_flight.insert(req.url.clone(), Vec::new());
                                     }
+
+                                    break Some(req.url);
                                 };
 
                                 let Some(url) = next_url else {
@@ -240,7 +277,7 @@ impl CustomEmojiLoader {
                                     let mut s = state.lock().unwrap();
                                     let cbs = s.in_flight.remove(&url).unwrap_or_default();
                                     if res.is_none() {
-                                        s.failed.insert(url.clone());
+                                        s.mark_failed(url.clone());
                                     }
                                     (cbs, res)
                                 };
@@ -271,7 +308,15 @@ impl CustomEmojiLoader {
         }
 
         let mut s = self.state.lock().unwrap();
-        s.failed.remove(&url);
+        if s.failed.contains(&url) {
+            // Already failed once this session (404, invalid URL, etc.):
+            // skip re-fetching rather than hammering the server on every
+            // row bind/recycle that references this emoji. Cleared only by
+            // an app restart (the set is in-memory); the codebase doesn't
+            // otherwise distinguish permanent vs. transient failures, so
+            // this is the simplest safe policy.
+            return;
+        }
 
         if let Some(cbs) = s.in_flight.get_mut(&url) {
             if let Some(cb) = callback {
@@ -996,5 +1041,50 @@ mod tests {
 
         std::fs::remove_file(&file_path).unwrap();
         assert!(resolve_custom_emoji_cached_file(&url).is_none());
+    }
+
+    #[test]
+    fn queue_skips_url_already_marked_failed() {
+        let url = "https://emoji.slack-edge.com/T_TEST/bad/emoji.png".to_string();
+        let loader = CustomEmojiLoader {
+            state: Arc::new(Mutex::new(LoaderState {
+                queue: VecDeque::new(),
+                in_flight: HashMap::new(),
+                failed: HashSet::from([url.clone()]),
+                failed_order: VecDeque::from([url.clone()]),
+            })),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        };
+
+        loader.queue(url.clone(), false, None);
+
+        let state = loader.state.lock().unwrap();
+        assert!(
+            state.queue.is_empty(),
+            "a URL already in the failed set must not be re-queued for download"
+        );
+        assert!(!state.in_flight.contains_key(&url));
+    }
+
+    #[test]
+    fn mark_failed_evicts_oldest_entry_past_the_cap() {
+        let mut state = LoaderState {
+            queue: VecDeque::new(),
+            in_flight: HashMap::new(),
+            failed: HashSet::new(),
+            failed_order: VecDeque::new(),
+        };
+
+        for i in 0..MAX_FAILED_EMOJI_URLS + 10 {
+            state.mark_failed(format!("https://example.com/emoji-{i}.png"));
+        }
+
+        assert_eq!(state.failed.len(), MAX_FAILED_EMOJI_URLS);
+        assert_eq!(state.failed_order.len(), MAX_FAILED_EMOJI_URLS);
+        assert!(!state.failed.contains("https://example.com/emoji-0.png"));
+        assert!(state.failed.contains(&format!(
+            "https://example.com/emoji-{}.png",
+            MAX_FAILED_EMOJI_URLS + 9
+        )));
     }
 }

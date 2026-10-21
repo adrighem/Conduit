@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::message_html::MessageHtmlContext;
 
@@ -138,13 +139,109 @@ fn contained_cache_file(cache_root: &Path, candidate: &Path) -> Option<PathBuf> 
     (resolved.starts_with(cache_root) && resolved.is_file()).then_some(resolved)
 }
 
-fn check_file_extensions(cache_root: &Path, base_dir: &Path, key: &str) -> Option<PathBuf> {
-    if !is_safe_cache_key(key) {
-        return None;
+/// How long the in-memory snapshot of the asset cache directory is trusted
+/// before a lookup rebuilds it. Row binds hammer `resolve_cached_asset_path`
+/// (once per visible row, on every scroll/recycle); without this, each call
+/// re-walked the cache directory and probed every known extension for every
+/// candidate path. A short TTL turns that into one directory walk every few
+/// seconds, with newly downloaded assets showing up within that window.
+const RESOLVED_ASSET_INDEX_TTL: Duration = Duration::from_secs(2);
+
+/// One-level-deep snapshot of the asset cache directory: every file stem
+/// (the content-addressed cache key, sans extension) mapped to its resolved
+/// path, plus the top-level directory names (candidate workspace keys) used
+/// to probe URL-hash based lookups. Rebuilt at most once per TTL window
+/// instead of walking the filesystem and probing extensions on every lookup.
+struct ResolvedAssetIndex {
+    cache_root: PathBuf,
+    built_at: Instant,
+    entries: HashMap<String, PathBuf>,
+    workspace_dirs: Vec<String>,
+}
+
+fn index_cache_file(cache_root: &Path, path: &Path, entries: &mut HashMap<String, PathBuf>) {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(stem) = EXTENSIONS.iter().find_map(|ext| name.strip_suffix(ext)) else {
+        return;
+    };
+    if !is_safe_cache_key(stem) {
+        return;
     }
-    EXTENSIONS
-        .iter()
-        .find_map(|ext| contained_cache_file(cache_root, &base_dir.join(format!("{key}{ext}"))))
+    if let Some(resolved) = contained_cache_file(cache_root, path) {
+        entries.insert(stem.to_string(), resolved);
+    }
+}
+
+fn build_resolved_asset_index(cache_root: &Path) -> ResolvedAssetIndex {
+    let mut entries = HashMap::new();
+    let mut workspace_dirs = Vec::new();
+    if let Ok(root_entries) = std::fs::read_dir(cache_root) {
+        for entry in root_entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    workspace_dirs.push(name.to_string());
+                }
+                if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                    for sub_entry in sub_entries.flatten() {
+                        index_cache_file(cache_root, &sub_entry.path(), &mut entries);
+                    }
+                }
+            } else {
+                index_cache_file(cache_root, &path, &mut entries);
+            }
+        }
+    }
+    ResolvedAssetIndex {
+        cache_root: cache_root.to_path_buf(),
+        built_at: Instant::now(),
+        entries,
+        workspace_dirs,
+    }
+}
+
+thread_local! {
+    static RESOLVED_ASSET_INDEX: RefCell<Option<ResolvedAssetIndex>> = const { RefCell::new(None) };
+}
+
+/// Looks up `cache_root` in the thread-local index, rebuilding it (one
+/// `read_dir` of the root plus one per workspace subdirectory) only when the
+/// root changed or the cached snapshot has aged past
+/// [`RESOLVED_ASSET_INDEX_TTL`].
+fn with_resolved_asset_index<T>(cache_root: &Path, f: impl FnOnce(&ResolvedAssetIndex) -> T) -> T {
+    RESOLVED_ASSET_INDEX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let stale = match slot.as_ref() {
+            Some(index) => {
+                index.cache_root != cache_root
+                    || index.built_at.elapsed() >= RESOLVED_ASSET_INDEX_TTL
+            }
+            None => true,
+        };
+        if stale {
+            *slot = Some(build_resolved_asset_index(cache_root));
+        }
+        f(slot.as_ref().expect("index was just built"))
+    })
+}
+
+/// Test-only escape hatch: forces the next lookup to rebuild the index
+/// instead of waiting out the TTL, so tests can assert on freshly-scanned
+/// state without sleeping.
+#[cfg(test)]
+fn reset_resolved_asset_index_for_tests() {
+    RESOLVED_ASSET_INDEX.with(|cell| *cell.borrow_mut() = None);
+}
+
+fn hashed_cache_key(workspace_dir_name: &str, url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(workspace_dir_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(url.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Maps a Slack-provided URL (or a `conduit-asset://` URI registered for it)
@@ -174,54 +271,25 @@ fn resolve_cached_asset_path_in(
         .strip_prefix("conduit-asset://")
         .or_else(|| source_uri.strip_prefix("conduit-cache://"));
 
-    if let Some(cache_key) = cache_key {
-        let clean_key = cache_key
-            .split('?')
-            .next()
-            .unwrap_or(cache_key)
-            .trim_matches('/');
-        if is_safe_cache_key(clean_key) {
-            if let Some(path) = check_file_extensions(&cache_root, &cache_root, clean_key) {
-                return Some(path);
-            }
-
-            if let Ok(entries) = std::fs::read_dir(&cache_root) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        if let Some(sub_path) = check_file_extensions(&cache_root, &path, clean_key)
-                        {
-                            return Some(sub_path);
-                        }
-                    }
+    with_resolved_asset_index(&cache_root, |index| {
+        if let Some(cache_key) = cache_key {
+            let clean_key = cache_key
+                .split('?')
+                .next()
+                .unwrap_or(cache_key)
+                .trim_matches('/');
+            if is_safe_cache_key(clean_key) {
+                if let Some(path) = index.entries.get(clean_key) {
+                    return Some(path.clone());
                 }
             }
         }
-    }
 
-    if let Ok(entries) = std::fs::read_dir(&cache_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(workspace_dir_name) = entry.file_name().to_str() {
-                    let hash = {
-                        use sha2::{Digest, Sha256};
-                        let mut hasher = Sha256::new();
-                        hasher.update(workspace_dir_name.as_bytes());
-                        hasher.update([0]);
-                        hasher.update(url.as_bytes());
-                        format!("{:x}", hasher.finalize())
-                    };
-
-                    if let Some(sub_path) = check_file_extensions(&cache_root, &path, &hash) {
-                        return Some(sub_path);
-                    }
-                }
-            }
-        }
-    }
-
-    None
+        index.workspace_dirs.iter().find_map(|workspace_dir_name| {
+            let hash = hashed_cache_key(workspace_dir_name, url);
+            index.entries.get(&hash).cloned()
+        })
+    })
 }
 
 #[cfg(test)]
@@ -334,5 +402,34 @@ mod path_tests {
             contained_cache_file(&root, &fx.cache.join("workspace")),
             None
         );
+    }
+
+    /// A repeated lookup for the same key must come from the in-memory
+    /// index, not a fresh directory scan: deleting the file on disk between
+    /// the two lookups should not change the (now stale) answer until the
+    /// index's TTL expires (simulated here via the test-only reset hook).
+    #[test]
+    fn resolve_uses_cached_index_instead_of_rescanning_on_repeat_lookup() {
+        reset_resolved_asset_index_for_tests();
+        let fx = Fixture::new("index-reuse");
+        let key = "b".repeat(64);
+        let file = fx.cache.join("workspace").join(format!("{key}.png"));
+        std::fs::write(&file, b"img").unwrap();
+        let uri = format!("conduit-asset://{key}");
+        let ctx = test_context();
+
+        let first = resolve_cached_asset_path_in(&fx.cache, &uri, &ctx);
+        assert_eq!(first, Some(file.canonicalize().unwrap()));
+
+        std::fs::remove_file(&file).unwrap();
+
+        // Index not stale yet: still answers from memory, proving the
+        // lookup did not re-scan the (now changed) directory.
+        let second = resolve_cached_asset_path_in(&fx.cache, &uri, &ctx);
+        assert_eq!(second, first);
+
+        reset_resolved_asset_index_for_tests();
+        let third = resolve_cached_asset_path_in(&fx.cache, &uri, &ctx);
+        assert_eq!(third, None);
     }
 }
