@@ -350,7 +350,12 @@ fn filter_workspace_search_matches(query: &str, matches: Vec<SearchMatch>) -> Ve
 
 #[derive(Clone)]
 pub struct SlackApi {
+    /// General client for unauthenticated or header-only GETs (asset
+    /// downloads, upload URLs); follows redirects to public HTTPS hosts.
     http: Client,
+    /// Client for requests carrying the token in the body; never follows a
+    /// cross-origin redirect, since reqwest replays the body on 307/308.
+    api_http: Client,
     pub(crate) api_base_url: String,
     access_token: String,
     browser_cookie_d: Option<String>,
@@ -706,6 +711,11 @@ impl SlackApi {
                 .read_timeout(HTTP_READ_TIMEOUT)
                 .build()
                 .expect("valid Slack HTTP client configuration"),
+            api_http: http_client::api_builder()
+                .connect_timeout(HTTP_CONNECT_TIMEOUT)
+                .read_timeout(HTTP_READ_TIMEOUT)
+                .build()
+                .expect("valid Slack API HTTP client configuration"),
             api_base_url: SLACK_API_BASE_URL.to_string(),
             access_token: token.access_token,
             browser_cookie_d: token.browser_cookie_d,
@@ -1929,7 +1939,7 @@ impl SlackApi {
             form = form.text(*key, value.clone());
         }
         let mut request = self
-            .http
+            .api_http
             .post(url)
             .timeout(API_REQUEST_TIMEOUT)
             .header(COOKIE, cookie)
@@ -1995,10 +2005,14 @@ impl SlackApi {
     }
 
     fn authenticated_request(&self, method: Method, url: &str) -> reqwest::RequestBuilder {
-        let mut request = self
-            .http
-            .request(method, url)
-            .bearer_auth(&self.access_token);
+        // Only body-less GETs may use the redirect-following client; anything
+        // with a body may carry `token=` and must stay on the same origin.
+        let client = if method == Method::GET {
+            &self.http
+        } else {
+            &self.api_http
+        };
+        let mut request = client.request(method, url).bearer_auth(&self.access_token);
 
         if let Some(cookie) = self
             .browser_cookie_d

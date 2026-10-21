@@ -171,7 +171,7 @@ pub struct SlackOAuthClient {
 impl SlackOAuthClient {
     pub fn new() -> Self {
         Self {
-            http: http_client::builder()
+            http: http_client::api_builder()
                 .connect_timeout(OAUTH_HTTP_CONNECT_TIMEOUT)
                 .timeout(OAUTH_HTTP_REQUEST_TIMEOUT)
                 .build()

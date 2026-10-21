@@ -1,7 +1,7 @@
 //! Fetching external preview images through Slack's public image proxy, as
 //! Slack's web client does, so the linked site never sees this client.
 
-use url::{Host, Url};
+use url::Url;
 
 const PROXY_BASE: &str = "https://slack-imgs.com/?c=1&o1=ro&url=";
 const MAX_ORIGINAL_URL_BYTES: usize = 2048;
@@ -31,24 +31,12 @@ pub(crate) fn slack_image_proxy_url(original: &str) -> Option<String> {
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
         || url.password().is_some()
-        || !is_public_domain(&url)
+        || !crate::http_client::is_public_domain(&url)
     {
         return None;
     }
     url.set_fragment(None);
     Some(format!("{PROXY_BASE}{}", urlencoding::encode(url.as_str())))
-}
-
-fn is_public_domain(url: &Url) -> bool {
-    let Some(Host::Domain(host)) = url.host() else {
-        return false;
-    };
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host.contains('.')
-        && !host.starts_with('.')
-        && !["localhost", "local", "internal", "lan", "home", "arpa"]
-            .iter()
-            .any(|reserved| host == *reserved || host.ends_with(&format!(".{reserved}")))
 }
 
 #[cfg(test)]
