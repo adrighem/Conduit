@@ -64,6 +64,13 @@ pub(crate) enum TimelineAction {
         ts: String,
         key: crate::rich_message::MessageControlKey,
     },
+    /// The user scrolled near the oldest loaded message: fetch the previous
+    /// page. Carries the surface it came from, like `AutoMarkRead`. The
+    /// handler answers with `NativeTimelineView::set_loading_older`.
+    LoadOlder {
+        channel_id: String,
+        thread_ts: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]

@@ -70,6 +70,7 @@ pub fn register_timeline_css() {
                 background-color: color-mix(in srgb, currentColor 15%, transparent);
                 min-height: 1px;
             }
+            .timeline-loading-older { border-radius: 9999px; padding: 6px; }
             .unread-separator-line { background-color: #1264A3; min-height: 2px; }
             .unread-separator-label { color: #1264A3; font-weight: bold; }
             .timeline-text-view,

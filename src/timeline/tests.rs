@@ -67,13 +67,11 @@ pub(crate) fn test_context() -> MessageHtmlContext {
         user_group_members: Arc::default(),
         current_user_id: None,
         thread_ts: None,
-        load_more_url: None,
         timeline_scroll: crate::message_html::TimelineScrollBehavior::default(),
         image_assets: HashMap::default(),
         failed_image_urls: std::collections::HashSet::default(),
         recent_reactions: Vec::new(),
         custom_emojis: Arc::default(),
-        timeline_generation: None,
         last_read: None,
         unread_separator_ts: None,
         message_control_handles: HashMap::default(),
@@ -1971,5 +1969,111 @@ fn avatar_never_loads_untrusted_url_as_local_path() {
         }
 
         let _ = std::fs::remove_file(png);
+    });
+}
+
+#[test]
+fn scroll_behavior_pins_only_fresh_bottom_or_following_renders() {
+    use crate::message_html::TimelineScrollBehavior as B;
+    for behavior in [B::Preserve, B::PreservePrepend, B::Bottom, B::StickToBottom] {
+        assert!(pins_to_bottom(behavior, true, false), "{behavior:?} fresh");
+    }
+    assert!(pins_to_bottom(B::Bottom, false, false));
+    assert!(pins_to_bottom(B::StickToBottom, false, true));
+    assert!(!pins_to_bottom(B::StickToBottom, false, false));
+    assert!(!pins_to_bottom(B::Preserve, false, true));
+    assert!(!pins_to_bottom(B::PreservePrepend, false, true));
+}
+
+#[test]
+fn oldest_edge_is_within_half_a_page_of_the_top() {
+    assert!(near_oldest_edge(0.0, 500.0));
+    assert!(near_oldest_edge(249.0, 500.0));
+    assert!(!near_oldest_edge(250.0, 500.0));
+    assert!(!near_oldest_edge(0.0, 0.0), "unallocated view never pages");
+}
+
+#[test]
+fn scrolling_near_top_requests_older_page_and_prepend_keeps_position() {
+    run_gtk_test(|| {
+        fn pump(ms: u64) {
+            let context = glib::MainContext::default();
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < end {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        // Newest first, as conversations are stored; all on one day.
+        fn page(range: std::ops::Range<u32>) -> Vec<SlackMessage> {
+            range
+                .rev()
+                .map(|i| SlackMessage {
+                    ts: format!("1700000{i:03}.000100"),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("message {i}")),
+                    ..Default::default()
+                })
+                .collect()
+        }
+        let ctx = test_context();
+        let requests: Rc<RefCell<Vec<String>>> = Rc::default();
+        let view = NativeTimelineView::new();
+        {
+            let requests = requests.clone();
+            view.set_on_action(move |action| {
+                if let TimelineAction::LoadOlder {
+                    channel_id,
+                    thread_ts,
+                } = action
+                {
+                    requests
+                        .borrow_mut()
+                        .push(format!("{channel_id}:{thread_ts:?}"));
+                }
+            });
+        }
+        let window = gtk::Window::new();
+        window.set_default_size(400, 500);
+        window.set_child(Some(view.widget()));
+        window.present();
+        view.set_read_mark_target("C1", None);
+        view.set_messages(&page(100..200), &ctx, None);
+        pump(400);
+        assert!(requests.borrow().is_empty(), "opens at the newest message");
+
+        let vadj = view.scrolled_window.vadjustment();
+        vadj.set_value(vadj.lower() + vadj.page_size() / 4.0);
+        pump(100);
+        assert_eq!(*requests.borrow(), vec!["C1:None".to_string()]);
+
+        // While the page is in flight, further scrolling does not re-request.
+        view.set_loading_older(true);
+        vadj.set_value(vadj.value() + 1.0);
+        pump(100);
+        assert_eq!(requests.borrow().len(), 1);
+
+        // GtkListView keeps its anchor row when rows land above it, so the
+        // offset grows by exactly the prepended height.
+        let (value_before, upper_before) = (vadj.value(), vadj.upper());
+        let mut prepend = ctx.clone();
+        prepend.timeline_scroll = crate::message_html::TimelineScrollBehavior::PreservePrepend;
+        view.set_messages(&page(0..200), &prepend, None);
+        view.finish_loading_older("C1", None);
+        pump(400);
+
+        let grown = vadj.upper() - upper_before;
+        assert!(grown > 0.0, "older rows were prepended");
+        assert!(
+            (vadj.value() - value_before - grown).abs() < 2.0,
+            "position moved: {value_before} -> {} after growing {grown}",
+            vadj.value()
+        );
+        assert_eq!(
+            requests.borrow().len(),
+            1,
+            "a full page above the anchor is not near the top"
+        );
+        window.destroy();
     });
 }

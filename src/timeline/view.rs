@@ -8,7 +8,7 @@ use gtk::{
     SignalListItemFactory, Widget,
 };
 
-use crate::message_html::MessageHtmlContext;
+use crate::message_html::{MessageHtmlContext, TimelineScrollBehavior};
 use crate::models::SlackMessage;
 
 use super::actions::*;
@@ -47,6 +47,17 @@ pub struct NativeTimelineView {
     /// briefly so it stands out after the jump.
     highlight_ts: Rc<RefCell<Option<String>>>,
     highlight_generation: Rc<Cell<u64>>,
+    /// Older-history paging: an older page is in flight (spinner shown).
+    loading_older: Rc<Cell<bool>>,
+    loading_older_indicator: Widget,
+    /// True between `set_messages` and the settled layout, so programmatic
+    /// scrolling during a render does not count as reaching the top.
+    settling: Rc<Cell<bool>>,
+    settle_generation: Rc<Cell<u64>>,
+    /// Set when the shown conversation/thread changes, so the next render
+    /// lands on the newest message instead of preserving a stale position.
+    surface_changed: Rc<Cell<bool>>,
+    check_load_older: Rc<dyn Fn()>,
 }
 
 impl std::fmt::Debug for NativeTimelineView {
@@ -590,7 +601,77 @@ impl NativeTimelineView {
                 });
         }
 
+        // --- Older-history paging ---
+        // Near the top of the loaded messages, ask the window for the
+        // previous page; GtkListView keeps its anchor row in place when the
+        // page is prepended, so the reading position survives.
+        let loading_older = Rc::new(Cell::new(false));
+        let settling = Rc::new(Cell::new(false));
+        let check_load_older: Rc<dyn Fn()> = {
+            let scrolled_window = scrolled_window.downgrade();
+            let read_mark_target = read_mark_target.clone();
+            let loading_older = loading_older.clone();
+            let settling = settling.clone();
+            let on_action = on_action.clone();
+            let queued = Rc::new(Cell::new(false));
+            Rc::new(move || {
+                if settling.get() || loading_older.get() {
+                    return;
+                }
+                let Some(scrolled_window) = scrolled_window.upgrade() else {
+                    return;
+                };
+                let vadj = scrolled_window.vadjustment();
+                if !scrolled_window.is_drawable()
+                    || !near_oldest_edge(vadj.value() - vadj.lower(), vadj.page_size())
+                {
+                    return;
+                }
+                let Some((channel_id, thread_ts)) = read_mark_target.borrow().clone() else {
+                    return;
+                };
+                // Scroll events arrive in bursts: keep one request queued.
+                if queued.replace(true) {
+                    return;
+                }
+                let on_action = on_action.clone();
+                let queued = queued.clone();
+                glib::idle_add_local_once(move || {
+                    queued.set(false);
+                    dispatch_timeline_action(
+                        &on_action,
+                        TimelineAction::LoadOlder {
+                            channel_id,
+                            thread_ts,
+                        },
+                    );
+                });
+            })
+        };
+        {
+            let check_load_older = check_load_older.clone();
+            scrolled_window
+                .vadjustment()
+                .connect_value_changed(move |_| check_load_older());
+        }
+
         overlay.set_child(Some(&scrolled_window));
+
+        let loading_older_indicator = Box::new(Orientation::Horizontal, 0);
+        loading_older_indicator.add_css_class("osd");
+        loading_older_indicator.add_css_class("timeline-loading-older");
+        loading_older_indicator.set_halign(gtk::Align::Center);
+        loading_older_indicator.set_valign(gtk::Align::Start);
+        loading_older_indicator.set_margin_top(12);
+        loading_older_indicator.set_can_target(false);
+        loading_older_indicator.set_visible(false);
+        loading_older_indicator.update_property(&[gtk::accessible::Property::Label(
+            &gettextrs::gettext("Loading older messages"),
+        )]);
+        let spinner = adw::Spinner::new();
+        spinner.set_size_request(20, 20);
+        loading_older_indicator.append(&spinner);
+        overlay.add_overlay(&loading_older_indicator);
 
         {
             let hovered = hovered.clone();
@@ -656,6 +737,42 @@ impl NativeTimelineView {
             bound_items,
             highlight_ts,
             highlight_generation: Rc::new(Cell::new(0)),
+            loading_older,
+            loading_older_indicator: loading_older_indicator.upcast(),
+            settling,
+            settle_generation: Rc::new(Cell::new(0)),
+            surface_changed: Rc::new(Cell::new(false)),
+            check_load_older,
+        }
+    }
+
+    /// Ends the older-page load of `channel_id`/`thread_ts` if this view
+    /// still shows that surface; a late reply for another one is ignored.
+    pub(crate) fn finish_loading_older(&self, channel_id: &str, thread_ts: Option<&str>) {
+        let shows_surface =
+            self.read_mark_target
+                .borrow()
+                .as_ref()
+                .is_some_and(|(channel, thread)| {
+                    channel == channel_id && thread.as_deref() == thread_ts
+                });
+        if shows_surface {
+            self.set_loading_older(false);
+        }
+    }
+
+    /// Shows or hides the "loading older messages" spinner. While shown, no
+    /// further `TimelineAction::LoadOlder` is dispatched. Clearing it
+    /// re-checks the position, so a page too short to scroll away from the
+    /// top chains into the next one.
+    pub(crate) fn set_loading_older(&self, loading: bool) {
+        if self.loading_older.replace(loading) == loading {
+            return;
+        }
+        self.loading_older_indicator.set_visible(loading);
+        if !loading {
+            let check_load_older = self.check_load_older.clone();
+            glib::idle_add_local_once(move || check_load_older());
         }
     }
 
@@ -718,9 +835,17 @@ impl NativeTimelineView {
     /// timeline surface (advances the conversation's `last_read` via
     /// `conversations.mark`) and `Some` for a thread pane surface (advances
     /// the thread's local-only read state instead).
+    ///
+    /// This is also the view's surface identity: switching it to another
+    /// conversation or thread drops a pending older-page spinner and makes
+    /// the next `set_messages` open at the newest message.
     pub(crate) fn set_read_mark_target(&self, channel_id: &str, thread_ts: Option<&str>) {
-        *self.read_mark_target.borrow_mut() =
-            Some((channel_id.to_string(), thread_ts.map(ToString::to_string)));
+        let target = Some((channel_id.to_string(), thread_ts.map(ToString::to_string)));
+        if *self.read_mark_target.borrow() != target {
+            self.surface_changed.set(true);
+            self.set_loading_older(false);
+        }
+        *self.read_mark_target.borrow_mut() = target;
         // The pending dwell carries the old target, so always restart it.
         self.reset_read_candidate();
         (self.recheck_read_visibility)();
@@ -875,6 +1000,13 @@ impl NativeTimelineView {
         if let Some(ts) = focus_ts {
             self.set_highlight(ts);
         }
+        let vadj = self.scrolled_window.vadjustment();
+        let fresh = self.surface_changed.replace(false) || self.store.n_items() == 0;
+        let pin_to_bottom = pins_to_bottom(context.timeline_scroll, fresh, is_near_bottom(&vadj));
+        self.settling.set(true);
+        let settle_generation = self.settle_generation.get().wrapping_add(1);
+        self.settle_generation.set(settle_generation);
+
         let unread_ts = context.unread_separator_ts.as_deref();
         let (items, focus_index) = build_store_items(messages, focus_ts, unread_ts);
         let inserted = self.splice_changed_items(&items);
@@ -885,17 +1017,16 @@ impl NativeTimelineView {
 
         let list_view = self.list_view.clone();
         let n_items = items.len() as u32;
-        let vadj = self.scrolled_window.vadjustment();
         let bound_items = self.bound_items.clone();
         let recheck_read_visibility = self.recheck_read_visibility.clone();
         glib::idle_add_local_once(move || {
-            let target = focus_index.or_else(|| n_items.checked_sub(1));
+            // Without a focus target or a pin, GtkListView keeps its anchor
+            // row in place, which preserves the position across prepends.
+            let target =
+                focus_index.or_else(|| pin_to_bottom.then(|| n_items.checked_sub(1)).flatten());
             if let Some(index) = target {
                 let info = gtk::ScrollInfo::new();
                 list_view.scroll_to(index, gtk::ListScrollFlags::FOCUS, Some(info));
-                if had_focus {
-                    list_view.grab_focus();
-                }
                 if focus_index.is_some() {
                     if vadj.page_size() > 0.0 && n_items > 0 {
                         let approx = (f64::from(index) / f64::from(n_items)) * vadj.upper()
@@ -905,14 +1036,28 @@ impl NativeTimelineView {
                     }
                     center_row_after_layout(&list_view, vadj, bound_items, index, n_items);
                 }
-            } else {
+            } else if pin_to_bottom {
                 vadj.set_value(vadj.upper() - vadj.page_size());
+            }
+            if had_focus {
+                list_view.grab_focus();
             }
             recheck_read_visibility();
         });
         let recheck_delayed = self.recheck_read_visibility.clone();
         glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
             recheck_delayed();
+        });
+        // Centering a focus target keeps adjusting for a few hundred ms.
+        let settle_delay = if focus_index.is_some() { 450 } else { 150 };
+        let settling = self.settling.clone();
+        let current_settle = self.settle_generation.clone();
+        let check_load_older = self.check_load_older.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(settle_delay), move || {
+            if current_settle.get() == settle_generation {
+                settling.set(false);
+                check_load_older();
+            }
         });
     }
 
@@ -949,6 +1094,7 @@ impl NativeTimelineView {
     /// Shows a plain-text placeholder (loading state, empty state, error message) in place of
     /// the message list, for surfaces that have no structured content to render yet.
     pub fn show_placeholder(&self, text: &str) {
+        self.set_loading_older(false);
         self.store.remove_all();
         self.placeholder_label.set_label(text);
         self.placeholder_label.set_visible(true);
@@ -958,6 +1104,36 @@ impl NativeTimelineView {
     pub fn widget(&self) -> &Widget {
         self.container.upcast_ref()
     }
+}
+
+/// Distance from the newest message within which the view still counts as
+/// following the conversation.
+const STICK_TO_BOTTOM_SLACK: f64 = 48.0;
+
+fn is_near_bottom(vadj: &gtk::Adjustment) -> bool {
+    vadj.page_size() <= 0.0
+        || vadj.upper() - vadj.page_size() - vadj.value() <= STICK_TO_BOTTOM_SLACK
+}
+
+/// Whether a render should land on the newest message. Fresh content always
+/// does; otherwise only `Bottom`, or `StickToBottom` while already there.
+/// `Preserve`/`PreservePrepend` leave the position to GtkListView's anchor.
+pub(crate) fn pins_to_bottom(
+    behavior: TimelineScrollBehavior,
+    fresh: bool,
+    was_near_bottom: bool,
+) -> bool {
+    fresh
+        || match behavior {
+            TimelineScrollBehavior::Bottom => true,
+            TimelineScrollBehavior::StickToBottom => was_near_bottom,
+            TimelineScrollBehavior::Preserve | TimelineScrollBehavior::PreservePrepend => false,
+        }
+}
+
+/// Whether the viewport is within half a page of the oldest loaded message.
+pub(crate) fn near_oldest_edge(offset_from_top: f64, page_size: f64) -> bool {
+    page_size > 0.0 && offset_from_top < page_size / 2.0
 }
 
 /// `scroll_to` only brings a row to the nearest edge and `ScrollInfo` cannot

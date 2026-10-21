@@ -37,13 +37,11 @@ pub struct MessageHtmlContext {
     pub user_group_members: Arc<HashMap<String, Vec<String>>>,
     pub current_user_id: Option<String>,
     pub thread_ts: Option<String>,
-    pub load_more_url: Option<String>,
     pub timeline_scroll: TimelineScrollBehavior,
     pub image_assets: HashMap<String, CachedAssetSource>,
     pub failed_image_urls: HashSet<String>,
     pub recent_reactions: Vec<String>,
     pub custom_emojis: Arc<HashMap<String, String>>,
-    pub timeline_generation: Option<u64>,
     pub last_read: Option<String>,
     /// Frozen "first unread message" anchor for the unread separator line.
     /// Computed once per conversation/thread-open and held fixed across
@@ -328,27 +326,9 @@ fn parse_slack_ts(ts: &str) -> Option<(i64, u32)> {
     Some((seconds, nanos))
 }
 
-pub fn load_more_action_url(channel_id: &str, cursor: &str, thread_ts: Option<&str>) -> String {
-    let mut url = format!(
-        "conduit://load-older?channel={}&cursor={}",
-        encode_query(channel_id),
-        encode_query(cursor)
-    );
-
-    append_thread_ts_query(&mut url, thread_ts);
-    url
-}
-
 /// Prefix of message target action links, which stay clickable in
 /// message text; the window opens them in Conduit.
 pub const MESSAGE_TARGET_URL_PREFIX: &str = "conduit://message?";
-
-fn append_thread_ts_query(url: &mut String, thread_ts: Option<&str>) {
-    if let Some(thread_ts) = thread_ts.filter(|ts| !ts.is_empty()) {
-        url.push_str("&thread_ts=");
-        url.push_str(&encode_query(thread_ts));
-    }
-}
 
 pub(crate) fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiEntry> {
     let catalog = EmojiCatalog::new(&context.custom_emojis);
@@ -401,10 +381,6 @@ fn emoji_entry(name: &str, context: &MessageHtmlContext) -> Option<EmojiEntry> {
         category: "",
         value,
     })
-}
-
-fn encode_query(value: &str) -> String {
-    urlencoding::encode(value).into_owned()
 }
 
 pub fn mrkdwn_to_pango(text: &str, context: &MessageHtmlContext) -> String {

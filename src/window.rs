@@ -62,7 +62,7 @@ use crate::message_handoff::{
     MessageControlRegistry, MessageRef, SafeSlackPermalink, TimelineSurfaceId,
 };
 use crate::message_html::{
-    self, CachedAssetKind, CachedAssetSource, MessageHtmlContext, TimelineScrollBehavior,
+    CachedAssetKind, CachedAssetSource, MessageHtmlContext, TimelineScrollBehavior,
 };
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUser,
@@ -3354,6 +3354,70 @@ impl ConduitWindow {
                     self.execute_control_action(&channel_id, &ts, key);
                 }
             }
+            TimelineAction::LoadOlder {
+                channel_id,
+                thread_ts,
+            } => self.load_older_messages(&channel_id, thread_ts.as_deref()),
+        }
+    }
+
+    /// Fetches the page before the oldest loaded message of the shown
+    /// conversation or thread, unless that surface moved on, has no older
+    /// page, shows a message context window, or already has a load running.
+    fn load_older_messages(&self, channel_id: &str, thread_ts: Option<&str>) {
+        let cursor = {
+            let mut view = self.imp().workspace.view.borrow_mut();
+            let cursor = match thread_ts {
+                Some(ts) => (view.selected_thread_target() == Some((channel_id, ts))
+                    && !view.has_thread_context(channel_id, ts))
+                .then(|| view.thread_cursor().map(str::to_owned))
+                .flatten(),
+                None => (view.visible_channel_id() == Some(channel_id)
+                    && !view.has_channel_context(channel_id))
+                .then(|| view.channel_cursor(channel_id).map(str::to_owned))
+                .flatten(),
+            };
+            let Some(cursor) = cursor else {
+                return;
+            };
+            let started = match thread_ts {
+                Some(_) => view.begin_thread_history_request(),
+                None => view.begin_history_request(channel_id),
+            };
+            if !started {
+                return;
+            }
+            cursor
+        };
+        if let Some(timeline) = self.surface_timeline(thread_ts.is_some()) {
+            timeline.set_loading_older(true);
+        }
+        let channel_id = channel_id.to_string();
+        self.send_command(match thread_ts {
+            Some(ts) => RuntimeCommand::LoadOlderThread {
+                channel_id,
+                ts: ts.to_string(),
+                cursor,
+            },
+            None => RuntimeCommand::LoadOlderHistory { channel_id, cursor },
+        });
+    }
+
+    /// Clears the older-page spinner once that load finished or failed.
+    fn finish_loading_older(&self, channel_id: &str, thread_ts: Option<&str>) {
+        if let Some(timeline) = self.surface_timeline(thread_ts.is_some()) {
+            timeline.finish_loading_older(channel_id, thread_ts);
+        }
+    }
+
+    fn surface_timeline(
+        &self,
+        thread: bool,
+    ) -> Option<crate::timeline_message_widget::NativeTimelineView> {
+        if thread {
+            self.thread_pane().native_timeline_view.borrow().clone()
+        } else {
+            self.imp().native_timeline_view.borrow().clone()
         }
     }
 
@@ -7290,6 +7354,9 @@ impl ConduitWindow {
                         append_older,
                         cached,
                     );
+                if append_older {
+                    self.finish_loading_older(&channel_id, None);
+                }
                 if outcome.visible {
                     if outcome.render {
                         let rendered_messages = self
@@ -7328,6 +7395,9 @@ impl ConduitWindow {
                     next_cursor,
                     append_older,
                 );
+                if append_older {
+                    self.finish_loading_older(&channel_id, Some(&thread_ts));
+                }
                 if let ThreadApplyOutcome::Applied { scroll, render } = outcome {
                     if render {
                         let rendered_messages = self
@@ -9337,6 +9407,7 @@ impl ConduitWindow {
                     .view
                     .borrow_mut()
                     .fail_history(&channel_id);
+                self.finish_loading_older(&channel_id, None);
                 if outcome.active {
                     self.set_status(error);
                     if !outcome.has_content {
@@ -9354,6 +9425,7 @@ impl ConduitWindow {
                     .view
                     .borrow_mut()
                     .fail_thread(&channel_id, &thread_ts);
+                self.finish_loading_older(&channel_id, Some(&thread_ts));
                 if outcome.active {
                     self.set_status(error);
                     if !outcome.has_content {
@@ -10251,24 +10323,6 @@ impl ConduitWindow {
         if thread_reaction_user || thread_uses_user {
             self.queue_ui_invalidations(UiInvalidations::THREAD);
         }
-    }
-
-    fn channel_load_more_url(&self, channel_id: &str) -> Option<String> {
-        self.imp()
-            .workspace
-            .view
-            .borrow()
-            .channel_cursor(channel_id)
-            .map(|cursor| message_html::load_more_action_url(channel_id, cursor, None))
-    }
-
-    fn thread_load_more_url(&self, channel_id: &str, ts: &str) -> Option<String> {
-        self.imp()
-            .workspace
-            .view
-            .borrow()
-            .thread_cursor()
-            .map(|cursor| message_html::load_more_action_url(channel_id, cursor, Some(ts)))
     }
 
     fn unread_thread_summaries(&self) -> Vec<sidebar::SidebarThreadSummary> {
@@ -11895,9 +11949,6 @@ impl ConduitWindow {
             context.message_control_handles,
             context.message_control_action_handles,
         ) = self.replace_message_control_handles(TimelineSurfaceId::Main, channel_id, &messages);
-        if !imp.workspace.view.borrow().has_channel_context(channel_id) {
-            context.load_more_url = self.channel_load_more_url(channel_id);
-        }
         context.timeline_scroll = scroll_behavior;
         context.unread_separator_ts = earliest_unread_ts(context.last_read.as_deref(), &messages);
         let active_open_generation = imp
@@ -11908,7 +11959,6 @@ impl ConduitWindow {
             .conversation_opening
             .borrow()
             .positioning_generation_for(channel_id);
-        context.timeline_generation = opening_generation;
         let opening_position = {
             let mut opening = imp.conversation_opening.borrow_mut();
             opening_generation
@@ -12040,14 +12090,6 @@ impl ConduitWindow {
             context.message_control_handles,
             context.message_control_action_handles,
         ) = self.replace_message_control_handles(TimelineSurfaceId::Thread, channel_id, &messages);
-        if !imp
-            .workspace
-            .view
-            .borrow()
-            .has_thread_context(channel_id, ts)
-        {
-            context.load_more_url = self.thread_load_more_url(channel_id, ts);
-        }
         context.timeline_scroll = scroll_behavior;
         let thread_last_read = imp
             .workspace
@@ -13736,9 +13778,7 @@ impl ConduitWindow {
                 .clone(),
             current_user_id,
             thread_ts: thread_ts.map(ToString::to_string),
-            load_more_url: None,
             timeline_scroll: TimelineScrollBehavior::Preserve,
-            timeline_generation: None,
             last_read,
             unread_separator_ts: None,
             image_assets,

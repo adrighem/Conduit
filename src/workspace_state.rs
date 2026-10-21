@@ -1078,7 +1078,6 @@ impl WorkspaceViewState {
         ConversationSelectionOutcome { decision, scroll }
     }
 
-    #[cfg(test)]
     pub(crate) fn begin_history_request(&mut self, channel_id: &str) -> bool {
         let history = self.channels.entry(channel_id.to_string()).or_default();
         if history.loading {
@@ -1220,7 +1219,6 @@ impl WorkspaceViewState {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn begin_thread_history_request(&mut self) -> bool {
         let Some(thread) = &mut self.thread else {
             return false;
