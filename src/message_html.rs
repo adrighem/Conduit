@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use gettextrs::gettext;
-use serde::Serialize;
 
 use crate::config;
 use crate::day_label::{capitalize_first_letter, date_text};
@@ -16,7 +16,6 @@ pub(crate) mod test_fixtures;
 #[cfg(test)]
 mod tests;
 
-const CACHED_ASSET_URI_PREFIX: &str = "conduit-asset://";
 const QUICK_REACTION_LIMIT: usize = 4;
 static TIME_FORMAT_LOCALE: OnceLock<Option<String>> = OnceLock::new();
 
@@ -38,7 +37,8 @@ pub struct MessageHtmlContext {
     pub current_user_id: Option<String>,
     pub thread_ts: Option<String>,
     pub timeline_scroll: TimelineScrollBehavior,
-    pub image_assets: HashMap<String, CachedAssetSource>,
+    /// Image source key (Slack URL) -> file the runtime cached for it.
+    pub image_assets: HashMap<String, PathBuf>,
     pub failed_image_urls: HashSet<String>,
     pub recent_reactions: Vec<String>,
     pub custom_emojis: Arc<HashMap<String, String>>,
@@ -78,46 +78,6 @@ pub enum TimelineScrollBehavior {
     PreservePrepend,
     Bottom,
     StickToBottom,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CachedAssetKind {
-    Image,
-    Video,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CachedAssetSource {
-    uri: String,
-    kind: CachedAssetKind,
-}
-
-impl CachedAssetSource {
-    pub fn new(uri: impl Into<String>, kind: CachedAssetKind) -> Option<Self> {
-        let uri = uri.into();
-        let key = uri.strip_prefix(CACHED_ASSET_URI_PREFIX)?;
-        if key.len() != 64
-            || !key
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return None;
-        }
-        Some(Self { uri, kind })
-    }
-
-    pub fn from_cache_key(cache_key: &str, kind: CachedAssetKind) -> Option<Self> {
-        Self::new(format!("{CACHED_ASSET_URI_PREFIX}{cache_key}"), kind)
-    }
-
-    pub fn uri(&self) -> &str {
-        &self.uri
-    }
-
-    pub fn kind(&self) -> CachedAssetKind {
-        self.kind
-    }
 }
 
 fn normalize_language_tag(locale: &str) -> Option<String> {

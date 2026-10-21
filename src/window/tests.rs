@@ -1,6 +1,4 @@
 use super::*;
-use crate::runtime::CachedAssetDescriptor;
-use crate::slack::PreviewAssetMime;
 
 #[test]
 fn font_family_is_extracted_from_pango_descriptions() {
@@ -258,79 +256,6 @@ use crate::runtime::{RuntimeOperation, RuntimeTarget};
 use crate::sidebar::ConversationKind;
 
 #[test]
-fn conduit_asset_requests_require_an_exact_known_cache_key() {
-    let key = "a".repeat(64);
-    assert_eq!(
-        conduit_asset_request_key(&format!("conduit-asset://{key}")),
-        Some(key.clone())
-    );
-    for uri in [
-        "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "conduit-asset://unknown",
-        "conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/path",
-        "conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
-        "conduit-asset://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?query=1",
-        "conduit-asset://AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "conduit-asset://user@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    ] {
-        assert_eq!(conduit_asset_request_key(uri), None, "{uri}");
-    }
-}
-
-#[test]
-fn conduit_asset_registry_evicts_least_recently_used_bytes() {
-    let first_key = "a".repeat(64);
-    let second_key = "b".repeat(64);
-    let third_key = "c".repeat(64);
-    let workspace_key = "f".repeat(64);
-    let descriptor = |cache_key: String| {
-        CachedAssetDescriptor::new(workspace_key.clone(), cache_key, PreviewAssetMime::Png, 4)
-            .unwrap()
-    };
-    let first = descriptor(first_key.clone());
-    let second = descriptor(second_key.clone());
-    let third = descriptor(third_key.clone());
-    let mut assets = BoundedConduitAssets::new(8, 4);
-    assets.set_workspace(Some(workspace_key));
-    let second_source =
-        CachedAssetSource::from_cache_key(&second_key, CachedAssetKind::Image).unwrap();
-
-    assert_eq!(assets.insert(first.clone()), Some(Vec::new()));
-    assert_eq!(assets.insert(second), Some(Vec::new()));
-    assert!(cached_asset_source_is_registered(&second_source, &assets));
-    assert_eq!(assets.get(&first_key), Some(first));
-    assert_eq!(assets.insert(third), Some(vec![second_key.clone()]));
-
-    assert!(assets.contains_key(&first_key));
-    assert!(!assets.contains_key(&second_key));
-    assert!(!cached_asset_source_is_registered(&second_source, &assets));
-    assert!(assets.contains_key(&third_key));
-    assert_eq!(assets.total_bytes(), 8);
-}
-
-#[test]
-fn conduit_asset_registry_caps_signature_only_entries() {
-    let workspace_key = "f".repeat(64);
-    let mut assets = BoundedConduitAssets::new(64, 2);
-    assets.set_workspace(Some(workspace_key.clone()));
-    for marker in ['a', 'b', 'c'] {
-        let descriptor = CachedAssetDescriptor::new(
-            workspace_key.clone(),
-            marker.to_string().repeat(64),
-            PreviewAssetMime::Jpeg,
-            3,
-        )
-        .unwrap();
-        assets.insert(descriptor).unwrap();
-    }
-
-    assert_eq!(assets.len(), 2);
-    assert!(!assets.contains_key(&"a".repeat(64)));
-    assert!(assets.contains_key(&"b".repeat(64)));
-    assert!(assets.contains_key(&"c".repeat(64)));
-}
-
-#[test]
 fn image_asset_key_sets_bound_count_and_bytes() {
     let mut keys = BoundedImageAssetKeys::default();
     for index in 0..=IMAGE_ASSET_KEY_SET_MAX_ENTRIES {
@@ -363,19 +288,6 @@ fn image_asset_key_sets_bound_count_and_bytes() {
         assert!(byte_bounded.insert_evicting(key));
     }
     assert_eq!(byte_bounded.len(), entries_by_bytes);
-}
-
-#[test]
-fn conduit_asset_registry_rejects_cross_workspace_descriptors() {
-    let current_workspace = "a".repeat(64);
-    let descriptor =
-        CachedAssetDescriptor::new("b".repeat(64), "c".repeat(64), PreviewAssetMime::Png, 8)
-            .unwrap();
-    let mut assets = BoundedConduitAssets::new(16, 4);
-    assets.set_workspace(Some(current_workspace));
-
-    assert_eq!(assets.insert(descriptor), None);
-    assert_eq!(assets.total_bytes(), 0);
 }
 
 fn sidebar_row(id: &str, title: &str) -> SidebarRowModel {

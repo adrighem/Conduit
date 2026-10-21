@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
-use crate::message_html::CachedAssetSource;
 use crate::runtime::CachedAssetDescriptor;
 
 pub const CONDUIT_ASSET_REGISTRY_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -88,16 +88,23 @@ impl BoundedImageAssetKeys {
     }
 }
 
+/// One image asset the runtime wrote to the on-disk cache.
 #[derive(Debug, Clone)]
-pub struct ConduitAssetEntry {
-    pub descriptor: CachedAssetDescriptor,
-    pub last_used: u64,
+struct CachedImageAsset {
+    path: PathBuf,
+    size: u64,
+    inserted: u64,
 }
 
+/// Bounded map from an image source key (the Slack URL a row asks for) to
+/// the cache file the runtime downloaded for it, scoped to the connected
+/// workspace. Rows read the path directly; nothing re-derives it from keys.
+/// When either bound is exceeded the oldest insertions are evicted.
 #[derive(Debug)]
-pub struct BoundedConduitAssets {
+pub struct CachedImageAssets {
+    cache_root: PathBuf,
     workspace_key: Option<String>,
-    entries: HashMap<String, ConduitAssetEntry>,
+    entries: HashMap<String, CachedImageAsset>,
     order: BTreeSet<(u64, String)>,
     total_bytes: u64,
     max_bytes: u64,
@@ -105,18 +112,20 @@ pub struct BoundedConduitAssets {
     clock: u64,
 }
 
-impl Default for BoundedConduitAssets {
+impl Default for CachedImageAssets {
     fn default() -> Self {
         Self::new(
+            crate::config::image_asset_cache_dir(),
             CONDUIT_ASSET_REGISTRY_MAX_BYTES,
             CONDUIT_ASSET_REGISTRY_MAX_ENTRIES,
         )
     }
 }
 
-impl BoundedConduitAssets {
-    pub fn new(max_bytes: u64, max_entries: usize) -> Self {
+impl CachedImageAssets {
+    pub fn new(cache_root: PathBuf, max_bytes: u64, max_entries: usize) -> Self {
         Self {
+            cache_root,
             workspace_key: None,
             entries: HashMap::new(),
             order: BTreeSet::new(),
@@ -134,30 +143,32 @@ impl BoundedConduitAssets {
         }
     }
 
-    pub fn insert(&mut self, descriptor: CachedAssetDescriptor) -> Option<Vec<String>> {
+    /// Records `descriptor` as the cached file for `key`. Returns the source
+    /// keys evicted to stay within bounds, or `None` when the descriptor is
+    /// rejected (no workspace, other workspace, or an out-of-range size).
+    pub fn insert(
+        &mut self,
+        key: String,
+        descriptor: CachedAssetDescriptor,
+    ) -> Option<Vec<String>> {
         let workspace_key = self.workspace_key.as_deref()?;
-        let cache_key = descriptor.cache_key().to_string();
-        let uri = descriptor.uri();
         if descriptor.workspace_key() != workspace_key
             || descriptor.size() == 0
             || descriptor.size() > self.max_bytes
-            || conduit_asset_request_key(&uri).as_deref() != Some(cache_key.as_str())
         {
             return None;
         }
 
+        self.remove(&key);
         self.clock = self.clock.saturating_add(1);
-        if let Some(replaced) = self.entries.remove(&cache_key) {
-            self.total_bytes = self.total_bytes.saturating_sub(replaced.descriptor.size());
-            self.order.remove(&(replaced.last_used, cache_key.clone()));
-        }
         self.total_bytes = self.total_bytes.saturating_add(descriptor.size());
-        self.order.insert((self.clock, cache_key.clone()));
+        self.order.insert((self.clock, key.clone()));
         self.entries.insert(
-            cache_key,
-            ConduitAssetEntry {
-                descriptor,
-                last_used: self.clock,
+            key,
+            CachedImageAsset {
+                path: descriptor.path_in(&self.cache_root),
+                size: descriptor.size(),
+                inserted: self.clock,
             },
         );
 
@@ -167,34 +178,30 @@ impl BoundedConduitAssets {
                 break;
             };
             if let Some(entry) = self.entries.remove(&oldest_key) {
-                self.total_bytes = self.total_bytes.saturating_sub(entry.descriptor.size());
+                self.total_bytes = self.total_bytes.saturating_sub(entry.size);
                 evicted.push(oldest_key);
             }
         }
         Some(evicted)
     }
 
-    #[cfg(test)]
-    pub fn get(&mut self, cache_key: &str) -> Option<CachedAssetDescriptor> {
-        let workspace_key = self.workspace_key.as_deref()?;
-        let entry = self.entries.get_mut(cache_key)?;
-        if entry.descriptor.workspace_key() != workspace_key {
-            return None;
-        }
-        let previous = entry.last_used;
-        self.clock = self.clock.saturating_add(1);
-        entry.last_used = self.clock;
-        let descriptor = entry.descriptor.clone();
-        self.order.remove(&(previous, cache_key.to_string()));
-        self.order.insert((self.clock, cache_key.to_string()));
-        Some(descriptor)
+    pub fn path(&self, key: &str) -> Option<&Path> {
+        self.entries.get(key).map(|entry| entry.path.as_path())
     }
 
-    pub fn remove(&mut self, cache_key: &str) -> Option<CachedAssetDescriptor> {
-        let entry = self.entries.remove(cache_key)?;
-        self.total_bytes = self.total_bytes.saturating_sub(entry.descriptor.size());
-        self.order.remove(&(entry.last_used, cache_key.to_string()));
-        Some(entry.descriptor)
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Path)> {
+        self.entries
+            .iter()
+            .map(|(key, entry)| (key, entry.path.as_path()))
+    }
+
+    pub fn remove(&mut self, key: &str) -> bool {
+        let Some(entry) = self.entries.remove(key) else {
+            return false;
+        };
+        self.total_bytes = self.total_bytes.saturating_sub(entry.size);
+        self.order.remove(&(entry.inserted, key.to_string()));
+        true
     }
 
     pub fn clear(&mut self) {
@@ -204,8 +211,8 @@ impl BoundedConduitAssets {
         self.clock = 0;
     }
 
-    pub fn contains_key(&self, cache_key: &str) -> bool {
-        self.entries.contains_key(cache_key)
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
     }
 
     #[cfg(test)]
@@ -219,36 +226,94 @@ impl BoundedConduitAssets {
     }
 }
 
-pub fn conduit_asset_request_key(uri: &str) -> Option<String> {
-    let parsed = url::Url::parse(uri).ok()?;
-    if parsed.scheme() != "conduit-asset"
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.port().is_some()
-        || !parsed.path().is_empty()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return None;
-    }
-    let key = parsed.host_str()?;
-    let valid_key = key.len() == 64
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    (valid_key && uri == format!("conduit-asset://{key}")).then(|| key.to_string())
-}
-
-pub fn cached_asset_source_is_registered(
-    source: &CachedAssetSource,
-    assets: &BoundedConduitAssets,
-) -> bool {
-    conduit_asset_request_key(source.uri()).is_some_and(|key| assets.contains_key(&key))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::slack::PreviewAssetMime;
+
+    const WORKSPACE: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    fn descriptor(workspace_key: &str, marker: char, size: u64) -> CachedAssetDescriptor {
+        CachedAssetDescriptor::new(
+            workspace_key.to_string(),
+            marker.to_string().repeat(64),
+            PreviewAssetMime::Png,
+            size,
+        )
+        .unwrap()
+    }
+
+    fn assets(max_bytes: u64, max_entries: usize) -> CachedImageAssets {
+        let mut assets = CachedImageAssets::new(PathBuf::from("/cache"), max_bytes, max_entries);
+        assets.set_workspace(Some(WORKSPACE.to_string()));
+        assets
+    }
+
+    #[test]
+    fn cached_image_assets_map_source_keys_to_cache_paths() {
+        let mut assets = assets(64, 4);
+        assert_eq!(
+            assets.insert("https://a".into(), descriptor(WORKSPACE, 'a', 4)),
+            Some(Vec::new())
+        );
+        let expected = PathBuf::from(format!("/cache/{WORKSPACE}/{}.png", "a".repeat(64)));
+        assert_eq!(assets.path("https://a"), Some(expected.as_path()));
+        assert_eq!(assets.path("https://b"), None);
+    }
+
+    #[test]
+    fn cached_image_assets_evict_oldest_by_bytes() {
+        let mut assets = assets(8, 4);
+        assets.insert("first".into(), descriptor(WORKSPACE, 'a', 4));
+        assets.insert("second".into(), descriptor(WORKSPACE, 'b', 4));
+        assert_eq!(
+            assets.insert("third".into(), descriptor(WORKSPACE, 'c', 4)),
+            Some(vec!["first".to_string()])
+        );
+        assert!(!assets.contains_key("first"));
+        assert!(assets.contains_key("second"));
+        assert!(assets.contains_key("third"));
+        assert_eq!(assets.total_bytes(), 8);
+    }
+
+    #[test]
+    fn cached_image_assets_cap_entry_count() {
+        let mut assets = assets(64, 2);
+        for marker in ['a', 'b', 'c'] {
+            assets
+                .insert(marker.to_string(), descriptor(WORKSPACE, marker, 3))
+                .unwrap();
+        }
+        assert_eq!(assets.len(), 2);
+        assert!(!assets.contains_key("a"));
+        assert!(assets.contains_key("b"));
+        assert!(assets.contains_key("c"));
+    }
+
+    #[test]
+    fn cached_image_assets_reinsert_replaces_without_double_counting() {
+        let mut assets = assets(64, 4);
+        assets.insert("key".into(), descriptor(WORKSPACE, 'a', 4));
+        assets.insert("key".into(), descriptor(WORKSPACE, 'a', 6));
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets.total_bytes(), 6);
+    }
+
+    #[test]
+    fn cached_image_assets_reject_cross_workspace_and_unscoped_descriptors() {
+        let mut assets = assets(16, 4);
+        assert_eq!(
+            assets.insert("key".into(), descriptor(&"b".repeat(64), 'c', 8)),
+            None
+        );
+        assert_eq!(assets.total_bytes(), 0);
+
+        assets.set_workspace(None);
+        assert_eq!(
+            assets.insert("key".into(), descriptor(WORKSPACE, 'c', 8)),
+            None
+        );
+    }
 
     #[test]
     fn bounded_image_asset_keys_evicts_oldest_in_clock_order() {

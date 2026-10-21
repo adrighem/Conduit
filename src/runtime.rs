@@ -2575,10 +2575,6 @@ impl CachedAssetDescriptor {
         &self.workspace_key
     }
 
-    pub(crate) fn cache_key(&self) -> &str {
-        &self.cache_key
-    }
-
     #[cfg(test)]
     pub(crate) fn content_type(&self) -> &'static str {
         self.mime_type.as_str()
@@ -2588,12 +2584,9 @@ impl CachedAssetDescriptor {
         self.size
     }
 
+    #[cfg(test)]
     pub(crate) fn is_video(&self) -> bool {
         self.mime_type.is_video()
-    }
-
-    pub(crate) fn uri(&self) -> String {
-        format!("conduit-asset://{}", self.cache_key)
     }
 
     pub(crate) fn matches_source(&self, key: &str) -> bool {

@@ -204,37 +204,6 @@ fn quick_reactions_canonicalize_and_deduplicate_aliases() {
 }
 
 #[test]
-fn cached_asset_source_rejects_data_uris() {
-    let rejected =
-        CachedAssetSource::new("data:image/png;base64,legacy-cache", CachedAssetKind::Image);
-    assert_eq!(rejected, None);
-}
-
-#[test]
-fn cached_asset_source_accepts_only_canonical_conduit_asset_uris() {
-    let valid = format!("{CACHED_ASSET_URI_PREFIX}{}", "a".repeat(64));
-    let source = CachedAssetSource::new(valid.clone(), CachedAssetKind::Video).unwrap();
-
-    assert_eq!(source.uri(), valid);
-    assert_eq!(source.kind(), CachedAssetKind::Video);
-
-    for invalid in [
-        format!("conduit-asset://{}", "a".repeat(63)),
-        format!("conduit-asset://{}", "a".repeat(65)),
-        format!("conduit-asset://{}", "A".repeat(64)),
-        format!("conduit-asset://{}?download=1", "a".repeat(64)),
-        format!("conduit-asset://{}/preview", "a".repeat(64)),
-        format!("conduit-asset://user@{}", "a".repeat(64)),
-        format!("CONDUIT-ASSET://{}", "a".repeat(64)),
-    ] {
-        assert_eq!(
-            CachedAssetSource::new(invalid, CachedAssetKind::Image),
-            None
-        );
-    }
-}
-
-#[test]
 fn cloned_render_context_shares_workspace_catalogs() {
     let context = MessageHtmlContext {
         user_names: Arc::new(HashMap::from([("U123".into(), "Ada".into())])),

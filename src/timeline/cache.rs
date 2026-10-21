@@ -141,14 +141,15 @@ fn contained_cache_file(cache_root: &Path, candidate: &Path) -> Option<PathBuf> 
 
 /// How long the in-memory snapshot of the asset cache directory is trusted
 /// before a lookup rebuilds it. Row binds hammer `resolve_cached_asset_path`
-/// (once per visible row, on every scroll/recycle); without this, each call
+/// for URLs the runtime has not reported yet (once per visible row, on every
+/// scroll/recycle); without this, each call
 /// re-walked the cache directory and probed every known extension for every
 /// candidate path. A short TTL turns that into one directory walk every few
 /// seconds. Misses are never trusted from the snapshot alone (see
 /// [`probe_cache_key`]), so a freshly downloaded asset resolves immediately.
 const RESOLVED_ASSET_INDEX_TTL: Duration = Duration::from_secs(2);
 
-/// One-level-deep snapshot of the asset cache directory: every file stem
+/// Snapshot of the per-workspace asset cache directories: every file stem
 /// (the content-addressed cache key, sans extension) mapped to its
 /// *unverified* on-disk path, plus the top-level directory names (candidate
 /// workspace keys) used to probe URL-hash based lookups. Building it is just
@@ -202,13 +203,6 @@ fn build_resolved_asset_index(cache_root: &Path) -> ResolvedAssetIndex {
     #[cfg(test)]
     INDEX_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let mut entries = HashMap::new();
-    if let Ok(root_entries) = std::fs::read_dir(cache_root) {
-        for entry in root_entries.flatten() {
-            if entry.file_type().is_ok_and(|kind| !kind.is_dir()) {
-                index_cache_file(entry.path(), &mut entries);
-            }
-        }
-    }
     let workspace_dirs = cache_workspace_dirs(cache_root);
     for (_, dir) in &workspace_dirs {
         if let Ok(sub_entries) = std::fs::read_dir(dir) {
@@ -298,10 +292,18 @@ fn probe_cache_key(index: &mut ResolvedAssetIndex, dir: &Path, key: &str) -> Opt
     Some(resolved)
 }
 
-/// Maps a Slack-provided URL (or a `conduit-asset://` URI registered for it)
-/// to a file inside the image asset cache. Never returns a path outside the
-/// cache directory, so untrusted message data cannot point the UI at
-/// arbitrary local files (`/dev/zero`, `~/.ssh/...`, FIFOs).
+/// Verifies that a cache path the runtime reported still points at a regular
+/// file inside the image asset cache (symlinks followed).
+pub(crate) fn verified_cached_asset_path(path: &Path) -> Option<PathBuf> {
+    let cache_root = crate::config::image_asset_cache_dir().canonicalize().ok()?;
+    contained_cache_file(&cache_root, path)
+}
+
+/// Maps a Slack-provided URL to a file inside the image asset cache: the
+/// path the runtime reported for it (`context.image_assets`), or else the
+/// URL-hash file a previous session left behind. Never returns a path
+/// outside the cache directory, so untrusted message data cannot point the
+/// UI at arbitrary local files (`/dev/zero`, `~/.ssh/...`, FIFOs).
 pub(crate) fn resolve_cached_asset_path(
     url: &str,
     context: &MessageHtmlContext,
@@ -315,23 +317,16 @@ fn resolve_cached_asset_path_in(
     context: &MessageHtmlContext,
 ) -> Option<PathBuf> {
     let cache_root = cache_dir.canonicalize().ok()?;
-    let source_uri = context
+    if let Some(path) = context
         .image_assets
         .get(url)
-        .map(|s| s.uri())
-        .unwrap_or(url);
-
-    let asset_key = source_uri
-        .strip_prefix("conduit-asset://")
-        .or_else(|| source_uri.strip_prefix("conduit-cache://"))
-        .map(|key| key.split('?').next().unwrap_or(key).trim_matches('/'))
-        .filter(|key| is_safe_cache_key(key));
+        .and_then(|path| contained_cache_file(&cache_root, path))
+    {
+        return Some(path);
+    }
 
     with_resolved_asset_index(&cache_root, |index| {
         // Fast path: answer from the snapshot (one containment check).
-        if let Some(path) = asset_key.and_then(|key| index.verified(key)) {
-            return Some(path);
-        }
         let hit = index
             .workspace_dirs
             .iter()
@@ -340,21 +335,14 @@ fn resolve_cached_asset_path_in(
             return hit;
         }
 
-        // Miss: re-check the disk for just these keys. The root listing is
+        // Miss: re-check the disk for just this URL. The root listing is
         // re-read (it holds only workspace dirs) so a workspace directory
         // created after the snapshot is found too.
-        let workspace_dirs = cache_workspace_dirs(&cache_root);
-        if let Some(key) = asset_key {
-            let found = std::iter::once(cache_root.as_path())
-                .chain(workspace_dirs.iter().map(|(_, dir)| dir.as_path()))
-                .find_map(|dir| probe_cache_key(index, dir, key));
-            if found.is_some() {
-                return found;
-            }
-        }
-        workspace_dirs.iter().find_map(|(dir_name, dir)| {
-            probe_cache_key(index, dir, &hashed_cache_key(dir_name, url))
-        })
+        cache_workspace_dirs(&cache_root)
+            .iter()
+            .find_map(|(dir_name, dir)| {
+                probe_cache_key(index, dir, &hashed_cache_key(dir_name, url))
+            })
     })
 }
 
@@ -394,37 +382,77 @@ mod path_tests {
         }
     }
 
+    /// A render context in which the runtime reported `path` for `url`.
+    fn context_with_asset(url: &str, path: PathBuf) -> MessageHtmlContext {
+        let mut ctx = test_context();
+        ctx.image_assets.insert(url.to_string(), path);
+        ctx
+    }
+
+    /// Where the runtime stores `url` for the fixture's `workspace` dir.
+    fn hashed_file(fx: &Fixture, url: &str, ext: &str) -> PathBuf {
+        fx.cache
+            .join("workspace")
+            .join(format!("{}{ext}", hashed_cache_key("workspace", url)))
+    }
+
     #[test]
-    fn resolves_key_inside_cache_dir() {
+    fn resolves_registered_path_inside_cache_dir() {
         let fx = Fixture::new("inside");
-        let key = "a".repeat(64);
-        let file = fx.cache.join("workspace").join(format!("{key}.png"));
+        let file = fx
+            .cache
+            .join("workspace")
+            .join(format!("{}.png", "a".repeat(64)));
         std::fs::write(&file, b"img").unwrap();
-        let found = resolve_cached_asset_path_in(
-            &fx.cache,
-            &format!("conduit-asset://{key}"),
-            &test_context(),
-        );
+        let url = "https://example.com/inside.png";
+        let found =
+            resolve_cached_asset_path_in(&fx.cache, url, &context_with_asset(url, file.clone()));
         assert_eq!(found, Some(file.canonicalize().unwrap()));
     }
 
     #[test]
-    fn rejects_dot_dot_segments_in_asset_uri() {
+    fn rejects_registered_paths_escaping_cache_dir() {
         let fx = Fixture::new("dotdot");
+        let url = "https://example.com/escape.png";
+        for path in [
+            fx.cache.join("workspace").join("../../secret.png"),
+            fx.cache.join("../secret.png"),
+            fx.secret.clone(),
+            PathBuf::from("/dev/zero"),
+            fx.cache.join("workspace"),
+        ] {
+            let ctx = context_with_asset(url, path.clone());
+            assert_eq!(
+                resolve_cached_asset_path_in(&fx.cache, url, &ctx),
+                None,
+                "{}",
+                path.display()
+            );
+        }
+        assert!(fx.secret.is_file());
+    }
+
+    #[test]
+    fn legacy_asset_uris_do_not_resolve() {
+        let fx = Fixture::new("legacy-uri");
+        let key = "a".repeat(64);
+        std::fs::write(
+            fx.cache.join("workspace").join(format!("{key}.png")),
+            b"img",
+        )
+        .unwrap();
         let ctx = test_context();
         for uri in [
-            "conduit-asset://../secret",
-            "conduit-asset://workspace/../../secret",
-            "conduit-cache://../secret",
-            "conduit-asset://..",
+            format!("conduit-asset://{key}"),
+            format!("conduit-cache://{key}"),
+            "conduit-asset://../secret".to_string(),
         ] {
             assert_eq!(
-                resolve_cached_asset_path_in(&fx.cache, uri, &ctx),
+                resolve_cached_asset_path_in(&fx.cache, &uri, &ctx),
                 None,
                 "{uri}"
             );
         }
-        assert!(fx.secret.is_file());
     }
 
     #[test]
@@ -441,20 +469,22 @@ mod path_tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_symlink_escaping_cache_dir() {
+    fn rejects_registered_symlink_escaping_cache_dir() {
         let fx = Fixture::new("symlink");
-        std::os::unix::fs::symlink(&fx.secret, fx.cache.join("escape.png")).unwrap();
-        let found =
-            resolve_cached_asset_path_in(&fx.cache, "conduit-asset://escape", &test_context());
+        let link = fx.cache.join("workspace").join("escape.png");
+        std::os::unix::fs::symlink(&fx.secret, &link).unwrap();
+        let url = "https://example.com/escape.png";
+        let found = resolve_cached_asset_path_in(&fx.cache, url, &context_with_asset(url, link));
         assert_eq!(found, None);
     }
 
     #[test]
     fn rejects_extensionless_cache_entries() {
+        reset_resolved_asset_index_for_tests();
         let fx = Fixture::new("noext");
-        std::fs::write(fx.cache.join("bare"), b"img").unwrap();
-        let found =
-            resolve_cached_asset_path_in(&fx.cache, "conduit-asset://bare", &test_context());
+        let url = "https://example.com/bare";
+        std::fs::write(hashed_file(&fx, url, ""), b"img").unwrap();
+        let found = resolve_cached_asset_path_in(&fx.cache, url, &test_context());
         assert_eq!(found, None);
     }
 
@@ -470,33 +500,31 @@ mod path_tests {
         );
     }
 
-    /// A repeated lookup for the same key must come from the in-memory
-    /// index, not a fresh directory scan: only one index build happens
-    /// across both lookups until the index is reset (standing in for TTL
-    /// expiry).
+    /// A repeated URL-hash lookup must come from the in-memory index, not a
+    /// fresh directory scan: only one index build happens across both
+    /// lookups until the index is reset (standing in for TTL expiry).
     #[test]
     fn resolve_uses_cached_index_instead_of_rescanning_on_repeat_lookup() {
         reset_resolved_asset_index_for_tests();
         let fx = Fixture::new("index-reuse");
-        let key = "b".repeat(64);
-        let file = fx.cache.join("workspace").join(format!("{key}.png"));
+        let url = "https://example.com/reuse.png";
+        let file = hashed_file(&fx, url, ".png");
         std::fs::write(&file, b"img").unwrap();
-        let uri = format!("conduit-asset://{key}");
         let ctx = test_context();
 
         let builds = resolved_asset_index_builds_for_tests();
-        let first = resolve_cached_asset_path_in(&fx.cache, &uri, &ctx);
+        let first = resolve_cached_asset_path_in(&fx.cache, url, &ctx);
         assert_eq!(first, Some(file.canonicalize().unwrap()));
         assert_eq!(resolved_asset_index_builds_for_tests(), builds + 1);
 
-        let second = resolve_cached_asset_path_in(&fx.cache, &uri, &ctx);
+        let second = resolve_cached_asset_path_in(&fx.cache, url, &ctx);
         assert_eq!(second, first);
         assert_eq!(resolved_asset_index_builds_for_tests(), builds + 1);
 
         // A hit is still verified at lookup time: a file deleted after the
         // snapshot is not returned.
         std::fs::remove_file(&file).unwrap();
-        let third = resolve_cached_asset_path_in(&fx.cache, &uri, &ctx);
+        let third = resolve_cached_asset_path_in(&fx.cache, url, &ctx);
         assert_eq!(third, None);
     }
 
@@ -506,22 +534,20 @@ mod path_tests {
     fn resolve_finds_asset_written_after_a_miss_without_waiting_for_ttl() {
         reset_resolved_asset_index_for_tests();
         let fx = Fixture::new("stale-miss");
-        let key = "c".repeat(64);
-        let uri = format!("conduit-asset://{key}");
         let ctx = test_context();
 
-        assert_eq!(resolve_cached_asset_path_in(&fx.cache, &uri, &ctx), None);
+        let url = "https://example.com/early.webp";
+        assert_eq!(resolve_cached_asset_path_in(&fx.cache, url, &ctx), None);
         let builds = resolved_asset_index_builds_for_tests();
 
-        let file = fx.cache.join("workspace").join(format!("{key}.webp"));
+        let file = hashed_file(&fx, url, ".webp");
         std::fs::write(&file, b"img").unwrap();
         assert_eq!(
-            resolve_cached_asset_path_in(&fx.cache, &uri, &ctx),
+            resolve_cached_asset_path_in(&fx.cache, url, &ctx),
             Some(file.canonicalize().unwrap())
         );
 
-        // Same for URL-hash lookups in a workspace dir created after the
-        // snapshot was taken.
+        // Same in a workspace dir created after the snapshot was taken.
         let url = "https://example.com/late.png";
         assert_eq!(resolve_cached_asset_path_in(&fx.cache, url, &ctx), None);
         let late_ws = fx.cache.join("late_ws");
@@ -540,17 +566,9 @@ mod path_tests {
     fn rejects_symlink_escaping_cache_dir_inside_workspace_dir() {
         reset_resolved_asset_index_for_tests();
         let fx = Fixture::new("symlink-ws");
-        let key = "d".repeat(64);
-        std::os::unix::fs::symlink(
-            &fx.secret,
-            fx.cache.join("workspace").join(format!("{key}.png")),
-        )
-        .unwrap();
-        let found = resolve_cached_asset_path_in(
-            &fx.cache,
-            &format!("conduit-asset://{key}"),
-            &test_context(),
-        );
+        let url = "https://example.com/symlink.png";
+        std::os::unix::fs::symlink(&fx.secret, hashed_file(&fx, url, ".png")).unwrap();
+        let found = resolve_cached_asset_path_in(&fx.cache, url, &test_context());
         assert_eq!(found, None);
     }
 }

@@ -61,9 +61,7 @@ use crate::message_handoff::{
     open_resolved_handoff, ExternalOpenError, ExternalOpener, HandoffProvenance,
     MessageControlRegistry, MessageRef, SafeSlackPermalink, TimelineSurfaceId,
 };
-use crate::message_html::{
-    CachedAssetKind, CachedAssetSource, MessageHtmlContext, TimelineScrollBehavior,
-};
+use crate::message_html::{MessageHtmlContext, TimelineScrollBehavior};
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUser,
     SlackUserStatus,
@@ -407,8 +405,7 @@ mod imp {
         pub message_font_settings_handler: RefCell<Option<(gtk::Settings, glib::SignalHandlerId)>>,
         pub(super) media_viewer: RefCell<Option<MediaViewer>>,
         pub(super) thread_pane_controller: RefCell<Option<ThreadPane>>,
-        pub image_assets: RefCell<HashMap<String, CachedAssetSource>>,
-        pub(super) conduit_assets: Rc<RefCell<BoundedConduitAssets>>,
+        pub image_assets: RefCell<CachedImageAssets>,
         pub(super) pending_image_assets: RefCell<BoundedImageAssetKeys>,
         pub(super) failed_image_assets: RefCell<BoundedImageAssetKeys>,
         pub(super) recovering_image_assets: RefCell<BoundedImageAssetKeys>,
@@ -7616,39 +7613,13 @@ impl ConduitWindow {
                     self.mark_image_asset_failed(&key);
                     return;
                 }
-                let kind = if asset.is_video() {
-                    CachedAssetKind::Video
-                } else {
-                    CachedAssetKind::Image
-                };
-                let Some(source) = CachedAssetSource::new(asset.uri(), kind) else {
+                let Some(evicted) = imp.image_assets.borrow_mut().insert(key.clone(), asset) else {
                     self.mark_image_asset_failed(&key);
                     return;
                 };
-                let Some(evicted) = imp.conduit_assets.borrow_mut().insert(asset) else {
-                    self.mark_image_asset_failed(&key);
-                    return;
-                };
-                if !evicted.is_empty() {
-                    let evicted = evicted.into_iter().collect::<HashSet<_>>();
-                    let evicted_sources = imp
-                        .image_assets
-                        .borrow()
-                        .iter()
-                        .filter(|(_, source)| {
-                            conduit_asset_request_key(source.uri())
-                                .is_some_and(|cache_key| evicted.contains(&cache_key))
-                        })
-                        .map(|(key, _)| key.clone())
-                        .collect::<Vec<_>>();
-                    for evicted_source in evicted_sources {
-                        imp.image_assets.borrow_mut().remove(&evicted_source);
-                        self.patch_image_asset(&evicted_source);
-                    }
+                for evicted_key in evicted {
+                    self.patch_image_asset(&evicted_key);
                 }
-                imp.image_assets
-                    .borrow_mut()
-                    .insert(key.clone(), source.clone());
                 self.patch_image_asset(&key);
             }
             RuntimeEventKind::ImageAssetFailed { key } => {
@@ -9220,8 +9191,7 @@ impl ConduitWindow {
         imp.workspace_avatar
             .set_custom_image(None::<&gtk::gdk::Paintable>);
         *imp.sidebar_error.borrow_mut() = None;
-        imp.image_assets.borrow_mut().clear();
-        imp.conduit_assets.borrow_mut().set_workspace(None);
+        imp.image_assets.borrow_mut().set_workspace(None);
         imp.pending_image_assets.borrow_mut().clear();
         imp.failed_image_assets.borrow_mut().clear();
         imp.recovering_image_assets.borrow_mut().clear();
@@ -9252,7 +9222,7 @@ impl ConduitWindow {
         let preview_scope = preview_workspace_scope(&auth);
         let workspace_id = workspace_identity(&auth);
         self.imp()
-            .conduit_assets
+            .image_assets
             .borrow_mut()
             .set_workspace(Some(preview_workspace_cache_key(&preview_scope)));
         *self.imp().workspace_id.borrow_mut() = workspace_id;
@@ -9297,13 +9267,8 @@ impl ConduitWindow {
         let texture = imp
             .image_assets
             .borrow()
-            .get(key)
-            .and_then(|source| {
-                crate::timeline_message_widget::resolve_cached_asset_path(
-                    source.uri(),
-                    &MessageHtmlContext::default(),
-                )
-            })
+            .path(key)
+            .and_then(crate::timeline_message_widget::verified_cached_asset_path)
             .and_then(|path| crate::timeline_message_widget::get_or_load_texture(&path));
         if let Some(texture) = texture {
             imp.workspace_avatar
@@ -9677,11 +9642,7 @@ impl ConduitWindow {
         imp.failed_image_assets
             .borrow_mut()
             .insert_evicting(key.to_string());
-        if let Some(source) = imp.image_assets.borrow_mut().remove(key) {
-            if let Some(cache_key) = conduit_asset_request_key(source.uri()) {
-                imp.conduit_assets.borrow_mut().remove(&cache_key);
-            }
-        }
+        imp.image_assets.borrow_mut().remove(key);
         self.patch_image_asset(key);
     }
 
@@ -13547,21 +13508,18 @@ impl ConduitWindow {
         }
 
         let known_assets = self.imp().image_assets.borrow();
-        let registered_assets = self.imp().conduit_assets.borrow();
         let failed_assets = self.imp().failed_image_assets.borrow();
         let mut pending_assets = self.imp().pending_image_assets.borrow_mut();
         let missing_requests = requests
             .into_iter()
             .filter(|(key, _)| {
-                !known_assets.get(key).is_some_and(|source| {
-                    cached_asset_source_is_registered(source, &registered_assets)
-                }) && !failed_assets.contains(key)
+                !known_assets.contains_key(key)
+                    && !failed_assets.contains(key)
                     && pending_assets.try_insert(key.clone())
             })
             .collect::<Vec<_>>();
         drop(pending_assets);
         drop(failed_assets);
-        drop(registered_assets);
         drop(known_assets);
 
         crate::debug::log(
@@ -13768,16 +13726,12 @@ impl ConduitWindow {
             .map(|settings| settings.strv(config::RECENT_REACTIONS_KEY))
             .map(|names| names.iter().map(ToString::to_string).collect())
             .unwrap_or_default();
-        let registered_assets = imp.conduit_assets.borrow();
         let image_assets = imp
             .image_assets
             .borrow()
             .iter()
-            .filter(|(key, source)| {
-                image_keys.is_none_or(|keys| keys.contains(*key))
-                    && cached_asset_source_is_registered(source, &registered_assets)
-            })
-            .map(|(key, value)| (key.clone(), value.clone()))
+            .filter(|(key, _)| image_keys.is_none_or(|keys| keys.contains(*key)))
+            .map(|(key, path)| (key.clone(), path.to_path_buf()))
             .collect();
         let last_read = self.visible_channel_id().and_then(|channel_id| {
             imp.workspace
