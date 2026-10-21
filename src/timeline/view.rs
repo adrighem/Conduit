@@ -1197,17 +1197,37 @@ pub(crate) fn near_oldest_edge(offset_from_top: f64, page_size: f64) -> bool {
     page_size > 0.0 && offset_from_top < page_size / 2.0
 }
 
+/// Retry budget for [`center_row_after_layout`]: matches the 450ms
+/// `settle_delay` that `set_messages` already allows a focus target to keep
+/// adjusting for, so a row that never centers gives up on the same schedule
+/// the rest of the settle logic assumes rather than spinning indefinitely.
+const CENTER_ROW_DEADLINE: std::time::Duration = std::time::Duration::from_millis(450);
+
+/// Whether `index` can no longer be centered because it fell out of the
+/// list's current model, e.g. a splice shrank or reordered the store after
+/// centering started.
+fn index_out_of_bounds(list_view: &gtk::ListView, index: u32) -> bool {
+    list_view
+        .model()
+        .is_none_or(|model| index >= model.n_items())
+}
+
 /// `scroll_to` only brings a row to the nearest edge and `ScrollInfo` cannot
 /// center, so recenter once the scrolled layout is in place: tick callbacks
 /// run before layout, hence the second frame.
+///
+/// Returns a flag set once the retry loop stops (centered, deadline hit, or
+/// the target row became invalid), mainly so tests can observe that it does
+/// stop instead of retrying forever.
 fn center_row_after_layout(
     list_view: &gtk::ListView,
     vadj: gtk::Adjustment,
     bound_items: BoundItems,
     index: u32,
     n_items: u32,
-) {
+) -> Rc<Cell<bool>> {
     let done = Rc::new(Cell::new(false));
+    let start = std::time::Instant::now();
 
     // Fast path: when running under a live compositor, tick callbacks fire every frame.
     {
@@ -1217,7 +1237,15 @@ fn center_row_after_layout(
         let bound_items = bound_items.clone();
         let frames = Cell::new(0_u8);
         list_view.add_tick_callback(move |list_view, _| {
-            if done.get() {
+            // The target index itself going out of bounds (e.g. a shrinking
+            // splice) is a correctness issue, not just a slow retry, so it
+            // stops on the very next tick rather than waiting out the
+            // deadline below.
+            if done.get()
+                || index_out_of_bounds(list_view, index)
+                || start.elapsed() >= CENTER_ROW_DEADLINE
+            {
+                done.set(true);
                 return glib::ControlFlow::Break;
             }
             frames.set(frames.get() + 1);
@@ -1246,8 +1274,13 @@ fn center_row_after_layout(
     {
         let list_view = list_view.clone();
         let attempts = Rc::new(Cell::new(0_u8));
+        let done = done.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
-            if done.get() {
+            if done.get()
+                || index_out_of_bounds(&list_view, index)
+                || start.elapsed() >= CENTER_ROW_DEADLINE
+            {
+                done.set(true);
                 return glib::ControlFlow::Break;
             }
             let count = attempts.get() + 1;
@@ -1282,6 +1315,8 @@ fn center_row_after_layout(
             }
         });
     }
+
+    done
 }
 
 fn center_row(
@@ -1332,5 +1367,87 @@ fn keep_focus_on_row(item: &gtk::ListItem) {
     }
     if let Some(row) = child.parent() {
         row.grab_focus();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timeline::tests::{run_gtk_test, test_context};
+
+    fn pump(ms: u64) {
+        let context = glib::MainContext::default();
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < end {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Pumps the loop until `done` is set or `max_ms` elapses, whichever
+    /// comes first, so a regression that never sets `done` fails the test
+    /// instead of hanging it.
+    fn pump_until_done(done: &Rc<Cell<bool>>, max_ms: u64) {
+        let context = glib::MainContext::default();
+        let end = std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
+        while std::time::Instant::now() < end && !done.get() {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// A store shrinking out from under an in-flight centering retry (e.g.
+    /// `splice_changed_items` dropping rows while a scroll-to-focus pass is
+    /// still settling) must not leave the retry spinning on every frame
+    /// forever: it should notice the target index is no longer valid and
+    /// stop on the very next tick.
+    #[test]
+    fn center_row_after_layout_stops_when_target_index_is_out_of_bounds() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let messages = (0..5)
+                .map(|i| SlackMessage {
+                    ts: format!("170000000{i}.000100"),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("message {i}")),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(400, 500);
+            window.set_child(Some(view.widget()));
+            window.present();
+            view.set_messages(&messages, &ctx, None);
+            pump(300);
+
+            // Simulate the target row having fallen out of the store (e.g. an
+            // incremental splice shrank it) before centering could finish.
+            let out_of_range_index = view.store.n_items() + 100;
+            let vadj = view.scrolled_window.vadjustment();
+            let start = std::time::Instant::now();
+            let done = center_row_after_layout(
+                &view.list_view,
+                vadj,
+                view.bound_items.clone(),
+                out_of_range_index,
+                view.store.n_items(),
+            );
+
+            pump_until_done(&done, 2_000);
+            let elapsed = start.elapsed();
+
+            assert!(
+                done.get(),
+                "an out-of-bounds target should stop the retry instead of spinning forever"
+            );
+            assert!(
+                elapsed < CENTER_ROW_DEADLINE,
+                "an out-of-bounds index should be noticed well before the \
+                 {CENTER_ROW_DEADLINE:?} retry deadline, took {elapsed:?}"
+            );
+
+            window.destroy();
+        });
     }
 }
