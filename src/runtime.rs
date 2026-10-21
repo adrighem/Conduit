@@ -1345,7 +1345,7 @@ impl WorkspaceReducerAdapter {
         };
         for effect in reduction.effects() {
             if let WorkspaceEffect::ConversationReadMarked { channel_id, ts } = effect {
-                read_flusher.enqueue(channel_id, ts);
+                read_flusher.enqueue(&ReadTarget::conversation(channel_id), ts);
             }
         }
     }
@@ -6107,7 +6107,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 },
             )
             .await;
-            context.read_flusher.enqueue(&channel_id, &ts);
+            context
+                .read_flusher
+                .enqueue(&ReadTarget::conversation(channel_id), &ts);
         }
         RuntimeCommand::MarkConversationUnread { channel_id, ts } => {
             apply_local_read_state(
@@ -6118,7 +6120,9 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 },
             )
             .await;
-            context.read_flusher.enqueue_force(&channel_id, &ts);
+            context
+                .read_flusher
+                .enqueue_force(&ReadTarget::conversation(channel_id), &ts);
         }
         RuntimeCommand::MarkThreadRead {
             channel_id,
@@ -6133,10 +6137,10 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 },
             )
             .await;
-            let target = target_ts.as_deref().unwrap_or(&thread_ts);
+            let target_ts = target_ts.unwrap_or_else(|| thread_ts.clone());
             context
                 .read_flusher
-                .enqueue_thread(&channel_id, &thread_ts, target);
+                .enqueue(&ReadTarget::thread(channel_id, thread_ts), &target_ts);
         }
     }
 
