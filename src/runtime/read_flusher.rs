@@ -13,10 +13,19 @@ use super::wait_for_realtime_or_shutdown;
 
 pub const READ_FLUSHER_MAX_MARKED_THREADS: usize = 1_024;
 
+/// Intent behind a channel mark. Reads only ever move the cursor forward;
+/// an unread is a deliberate user rewind that must always take effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadMarkKind {
+    Read,
+    Unread,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingReadMark {
     pub channel_id: String,
     pub target_ts: String,
+    pub kind: ReadMarkKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,11 +38,11 @@ pub struct PendingThreadReadMark {
 #[derive(Clone, Debug, Default)]
 pub struct ReadFlusherQueue {
     last_marked: HashMap<String, String>,
-    pending: HashMap<String, String>,
+    pending: HashMap<String, PendingReadMark>,
     last_marked_threads: HashMap<(String, String), String>,
     last_marked_thread_order: VecDeque<(String, String)>,
     pending_threads: HashMap<(String, String), String>,
-    in_flight: HashMap<String, String>,
+    in_flight: HashMap<String, PendingReadMark>,
     in_flight_threads: HashMap<(String, String), String>,
 }
 
@@ -62,33 +71,53 @@ impl ReadFlusherQueue {
 
     #[allow(dead_code)]
     pub fn pending_mark(&self, channel_id: &str) -> Option<&str> {
-        self.pending.get(channel_id).map(String::as_str)
+        self.pending
+            .get(channel_id)
+            .map(|mark| mark.target_ts.as_str())
     }
 
-    pub fn enqueue(&mut self, channel_id: &str, target_ts: &str) -> bool {
-        if let Some(marked_ts) = self.last_marked.get(channel_id) {
-            if !slack_timestamp_is_after(target_ts, marked_ts) {
-                return false;
-            }
-        }
-        if let Some(p_ts) = self.pending.get(channel_id) {
-            if !slack_timestamp_is_after(target_ts, p_ts) {
-                return false;
-            }
-        }
-        if let Some(f_ts) = self.in_flight.get(channel_id) {
-            if !slack_timestamp_is_after(target_ts, f_ts) {
-                return false;
-            }
-        }
+    #[cfg(test)]
+    pub fn pending_mark_kind(&self, channel_id: &str) -> Option<ReadMarkKind> {
+        self.pending.get(channel_id).map(|mark| mark.kind)
+    }
+
+    /// The cursor the user most recently asked for: a pending mark is newer
+    /// than the in-flight one, which is newer than the last confirmed one.
+    /// After a forced unread this can sit behind `last_marked`.
+    fn latest_intended_ts(&self, channel_id: &str) -> Option<&str> {
         self.pending
-            .insert(channel_id.to_string(), target_ts.to_string());
+            .get(channel_id)
+            .or_else(|| self.in_flight.get(channel_id))
+            .map(|mark| mark.target_ts.as_str())
+            .or_else(|| self.last_marked(channel_id))
+    }
+
+    /// Queues a read mark if it moves the latest intended cursor forward.
+    pub fn enqueue(&mut self, channel_id: &str, target_ts: &str) -> bool {
+        if let Some(latest_ts) = self.latest_intended_ts(channel_id) {
+            if !slack_timestamp_is_after(target_ts, latest_ts) {
+                return false;
+            }
+        }
+        self.insert_pending(channel_id, target_ts, ReadMarkKind::Read);
         true
     }
 
+    /// Queues a user-forced unread mark; it replaces any pending mark and is
+    /// never filtered against older, higher read cursors.
     pub fn enqueue_force(&mut self, channel_id: &str, target_ts: &str) {
-        self.pending
-            .insert(channel_id.to_string(), target_ts.to_string());
+        self.insert_pending(channel_id, target_ts, ReadMarkKind::Unread);
+    }
+
+    fn insert_pending(&mut self, channel_id: &str, target_ts: &str, kind: ReadMarkKind) {
+        self.pending.insert(
+            channel_id.to_string(),
+            PendingReadMark {
+                channel_id: channel_id.to_string(),
+                target_ts: target_ts.to_string(),
+                kind,
+            },
+        );
     }
 
     #[allow(dead_code)]
@@ -171,14 +200,7 @@ impl ReadFlusherQueue {
     /// reports success through [`Self::mark_succeeded`]. Drained marks stay
     /// in flight until settled so the same target is not enqueued again.
     pub fn flush(&mut self) -> Vec<PendingReadMark> {
-        let marks: Vec<PendingReadMark> = self
-            .pending
-            .drain()
-            .map(|(channel_id, target_ts)| PendingReadMark {
-                channel_id,
-                target_ts,
-            })
-            .collect();
+        let marks: Vec<PendingReadMark> = self.pending.drain().map(|(_, mark)| mark).collect();
         for mark in &marks {
             self.begin_in_flight(mark);
         }
@@ -186,31 +208,39 @@ impl ReadFlusherQueue {
     }
 
     pub fn flush_channel(&mut self, channel_id: &str) -> Option<PendingReadMark> {
-        let mark = self
-            .pending
-            .remove(channel_id)
-            .map(|target_ts| PendingReadMark {
-                channel_id: channel_id.to_string(),
-                target_ts,
-            })?;
+        let mark = self.pending.remove(channel_id)?;
         self.begin_in_flight(&mark);
         Some(mark)
     }
 
     fn begin_in_flight(&mut self, mark: &PendingReadMark) {
-        self.in_flight
-            .insert(mark.channel_id.clone(), mark.target_ts.clone());
+        self.in_flight.insert(mark.channel_id.clone(), mark.clone());
     }
 
     pub fn mark_succeeded(&mut self, mark: &PendingReadMark) {
         self.in_flight.remove(&mark.channel_id);
-        self.set_last_marked(mark.channel_id.as_str(), mark.target_ts.as_str());
+        match mark.kind {
+            ReadMarkKind::Read => {
+                self.set_last_marked(mark.channel_id.as_str(), mark.target_ts.as_str());
+            }
+            // Slack now holds the rewound cursor; mirror it so later reads
+            // past it are not mistaken for duplicates.
+            ReadMarkKind::Unread => {
+                self.last_marked
+                    .insert(mark.channel_id.clone(), mark.target_ts.clone());
+            }
+        }
     }
 
-    /// Puts a failed mark back unless a newer target superseded it meanwhile.
+    /// Puts a failed mark back unless the user queued a newer mark for the
+    /// channel meanwhile. Anything pending was enqueued after this mark was
+    /// drained, so it is the most recent intent and wins regardless of kind
+    /// or timestamp order.
     pub fn mark_failed(&mut self, mark: &PendingReadMark) {
         self.in_flight.remove(&mark.channel_id);
-        self.enqueue(&mark.channel_id, &mark.target_ts);
+        if !self.pending.contains_key(&mark.channel_id) {
+            self.pending.insert(mark.channel_id.clone(), mark.clone());
+        }
     }
 
     /// Gives up on a mark that can never succeed; it is not requeued.

@@ -10933,10 +10933,12 @@ fn read_flusher_queue_debounced_batching() {
     assert!(flushed.contains(&PendingReadMark {
         channel_id: "C1".to_string(),
         target_ts: "150.000000".to_string(),
+        kind: ReadMarkKind::Read,
     }));
     assert!(flushed.contains(&PendingReadMark {
         channel_id: "C2".to_string(),
         target_ts: "200.000000".to_string(),
+        kind: ReadMarkKind::Read,
     }));
 
     // last_marked only advances once Slack confirmed the mark
@@ -10961,6 +10963,7 @@ fn read_flusher_queue_immediate_channel_flush() {
         Some(PendingReadMark {
             channel_id: "C1".to_string(),
             target_ts: "100.000000".to_string(),
+            kind: ReadMarkKind::Read,
         })
     );
     assert_eq!(queue.last_marked("C1"), None);
@@ -11077,6 +11080,79 @@ fn read_flusher_queue_forced_enqueue() {
     // Force enqueue allows backward mark for manual overrides
     queue.enqueue_force("C1", "100.000000");
     assert_eq!(queue.pending_mark("C1"), Some("100.000000"));
+}
+
+#[test]
+fn read_flusher_queue_forced_unread_rewinds_last_marked() {
+    let mut queue = ReadFlusherQueue::new();
+    assert!(queue.enqueue("C1", "20.000000"));
+    let read = queue.flush();
+    queue.mark_succeeded(&read[0]);
+    assert_eq!(queue.last_marked("C1"), Some("20.000000"));
+
+    // A forced unread to an earlier ts must rewind the confirmed cursor.
+    queue.enqueue_force("C1", "15.000000");
+    let unread = queue.flush();
+    assert_eq!(unread[0].kind, ReadMarkKind::Unread);
+    queue.mark_succeeded(&unread[0]);
+    assert_eq!(queue.last_marked("C1"), Some("15.000000"));
+
+    // Reading again must reach Slack instead of being deduplicated away.
+    assert!(queue.enqueue("C1", "20.000000"));
+    assert_eq!(queue.pending_mark("C1"), Some("20.000000"));
+}
+
+#[test]
+fn read_flusher_queue_read_after_pending_unread_is_not_rejected() {
+    let mut queue = ReadFlusherQueue::new();
+    assert!(queue.enqueue("C1", "20.000000"));
+    let read = queue.flush();
+    queue.mark_succeeded(&read[0]);
+
+    // Before the unread reaches Slack, a read past it is the newer intent.
+    queue.enqueue_force("C1", "15.000000");
+    assert!(queue.enqueue("C1", "18.000000"));
+    assert_eq!(queue.pending_mark("C1"), Some("18.000000"));
+    assert_eq!(queue.pending_mark_kind("C1"), Some(ReadMarkKind::Read));
+}
+
+#[test]
+fn read_flusher_queue_failed_read_retry_keeps_newer_unread() {
+    let mut queue = ReadFlusherQueue::new();
+    assert!(queue.enqueue("C1", "20.000000"));
+    let in_flight = queue.flush();
+
+    // The user forces unread while read:20 is still in flight.
+    queue.enqueue_force("C1", "15.000000");
+
+    // read:20 fails transiently; its retry must not clobber unread:15.
+    queue.mark_failed(&in_flight[0]);
+    assert_eq!(queue.pending_mark("C1"), Some("15.000000"));
+    assert_eq!(queue.pending_mark_kind("C1"), Some(ReadMarkKind::Unread));
+
+    let flushed = queue.flush();
+    assert_eq!(
+        flushed,
+        vec![PendingReadMark {
+            channel_id: "C1".to_string(),
+            target_ts: "15.000000".to_string(),
+            kind: ReadMarkKind::Unread,
+        }]
+    );
+}
+
+#[test]
+fn read_flusher_queue_failed_unread_is_retried() {
+    let mut queue = ReadFlusherQueue::new();
+    assert!(queue.enqueue("C1", "20.000000"));
+    let read = queue.flush();
+    queue.mark_succeeded(&read[0]);
+
+    queue.enqueue_force("C1", "15.000000");
+    let unread = queue.flush();
+    queue.mark_failed(&unread[0]);
+    assert_eq!(queue.pending_mark("C1"), Some("15.000000"));
+    assert_eq!(queue.pending_mark_kind("C1"), Some(ReadMarkKind::Unread));
 }
 
 #[test]
