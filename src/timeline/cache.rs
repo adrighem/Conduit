@@ -115,23 +115,52 @@ pub(crate) fn set_media_collapsed(ts: &str, slot: &str, collapsed: bool) {
 }
 
 const EXTENSIONS: &[&str] = &[
-    "", ".png", ".gif", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".mov", ".ogg", ".avif",
+    ".png", ".gif", ".jpg", ".jpeg", ".webp", ".avif", ".mp4", ".webm", ".mov", ".ogv", ".ogg",
 ];
 
-fn check_file_extensions(base_dir: &Path, key: &str) -> Option<PathBuf> {
-    for ext in EXTENSIONS {
-        let p = base_dir.join(format!("{key}{ext}"));
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
+/// Cache keys are file stems (hex digests in practice). Anything carrying a
+/// path separator, `.`/`..` segment or other punctuation is not a key we wrote.
+fn is_safe_cache_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+/// Returns the resolved path of `candidate` only when it is a regular file
+/// that still lives inside `cache_root` after symlinks are followed.
+/// `cache_root` must already be canonical.
+fn contained_cache_file(cache_root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let resolved = candidate.canonicalize().ok()?;
+    (resolved.starts_with(cache_root) && resolved.is_file()).then_some(resolved)
+}
+
+fn check_file_extensions(cache_root: &Path, base_dir: &Path, key: &str) -> Option<PathBuf> {
+    if !is_safe_cache_key(key) {
+        return None;
+    }
+    EXTENSIONS
+        .iter()
+        .find_map(|ext| contained_cache_file(cache_root, &base_dir.join(format!("{key}{ext}"))))
+}
+
+/// Maps a Slack-provided URL (or a `conduit-asset://` URI registered for it)
+/// to a file inside the image asset cache. Never returns a path outside the
+/// cache directory, so untrusted message data cannot point the UI at
+/// arbitrary local files (`/dev/zero`, `~/.ssh/...`, FIFOs).
 pub(crate) fn resolve_cached_asset_path(
     url: &str,
     context: &MessageHtmlContext,
 ) -> Option<PathBuf> {
+    resolve_cached_asset_path_in(&crate::config::image_asset_cache_dir(), url, context)
+}
+
+fn resolve_cached_asset_path_in(
+    cache_dir: &Path,
+    url: &str,
+    context: &MessageHtmlContext,
+) -> Option<PathBuf> {
+    let cache_root = cache_dir.canonicalize().ok()?;
     let source_uri = context
         .image_assets
         .get(url)
@@ -142,24 +171,23 @@ pub(crate) fn resolve_cached_asset_path(
         .strip_prefix("conduit-asset://")
         .or_else(|| source_uri.strip_prefix("conduit-cache://"));
 
-    let cache_dir = crate::config::image_asset_cache_dir();
-
     if let Some(cache_key) = cache_key {
         let clean_key = cache_key
             .split('?')
             .next()
             .unwrap_or(cache_key)
             .trim_matches('/');
-        if !clean_key.is_empty() {
-            if let Some(path) = check_file_extensions(&cache_dir, clean_key) {
+        if is_safe_cache_key(clean_key) {
+            if let Some(path) = check_file_extensions(&cache_root, &cache_root, clean_key) {
                 return Some(path);
             }
 
-            if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            if let Ok(entries) = std::fs::read_dir(&cache_root) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_dir() {
-                        if let Some(sub_path) = check_file_extensions(&path, clean_key) {
+                        if let Some(sub_path) = check_file_extensions(&cache_root, &path, clean_key)
+                        {
                             return Some(sub_path);
                         }
                     }
@@ -168,7 +196,7 @@ pub(crate) fn resolve_cached_asset_path(
         }
     }
 
-    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+    if let Ok(entries) = std::fs::read_dir(&cache_root) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -182,7 +210,7 @@ pub(crate) fn resolve_cached_asset_path(
                         format!("{:x}", hasher.finalize())
                     };
 
-                    if let Some(sub_path) = check_file_extensions(&path, &hash) {
+                    if let Some(sub_path) = check_file_extensions(&cache_root, &path, &hash) {
                         return Some(sub_path);
                     }
                 }
@@ -191,4 +219,117 @@ pub(crate) fn resolve_cached_asset_path(
     }
 
     None
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    use crate::timeline::tests::test_context;
+
+    /// Lays out `<root>/cache` plus a sibling `<root>/secret.png` the
+    /// resolver must never reach.
+    struct Fixture {
+        root: PathBuf,
+        cache: PathBuf,
+        secret: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("conduit-cache-path-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let cache = root.join("cache");
+            std::fs::create_dir_all(cache.join("workspace")).unwrap();
+            let secret = root.join("secret.png");
+            std::fs::write(&secret, b"secret").unwrap();
+            Self {
+                root,
+                cache,
+                secret,
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn resolves_key_inside_cache_dir() {
+        let fx = Fixture::new("inside");
+        let key = "a".repeat(64);
+        let file = fx.cache.join("workspace").join(format!("{key}.png"));
+        std::fs::write(&file, b"img").unwrap();
+        let found = resolve_cached_asset_path_in(
+            &fx.cache,
+            &format!("conduit-asset://{key}"),
+            &test_context(),
+        );
+        assert_eq!(found, Some(file.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn rejects_dot_dot_segments_in_asset_uri() {
+        let fx = Fixture::new("dotdot");
+        let ctx = test_context();
+        for uri in [
+            "conduit-asset://../secret",
+            "conduit-asset://workspace/../../secret",
+            "conduit-cache://../secret",
+            "conduit-asset://..",
+        ] {
+            assert_eq!(
+                resolve_cached_asset_path_in(&fx.cache, uri, &ctx),
+                None,
+                "{uri}"
+            );
+        }
+        assert!(fx.secret.is_file());
+    }
+
+    #[test]
+    fn rejects_bare_local_paths_outside_cache_dir() {
+        let fx = Fixture::new("outside");
+        let ctx = test_context();
+        let secret = fx.secret.to_str().unwrap();
+        assert_eq!(resolve_cached_asset_path_in(&fx.cache, secret, &ctx), None);
+        assert_eq!(
+            resolve_cached_asset_path_in(&fx.cache, "/dev/zero", &ctx),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escaping_cache_dir() {
+        let fx = Fixture::new("symlink");
+        std::os::unix::fs::symlink(&fx.secret, fx.cache.join("escape.png")).unwrap();
+        let found =
+            resolve_cached_asset_path_in(&fx.cache, "conduit-asset://escape", &test_context());
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn rejects_extensionless_cache_entries() {
+        let fx = Fixture::new("noext");
+        std::fs::write(fx.cache.join("bare"), b"img").unwrap();
+        let found =
+            resolve_cached_asset_path_in(&fx.cache, "conduit-asset://bare", &test_context());
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn contained_cache_file_requires_regular_file_under_root() {
+        let fx = Fixture::new("contained");
+        let root = fx.cache.canonicalize().unwrap();
+        assert_eq!(contained_cache_file(&root, &fx.secret), None);
+        assert_eq!(contained_cache_file(&root, Path::new("/dev/zero")), None);
+        assert_eq!(
+            contained_cache_file(&root, &fx.cache.join("workspace")),
+            None
+        );
+    }
 }

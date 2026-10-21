@@ -947,7 +947,7 @@ fn test_timeline_message_widget_all_gtk() {
         std::fs::write(&dummy_file, b"test").unwrap();
 
         let found = resolve_cached_asset_path(test_url, &ctx);
-        assert_eq!(found, Some(dummy_file.clone()));
+        assert_eq!(found, Some(dummy_file.canonicalize().unwrap()));
 
         let _ = std::fs::remove_file(dummy_file);
         let _ = std::fs::remove_dir(ws_dir);
@@ -1937,5 +1937,39 @@ fn test_render_text_content_with_code_block() {
             w.has_css_class("code-block")
         });
         assert!(code_block.is_some(), "expected rendered code block widget");
+    });
+}
+
+#[test]
+fn avatar_never_loads_untrusted_url_as_local_path() {
+    run_gtk_test(|| {
+        // A real, loadable PNG on disk: the old fallback would have opened it
+        // straight from the Slack-provided `icon_url`.
+        let png = std::env::temp_dir().join(format!(
+            "conduit-avatar-local-path-{}.png",
+            std::process::id()
+        ));
+        gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, true, 8, 4, 4)
+            .unwrap()
+            .savev(&png, "png", &[])
+            .unwrap();
+
+        for url in [png.to_str().unwrap(), "/dev/zero"] {
+            let message = SlackMessage {
+                ts: "1700000000.000100".to_string(),
+                icons: Some(crate::models::SlackIcons {
+                    image_72: Some(url.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(message.avatar_url(), Some(url));
+            let avatar = build_avatar_widget(&message, &test_context())
+                .downcast::<adw::Avatar>()
+                .unwrap();
+            assert!(avatar.custom_image().is_none(), "{url}");
+        }
+
+        let _ = std::fs::remove_file(png);
     });
 }

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use adw::prelude::*;
 use gtk::{glib, pango, Box, Button, Label, Orientation, TextView, Widget};
@@ -56,12 +56,7 @@ fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
 
 fn create_inline_emoji_widget(emoji: &InlineCustomEmoji, context: &MessageHtmlContext) -> Widget {
     let local_path = crate::emoji_picker_window::resolve_custom_emoji_cached_file(&emoji.url)
-        .or_else(|| resolve_cached_asset_path(&emoji.url, context))
-        .or_else(|| {
-            Path::new(&emoji.url)
-                .exists()
-                .then(|| PathBuf::from(&emoji.url))
-        });
+        .or_else(|| resolve_cached_asset_path(&emoji.url, context));
 
     if let Some(path) = local_path {
         let widget = load_animated_or_static_picture(&path, 18, 18, gtk::ContentFit::Contain);

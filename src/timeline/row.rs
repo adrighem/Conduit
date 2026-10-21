@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -260,15 +260,9 @@ fn render_files(
             .flatten()
             .collect();
 
-            let local_thumb = video_candidates.iter().find_map(|&url| {
-                resolve_cached_asset_path(url, context).or_else(|| {
-                    if std::path::Path::new(url).exists() {
-                        Some(std::path::PathBuf::from(url))
-                    } else {
-                        None
-                    }
-                })
-            });
+            let local_thumb = video_candidates
+                .iter()
+                .find_map(|&url| resolve_cached_asset_path(url, context));
 
             let video_url = file
                 .media_url()
@@ -354,15 +348,9 @@ fn render_files(
             .flatten()
             .collect();
 
-            let local_path = candidates.iter().find_map(|&url| {
-                resolve_cached_asset_path(url, context).or_else(|| {
-                    if std::path::Path::new(url).exists() {
-                        Some(std::path::PathBuf::from(url))
-                    } else {
-                        None
-                    }
-                })
-            });
+            let local_path = candidates
+                .iter()
+                .find_map(|&url| resolve_cached_asset_path(url, context));
 
             let img_widget: Widget = if let Some(path) = local_path {
                 let pic =
@@ -486,11 +474,10 @@ pub fn build_avatar_widget(message: &SlackMessage, context: &MessageHtmlContext)
         .or_else(|| message.avatar_url());
 
     if let Some(url) = avatar_source_url {
-        let local_path = resolve_cached_asset_path(url, context)
-            .or_else(|| Path::new(url).exists().then(|| PathBuf::from(url)));
-        let texture = local_path.and_then(|path| {
-            get_or_load_texture(&path).or_else(|| gtk::gdk::Texture::from_filename(&path).ok())
-        });
+        // Only cached downloads: `url` comes from Slack (icon_url, bot icons)
+        // and must never be opened as a local path.
+        let texture =
+            resolve_cached_asset_path(url, context).and_then(|path| get_or_load_texture(&path));
         if let Some(texture) = texture {
             avatar.set_custom_image(Some(texture.upcast_ref::<gtk::gdk::Paintable>()));
         }
