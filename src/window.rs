@@ -61,7 +61,7 @@ use crate::message_handoff::{
     open_resolved_handoff, ExternalOpenError, ExternalOpener, HandoffProvenance,
     MessageControlRegistry, MessageRef, SafeSlackPermalink, TimelineSurfaceId,
 };
-use crate::message_html::{MessageHtmlContext, TimelineScrollBehavior};
+use crate::message_markup::{MessageRenderContext, TimelineScrollBehavior};
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackConversation, SlackFile, SlackMessage, SlackUser,
     SlackUserStatus,
@@ -8994,7 +8994,7 @@ impl ConduitWindow {
         };
 
         let author = message.author_label();
-        let time_str = crate::message_html::localized_timestamp_parts(&message.ts)
+        let time_str = crate::message_timestamp::localized_timestamp_parts(&message.ts)
             .map(|(_, _, short)| short)
             .unwrap_or_else(|| message.ts.clone());
         let text = message.visible_text();
@@ -13316,7 +13316,7 @@ impl ConduitWindow {
         &self,
         kind: crate::secondary_views::SecondaryKind,
         rows: Vec<crate::secondary_views::SecondaryRow>,
-        context: &MessageHtmlContext,
+        context: &MessageRenderContext,
     ) {
         self.imp().message_title.set_title(&kind.title());
         if let Some(view) = self.secondary_view() {
@@ -13597,7 +13597,7 @@ impl ConduitWindow {
         }
     }
 
-    fn message_html_context(&self, thread_ts: Option<&str>) -> MessageHtmlContext {
+    fn message_html_context(&self, thread_ts: Option<&str>) -> MessageRenderContext {
         self.message_html_context_with_image_keys(thread_ts, None)
     }
 
@@ -13690,7 +13690,7 @@ impl ConduitWindow {
         &self,
         thread_ts: Option<&str>,
         image_keys: Option<&HashSet<String>>,
-    ) -> MessageHtmlContext {
+    ) -> MessageRenderContext {
         let imp = self.imp();
         let user_names = imp.workspace.user_directory.user_names.borrow().clone();
         let current_user_id = imp.current_user_id.borrow().clone();
@@ -13740,7 +13740,7 @@ impl ConduitWindow {
                 .get(&channel_id)
                 .and_then(|state| state.last_read.clone())
         });
-        MessageHtmlContext {
+        MessageRenderContext {
             user_names,
             user_full_names: imp
                 .workspace

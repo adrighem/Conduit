@@ -4,7 +4,7 @@ use adw::prelude::*;
 use gtk::{glib, pango, Box, Button, Label, Orientation, TextView, Widget};
 use sourceview5::prelude::*;
 
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 use crate::timeline::actions::{ActionHandler, TimelineAction};
 use crate::timeline::cache::resolve_cached_asset_path;
 use crate::timeline::row::{load_animated_or_static_picture, register_timeline_css};
@@ -54,7 +54,7 @@ fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
     Some(unescape_xml_attribute(&tag[start..end]))
 }
 
-fn create_inline_emoji_widget(emoji: &InlineCustomEmoji, context: &MessageHtmlContext) -> Widget {
+fn create_inline_emoji_widget(emoji: &InlineCustomEmoji, context: &MessageRenderContext) -> Widget {
     let local_path = crate::emoji_picker_window::resolve_custom_emoji_cached_file(&emoji.url)
         .or_else(|| resolve_cached_asset_path(&emoji.url, context));
 
@@ -151,7 +151,7 @@ pub fn strip_anchor_tags(markup: &str) -> (String, Vec<MarkupLink>) {
 
 pub(crate) fn attach_label_links(
     label: &Label,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     on_action: Option<&ActionHandler>,
 ) {
     let context = context.clone();
@@ -181,7 +181,7 @@ pub(crate) fn attach_label_links(
 fn attach_text_view_links(
     view: &TextView,
     links: Vec<MarkupLink>,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     on_action: Option<&ActionHandler>,
 ) {
     if links.is_empty() {
@@ -247,7 +247,7 @@ fn attach_text_view_links(
 
 pub(crate) fn create_message_text_widget(
     pango: &str,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     on_action: Option<&ActionHandler>,
 ) -> Widget {
     if !pango.contains("<conduit-custom-emoji ") {
@@ -510,7 +510,7 @@ pub fn build_code_block_widget(code: &str, lang: Option<&str>) -> Widget {
 pub(crate) fn render_text_content(
     text: &str,
     target_box: &Box,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     on_action: Option<&ActionHandler>,
 ) {
     let segments = parse_text_segments(text);
@@ -524,7 +524,7 @@ pub(crate) fn render_text_content(
                 register_timeline_css();
                 let quote_box = Box::new(Orientation::Vertical, 0);
                 quote_box.add_css_class("blockquote");
-                let pango = crate::message_html::mrkdwn_to_pango(&quote_text, context);
+                let pango = crate::message_markup::mrkdwn_to_pango(&quote_text, context);
                 let text_widget =
                     create_message_text_widget(&format!("<i>{}</i>", pango), context, on_action);
                 quote_box.append(&text_widget);
@@ -532,7 +532,7 @@ pub(crate) fn render_text_content(
             }
             TextSegment::Normal(normal_text) => {
                 if !normal_text.trim().is_empty() {
-                    let pango = crate::message_html::mrkdwn_to_pango(&normal_text, context);
+                    let pango = crate::message_markup::mrkdwn_to_pango(&normal_text, context);
                     let text_widget = create_message_text_widget(&pango, context, on_action);
                     target_box.append(&text_widget);
                 }

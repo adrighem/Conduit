@@ -1,14 +1,14 @@
 //! File list rows.
 
 use super::model::{is_http_url, FileOpenTarget, FileRow};
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 use crate::models::SlackFile;
 
 /// File rows, newest first.
 pub(crate) fn file_rows(
     files: &[SlackFile],
     channel_title: &dyn Fn(&str) -> String,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
 ) -> Vec<FileRow> {
     let mut files = files.iter().collect::<Vec<_>>();
     files.sort_by_key(|file| std::cmp::Reverse(file_created(file)));

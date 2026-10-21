@@ -42,8 +42,8 @@ mod http_client;
 mod huddles;
 mod image_proxy;
 mod message_handoff;
-mod message_html;
-pub(crate) use message_html as message_markup;
+mod message_markup;
+mod message_timestamp;
 mod models;
 mod picker_views;
 mod profile_dialog;
@@ -96,7 +96,7 @@ fn main() -> glib::ExitCode {
     // Set up gettext translations
     let _ = setlocale(LocaleCategory::LcAll, "");
     let time_locale = setlocale(LocaleCategory::LcTime, "");
-    message_html::initialize_time_format_locale(time_locale.as_deref());
+    message_timestamp::initialize_time_format_locale(time_locale.as_deref());
     bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR).expect("Unable to bind the text domain");
     bind_textdomain_codeset(GETTEXT_PACKAGE, "UTF-8")
         .expect("Unable to set the text domain encoding");

@@ -1,11 +1,11 @@
+//! Slack mrkdwn to Pango markup, plus the per-render [`MessageRenderContext`]
+//! that carries the workspace catalogs every message renderer reads.
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-
-use gettextrs::gettext;
+use std::sync::Arc;
 
 use crate::config;
-use crate::day_label::{capitalize_first_letter, date_text};
 use crate::emoji::{EmojiCatalog, EmojiEntry, EmojiValue};
 use crate::message_handoff::{MessageControlHandle, MessageRef};
 use crate::models::{SlackMessage, SlackUserStatus};
@@ -17,13 +17,10 @@ pub(crate) mod test_fixtures;
 mod tests;
 
 const QUICK_REACTION_LIMIT: usize = 4;
-static TIME_FORMAT_LOCALE: OnceLock<Option<String>> = OnceLock::new();
 
 /// Canonical render context for Slack message formatting and timeline display.
-pub type MessageRenderContext = MessageHtmlContext;
-
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct MessageHtmlContext {
+pub struct MessageRenderContext {
     pub user_names: Arc<HashMap<String, String>>,
     pub user_full_names: Arc<HashMap<String, String>>,
     pub user_avatar_urls: Arc<HashMap<String, String>>,
@@ -52,7 +49,7 @@ pub struct MessageHtmlContext {
         HashMap<(MessageRef, MessageControlKey), MessageControlHandle>,
 }
 
-impl MessageHtmlContext {
+impl MessageRenderContext {
     /// The user whose name and avatar head `message`: its author, or for an
     /// app-posted message the invoking person (e.g. `/giphy`), provided the
     /// directory knows that user and does not flag them as a bot. Anything
@@ -80,217 +77,11 @@ pub enum TimelineScrollBehavior {
     StickToBottom,
 }
 
-fn normalize_language_tag(locale: &str) -> Option<String> {
-    let locale = locale.trim();
-    let (locale, modifier) = locale
-        .split_once('@')
-        .map_or((locale, None), |(locale, modifier)| {
-            (locale, Some(modifier.to_ascii_lowercase()))
-        });
-    let locale = locale.split('.').next().unwrap_or_default();
-    if locale.is_empty() || locale.eq_ignore_ascii_case("C") || locale.eq_ignore_ascii_case("POSIX")
-    {
-        return None;
-    }
-
-    let locale = locale.replace('_', "-");
-    let subtags = locale.split('-').collect::<Vec<_>>();
-    let language = subtags.first().copied()?;
-    if !(2..=8).contains(&language.len())
-        || !language
-            .chars()
-            .all(|character| character.is_ascii_alphabetic())
-        || subtags.iter().any(|subtag| {
-            subtag.is_empty()
-                || subtag.len() > 8
-                || !subtag
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric())
-        })
-    {
-        return None;
-    }
-
-    let mut normalized = subtags
-        .iter()
-        .enumerate()
-        .map(|(index, subtag)| {
-            if index == 0 {
-                subtag.to_ascii_lowercase()
-            } else if subtag.len() == 2
-                && subtag
-                    .chars()
-                    .all(|character| character.is_ascii_alphabetic())
-            {
-                subtag.to_ascii_uppercase()
-            } else if subtag.len() == 4
-                && subtag
-                    .chars()
-                    .all(|character| character.is_ascii_alphabetic())
-            {
-                let mut characters = subtag.chars();
-                characters
-                    .next()
-                    .map(|character| {
-                        format!(
-                            "{}{}",
-                            character.to_ascii_uppercase(),
-                            characters.as_str().to_ascii_lowercase()
-                        )
-                    })
-                    .unwrap_or_default()
-            } else {
-                subtag.to_ascii_lowercase()
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let modifier_script = match modifier.as_deref() {
-        Some("arabic") => Some("Arab"),
-        Some("cyrillic" | "cyrl") => Some("Cyrl"),
-        Some("devanagari") => Some("Deva"),
-        Some("hebrew") => Some("Hebr"),
-        Some("ijekavianlatin" | "iqtelif" | "latin" | "latn") => Some("Latn"),
-        Some("shaw") => Some("Shaw"),
-        _ => None,
-    };
-    let modifier_variant = match modifier.as_deref() {
-        Some("ije" | "ijekavian" | "ijekavianlatin") => Some("ijekavsk"),
-        Some("valencia") => Some("valencia"),
-        _ => None,
-    };
-    let has_script = normalized.iter().skip(1).any(|subtag| {
-        subtag.len() == 4
-            && subtag
-                .chars()
-                .all(|character| character.is_ascii_alphabetic())
-    });
-    if let Some(script) = modifier_script.filter(|_| !has_script) {
-        normalized.insert(1, script.to_string());
-    }
-    if let Some(variant) = modifier_variant.filter(|variant| {
-        !normalized
-            .iter()
-            .any(|subtag| subtag.eq_ignore_ascii_case(variant))
-    }) {
-        normalized.push(variant.to_string());
-    }
-
-    Some(normalized.join("-"))
-}
-
-pub(crate) fn initialize_time_format_locale(locale: Option<&[u8]>) {
-    let _ = TIME_FORMAT_LOCALE.set(normalize_time_format_locale(locale));
-}
-
-fn normalize_time_format_locale(locale: Option<&[u8]>) -> Option<String> {
-    locale
-        .and_then(|locale| std::str::from_utf8(locale).ok())
-        .and_then(normalize_language_tag)
-}
-
-#[cfg(test)]
-fn preferred_time_locale<'a>(locales: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
-    for locale in locales.into_iter().flatten() {
-        if !locale.trim().is_empty() {
-            return normalize_language_tag(locale);
-        }
-    }
-    None
-}
-
-pub(crate) fn localized_timestamp_parts(ts: &str) -> Option<(String, String, String)> {
-    let datetime = slack_ts_datetime(ts)?;
-    let now = gtk::glib::DateTime::now_local().ok()?;
-    localized_timestamp_parts_at(&datetime, &now)
-}
-
-fn localized_timestamp_parts_at(
-    datetime: &gtk::glib::DateTime,
-    now: &gtk::glib::DateTime,
-) -> Option<(String, String, String)> {
-    let machine = datetime.format_iso8601().ok()?.to_string();
-    let full = localized_full_timestamp(datetime)?;
-    let short = compact_timestamp_text(datetime, now)?;
-    Some((machine, full, short))
-}
-
-fn localized_full_timestamp(datetime: &gtk::glib::DateTime) -> Option<String> {
-    let localized = datetime.format("%c").ok()?.to_string();
-    let timezone = datetime.format("%Z").ok()?.to_string();
-    Some(full_timestamp_with_timezone(&localized, &timezone))
-}
-
-fn full_timestamp_with_timezone(localized: &str, timezone: &str) -> String {
-    let timezone = timezone.trim();
-    let already_present = localized.split_whitespace().any(|part| {
-        part.trim_matches(|character: char| {
-            !character.is_alphanumeric() && character != '+' && character != '-'
-        })
-        .eq_ignore_ascii_case(timezone)
-    });
-    if timezone.is_empty() || already_present {
-        localized.to_string()
-    } else {
-        format!("{localized} {timezone}")
-    }
-}
-
-fn compact_timestamp_text(
-    datetime: &gtk::glib::DateTime,
-    now: &gtk::glib::DateTime,
-) -> Option<String> {
-    let time = datetime.format(&gettext("%H:%M")).ok()?.to_string();
-    let days_old = crate::day_label::days_old(datetime, now);
-
-    if days_old == 0 {
-        return Some(time);
-    }
-
-    let day = if days_old == 1 {
-        gettext("Yesterday")
-    } else if (2..=6).contains(&days_old) {
-        capitalize_first_letter(&datetime.format("%A").ok()?)
-    } else {
-        date_text(datetime, now)?
-    };
-    Some(
-        gettext("{day}, {time}")
-            .replace("{day}", &day)
-            .replace("{time}", &time),
-    )
-}
-
-pub(crate) fn slack_ts_datetime(ts: &str) -> Option<gtk::glib::DateTime> {
-    let (seconds, _) = parse_slack_ts(ts)?;
-    gtk::glib::DateTime::from_unix_local(seconds).ok()
-}
-
-fn parse_slack_ts(ts: &str) -> Option<(i64, u32)> {
-    let (seconds, fraction) = ts.split_once('.').unwrap_or((ts, ""));
-    let seconds = seconds.parse::<i64>().ok()?;
-    let mut fraction = fraction
-        .chars()
-        .take(9)
-        .filter(|character| character.is_ascii_digit())
-        .collect::<String>();
-    while fraction.len() < 9 {
-        fraction.push('0');
-    }
-    let nanos = if fraction.is_empty() {
-        0
-    } else {
-        fraction.parse::<u32>().ok()?
-    };
-
-    Some((seconds, nanos))
-}
-
 /// Prefix of message target action links, which stay clickable in
 /// message text; the window opens them in Conduit.
 pub const MESSAGE_TARGET_URL_PREFIX: &str = "conduit://message?";
 
-pub(crate) fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiEntry> {
+pub(crate) fn recent_reactions(context: &MessageRenderContext) -> Vec<EmojiEntry> {
     let catalog = EmojiCatalog::new(&context.custom_emojis);
     let mut usage = HashMap::new();
     for (index, name) in context
@@ -329,7 +120,7 @@ pub(crate) fn recent_reactions(context: &MessageHtmlContext) -> Vec<EmojiEntry> 
         .collect()
 }
 
-fn emoji_entry(name: &str, context: &MessageHtmlContext) -> Option<EmojiEntry> {
+fn emoji_entry(name: &str, context: &MessageRenderContext) -> Option<EmojiEntry> {
     let catalog = EmojiCatalog::new(&context.custom_emojis);
     let value = catalog.resolve(name)?;
     let label = emojis::get_by_shortcode(name)
@@ -343,7 +134,7 @@ fn emoji_entry(name: &str, context: &MessageHtmlContext) -> Option<EmojiEntry> {
     })
 }
 
-pub fn mrkdwn_to_pango(text: &str, context: &MessageHtmlContext) -> String {
+pub fn mrkdwn_to_pango(text: &str, context: &MessageRenderContext) -> String {
     let mut output = String::new();
     let mut rest = text;
 
@@ -366,7 +157,7 @@ pub fn mrkdwn_to_pango(text: &str, context: &MessageHtmlContext) -> String {
     output
 }
 
-fn mrkdwn_to_pango_inline(text: &str, context: &MessageHtmlContext) -> String {
+fn mrkdwn_to_pango_inline(text: &str, context: &MessageRenderContext) -> String {
     let mut output = String::new();
     let mut rest = text;
 
@@ -442,7 +233,10 @@ fn mention_pill_pango(prefix: &str, label: &str) -> String {
     )
 }
 
-fn render_slack_entity_pango(text: &str, context: &MessageHtmlContext) -> Option<(String, usize)> {
+fn render_slack_entity_pango(
+    text: &str,
+    context: &MessageRenderContext,
+) -> Option<(String, usize)> {
     if !text.starts_with('<') {
         return None;
     }
@@ -513,7 +307,7 @@ fn render_slack_entity_pango(text: &str, context: &MessageHtmlContext) -> Option
 
 fn render_bare_channel_reference_pango(
     text: &str,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
 ) -> Option<(String, usize)> {
     let candidate = text.strip_prefix('#')?;
     let id_length = candidate
@@ -534,7 +328,7 @@ fn render_bare_channel_reference_pango(
     Some((mention_pill_pango(prefix, display), id_length + 1))
 }
 
-fn user_group_mention_pango(raw: &str, context: &MessageHtmlContext) -> String {
+fn user_group_mention_pango(raw: &str, context: &MessageRenderContext) -> String {
     let Some(group) = raw.strip_prefix("!subteam^") else {
         return escape_pango(raw);
     };
@@ -576,7 +370,7 @@ fn external_link_pango(url: &str, label: &str) -> String {
 
 fn render_emoji_shortcode_pango(
     text: &str,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
 ) -> Option<(String, usize)> {
     if !text.starts_with(':') {
         return None;
@@ -622,7 +416,7 @@ fn render_wrapped_pango(
     text: &str,
     marker: char,
     tag: &str,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
 ) -> Option<(String, usize)> {
     if !text.starts_with(marker) {
         return None;

@@ -7,7 +7,7 @@ use gtk::{
     ToggleButton, Widget,
 };
 
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 use crate::models::{SlackFile, SlackMessage};
 
 use super::actions::{
@@ -218,7 +218,7 @@ pub fn format_file_size(bytes: u64) -> String {
 fn render_files(
     files: &[SlackFile],
     root_box: &Box,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     on_open_media: Option<&OpenMediaCallback>,
     on_action: Option<&ActionHandler>,
     ts: &str,
@@ -462,7 +462,7 @@ fn render_files(
     root_box.append(&files_box);
 }
 
-pub fn build_avatar_widget(message: &SlackMessage, context: &MessageHtmlContext) -> Widget {
+pub fn build_avatar_widget(message: &SlackMessage, context: &MessageRenderContext) -> Widget {
     // A fixed-size avatar: a bare Picture would grow to the image's natural
     // size in the row.
     let avatar = adw::Avatar::new(TIMELINE_AVATAR_SIZE, None, false);
@@ -488,7 +488,7 @@ pub fn build_avatar_widget(message: &SlackMessage, context: &MessageHtmlContext)
 
 pub fn build_thread_replies_widget(
     message: &SlackMessage,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     on_open_thread: Option<&Rc<dyn Fn(String)>>,
 ) -> Option<Box> {
     let reply_count = message.reply_count.filter(|count| *count > 0)?;
@@ -501,7 +501,8 @@ pub fn build_thread_replies_widget(
         format!("{reply_count} replies")
     };
     let label_text = if let Some(latest_ts) = &message.latest_reply {
-        if let Some((_m, _full, short)) = crate::message_html::localized_timestamp_parts(latest_ts)
+        if let Some((_m, _full, short)) =
+            crate::message_timestamp::localized_timestamp_parts(latest_ts)
         {
             format!("{count_str}   Last reply {short}")
         } else {
@@ -535,7 +536,7 @@ pub fn build_thread_replies_widget(
 /// Full-width rule with the day label ("Today", "15 Sep", ...) centered on
 /// it. Deliberately distinct from the red/accent unread separator.
 pub fn day_separator_widget(ts: &str) -> Box {
-    let label_text = crate::message_html::slack_ts_datetime(ts)
+    let label_text = crate::message_timestamp::slack_ts_datetime(ts)
         .zip(gtk::glib::DateTime::now_local().ok())
         .and_then(|(dt, now)| crate::day_label::day_label(&dt, &now))
         .unwrap_or_default();
@@ -592,7 +593,7 @@ pub fn unread_separator_widget() -> Box {
 pub fn wrap_with_unread_separator_if_needed(
     content: Box,
     message_ts: &str,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
 ) -> Box {
     // Tag the row with its message ts (repurposing the CSS/accessible widget
     // name as a plain string tag, not used for CSS selection anywhere in this
@@ -614,7 +615,7 @@ pub fn wrap_with_unread_separator_if_needed(
 /// messages render identically.
 fn render_message_content(
     message: &SlackMessage,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     on_open_media: Option<&OpenMediaCallback>,
     on_action: Option<&ActionHandler>,
     root_box: &Box,
@@ -664,7 +665,7 @@ fn render_message_content(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_timeline_message_widget(
     message: &SlackMessage,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     on_open_media: Option<&OpenMediaCallback>,
     on_open_thread: Option<&Rc<dyn Fn(String)>>,
     on_toggle_reaction: Option<&ToggleReactionCallback>,
@@ -697,7 +698,7 @@ pub(crate) fn build_timeline_message_widget(
                 _ => "system event",
             });
 
-            let pango = crate::message_html::mrkdwn_to_pango(sys_text, context);
+            let pango = crate::message_markup::mrkdwn_to_pango(sys_text, context);
             let text_widget =
                 create_message_text_widget(&format!("<i>{}</i>", pango), context, on_author_action);
             text_widget.add_css_class("dim-label");
@@ -792,7 +793,7 @@ pub(crate) fn build_timeline_message_widget(
 
         let timestamp_label = Label::new(None);
         if let Some((_machine, full, short)) =
-            crate::message_html::localized_timestamp_parts(&message.ts)
+            crate::message_timestamp::localized_timestamp_parts(&message.ts)
         {
             timestamp_label.set_text(&short);
             timestamp_label.set_tooltip_text(Some(&full));
@@ -833,7 +834,7 @@ pub(crate) fn build_timeline_message_widget(
         let motion = gtk::EventControllerMotion::new();
         let cb_enter = cb.clone();
         let ts = message.ts.clone();
-        let reactions = crate::message_html::recent_reactions(context);
+        let reactions = crate::message_markup::recent_reactions(context);
         motion.connect_enter(move |motion, _, _| {
             let Some(row) = motion.widget() else {
                 return;

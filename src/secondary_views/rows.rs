@@ -7,7 +7,7 @@ use gettextrs::gettext;
 use gtk::pango;
 
 use super::model::{FileRow, SavedRow, SearchRow, SecondaryAction, SecondaryRow, ThreadRow};
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 use crate::timeline_message_widget::{
     build_timeline_message_widget, get_or_load_texture, resolve_cached_asset_path, TimelineAction,
 };
@@ -55,7 +55,7 @@ fn register_css() {
 /// own actions; activating the list item runs [`SecondaryRow::primary_action`].
 pub(crate) fn build_row(
     row: &SecondaryRow,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     dispatch: &Dispatch,
 ) -> gtk::Widget {
     register_css();
@@ -102,7 +102,7 @@ fn heading(text: &str) -> gtk::Label {
 }
 
 fn timestamp_label(ts: &str) -> Option<gtk::Label> {
-    let (_, full, short) = crate::message_html::localized_timestamp_parts(ts)?;
+    let (_, full, short) = crate::message_timestamp::localized_timestamp_parts(ts)?;
     let label = caption(&short);
     label.set_tooltip_text(Some(&full));
     Some(label)
@@ -135,7 +135,7 @@ fn author_callback(dispatch: &Dispatch) -> Rc<dyn Fn(TimelineAction)> {
 fn message_widget(
     channel_id: &str,
     message: &crate::models::SlackMessage,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     dispatch: &Dispatch,
 ) -> gtk::Widget {
     let author = author_callback(dispatch);
@@ -162,7 +162,7 @@ fn message_widget(
     .upcast()
 }
 
-fn thread_card(row: &ThreadRow, context: &MessageHtmlContext, dispatch: &Dispatch) -> gtk::Box {
+fn thread_card(row: &ThreadRow, context: &MessageRenderContext, dispatch: &Dispatch) -> gtk::Box {
     let card = card_box();
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let channel = heading(&row.channel_title);
@@ -221,7 +221,7 @@ fn search_card(row: &SearchRow) -> gtk::Box {
     card
 }
 
-fn file_thumbnail(row: &FileRow, context: &MessageHtmlContext) -> gtk::Widget {
+fn file_thumbnail(row: &FileRow, context: &MessageRenderContext) -> gtk::Widget {
     let texture = row
         .thumbnail_url
         .as_deref()
@@ -246,7 +246,7 @@ fn file_meta_text(row: &FileRow) -> String {
     let date = row
         .created_ts
         .as_deref()
-        .and_then(crate::message_html::localized_timestamp_parts)
+        .and_then(crate::message_timestamp::localized_timestamp_parts)
         .map(|(_, _, short)| short);
     [
         Some(row.detail.clone()),
@@ -261,7 +261,7 @@ fn file_meta_text(row: &FileRow) -> String {
     .join(" \u{b7} ")
 }
 
-fn file_card(row: &FileRow, context: &MessageHtmlContext) -> gtk::Box {
+fn file_card(row: &FileRow, context: &MessageRenderContext) -> gtk::Box {
     let card = card_box();
     card.set_orientation(gtk::Orientation::Horizontal);
     card.set_spacing(12);
@@ -285,7 +285,7 @@ fn file_card(row: &FileRow, context: &MessageHtmlContext) -> gtk::Box {
     card
 }
 
-fn saved_card(row: &SavedRow, context: &MessageHtmlContext, dispatch: &Dispatch) -> gtk::Box {
+fn saved_card(row: &SavedRow, context: &MessageRenderContext, dispatch: &Dispatch) -> gtk::Box {
     let card = card_box();
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let channel = heading(&row.channel_title);

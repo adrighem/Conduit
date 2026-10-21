@@ -8,7 +8,7 @@ use gtk::{
     SignalListItemFactory, Widget,
 };
 
-use crate::message_html::{MessageHtmlContext, TimelineScrollBehavior};
+use crate::message_markup::{MessageRenderContext, TimelineScrollBehavior};
 use crate::models::SlackMessage;
 
 use super::actions::*;
@@ -24,7 +24,7 @@ pub struct NativeTimelineView {
     pub(crate) list_view: ListView,
     placeholder_label: Label,
     pub store: gio::ListStore,
-    pub(crate) context: Rc<RefCell<Option<MessageHtmlContext>>>,
+    pub(crate) context: Rc<RefCell<Option<MessageRenderContext>>>,
     on_action: ActionSlot,
     asset_update_pending: Rc<Cell<bool>>,
     read_mark_target: ReadMarkTarget,
@@ -79,7 +79,7 @@ impl NativeTimelineView {
         let selection = NoSelection::new(Some(store.clone()));
 
         let factory = SignalListItemFactory::new();
-        let context: Rc<RefCell<Option<MessageHtmlContext>>> = Rc::new(RefCell::new(None));
+        let context: Rc<RefCell<Option<MessageRenderContext>>> = Rc::new(RefCell::new(None));
         let on_action: ActionSlot = Rc::new(RefCell::new(None));
         let hovered: Rc<RefCell<Option<HoveredMessage>>> = Rc::new(RefCell::new(None));
         let hover_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
@@ -918,7 +918,7 @@ impl NativeTimelineView {
     /// Re-renders bound rows after an image asset arrived, keeping scroll
     /// position and focus. Only the image fields of `context` are taken; the
     /// rest (unread anchor, thread) belongs to the rendered conversation.
-    pub fn update_image_asset(&self, context: &MessageHtmlContext) {
+    pub fn update_image_asset(&self, context: &MessageRenderContext) {
         {
             let mut current = self.context.borrow_mut();
             let Some(current) = current.as_mut() else {
@@ -1004,7 +1004,7 @@ impl NativeTimelineView {
     pub fn set_messages(
         &self,
         messages: &[SlackMessage],
-        context: &MessageHtmlContext,
+        context: &MessageRenderContext,
         focus_ts: Option<&str>,
     ) {
         self.placeholder_label.set_visible(false);

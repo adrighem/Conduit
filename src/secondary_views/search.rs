@@ -3,7 +3,7 @@
 use gettextrs::gettext;
 
 use super::model::{is_http_url, plain_text, SearchRow};
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 use crate::models::SearchMatch;
 
 /// Search rows in API rank order, with the query terms highlighted.
@@ -11,7 +11,7 @@ pub(crate) fn search_rows(
     results: &[SearchMatch],
     query: &str,
     known_channel_title: &dyn Fn(&str) -> Option<String>,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
 ) -> Vec<SearchRow> {
     let terms = highlight_terms(query);
     results

@@ -23,7 +23,7 @@ pub(crate) use model::{
 };
 pub(crate) use search::search_rows;
 
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 use rows::Dispatch;
 
 const STATUS_PAGE: &str = "status";
@@ -81,7 +81,7 @@ pub(crate) struct SecondaryView {
     scrolled_window: gtk::ScrolledWindow,
     list_view: gtk::ListView,
     store: gio::ListStore,
-    context: Rc<RefCell<MessageHtmlContext>>,
+    context: Rc<RefCell<MessageRenderContext>>,
     on_action: ActionHandler,
     kind: Rc<Cell<Option<SecondaryKind>>>,
 }
@@ -99,7 +99,7 @@ impl std::fmt::Debug for SecondaryView {
 impl SecondaryView {
     pub(crate) fn new() -> Self {
         let store = gio::ListStore::new::<SecondaryRowObject>();
-        let context = Rc::new(RefCell::new(MessageHtmlContext::default()));
+        let context = Rc::new(RefCell::new(MessageRenderContext::default()));
         let on_action: ActionHandler = Rc::new(RefCell::new(None));
         let dispatch: Dispatch = {
             let on_action = on_action.clone();
@@ -240,7 +240,7 @@ impl SecondaryView {
         &self,
         kind: SecondaryKind,
         rows: Vec<SecondaryRow>,
-        context: &MessageHtmlContext,
+        context: &MessageRenderContext,
     ) {
         if rows.is_empty() {
             let empty = kind.empty_state();

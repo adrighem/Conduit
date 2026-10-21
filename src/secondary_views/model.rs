@@ -5,7 +5,7 @@
 
 use gettextrs::gettext;
 
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 use crate::models::{SavedItem, SearchMessageLocation, SlackMessage};
 
 /// Participant names shown on a thread card before collapsing into "+N".
@@ -194,7 +194,7 @@ impl SecondaryRow {
     }
 
     /// Screen reader label for the whole list item.
-    pub(crate) fn accessible_label(&self, context: &MessageHtmlContext) -> String {
+    pub(crate) fn accessible_label(&self, context: &MessageRenderContext) -> String {
         match self {
             Self::Thread(row) => {
                 let mut label = gettext("Thread in {channel} by {author}: {text}")
@@ -241,7 +241,7 @@ pub(crate) fn reply_count_label(count: u64) -> String {
     }
 }
 
-pub(crate) fn message_author(message: &SlackMessage, context: &MessageHtmlContext) -> String {
+pub(crate) fn message_author(message: &SlackMessage, context: &MessageRenderContext) -> String {
     context
         .display_user_id(message)
         .and_then(|user_id| context.user_names.get(user_id).cloned())
@@ -256,11 +256,11 @@ pub(crate) fn message_author(message: &SlackMessage, context: &MessageHtmlContex
         .unwrap_or_else(|| gettext("Unknown"))
 }
 
-fn message_summary(message: &SlackMessage, context: &MessageHtmlContext) -> String {
+fn message_summary(message: &SlackMessage, context: &MessageRenderContext) -> String {
     plain_text(&message.visible_text(), context)
 }
 
-pub(super) fn plain_text(text: &str, context: &MessageHtmlContext) -> String {
+pub(super) fn plain_text(text: &str, context: &MessageRenderContext) -> String {
     let plain = crate::channel_details::slack_text_to_plain(text, &context.custom_emojis, &|id| {
         context.user_names.get(id).cloned()
     });
@@ -272,7 +272,7 @@ pub(crate) fn thread_rows(
     roots: Vec<(String, SlackMessage)>,
     state: &dyn Fn(&str, &str) -> ThreadState,
     channel_title: &dyn Fn(&str) -> String,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
 ) -> Vec<ThreadRow> {
     roots
         .into_iter()
@@ -298,7 +298,7 @@ pub(crate) fn thread_rows(
 }
 
 /// "Alice, Bob, Carol +2": known names only; unresolved ids are counted.
-pub(crate) fn participants_label(ids: &[String], context: &MessageHtmlContext) -> String {
+pub(crate) fn participants_label(ids: &[String], context: &MessageRenderContext) -> String {
     let mut names = Vec::new();
     let mut hidden = 0_usize;
     for id in ids {
@@ -347,15 +347,15 @@ pub(super) mod tests {
 
     use super::*;
 
-    pub(crate) fn context() -> MessageHtmlContext {
-        MessageHtmlContext {
+    pub(crate) fn context() -> MessageRenderContext {
+        MessageRenderContext {
             user_names: Arc::new(HashMap::from([
                 ("U1".to_string(), "Alice".to_string()),
                 ("U2".to_string(), "Bob".to_string()),
                 ("U3".to_string(), "Carol".to_string()),
                 ("U4".to_string(), "Dave".to_string()),
             ])),
-            ..MessageHtmlContext::default()
+            ..MessageRenderContext::default()
         }
     }
 

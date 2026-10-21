@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 
 pub(crate) const MAX_TEXTURE_CACHE_SIZE: usize = 256;
 
@@ -306,7 +306,7 @@ pub(crate) fn verified_cached_asset_path(path: &Path) -> Option<PathBuf> {
 /// UI at arbitrary local files (`/dev/zero`, `~/.ssh/...`, FIFOs).
 pub(crate) fn resolve_cached_asset_path(
     url: &str,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
 ) -> Option<PathBuf> {
     resolve_cached_asset_path_in(&crate::config::image_asset_cache_dir(), url, context)
 }
@@ -314,7 +314,7 @@ pub(crate) fn resolve_cached_asset_path(
 fn resolve_cached_asset_path_in(
     cache_dir: &Path,
     url: &str,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
 ) -> Option<PathBuf> {
     let cache_root = cache_dir.canonicalize().ok()?;
     if let Some(path) = context
@@ -383,7 +383,7 @@ mod path_tests {
     }
 
     /// A render context in which the runtime reported `path` for `url`.
-    fn context_with_asset(url: &str, path: PathBuf) -> MessageHtmlContext {
+    fn context_with_asset(url: &str, path: PathBuf) -> MessageRenderContext {
         let mut ctx = test_context();
         ctx.image_assets.insert(url.to_string(), path);
         ctx

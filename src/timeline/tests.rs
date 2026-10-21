@@ -8,7 +8,7 @@ use std::sync::Arc;
 use adw::prelude::*;
 use gtk::{glib, Box, Button, Label, Orientation, Picture, TextView, ToggleButton, Widget};
 
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 use crate::models::{
     SlackAttachment, SlackAttachmentField, SlackFile, SlackMessage, SlackReaction,
 };
@@ -54,8 +54,8 @@ fn strip_anchor_tags_returns_link_ranges_of_visible_text() {
     );
 }
 
-pub(crate) fn test_context() -> MessageHtmlContext {
-    MessageHtmlContext {
+pub(crate) fn test_context() -> MessageRenderContext {
+    MessageRenderContext {
         user_names: Arc::new(HashMap::from([("U123".to_string(), "Alice".to_string())])),
         user_full_names: Arc::default(),
         user_avatar_urls: Arc::default(),
@@ -67,7 +67,7 @@ pub(crate) fn test_context() -> MessageHtmlContext {
         user_group_members: Arc::default(),
         current_user_id: None,
         thread_ts: None,
-        timeline_scroll: crate::message_html::TimelineScrollBehavior::default(),
+        timeline_scroll: crate::message_markup::TimelineScrollBehavior::default(),
         image_assets: HashMap::default(),
         failed_image_urls: std::collections::HashSet::default(),
         recent_reactions: Vec::new(),
@@ -138,7 +138,7 @@ fn rich_text_channel_element_renders_as_pill_instead_of_vanishing() {
     context
         .conversation_titles
         .insert("C123".to_string(), "#general".to_string());
-    let pango = crate::message_html::mrkdwn_to_pango(&token, &context);
+    let pango = crate::message_markup::mrkdwn_to_pango(&token, &context);
     assert!(pango.contains("background=\"#D6ECFF\""));
     assert!(pango.contains("general"));
 }
@@ -1974,7 +1974,7 @@ fn avatar_never_loads_untrusted_url_as_local_path() {
 
 #[test]
 fn scroll_behavior_pins_only_fresh_bottom_or_following_renders() {
-    use crate::message_html::TimelineScrollBehavior as B;
+    use crate::message_markup::TimelineScrollBehavior as B;
     for behavior in [B::Preserve, B::PreservePrepend, B::Bottom, B::StickToBottom] {
         assert!(pins_to_bottom(behavior, true, false), "{behavior:?} fresh");
     }
@@ -2057,7 +2057,7 @@ fn scrolling_near_top_requests_older_page_and_prepend_keeps_position() {
         // offset grows by exactly the prepended height.
         let (value_before, upper_before) = (vadj.value(), vadj.upper());
         let mut prepend = ctx.clone();
-        prepend.timeline_scroll = crate::message_html::TimelineScrollBehavior::PreservePrepend;
+        prepend.timeline_scroll = crate::message_markup::TimelineScrollBehavior::PreservePrepend;
         view.set_messages(&page(0..200), &prepend, None);
         view.finish_loading_older("C1", None);
         pump(400);

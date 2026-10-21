@@ -132,7 +132,7 @@ pub(crate) fn build_store_items(
         .iter()
         .rev()
         .map(|msg| {
-            crate::message_html::slack_ts_datetime(&msg.ts)
+            crate::message_timestamp::slack_ts_datetime(&msg.ts)
                 .map(|dt| crate::day_label::local_calendar_day(&dt))
         })
         .collect();

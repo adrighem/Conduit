@@ -83,9 +83,8 @@ Rich messages have one transport-to-presentation path:
 1. `slack_message_wire.rs` tolerantly decodes Slack payloads.
 2. `rich_message_normalize.rs` converts supported wire shapes into the canonical types in
    `rich_message.rs`.
-3. `message_html/rich_plan.rs` classifies control capabilities without rendering.
-4. `message_html/rich_components.rs` renders only canonical nodes.
-5. `message_handoff.rs` owns opaque control handles and exact-message Slack handoff policy.
+3. `timeline_document_widget.rs` renders only canonical nodes.
+4. `message_handoff.rs` owns opaque control handles and exact-message Slack handoff policy.
 
 To add a supported node, extend the canonical enum first. The compiler will identify the
 normalizer, text/accessibility projection, and renderer matches that need updating. Add a small

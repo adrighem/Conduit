@@ -82,7 +82,7 @@ impl ThreadPane {
         if let Some(native_view) = self.native_timeline_view.borrow().as_ref() {
             native_view.set_messages(
                 &[],
-                &crate::message_html::MessageHtmlContext::default(),
+                &crate::message_markup::MessageRenderContext::default(),
                 None,
             );
         }

@@ -6,7 +6,7 @@ use gtk::{glib, Box, Button, Image, Label, Orientation, Picture, Widget};
 use super::actions::ToggleReactionCallback;
 use super::cache::{resolve_cached_asset_path, REACTION_TEXTURE_CACHE};
 use super::row::register_timeline_css;
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 use crate::models::SlackMessage;
 
 pub const REACTION_EMOJI_SIZE: i32 = 32;
@@ -97,7 +97,7 @@ pub fn load_add_reaction_widget() -> Widget {
 pub fn resolve_reaction_emoji_widget(
     clean_name: &str,
     raw_name: &str,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     emoji_catalog: &crate::emoji::EmojiCatalog,
 ) -> Widget {
     match emoji_catalog
@@ -163,7 +163,7 @@ pub fn resolve_reaction_emoji_widget(
 
 pub fn build_reactions_widget(
     message: &SlackMessage,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     on_toggle_reaction: Option<&ToggleReactionCallback>,
 ) -> Option<adw::WrapBox> {
     let reactions = message.reactions.as_deref().filter(|r| !r.is_empty())?;

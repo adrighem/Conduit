@@ -6,7 +6,7 @@ use gtk::{Box, Button, Orientation};
 
 use super::actions::{dispatch_timeline_action, ActionSlot, HoveredMessage, TimelineAction};
 use super::reactions::{load_add_reaction_widget, resolve_reaction_emoji_widget};
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 
 /// Shared hover state the quick bar buttons need to cooperate with the row.
 pub(crate) struct QuickBarState<'a> {
@@ -21,7 +21,7 @@ pub(crate) fn rebuild_quick_bar(
     quick_bar: &Box,
     ts: &str,
     reactions: &[crate::emoji::EmojiEntry],
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     state: &QuickBarState<'_>,
 ) {
     let QuickBarState {

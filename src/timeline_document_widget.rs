@@ -1,5 +1,5 @@
 //! Native GTK rendering of a [`MessageDocument`], the canonical message
-//! content shared with the HTML renderer (`message_html::rich_components`).
+//! content.
 //!
 //! Cached messages keep only the document (raw blocks and attachments are
 //! discarded on save), so this is the single content path for the native
@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use adw::prelude::*;
 use gtk::{glib, pango, Box, Button, CssProvider, Grid, Label, Orientation, Separator, Widget};
 
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 use crate::rich_message::{
     MessageAccessory, MessageAttachment, MessageContextElement, MessageControl, MessageDocument,
     MessageField, MessageImage, MessageLinkedText, MessageNode, MessageQuote, RichInline,
@@ -46,7 +46,7 @@ pub(crate) fn document_replaces_text(document: &MessageDocument) -> bool {
 }
 
 pub(crate) struct DocumentRenderer<'a> {
-    context: &'a MessageHtmlContext,
+    context: &'a MessageRenderContext,
     sources: MediaSources<'a>,
     ts: &'a str,
     on_action: Option<&'a crate::timeline_message_widget::ActionHandler>,
@@ -55,7 +55,7 @@ pub(crate) struct DocumentRenderer<'a> {
 
 impl<'a> DocumentRenderer<'a> {
     pub(crate) fn new(
-        context: &'a MessageHtmlContext,
+        context: &'a MessageRenderContext,
         sources: MediaSources<'a>,
         ts: &'a str,
         on_action: Option<&'a crate::timeline_message_widget::ActionHandler>,
@@ -123,7 +123,7 @@ impl<'a> DocumentRenderer<'a> {
 
     fn mrkdwn_widget(&self, text: &str) -> Widget {
         create_message_text_widget(
-            &crate::message_html::mrkdwn_to_pango(text, self.context),
+            &crate::message_markup::mrkdwn_to_pango(text, self.context),
             self.context,
             self.on_action,
         )
@@ -174,7 +174,7 @@ impl<'a> DocumentRenderer<'a> {
                     row.append(&context_icon(image, &self.sources))
                 }
                 MessageContextElement::Text(text) => {
-                    let pango = crate::message_html::mrkdwn_to_pango(text, self.context);
+                    let pango = crate::message_markup::mrkdwn_to_pango(text, self.context);
                     let widget = create_message_text_widget(
                         &format!("<span size=\"small\">{pango}</span>"),
                         self.context,
@@ -294,7 +294,7 @@ impl<'a> DocumentRenderer<'a> {
             row.append(&context_icon(&image, &self.sources));
         }
         if let Some(footer) = attachment.footer.as_deref() {
-            let pango = crate::message_html::mrkdwn_to_pango(footer, self.context);
+            let pango = crate::message_markup::mrkdwn_to_pango(footer, self.context);
             let label = self.link_label(&format!("<span size=\"small\">{pango}</span>"));
             label.add_css_class("dim-label");
             row.append(&label);
@@ -306,7 +306,7 @@ impl<'a> DocumentRenderer<'a> {
         let value = field
             .value
             .as_deref()
-            .map(|value| crate::message_html::mrkdwn_to_pango(value, self.context));
+            .map(|value| crate::message_markup::mrkdwn_to_pango(value, self.context));
         let markup = match (field.title.as_deref(), value) {
             (Some(title), Some(value)) => {
                 format!("<b>{}</b>\n{value}", glib::markup_escape_text(title))
@@ -748,7 +748,7 @@ mod tests {
     #[test]
     fn call_button_has_suggested_action() {
         crate::timeline::tests::run_gtk_test(|| {
-            let context = MessageHtmlContext::default();
+            let context = MessageRenderContext::default();
             let sources = MediaSources {
                 resolve: &|_| None,
                 is_failed: &|_| false,

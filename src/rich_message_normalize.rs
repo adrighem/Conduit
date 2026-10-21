@@ -776,7 +776,7 @@ fn normalize_color(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message_html::test_fixtures;
+    use crate::message_markup::test_fixtures;
 
     #[test]
     fn normalizes_valid_jira_siblings_without_sensitive_control_data() {

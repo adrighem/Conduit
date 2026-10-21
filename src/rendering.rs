@@ -1,5 +1,5 @@
 use crate::emoji::{EmojiCatalog, EmojiValue};
-use crate::message_html::decode_html_entity_prefix;
+use crate::message_markup::decode_html_entity_prefix;
 use crate::models::SlackMessage;
 use std::collections::HashMap;
 

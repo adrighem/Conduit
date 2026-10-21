@@ -11,7 +11,7 @@ use adw::prelude::*;
 use gettextrs::gettext;
 use gtk::gio;
 
-use crate::message_html::MessageHtmlContext;
+use crate::message_markup::MessageRenderContext;
 use crate::timeline_message_widget::TimelineAction;
 
 /// Menu item: action name, label, enabled flag and action constructor.
@@ -114,7 +114,7 @@ pub(crate) fn author_menu_button(
 pub(crate) fn user_mention_popover(
     parent: &impl IsA<gtk::Widget>,
     user_id: &str,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     on_action: Rc<dyn Fn(TimelineAction)>,
     pointing_to: Option<gtk::gdk::Rectangle>,
 ) -> Option<gtk::PopoverMenu> {
@@ -177,7 +177,7 @@ pub(crate) fn user_mention_popover(
 pub(crate) fn show_user_mention_popover(
     parent: &impl IsA<gtk::Widget>,
     user_id: &str,
-    context: &MessageHtmlContext,
+    context: &MessageRenderContext,
     on_action: Rc<dyn Fn(TimelineAction)>,
     pointing_to: Option<gtk::gdk::Rectangle>,
 ) {
@@ -245,7 +245,7 @@ mod tests {
     fn user_mention_popover_builds_menu_and_popover() {
         crate::timeline_message_widget::tests::run_gtk_test(|| {
             let label = gtk::Label::new(None);
-            let context = MessageHtmlContext {
+            let context = MessageRenderContext {
                 current_user_id: Some("U_SELF".to_string()),
                 ..Default::default()
             };
