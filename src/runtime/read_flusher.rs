@@ -13,8 +13,9 @@ use super::wait_for_realtime_or_shutdown;
 
 pub const READ_FLUSHER_MAX_MARKED_THREADS: usize = 1_024;
 
-/// Intent behind a channel mark. Reads only ever move the cursor forward;
-/// an unread is a deliberate user rewind that must always take effect.
+/// Intent behind a channel mark. A read is only queued if it moves past the
+/// latest intended cursor; an unread is a deliberate user rewind that is
+/// always queued.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadMarkKind {
     Read,
@@ -217,19 +218,18 @@ impl ReadFlusherQueue {
         self.in_flight.insert(mark.channel_id.clone(), mark.clone());
     }
 
+    /// Mirrors Slack's cursor after a confirmed mark, for both kinds.
+    ///
+    /// `conversations.mark` sets the cursor absolutely, so the last mark that
+    /// succeeded is Slack's cursor even when it sits behind `last_marked`
+    /// (e.g. a read that superseded an unsent or failed unread). Ordering is
+    /// already enforced upstream: `enqueue` gates reads against the latest
+    /// intent, and the flusher settles at most one mark per channel at a time,
+    /// so a success is never older than a previously settled mark.
     pub fn mark_succeeded(&mut self, mark: &PendingReadMark) {
         self.in_flight.remove(&mark.channel_id);
-        match mark.kind {
-            ReadMarkKind::Read => {
-                self.set_last_marked(mark.channel_id.as_str(), mark.target_ts.as_str());
-            }
-            // Slack now holds the rewound cursor; mirror it so later reads
-            // past it are not mistaken for duplicates.
-            ReadMarkKind::Unread => {
-                self.last_marked
-                    .insert(mark.channel_id.clone(), mark.target_ts.clone());
-            }
-        }
+        self.last_marked
+            .insert(mark.channel_id.clone(), mark.target_ts.clone());
     }
 
     /// Puts a failed mark back unless the user queued a newer mark for the

@@ -11117,6 +11117,48 @@ fn read_flusher_queue_read_after_pending_unread_is_not_rejected() {
 }
 
 #[test]
+fn read_flusher_queue_read_superseding_pending_unread_rewinds_last_marked() {
+    let mut queue = ReadFlusherQueue::new();
+    assert!(queue.enqueue("C1", "20.000000"));
+    let read = queue.flush();
+    queue.mark_succeeded(&read[0]);
+
+    // unread:15 is replaced by read:18 before it ever reaches Slack.
+    queue.enqueue_force("C1", "15.000000");
+    assert!(queue.enqueue("C1", "18.000000"));
+    let flushed = queue.flush();
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].kind, ReadMarkKind::Read);
+    queue.mark_succeeded(&flushed[0]);
+
+    // Slack's cursor is now 18, so 19 must still be markable.
+    assert_eq!(queue.last_marked("C1"), Some("18.000000"));
+    assert!(queue.enqueue("C1", "19.000000"));
+}
+
+#[test]
+fn read_flusher_queue_read_after_failed_in_flight_unread_rewinds_last_marked() {
+    let mut queue = ReadFlusherQueue::new();
+    assert!(queue.enqueue("C1", "20.000000"));
+    let read = queue.flush();
+    queue.mark_succeeded(&read[0]);
+
+    // unread:15 is in flight when the user reads up to 18.
+    queue.enqueue_force("C1", "15.000000");
+    let unread = queue.flush();
+    assert!(queue.enqueue("C1", "18.000000"));
+
+    // unread:15 fails; the newer read:18 wins and is not clobbered.
+    queue.mark_failed(&unread[0]);
+    let flushed = queue.flush();
+    assert_eq!(flushed[0].target_ts, "18.000000");
+    queue.mark_succeeded(&flushed[0]);
+
+    assert_eq!(queue.last_marked("C1"), Some("18.000000"));
+    assert!(queue.enqueue("C1", "19.000000"));
+}
+
+#[test]
 fn read_flusher_queue_failed_read_retry_keeps_newer_unread() {
     let mut queue = ReadFlusherQueue::new();
     assert!(queue.enqueue("C1", "20.000000"));
