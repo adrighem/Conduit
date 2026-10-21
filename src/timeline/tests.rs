@@ -60,8 +60,8 @@ pub(crate) fn test_context() -> MessageRenderContext {
         user_full_names: Arc::default(),
         user_avatar_urls: Arc::default(),
         bot_user_ids: Arc::default(),
-        conversation_titles: HashMap::default(),
-        private_conversation_ids: std::collections::HashSet::default(),
+        conversation_titles: Arc::default(),
+        private_conversation_ids: Arc::default(),
         user_statuses: Arc::default(),
         user_group_names: Arc::default(),
         user_group_members: Arc::default(),
@@ -135,8 +135,7 @@ fn rich_text_channel_element_renders_as_pill_instead_of_vanishing() {
     assert_eq!(token, "<#C123>");
 
     let mut context = test_context();
-    context
-        .conversation_titles
+    Arc::make_mut(&mut context.conversation_titles)
         .insert("C123".to_string(), "#general".to_string());
     let pango = crate::message_markup::mrkdwn_to_pango(&token, &context);
     assert!(pango.contains("background=\"#D6ECFF\""));

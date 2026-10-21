@@ -150,8 +150,7 @@ fn test_mrkdwn_to_pango_mentions() {
     user_names.insert("U123".to_string(), "Alice".to_string());
     context.user_names = Arc::new(user_names);
 
-    context
-        .conversation_titles
+    Arc::make_mut(&mut context.conversation_titles)
         .insert("C123".to_string(), "general".to_string());
 
     let input = "<@U123> in <#C123|general> and <#C999>";
@@ -165,10 +164,9 @@ fn test_mrkdwn_to_pango_mentions() {
 #[test]
 fn test_mrkdwn_to_pango_private_channel_mention() {
     let mut context = MessageRenderContext::default();
-    context
-        .conversation_titles
+    Arc::make_mut(&mut context.conversation_titles)
         .insert("C123".to_string(), "#secret-room".to_string());
-    context.private_conversation_ids.insert("C123".to_string());
+    Arc::make_mut(&mut context.private_conversation_ids).insert("C123".to_string());
 
     let output = mrkdwn_to_pango("<#C123|secret-room>", &context);
     assert_eq!(
@@ -207,4 +205,51 @@ fn test_mrkdwn_to_pango_nested_formatting() {
     let input = "*bold with `code` and _italic_*";
     let output = mrkdwn_to_pango(input, &context);
     assert_eq!(output, "<b>bold with <tt>code</tt> and <i>italic</i></b>");
+}
+
+#[test]
+fn render_context_equality_tracks_shared_directories_and_per_render_fields() {
+    let mut titles = HashMap::new();
+    titles.insert("C1".to_string(), "#general".to_string());
+    let base = MessageRenderContext {
+        conversation_titles: Arc::new(titles),
+        ..MessageRenderContext::default()
+    };
+
+    // A re-render reusing the same snapshots is unchanged.
+    let rerender = base.clone();
+    assert!(Arc::ptr_eq(
+        &base.conversation_titles,
+        &rerender.conversation_titles
+    ));
+    assert_eq!(base, rerender);
+
+    // A rebuilt snapshot with equal contents still compares equal.
+    let rebuilt = MessageRenderContext {
+        conversation_titles: Arc::new(base.conversation_titles.as_ref().clone()),
+        ..base.clone()
+    };
+    assert_eq!(base, rebuilt);
+
+    // A rebuilt snapshot with different contents is a change.
+    let mut renamed = base.clone();
+    Arc::make_mut(&mut renamed.conversation_titles)
+        .insert("C1".to_string(), "#announcements".to_string());
+    assert!(!Arc::ptr_eq(
+        &base.conversation_titles,
+        &renamed.conversation_titles
+    ));
+    assert_ne!(base, renamed);
+
+    // Per-render fields are a change even with shared snapshots.
+    let unread = MessageRenderContext {
+        unread_separator_ts: Some("1.0".to_string()),
+        ..base.clone()
+    };
+    assert_ne!(base, unread);
+    let thread = MessageRenderContext {
+        thread_ts: Some("1.0".to_string()),
+        ..base.clone()
+    };
+    assert_ne!(base, thread);
 }

@@ -1,5 +1,11 @@
 use crate::models::SlackConversation;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// Source of [`ConversationCatalog::content_stamp`] values. Process-wide, so
+/// a stamp never repeats even when a catalog is replaced wholesale.
+static NEXT_CONTENT_STAMP: AtomicU64 = AtomicU64::new(1);
 
 /// The canonical, revision-aware set of conversations for a workspace.
 ///
@@ -11,6 +17,9 @@ pub(crate) struct ConversationCatalog {
     entries: HashMap<String, CatalogEntry>,
     revision: u64,
     last_committed_snapshot: u64,
+    /// Changes on every mutation and is unique across catalogs; `0` only for
+    /// a never-mutated (empty) catalog. See [`ConversationTitlesCache`].
+    content_stamp: u64,
 }
 
 #[derive(Debug)]
@@ -33,6 +42,11 @@ impl ConversationCatalog {
             catalog.insert_cached(conversation);
         }
         catalog
+    }
+
+    /// Cheap change marker: equal stamps imply equal contents.
+    pub(crate) fn content_stamp(&self) -> u64 {
+        self.content_stamp
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<&SlackConversation> {
@@ -172,6 +186,7 @@ impl ConversationCatalog {
     }
 
     fn insert_cached(&mut self, conversation: SlackConversation) {
+        self.touch();
         let id = conversation.id.clone();
         match self.entries.get_mut(&id) {
             Some(entry) => {
@@ -191,8 +206,97 @@ impl ConversationCatalog {
     }
 
     fn next_revision(&mut self) -> u64 {
+        self.touch();
         self.revision = self.revision.saturating_add(1);
         self.revision
+    }
+
+    fn touch(&mut self) {
+        self.content_stamp = NEXT_CONTENT_STAMP.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Conversation titles and privacy as message renderers read them, derived
+/// from the catalog plus the channels discovered for the picker.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConversationTitles {
+    pub(crate) titles: Arc<HashMap<String, String>>,
+    pub(crate) private_ids: Arc<HashSet<String>>,
+}
+
+/// Rebuilds [`ConversationTitles`] only when an input changed, so renders
+/// share one snapshot and render contexts compare it by pointer.
+#[derive(Debug, Default)]
+pub(crate) struct ConversationTitlesCache {
+    entry: Option<(ConversationTitlesKey, ConversationTitles)>,
+}
+
+/// Holds clones of the shared inputs: while it does, copy-on-write mutation
+/// (`Arc::make_mut`) must reallocate, so pointer equality means "unchanged".
+#[derive(Debug)]
+struct ConversationTitlesKey {
+    user_names: Arc<HashMap<String, String>>,
+    current_user_id: Option<String>,
+    discovered: Arc<Vec<SlackConversation>>,
+    catalog_stamp: u64,
+}
+
+impl ConversationTitlesKey {
+    fn matches(
+        &self,
+        user_names: &Arc<HashMap<String, String>>,
+        current_user_id: Option<&str>,
+        discovered: &Arc<Vec<SlackConversation>>,
+        catalog: &ConversationCatalog,
+    ) -> bool {
+        Arc::ptr_eq(&self.user_names, user_names)
+            && self.current_user_id.as_deref() == current_user_id
+            && Arc::ptr_eq(&self.discovered, discovered)
+            && self.catalog_stamp == catalog.content_stamp()
+    }
+}
+
+impl ConversationTitlesCache {
+    pub(crate) fn get(
+        &mut self,
+        user_names: &Arc<HashMap<String, String>>,
+        current_user_id: Option<&str>,
+        discovered: &Arc<Vec<SlackConversation>>,
+        catalog: &ConversationCatalog,
+    ) -> ConversationTitles {
+        if let Some((key, titles)) = &self.entry {
+            if key.matches(user_names, current_user_id, discovered, catalog) {
+                return titles.clone();
+            }
+        }
+        // Catalog entries win over discovered channels with the same id.
+        let conversations = discovered.iter().chain(catalog.iter());
+        let titles = ConversationTitles {
+            titles: Arc::new(
+                conversations
+                    .clone()
+                    .map(|conversation| {
+                        let title =
+                            conversation.display_name_with_users(user_names, current_user_id);
+                        (conversation.id.clone(), title)
+                    })
+                    .collect(),
+            ),
+            private_ids: Arc::new(
+                conversations
+                    .filter(|conversation| conversation.is_private.unwrap_or(false))
+                    .map(|conversation| conversation.id.clone())
+                    .collect(),
+            ),
+        };
+        let key = ConversationTitlesKey {
+            user_names: user_names.clone(),
+            current_user_id: current_user_id.map(ToString::to_string),
+            discovered: discovered.clone(),
+            catalog_stamp: catalog.content_stamp(),
+        };
+        self.entry = Some((key, titles.clone()));
+        titles
     }
 }
 
@@ -243,6 +347,66 @@ mod tests {
             id: id.to_string(),
             ..SlackConversation::default()
         }
+    }
+
+    #[test]
+    fn content_stamp_changes_on_every_mutation_and_never_repeats() {
+        let mut catalog = ConversationCatalog::from_cached([conversation("C1")]);
+        let cached = catalog.content_stamp();
+        assert_ne!(cached, ConversationCatalog::default().content_stamp());
+
+        catalog.upsert_metadata(conversation("C2"));
+        let upserted = catalog.content_stamp();
+        assert_ne!(upserted, cached);
+
+        catalog.remove("C2");
+        assert_ne!(catalog.content_stamp(), upserted);
+
+        // A wholesale replacement with the same contents still gets a fresh stamp.
+        let replaced = ConversationCatalog::from_cached([conversation("C1")]);
+        assert_ne!(replaced.content_stamp(), cached);
+    }
+
+    #[test]
+    fn title_cache_reuses_the_snapshot_until_an_input_changes() {
+        let mut general = conversation("C1");
+        general.name = Some("general".to_string());
+        general.is_private = Some(true);
+        let mut catalog = ConversationCatalog::from_cached([general]);
+        let mut discovered_channel = conversation("C2");
+        discovered_channel.name = Some("random".to_string());
+        let discovered = Arc::new(vec![discovered_channel]);
+        let user_names = Arc::new(HashMap::new());
+        let mut cache = ConversationTitlesCache::default();
+
+        let first = cache.get(&user_names, None, &discovered, &catalog);
+        assert_eq!(first.titles.len(), 2);
+        assert!(first.private_ids.contains("C1"));
+        assert!(!first.private_ids.contains("C2"));
+
+        let again = cache.get(&user_names, None, &discovered, &catalog);
+        assert!(Arc::ptr_eq(&first.titles, &again.titles));
+        assert!(Arc::ptr_eq(&first.private_ids, &again.private_ids));
+
+        let mut renamed = conversation("C1");
+        renamed.name = Some("announcements".to_string());
+        catalog.upsert_metadata(renamed);
+        let after_catalog = cache.get(&user_names, None, &discovered, &catalog);
+        assert!(!Arc::ptr_eq(&first.titles, &after_catalog.titles));
+        assert_ne!(first.titles, after_catalog.titles);
+
+        let mut shared_names = user_names.clone();
+        Arc::make_mut(&mut shared_names).insert("U1".to_string(), "Ada".to_string());
+        let after_users = cache.get(&shared_names, None, &discovered, &catalog);
+        assert!(!Arc::ptr_eq(&after_catalog.titles, &after_users.titles));
+
+        let after_user_id = cache.get(&shared_names, Some("U1"), &discovered, &catalog);
+        assert!(!Arc::ptr_eq(&after_users.titles, &after_user_id.titles));
+
+        let rediscovered = Arc::new(discovered.as_ref().clone());
+        let after_discovery = cache.get(&shared_names, Some("U1"), &rediscovered, &catalog);
+        assert!(!Arc::ptr_eq(&after_user_id.titles, &after_discovery.titles));
+        assert_eq!(after_user_id.titles, after_discovery.titles);
     }
 
     #[test]

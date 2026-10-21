@@ -46,6 +46,7 @@ use crate::composer::{
     MessageEditKeyAction, RichComposerDraft, SlashCommandValidation, TextViewEnterAction,
 };
 use crate::config;
+use crate::conversation_catalog::ConversationTitlesCache;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
 use crate::emoji::{
     emoji_picker_accessible_label, move_emoji_picker_selection, EmojiCatalog, EmojiEntry,
@@ -369,7 +370,10 @@ mod imp {
         pub auth_debug: Cell<bool>,
         pub(super) workspace: WorkspaceSessionState,
         pub pending_opened_conversation_ids: RefCell<HashSet<String>>,
-        pub discovered_channels: RefCell<Vec<SlackConversation>>,
+        /// Shared so the render context's title cache can detect changes
+        /// by pointer; replace or `Arc::make_mut` it, never mutate in place.
+        pub discovered_channels: RefCell<Arc<Vec<SlackConversation>>>,
+        pub(super) conversation_titles: RefCell<ConversationTitlesCache>,
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
         pub(super) people_picker_view: RefCell<Option<PeoplePickerView>>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
@@ -7299,7 +7303,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::ConversationChannelsDiscovered(channels) => {
-                *self.imp().discovered_channels.borrow_mut() = channels;
+                *self.imp().discovered_channels.borrow_mut() = Arc::new(channels);
                 self.refresh_open_conversation_picker();
             }
             RuntimeEventKind::ConversationPeopleDiscovered(users) => {
@@ -9180,7 +9184,7 @@ impl ConduitWindow {
         imp.pending_opened_conversation_ids.borrow_mut().clear();
         imp.pending_sent_drafts.borrow_mut().clear();
         imp.pending_upload_drafts.borrow_mut().clear();
-        imp.discovered_channels.borrow_mut().clear();
+        *imp.discovered_channels.borrow_mut() = Arc::default();
         imp.status_expiry_generation
             .set(imp.status_expiry_generation.get().saturating_add(1));
         *imp.workspace_name.borrow_mut() = None;
@@ -9723,10 +9727,12 @@ impl ConduitWindow {
             self.apply_workspace_timeline_projection(revision, application.timeline_changes());
         }
         if application.conversation_changed() {
-            remove_patch_departures_from_discovery(
-                &mut self.imp().discovered_channels.borrow_mut(),
-                application.removals(),
-            );
+            if !application.removals().is_empty() {
+                remove_patch_departures_from_discovery(
+                    Arc::make_mut(&mut self.imp().discovered_channels.borrow_mut()),
+                    application.removals(),
+                );
+            }
             for removal in application.removals() {
                 let channel_id = removal.channel_id();
                 if selected_before.as_deref() == Some(channel_id)
@@ -13694,31 +13700,12 @@ impl ConduitWindow {
         let imp = self.imp();
         let user_names = imp.workspace.user_directory.user_names.borrow().clone();
         let current_user_id = imp.current_user_id.borrow().clone();
-        let mut conversation_titles = imp
-            .discovered_channels
-            .borrow()
-            .iter()
-            .map(|conversation| {
-                let title =
-                    conversation.display_name_with_users(&user_names, current_user_id.as_deref());
-                (conversation.id.clone(), title)
-            })
-            .collect::<HashMap<_, _>>();
-        conversation_titles.extend(imp.workspace.conversations.borrow().iter().map(
-            |conversation| {
-                let title =
-                    conversation.display_name_with_users(&user_names, current_user_id.as_deref());
-                (conversation.id.clone(), title)
-            },
-        ));
-        let private_conversation_ids = imp
-            .discovered_channels
-            .borrow()
-            .iter()
-            .chain(imp.workspace.conversations.borrow().iter())
-            .filter(|conversation| conversation.is_private.unwrap_or(false))
-            .map(|conversation| conversation.id.clone())
-            .collect::<HashSet<_>>();
+        let conversation_titles = imp.conversation_titles.borrow_mut().get(
+            &user_names,
+            current_user_id.as_deref(),
+            &imp.discovered_channels.borrow(),
+            &imp.workspace.conversations.borrow(),
+        );
         let recent_reactions = imp
             .settings
             .borrow()
@@ -13755,8 +13742,8 @@ impl ConduitWindow {
                 .borrow()
                 .clone(),
             bot_user_ids: imp.workspace.user_directory.bot_user_ids.borrow().clone(),
-            conversation_titles,
-            private_conversation_ids,
+            conversation_titles: conversation_titles.titles,
+            private_conversation_ids: conversation_titles.private_ids,
             user_statuses: imp.workspace.user_directory.user_statuses.borrow().clone(),
             user_group_names: imp
                 .workspace

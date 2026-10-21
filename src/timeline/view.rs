@@ -1009,6 +1009,8 @@ impl NativeTimelineView {
     ) {
         self.placeholder_label.set_visible(false);
         self.scrolled_window.set_visible(true);
+        // Cheap: directory snapshots are shared `Arc`s, cloned by refcount and
+        // compared by pointer first (see `MessageRenderContext`).
         let context_changed = self.context.replace(Some(context.clone())).as_ref() != Some(context);
         *self.latest_message_ts.borrow_mut() = messages.first().map(|msg| msg.ts.clone());
         self.reset_read_candidate();

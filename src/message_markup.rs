@@ -19,6 +19,13 @@ mod tests;
 const QUICK_REACTION_LIMIT: usize = 4;
 
 /// Canonical render context for Slack message formatting and timeline display.
+///
+/// The workspace directories (users, groups, conversations, emoji) are
+/// `Arc`-shared snapshots that the window reuses until their source changes.
+/// Cloning a context only bumps their refcounts, and the derived `PartialEq`
+/// checks them by pointer before contents (`Arc<T: Eq>` short-circuits on
+/// `Arc::ptr_eq`), so comparing two renders of an unchanged workspace only
+/// walks the per-render fields (thread, unread anchor, images, controls).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MessageRenderContext {
     pub user_names: Arc<HashMap<String, String>>,
@@ -26,8 +33,8 @@ pub struct MessageRenderContext {
     pub user_avatar_urls: Arc<HashMap<String, String>>,
     /// Directory users flagged `is_bot`; see [`Self::display_user_id`].
     pub bot_user_ids: Arc<HashSet<String>>,
-    pub conversation_titles: HashMap<String, String>,
-    pub private_conversation_ids: HashSet<String>,
+    pub conversation_titles: Arc<HashMap<String, String>>,
+    pub private_conversation_ids: Arc<HashSet<String>>,
     pub user_statuses: Arc<HashMap<String, SlackUserStatus>>,
     pub user_group_names: Arc<HashMap<String, String>>,
     pub user_group_members: Arc<HashMap<String, Vec<String>>>,
