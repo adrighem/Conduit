@@ -3403,10 +3403,18 @@ impl ConduitWindow {
         });
     }
 
-    /// Clears the older-page spinner once that load finished or failed.
+    /// Clears the older-page spinner once that load finished.
     fn finish_loading_older(&self, channel_id: &str, thread_ts: Option<&str>) {
         if let Some(timeline) = self.surface_timeline(thread_ts.is_some()) {
             timeline.finish_loading_older(channel_id, thread_ts);
+        }
+    }
+
+    /// Clears the older-page spinner after a failed load and backs off
+    /// before the next attempt.
+    fn fail_loading_older(&self, channel_id: &str, thread_ts: Option<&str>) {
+        if let Some(timeline) = self.surface_timeline(thread_ts.is_some()) {
+            timeline.fail_loading_older(channel_id, thread_ts);
         }
     }
 
@@ -9407,7 +9415,7 @@ impl ConduitWindow {
                     .view
                     .borrow_mut()
                     .fail_history(&channel_id);
-                self.finish_loading_older(&channel_id, None);
+                self.fail_loading_older(&channel_id, None);
                 if outcome.active {
                     self.set_status(error);
                     if !outcome.has_content {
@@ -9425,7 +9433,7 @@ impl ConduitWindow {
                     .view
                     .borrow_mut()
                     .fail_thread(&channel_id, &thread_ts);
-                self.finish_loading_older(&channel_id, Some(&thread_ts));
+                self.fail_loading_older(&channel_id, Some(&thread_ts));
                 if outcome.active {
                     self.set_status(error);
                     if !outcome.has_content {

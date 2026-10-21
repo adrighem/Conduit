@@ -50,6 +50,9 @@ pub struct NativeTimelineView {
     /// Older-history paging: an older page is in flight (spinner shown).
     loading_older: Rc<Cell<bool>>,
     loading_older_indicator: Widget,
+    /// Backoff after a failed older-page load, so sitting near the top
+    /// while offline or rate-limited does not re-request in a tight loop.
+    older_backoff: Rc<OlderPageBackoff>,
     /// True between `set_messages` and the settled layout, so programmatic
     /// scrolling during a render does not count as reaching the top.
     settling: Rc<Cell<bool>>,
@@ -607,15 +610,20 @@ impl NativeTimelineView {
         // page is prepended, so the reading position survives.
         let loading_older = Rc::new(Cell::new(false));
         let settling = Rc::new(Cell::new(false));
+        let older_backoff = Rc::new(OlderPageBackoff::default());
         let check_load_older: Rc<dyn Fn()> = {
             let scrolled_window = scrolled_window.downgrade();
             let read_mark_target = read_mark_target.clone();
             let loading_older = loading_older.clone();
             let settling = settling.clone();
+            let older_backoff = older_backoff.clone();
             let on_action = on_action.clone();
             let queued = Rc::new(Cell::new(false));
             Rc::new(move || {
-                if settling.get() || loading_older.get() {
+                if settling.get()
+                    || loading_older.get()
+                    || older_backoff.cooling_down(std::time::Instant::now())
+                {
                     return;
                 }
                 let Some(scrolled_window) = scrolled_window.upgrade() else {
@@ -739,6 +747,7 @@ impl NativeTimelineView {
             highlight_generation: Rc::new(Cell::new(0)),
             loading_older,
             loading_older_indicator: loading_older_indicator.upcast(),
+            older_backoff,
             settling,
             settle_generation: Rc::new(Cell::new(0)),
             surface_changed: Rc::new(Cell::new(false)),
@@ -749,16 +758,33 @@ impl NativeTimelineView {
     /// Ends the older-page load of `channel_id`/`thread_ts` if this view
     /// still shows that surface; a late reply for another one is ignored.
     pub(crate) fn finish_loading_older(&self, channel_id: &str, thread_ts: Option<&str>) {
-        let shows_surface =
-            self.read_mark_target
-                .borrow()
-                .as_ref()
-                .is_some_and(|(channel, thread)| {
-                    channel == channel_id && thread.as_deref() == thread_ts
-                });
-        if shows_surface {
+        if self.shows_surface(channel_id, thread_ts) {
+            self.older_backoff.reset();
             self.set_loading_older(false);
         }
+    }
+
+    /// Ends a failed older-page load of `channel_id`/`thread_ts` and holds
+    /// off the next one with a growing delay, re-checking once it elapses.
+    /// A failure while no older page is in flight (an initial load) leaves
+    /// paging alone.
+    pub(crate) fn fail_loading_older(&self, channel_id: &str, thread_ts: Option<&str>) {
+        if !self.shows_surface(channel_id, thread_ts) || !self.loading_older.get() {
+            return;
+        }
+        let delay = self.older_backoff.fail(std::time::Instant::now());
+        self.set_loading_older(false);
+        let check_load_older = self.check_load_older.clone();
+        glib::timeout_add_local_once(delay, move || check_load_older());
+    }
+
+    fn shows_surface(&self, channel_id: &str, thread_ts: Option<&str>) -> bool {
+        self.read_mark_target
+            .borrow()
+            .as_ref()
+            .is_some_and(|(channel, thread)| {
+                channel == channel_id && thread.as_deref() == thread_ts
+            })
     }
 
     /// Shows or hides the "loading older messages" spinner. While shown, no
@@ -843,6 +869,7 @@ impl NativeTimelineView {
         let target = Some((channel_id.to_string(), thread_ts.map(ToString::to_string)));
         if *self.read_mark_target.borrow() != target {
             self.surface_changed.set(true);
+            self.older_backoff.reset();
             self.set_loading_older(false);
         }
         *self.read_mark_target.borrow_mut() = target;
@@ -1129,6 +1156,40 @@ pub(crate) fn pins_to_bottom(
             TimelineScrollBehavior::StickToBottom => was_near_bottom,
             TimelineScrollBehavior::Preserve | TimelineScrollBehavior::PreservePrepend => false,
         }
+}
+
+/// Exponential backoff for failed older-page loads: 2s, 4s, 8s, ... capped
+/// at 30s, cleared by a successful page or a surface switch.
+#[derive(Default)]
+pub(crate) struct OlderPageBackoff {
+    failures: Cell<u32>,
+    retry_at: Cell<Option<std::time::Instant>>,
+}
+
+impl OlderPageBackoff {
+    const BASE: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Records a failure at `now` and returns how long to wait before the
+    /// next attempt.
+    pub(crate) fn fail(&self, now: std::time::Instant) -> std::time::Duration {
+        let failures = self.failures.get().saturating_add(1);
+        self.failures.set(failures);
+        let delay = Self::BASE
+            .saturating_mul(1 << (failures - 1).min(5))
+            .min(Self::MAX);
+        self.retry_at.set(Some(now + delay));
+        delay
+    }
+
+    pub(crate) fn cooling_down(&self, now: std::time::Instant) -> bool {
+        self.retry_at.get().is_some_and(|at| now < at)
+    }
+
+    pub(crate) fn reset(&self) {
+        self.failures.set(0);
+        self.retry_at.set(None);
+    }
 }
 
 /// Whether the viewport is within half a page of the oldest loaded message.

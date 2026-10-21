@@ -2077,3 +2077,87 @@ fn scrolling_near_top_requests_older_page_and_prepend_keeps_position() {
         window.destroy();
     });
 }
+
+#[test]
+fn older_page_backoff_grows_caps_and_resets() {
+    use std::time::{Duration, Instant};
+    let backoff = OlderPageBackoff::default();
+    let now = Instant::now();
+    assert!(!backoff.cooling_down(now));
+    let delays: Vec<u64> = (0..7).map(|_| backoff.fail(now).as_secs()).collect();
+    assert_eq!(delays, vec![2, 4, 8, 16, 30, 30, 30]);
+    assert!(backoff.cooling_down(now + Duration::from_secs(29)));
+    assert!(!backoff.cooling_down(now + Duration::from_secs(30)));
+    backoff.reset();
+    assert!(!backoff.cooling_down(now));
+    assert_eq!(backoff.fail(now), Duration::from_secs(2));
+}
+
+#[test]
+fn failed_older_page_backs_off_instead_of_rerequesting() {
+    run_gtk_test(|| {
+        fn pump(ms: u64) {
+            let context = glib::MainContext::default();
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            while std::time::Instant::now() < end {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        let messages: Vec<SlackMessage> = (0..200u32)
+            .rev()
+            .map(|i| SlackMessage {
+                ts: format!("1700000{i:03}.000100"),
+                user: Some("U123".to_string()),
+                text: Some(format!("message {i}")),
+                ..Default::default()
+            })
+            .collect();
+        let ctx = test_context();
+        let requests = Rc::new(Cell::new(0u32));
+        let view = NativeTimelineView::new();
+        {
+            let requests = requests.clone();
+            let handle = view.clone();
+            view.set_on_action(move |action| {
+                if let TimelineAction::LoadOlder { .. } = action {
+                    requests.set(requests.get() + 1);
+                    // As the window does: spinner up while the page loads.
+                    handle.set_loading_older(true);
+                }
+            });
+        }
+        let window = gtk::Window::new();
+        window.set_default_size(400, 500);
+        window.set_child(Some(view.widget()));
+        window.present();
+        view.set_read_mark_target("C1", None);
+        view.set_messages(&messages, &ctx, None);
+        pump(400);
+        assert_eq!(requests.get(), 0, "opens at the newest message");
+
+        let vadj = view.scrolled_window.vadjustment();
+        vadj.set_value(vadj.lower() + vadj.page_size() / 4.0);
+        pump(100);
+        assert_eq!(requests.get(), 1);
+
+        // The page fails while the user still sits near the top: no retry
+        // on the idle re-check, nor on further scrolling during cooldown.
+        view.fail_loading_older("C1", None);
+        pump(200);
+        vadj.set_value(vadj.value() + 1.0);
+        pump(200);
+        assert_eq!(requests.get(), 1, "a failed page is not retried at once");
+
+        // A failure for another surface leaves paging alone.
+        view.fail_loading_older("C2", None);
+
+        // Switching away and back clears the cooldown.
+        view.set_read_mark_target("C2", None);
+        view.set_read_mark_target("C1", None);
+        vadj.set_value(vadj.value() - 1.0);
+        pump(200);
+        assert_eq!(requests.get(), 2, "a fresh surface pages again");
+        window.destroy();
+    });
+}
