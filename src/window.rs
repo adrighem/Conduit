@@ -1208,12 +1208,39 @@ fn composer_emoji_preview(entry: &EmojiEntry) -> gtk::Widget {
             preview.upcast()
         }
         EmojiValue::CustomImage(url) => {
-            let preview = gtk::Picture::for_file(&gio::File::for_uri(url));
-            preview.set_alternative_text(Some(&entry.label));
-            preview.set_can_shrink(true);
-            preview.set_content_fit(gtk::ContentFit::Contain);
-            preview.set_size_request(24, 24);
-            preview.upcast()
+            // Only cached downloads, never the raw URL: the emoji loader caps
+            // the fetch size and the picture loader the decoded pixel count.
+            let slot = adw::Bin::new();
+            slot.set_size_request(24, 24);
+            slot.update_property(&[gtk::accessible::Property::Label(&entry.label)]);
+            let show = |slot: &adw::Bin, path: &Path| {
+                slot.set_child(Some(
+                    &crate::timeline_message_widget::load_animated_or_static_picture(
+                        path,
+                        24,
+                        24,
+                        gtk::ContentFit::Contain,
+                    ),
+                ));
+            };
+            if let Some(path) = crate::emoji_picker_window::resolve_custom_emoji_cached_file(url) {
+                show(&slot, &path);
+            } else {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+                crate::emoji_picker_window::request_custom_emoji_file(url, move |path| {
+                    let _ = tx.send(path);
+                });
+                let weak_slot = slot.downgrade();
+                glib::spawn_future_local(async move {
+                    let Some(path) = rx.recv().await else {
+                        return;
+                    };
+                    if let Some(slot) = weak_slot.upgrade() {
+                        show(&slot, &path);
+                    }
+                });
+            }
+            slot.upcast()
         }
     }
 }
@@ -4089,6 +4116,11 @@ impl ConduitWindow {
         };
         viewer.loaded_path = Some(path.clone());
         if mime_type.starts_with("image/") {
+            // A tiny attachment can still decode to gigabytes of pixels.
+            if !crate::animated_image::within_decode_budget(&path) {
+                self.set_status("Could not display image: it is too large to decode");
+                return;
+            }
             match gdk_pixbuf::Pixbuf::from_file(&path) {
                 Ok(pixbuf) => {
                     viewer.natural_size = (pixbuf.width(), pixbuf.height());

@@ -224,17 +224,60 @@ fn switcher_avatar_picture(url: &str, label: &str, size: i32) -> gtk::Picture {
     picture.set_overflow(gtk::Overflow::Hidden);
     picture.add_css_class("switcher-avatar");
 
-    let weak_picture = picture.downgrade();
-    let file = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_FILE")
-        .map(gtk::gio::File::for_path)
-        .unwrap_or_else(|| gtk::gio::File::for_uri(url));
+    load_sidebar_image(&picture, url, size);
+    picture
+}
 
-    file.read_async(
+fn sidebar_status_emoji_picture(url: &str, label: &str, size: i32) -> gtk::Picture {
+    let picture = gtk::Picture::new();
+    picture.set_alternative_text(Some(label));
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk::ContentFit::Contain);
+    picture.set_size_request(size, size);
+    picture.set_halign(gtk::Align::Center);
+    picture.set_valign(gtk::Align::Center);
+
+    load_sidebar_image(&picture, url, size);
+    picture
+}
+
+/// Shows the image at `url` in `picture`, scaled to `size`. Only cached
+/// downloads are decoded, never the raw URL: the shared emoji loader rejects
+/// non-https and private hosts and caps the download size, and the decode
+/// budget rejects files that would inflate to gigabytes of pixels.
+fn load_sidebar_image(picture: &gtk::Picture, url: &str, size: i32) {
+    let weak_picture = picture.downgrade();
+    if let Some(path) = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_FILE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::emoji_picker_window::resolve_custom_emoji_cached_file(url))
+    {
+        decode_sidebar_image(weak_picture, &path, size);
+        return;
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
+    crate::emoji_picker_window::request_custom_emoji_file(url, move |path| {
+        let _ = tx.send(path);
+    });
+    gtk::glib::spawn_future_local(async move {
+        if let Some(path) = rx.recv().await {
+            decode_sidebar_image(weak_picture, &path, size);
+        }
+    });
+}
+
+fn decode_sidebar_image(
+    weak_picture: gtk::glib::WeakRef<gtk::Picture>,
+    path: &std::path::Path,
+    size: i32,
+) {
+    if weak_picture.upgrade().is_none() || !crate::animated_image::within_decode_budget(path) {
+        return;
+    }
+    gtk::gio::File::for_path(path).read_async(
         gtk::glib::Priority::DEFAULT,
         gtk::gio::Cancellable::NONE,
         move |stream| {
             let Ok(stream) = stream else { return };
-            let weak_picture = weak_picture.clone();
             gdk_pixbuf::PixbufAnimation::from_stream_async(
                 &stream,
                 gtk::gio::Cancellable::NONE,
@@ -260,56 +303,6 @@ fn switcher_avatar_picture(url: &str, label: &str, size: i32) -> gtk::Picture {
             );
         },
     );
-    picture
-}
-
-fn sidebar_status_emoji_picture(url: &str, label: &str, size: i32) -> gtk::Picture {
-    let picture = gtk::Picture::new();
-    picture.set_alternative_text(Some(label));
-    picture.set_can_shrink(true);
-    picture.set_content_fit(gtk::ContentFit::Contain);
-    picture.set_size_request(size, size);
-    picture.set_halign(gtk::Align::Center);
-    picture.set_valign(gtk::Align::Center);
-
-    let weak_picture = picture.downgrade();
-    let file = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_FILE")
-        .map(gtk::gio::File::for_path)
-        .unwrap_or_else(|| gtk::gio::File::for_uri(url));
-
-    file.read_async(
-        gtk::glib::Priority::DEFAULT,
-        gtk::gio::Cancellable::NONE,
-        move |stream| {
-            let Ok(stream) = stream else { return };
-            let weak_picture = weak_picture.clone();
-            gdk_pixbuf::PixbufAnimation::from_stream_async(
-                &stream,
-                gtk::gio::Cancellable::NONE,
-                move |animation| {
-                    let Some(picture) = weak_picture.upgrade() else {
-                        return;
-                    };
-                    let Ok(animation) = animation else { return };
-                    let frame =
-                        std::rc::Rc::new(animation.iter(Some(std::time::SystemTime::now())));
-                    let pixbuf = frame.pixbuf();
-                    let w = pixbuf.width();
-                    let h = pixbuf.height();
-                    let (target_w, target_h) = if w > h {
-                        (size, (size * h / w).max(1))
-                    } else {
-                        ((size * w / h).max(1), size)
-                    };
-                    let scaled = pixbuf
-                        .scale_simple(target_w, target_h, gdk_pixbuf::InterpType::Bilinear)
-                        .unwrap_or(pixbuf);
-                    picture.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&scaled)));
-                },
-            );
-        },
-    );
-    picture
 }
 
 fn sidebar_title_attributes(unread: bool) -> gtk::pango::AttrList {
