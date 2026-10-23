@@ -398,6 +398,8 @@ pub(crate) fn inlines_to_mrkdwn(inlines: &[RichInline]) -> String {
                 styled(&format!("<{url}|{}>", escape_mrkdwn(label)), *style)
             }
             RichInline::User(user_id) => format!("<@{user_id}>"),
+            RichInline::UserGroup(group_id) => format!("<!subteam^{group_id}>"),
+            RichInline::Broadcast(range) => format!("<!{range}>"),
             RichInline::Channel(channel_id) => format!("<#{channel_id}>"),
             RichInline::Emoji(name) => format!(":{name}:"),
         })
@@ -410,7 +412,8 @@ fn inlines_plain_text(inlines: &[RichInline]) -> String {
         .map(|inline| match inline {
             RichInline::Text { text, .. } => text.clone(),
             RichInline::Link { label, .. } => label.clone(),
-            RichInline::User(user_id) => format!("@{user_id}"),
+            RichInline::User(user_id) | RichInline::UserGroup(user_id) => format!("@{user_id}"),
+            RichInline::Broadcast(range) => format!("@{range}"),
             RichInline::Channel(channel_id) => format!("#{channel_id}"),
             RichInline::Emoji(name) => format!(":{name}:"),
         })

@@ -207,7 +207,11 @@ fn build(input: &DetailsInput, callbacks: Callbacks) -> Rc<Inner> {
     toolbar.set_content(Some(&toasts));
 
     let dialog = adw::Dialog::new();
-    dialog.set_title(&gettext("Conversation details"));
+    dialog.set_title(&if input.layout.conversation {
+        gettext("Conversation details")
+    } else {
+        gettext("User group")
+    });
     dialog.set_content_width(520);
     dialog.set_content_height(620);
     dialog.set_child(Some(&toolbar));

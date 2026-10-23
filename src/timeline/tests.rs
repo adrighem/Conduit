@@ -143,6 +143,22 @@ fn rich_text_channel_element_renders_as_pill_instead_of_vanishing() {
 }
 
 #[test]
+fn rich_text_usergroup_element_renders_its_handle() {
+    let token = crate::timeline_document_widget::inlines_to_mrkdwn(&[
+        crate::rich_message::RichInline::UserGroup("S0614TZR7".to_string()),
+    ]);
+    let mut context = test_context();
+    Arc::make_mut(&mut context.user_group_names)
+        .insert("S0614TZR7".to_string(), "cloudops-support".to_string());
+    let pango = crate::message_markup::mrkdwn_to_pango(&token, &context);
+    assert!(pango.contains("@cloudops-support"), "{pango}");
+    assert!(
+        pango.contains("<a href=\"conduit-usergroup://S0614TZR7\">"),
+        "group pill should link to its members: {pango}"
+    );
+}
+
+#[test]
 fn media_collapse_key_is_stable_and_namespaced_per_slot() {
     let a = media_collapse_key("1710000000.000100", "file:0");
     let b = media_collapse_key("1710000000.000100", "file:0");

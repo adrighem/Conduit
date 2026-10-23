@@ -26,6 +26,17 @@ pub(crate) enum TitleBehavior {
 pub(crate) struct DetailsLayout {
     pub(crate) about: bool,
     pub(crate) settings: bool,
+    /// A conversation (star and mute apply); `false` for a user group.
+    pub(crate) conversation: bool,
+}
+
+impl DetailsLayout {
+    /// A user group: just its members.
+    pub(crate) const USER_GROUP: Self = Self {
+        about: false,
+        settings: false,
+        conversation: false,
+    };
 }
 
 pub(crate) fn title_behavior(kind: ConversationKind) -> Option<TitleBehavior> {
@@ -34,11 +45,13 @@ pub(crate) fn title_behavior(kind: ConversationKind) -> Option<TitleBehavior> {
         ConversationKind::GroupDirectMessage => Some(TitleBehavior::OpenDetails(DetailsLayout {
             about: false,
             settings: false,
+            conversation: true,
         })),
         ConversationKind::PublicChannel | ConversationKind::PrivateChannel => {
             Some(TitleBehavior::OpenDetails(DetailsLayout {
                 about: true,
                 settings: true,
+                conversation: true,
             }))
         }
         _ => None,

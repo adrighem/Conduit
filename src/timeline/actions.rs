@@ -50,6 +50,8 @@ pub(crate) enum TimelineAction {
     OpenLink(String),
     /// Show the native profile dialog for this user.
     ShowProfile(String),
+    /// Show the members of this user group (`S…` ID).
+    ShowUserGroup(String),
     /// Fired by the visibility-based auto-read-marking mechanism once a
     /// message has dwelled sufficiently on screen. Carries its own
     /// channel_id/thread_ts explicitly rather than relying on the handler

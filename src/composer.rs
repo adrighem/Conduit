@@ -363,7 +363,9 @@ impl MessageDraftBuilder {
                         kind: ComposerEntityKind::Link { url: url.clone() },
                     });
                 }
-                RichInline::User(user_id) => {
+                RichInline::User(user_id)
+                | RichInline::UserGroup(user_id)
+                | RichInline::Broadcast(user_id) => {
                     let label = format!(
                         "@{}",
                         user_names

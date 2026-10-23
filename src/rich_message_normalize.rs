@@ -465,6 +465,12 @@ fn normalize_inline(value: &Value) -> Option<RichInline> {
         "user" => Some(RichInline::User(
             value.get("user_id")?.as_str()?.to_string(),
         )),
+        "usergroup" => Some(RichInline::UserGroup(
+            value.get("usergroup_id")?.as_str()?.to_string(),
+        )),
+        "broadcast" => Some(RichInline::Broadcast(
+            value.get("range")?.as_str()?.to_string(),
+        )),
         "channel" => Some(RichInline::Channel(
             value.get("channel_id")?.as_str()?.to_string(),
         )),
@@ -777,6 +783,27 @@ fn normalize_color(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::message_markup::test_fixtures;
+
+    #[test]
+    fn keeps_usergroup_and_broadcast_mentions() {
+        let blocks = serde_json::json!([{
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_section",
+                "elements": [
+                    {"type": "text", "text": "is that you "},
+                    {"type": "usergroup", "usergroup_id": "S0614TZR7"},
+                    {"type": "text", "text": "? "},
+                    {"type": "broadcast", "range": "here"}
+                ]
+            }]
+        }]);
+        let document = normalize_blocks_with_files(&blocks, "Choose", "More actions", &[]);
+        assert_eq!(
+            document.visible_text(),
+            "is that you <!subteam^S0614TZR7>? <!here>"
+        );
+    }
 
     #[test]
     fn normalizes_valid_jira_siblings_without_sensitive_control_data() {

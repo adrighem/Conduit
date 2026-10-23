@@ -38,6 +38,9 @@ pub(super) fn build_header(input: &DetailsInput) -> (gtk::Box, gtk::Box, gtk::To
     let star_button = gtk::ToggleButton::new();
     star_button.add_css_class("flat");
     star_button.set_valign(gtk::Align::Center);
+    // User groups cannot be starred or muted.
+    star_button.set_visible(input.layout.conversation);
+    muted_box.set_visible(input.layout.conversation);
     header.append(&star_button);
     (header, muted_box, star_button)
 }

@@ -3381,6 +3381,7 @@ impl ConduitWindow {
             }
             TimelineAction::OpenLink(uri) => self.open_link(&uri),
             TimelineAction::ShowProfile(user_id) => self.show_profile_dialog(&user_id),
+            TimelineAction::ShowUserGroup(group_id) => self.show_user_group_details(&group_id),
             TimelineAction::AutoMarkRead {
                 channel_id,
                 thread_ts,
@@ -5605,10 +5606,19 @@ impl ConduitWindow {
             self.set_status(&error_msg);
             return false;
         };
-        let Some((draft, uses_rich_blocks)) = composer_draft_from_message(
-            &original,
-            &self.imp().workspace.user_directory.user_names.borrow(),
-        ) else {
+        // Mentions of users and user groups both resolve to `@label`.
+        let directory = &self.imp().workspace.user_directory;
+        let mut mention_names = directory.user_names.borrow().as_ref().clone();
+        mention_names.extend(
+            directory
+                .user_group_names
+                .borrow()
+                .iter()
+                .map(|(id, name)| (id.clone(), name.trim_start_matches('@').to_string())),
+        );
+        let Some((draft, uses_rich_blocks)) =
+            composer_draft_from_message(&original, &mention_names)
+        else {
             self.set_status(&gettext("This message layout cannot be safely edited."));
             return false;
         };
@@ -8883,6 +8893,48 @@ impl ConduitWindow {
                 }
                 None => text.to_string(),
             }),
+        }
+    }
+
+    /// Opens the members of a user group, from the `usergroups.list` snapshot
+    /// taken during discovery; members click through to their profiles.
+    fn show_user_group_details(&self, group_id: &str) {
+        let directory = &self.imp().workspace.user_directory;
+        let handle = directory
+            .user_group_names
+            .borrow()
+            .get(group_id)
+            .map(|name| name.trim_start_matches('@').to_string())
+            .unwrap_or_else(|| group_id.to_string());
+        let members = directory
+            .user_group_members
+            .borrow()
+            .get(group_id)
+            .cloned()
+            .unwrap_or_default();
+        let input = crate::channel_details_dialog::DetailsInput {
+            channel_id: group_id.to_string(),
+            title: format!("@{handle}"),
+            layout: crate::channel_details::DetailsLayout::USER_GROUP,
+            is_private: false,
+            muted: false,
+            starred: false,
+            about: crate::channel_details::AboutModel {
+                member_count: Some(members.len()),
+                ..Default::default()
+            },
+            loaded: true,
+            utc_offset_secs: 0,
+        };
+        crate::channel_details_dialog::present(self, &input, self.channel_details_callbacks());
+        if members.is_empty() {
+            // Without `usergroups:read` (older sign-ins) no groups load at all.
+            crate::channel_details_dialog::show_error(
+                group_id,
+                &gettext("Members unavailable. Sign in again to load user groups."),
+            );
+        } else {
+            crate::channel_details_dialog::append_members(group_id, &members, true);
         }
     }
 

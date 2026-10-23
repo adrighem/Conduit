@@ -342,6 +342,10 @@ pub enum RichInline {
         style: RichInlineStyle,
     },
     User(String),
+    /// Slack user group (`S…` ID), rendered as its `@handle`.
+    UserGroup(String),
+    /// `here`, `channel` or `everyone`.
+    Broadcast(String),
     Channel(String),
     Emoji(String),
 }
@@ -684,6 +688,8 @@ fn inlines_to_text(inlines: &[RichInline]) -> String {
                 }
             }
             RichInline::User(id) => out.push_str(&format!("<@{id}>")),
+            RichInline::UserGroup(id) => out.push_str(&format!("<!subteam^{id}>")),
+            RichInline::Broadcast(range) => out.push_str(&format!("<!{range}>")),
             RichInline::Channel(id) => out.push_str(&format!("<#{id}>")),
             RichInline::Emoji(name) => out.push_str(&format!(":{name}:")),
         }

@@ -160,6 +160,14 @@ pub fn strip_anchor_tags(markup: &str) -> (String, Vec<MarkupLink>) {
     (out, links)
 }
 
+/// The action for a clicked non-user link: user group members or open URL.
+fn link_action(href: &str) -> TimelineAction {
+    match href.strip_prefix(crate::message_markup::USER_GROUP_URL_PREFIX) {
+        Some(group_id) => TimelineAction::ShowUserGroup(group_id.to_string()),
+        None => TimelineAction::OpenLink(href.to_string()),
+    }
+}
+
 pub(crate) fn attach_label_links(
     label: &Label,
     context: &MessageRenderContext,
@@ -180,7 +188,7 @@ pub(crate) fn attach_label_links(
             }
             glib::Propagation::Stop
         } else if let Some(on_action) = on_action.as_ref() {
-            on_action(TimelineAction::OpenLink(uri.to_string()));
+            on_action(link_action(uri));
             glib::Propagation::Stop
         } else {
             glib::Propagation::Proceed
@@ -242,7 +250,7 @@ fn attach_text_view_links(
                         );
                     }
                 } else if let Some(on_action) = on_action.as_ref() {
-                    on_action(TimelineAction::OpenLink(href.clone()));
+                    on_action(link_action(href));
                 } else {
                     let _ = gtk::gio::AppInfo::launch_default_for_uri(
                         href,

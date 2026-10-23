@@ -87,6 +87,9 @@ pub enum TimelineScrollBehavior {
     StickToBottom,
 }
 
+/// Prefix of user group mention links; the timeline opens the group's members.
+pub const USER_GROUP_URL_PREFIX: &str = "conduit-usergroup://";
+
 /// Prefix of message target action links, which stay clickable in
 /// message text; the window opens them in Conduit.
 pub const MESSAGE_TARGET_URL_PREFIX: &str = "conduit://message?";
@@ -354,7 +357,11 @@ fn user_group_mention_pango(raw: &str, context: &MessageRenderContext) -> String
         .or(fallback_label)
         .unwrap_or_else(|| group_id.to_string());
     let label = normalized_user_group_label(&label);
-    mention_pill_pango("@", &label)
+    format!(
+        "<a href=\"{USER_GROUP_URL_PREFIX}{}\">{}</a>",
+        escape_pango(group_id),
+        mention_pill_pango("@", &label)
+    )
 }
 
 fn slack_special_entity_pango(raw: &str) -> String {
