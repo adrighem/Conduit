@@ -20,6 +20,8 @@ use gtk::{gdk, glib, graphene, Box, Orientation, Widget};
 use super::actions::ActionSlot;
 use super::quick_actions::{rebuild_quick_bar, QuickBarState};
 use super::tests::{run_gtk_test, test_context, TempTestDir};
+use super::text::{create_message_text_widget, render_text_content};
+use crate::message_markup::MessageRenderContext;
 
 /// Alpha above which a pixel counts as drawn.
 const INK_ALPHA: u8 = 64;
@@ -153,6 +155,47 @@ fn run_visual_test<F: FnOnce() + Send + 'static>(f: F) {
     }
 }
 
+/// Context with `:visual_solid:`, a fully opaque custom emoji whose ink box
+/// is exactly its rendered size: a font-independent size reference.
+fn solid_emoji_context(temp_dir: &TempTestDir) -> (MessageRenderContext, String) {
+    let img_path = temp_dir.path().join("solid.png");
+    let pixbuf =
+        gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 64, 64).expect("pixbuf");
+    pixbuf.fill(0x3366ccff);
+    pixbuf.savev(&img_path, "png", &[]).expect("save");
+    let img_url = "https://example.com/visual-solid.png".to_string();
+    crate::emoji_picker_window::invalidate_or_set_custom_emoji_cached_file(&img_url, img_path);
+    let mut context = test_context();
+    context.custom_emojis = Arc::new(HashMap::from([(
+        "visual_solid".to_string(),
+        img_url.clone(),
+    )]));
+    (context, img_url)
+}
+
+/// First descendant of `widget` (itself included) matching `predicate`.
+fn find_widget(widget: &Widget, predicate: &dyn Fn(&Widget) -> bool) -> Option<Widget> {
+    if predicate(widget) {
+        return Some(widget.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        if let Some(found) = find_widget(&current, predicate) {
+            return Some(found);
+        }
+        child = current.next_sibling();
+    }
+    None
+}
+
+/// Larger side of the ink drawn by `widget` rendered alone.
+fn ink_side(window: &gtk::Window, widget: &impl IsA<Widget>) -> u32 {
+    let ink = render(window, widget, None)
+        .ink()
+        .expect("widget drew nothing");
+    ink.width.max(ink.height)
+}
+
 #[test]
 fn quick_bar_add_reaction_sits_between_emoji_and_action_icons() {
     run_visual_test(|| {
@@ -160,23 +203,8 @@ fn quick_bar_add_reaction_sits_between_emoji_and_action_icons() {
         // Same stylesheet as the app, so results do not depend on test order.
         super::row::register_timeline_css();
 
-        // A fully opaque custom emoji gives a font-independent 32px reference.
         let temp_dir = TempTestDir::new("visual-quick-bar");
-        let img_path = temp_dir.path().join("solid.png");
-        let pixbuf =
-            gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 64, 64).expect("pixbuf");
-        pixbuf.fill(0x3366ccff);
-        pixbuf.savev(&img_path, "png", &[]).expect("save");
-        let img_url = "https://example.com/visual-solid.png".to_string();
-        crate::emoji_picker_window::invalidate_or_set_custom_emoji_cached_file(
-            &img_url,
-            img_path.clone(),
-        );
-        let mut context = test_context();
-        context.custom_emojis = Arc::new(HashMap::from([(
-            "visual_solid".to_string(),
-            img_url.clone(),
-        )]));
+        let (context, img_url) = solid_emoji_context(&temp_dir);
         let reactions = vec![crate::emoji::EmojiEntry {
             name: "visual_solid".to_string(),
             label: "visual_solid".to_string(),
@@ -225,6 +253,62 @@ fn quick_bar_add_reaction_sits_between_emoji_and_action_icons() {
         assert!(
             add_side > reply_side,
             "add-reaction glyph {add:?} should read larger than action icon {reply:?}"
+        );
+    });
+}
+
+#[test]
+fn message_emoji_render_inline_at_22px_and_jumbo_at_reaction_size() {
+    run_visual_test(|| {
+        super::row::register_timeline_css();
+        let temp_dir = TempTestDir::new("visual-message-emoji");
+        let (context, _) = solid_emoji_context(&temp_dir);
+        let is_picture = |w: &Widget| w.is::<gtk::Picture>();
+
+        // Inline: emoji next to text, custom and unicode at the same size.
+        let inline = Box::new(Orientation::Vertical, 0);
+        render_text_content("hi :visual_solid: there", &inline, &context, None);
+        let unicode = Box::new(Orientation::Vertical, 0);
+        let pango = crate::message_markup::mrkdwn_to_pango(":smile:", &context);
+        unicode.append(&create_message_text_widget(&pango, &context, None));
+        // Emoji-only: rendered with the reaction widgets.
+        let jumbo = Box::new(Orientation::Vertical, 0);
+        render_text_content(":visual_solid: :smile:", &jumbo, &context, None);
+
+        let page = Box::new(Orientation::Vertical, 8);
+        page.set_size_request(320, -1);
+        page.append(&inline);
+        page.append(&unicode);
+        page.append(&jumbo);
+        let window = show_in_window(&page);
+        render(&window, &page, Some("message-emoji"));
+
+        let inline_custom = find_widget(inline.upcast_ref(), &is_picture).expect("inline picture");
+        let inline_custom = ink_side(&window, &inline_custom);
+        let inline_unicode = ink_side(&window, &unicode);
+        let jumbo_custom = find_widget(jumbo.upcast_ref(), &is_picture).expect("jumbo picture");
+        let jumbo_custom = ink_side(&window, &jumbo_custom);
+        let jumbo_unicode = find_widget(jumbo.upcast_ref(), &|w| w.is::<gtk::Label>())
+            .expect("jumbo unicode label");
+        let jumbo_unicode = ink_side(&window, &jumbo_unicode);
+        window.destroy();
+
+        let inline_size = crate::message_markup::INLINE_EMOJI_SIZE as u32;
+        let jumbo_size = super::reactions::REACTION_EMOJI_SIZE as u32;
+        assert_eq!(inline_custom, inline_size, "inline custom emoji");
+        assert!(
+            jumbo_custom >= jumbo_size,
+            "jumbo custom emoji {jumbo_custom} should match reactions ({jumbo_size}px)"
+        );
+        // Glyph ink depends on the emoji font; allow its padding either way.
+        let near = |ink: u32, target: u32| ink * 4 >= target * 3 && ink * 4 <= target * 5;
+        assert!(
+            near(inline_unicode, inline_custom),
+            "inline unicode {inline_unicode} should match inline custom {inline_custom}"
+        );
+        assert!(
+            near(jumbo_unicode, jumbo_custom),
+            "jumbo unicode {jumbo_unicode} should match jumbo custom {jumbo_custom}"
         );
     });
 }

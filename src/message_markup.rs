@@ -6,11 +6,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config;
-use crate::emoji::{EmojiCatalog, EmojiEntry, EmojiValue};
+use crate::emoji::{EmojiCatalog, EmojiEntry};
 use crate::message_handoff::{MessageControlHandle, MessageRef};
 use crate::models::{SlackMessage, SlackUserStatus};
 use crate::rich_message::MessageControlKey;
+use emoji::render_emoji_shortcode_pango;
+pub use emoji::{emoji_only_names, INLINE_EMOJI_SIZE};
 
+mod emoji;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 #[cfg(test)]
@@ -375,50 +378,6 @@ fn external_link_pango(url: &str, label: &str) -> String {
     )
 }
 
-fn render_emoji_shortcode_pango(
-    text: &str,
-    context: &MessageRenderContext,
-) -> Option<(String, usize)> {
-    if !text.starts_with(':') {
-        return None;
-    }
-
-    let end = text[1..].find(':')? + 1;
-    let code = &text[1..end];
-    if code.is_empty()
-        || code.len() > 64
-        || !code.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '+')
-        })
-    {
-        return None;
-    }
-
-    let mut consumed = end + 1;
-    let mut resolved_code = code.to_string();
-    if let Some((modifier, modifier_len)) = adjacent_skin_tone_shortcode(&text[consumed..]) {
-        resolved_code.push_str("::");
-        resolved_code.push_str(modifier);
-        consumed += modifier_len;
-    }
-    let shortcode = &text[..consumed];
-    let emoji = EmojiCatalog::new(&context.custom_emojis).resolve(&resolved_code);
-
-    let rendered = match emoji {
-        Some(EmojiValue::Unicode(val)) => escape_pango(val),
-        Some(EmojiValue::CustomImage(ref url)) => {
-            format!(
-                "<conduit-custom-emoji name=\"{}\" url=\"{}\"/>",
-                escape_pango(&resolved_code),
-                escape_pango(url)
-            )
-        }
-        _ => escape_pango(shortcode),
-    };
-
-    Some((rendered, consumed))
-}
-
 fn render_wrapped_pango(
     text: &str,
     marker: char,
@@ -442,7 +401,7 @@ fn render_wrapped_pango(
     ))
 }
 
-fn escape_pango(text: &str) -> String {
+pub(super) fn escape_pango(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     let mut rest = text;
     while !rest.is_empty() {
@@ -472,22 +431,6 @@ fn push_escaped_pango_character(output: &mut String, character: char) {
 
 fn normalized_user_group_label(label: &str) -> String {
     label.trim().trim_start_matches('@').to_string()
-}
-
-fn adjacent_skin_tone_shortcode(text: &str) -> Option<(&str, usize)> {
-    if !text.starts_with(":skin-tone-") {
-        return None;
-    }
-    let end = text[1..].find(':')? + 1;
-    let modifier = &text[1..end];
-    if modifier.len() > 64
-        || !modifier.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '+')
-        })
-    {
-        return None;
-    }
-    Some((modifier, end + 1))
 }
 
 pub(super) fn is_http_url(value: &str) -> bool {

@@ -4,9 +4,10 @@ use adw::prelude::*;
 use gtk::{glib, pango, Box, Button, Label, Orientation, TextView, Widget};
 use sourceview5::prelude::*;
 
-use crate::message_markup::MessageRenderContext;
+use crate::message_markup::{emoji_only_names, MessageRenderContext, INLINE_EMOJI_SIZE};
 use crate::timeline::actions::{ActionHandler, TimelineAction};
 use crate::timeline::cache::resolve_cached_asset_path;
+use crate::timeline::reactions::{new_chip_wrap_box, resolve_reaction_emoji_widget};
 use crate::timeline::row::{load_animated_or_static_picture, register_timeline_css};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +60,12 @@ fn create_inline_emoji_widget(emoji: &InlineCustomEmoji, context: &MessageRender
         .or_else(|| resolve_cached_asset_path(&emoji.url, context));
 
     if let Some(path) = local_path {
-        let widget = load_animated_or_static_picture(&path, 18, 18, gtk::ContentFit::Contain);
+        let widget = load_animated_or_static_picture(
+            &path,
+            INLINE_EMOJI_SIZE,
+            INLINE_EMOJI_SIZE,
+            gtk::ContentFit::Contain,
+        );
         widget.set_valign(gtk::Align::Center);
         widget.set_tooltip_text(Some(&format!(":{}:", emoji.name)));
         widget
@@ -82,7 +88,12 @@ fn create_inline_emoji_widget(emoji: &InlineCustomEmoji, context: &MessageRender
                 return;
             };
             if let Some(bin) = bin_weak.upgrade() {
-                let pic = load_animated_or_static_picture(&path, 18, 18, gtk::ContentFit::Contain);
+                let pic = load_animated_or_static_picture(
+                    &path,
+                    INLINE_EMOJI_SIZE,
+                    INLINE_EMOJI_SIZE,
+                    gtk::ContentFit::Contain,
+                );
                 pic.set_valign(gtk::Align::Center);
                 pic.set_tooltip_text(Some(&format!(":{}:", emoji_name)));
                 bin.set_child(Some(&pic));
@@ -507,12 +518,29 @@ pub fn build_code_block_widget(code: &str, lang: Option<&str>) -> Widget {
     container.upcast::<Widget>()
 }
 
+/// An emoji-only message: its emoji at reaction size, as Slack does.
+fn build_jumbo_emoji_row(names: &[String], context: &MessageRenderContext) -> Widget {
+    let catalog = crate::emoji::EmojiCatalog::new(&context.custom_emojis);
+    let row = new_chip_wrap_box();
+    row.add_css_class("jumbo-emoji");
+    for name in names {
+        let widget = resolve_reaction_emoji_widget(name, name, context, &catalog);
+        widget.set_tooltip_text(Some(&format!(":{name}:")));
+        row.append(&widget);
+    }
+    row.upcast()
+}
+
 pub(crate) fn render_text_content(
     text: &str,
     target_box: &Box,
     context: &MessageRenderContext,
     on_action: Option<&ActionHandler>,
 ) {
+    if let Some(names) = emoji_only_names(text, context) {
+        target_box.append(&build_jumbo_emoji_row(&names, context));
+        return;
+    }
     let segments = parse_text_segments(text);
     for seg in segments {
         match seg {

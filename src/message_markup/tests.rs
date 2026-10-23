@@ -184,7 +184,10 @@ fn test_mrkdwn_to_pango_emoji() {
     let context = MessageRenderContext::default();
     let input = ":smile: and :unknown_emoji:";
     let output = mrkdwn_to_pango(input, &context);
-    assert_eq!(output, "😄 and :unknown_emoji:");
+    assert_eq!(
+        output,
+        "<span font_desc=\"22px\">😄</span> and :unknown_emoji:"
+    );
 
     let mut emojis = HashMap::new();
     emojis.insert(
