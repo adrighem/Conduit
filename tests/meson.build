@@ -88,6 +88,31 @@ test(
   suite: 'metadata',
 )
 
+if not headless_tests_option.disabled() and xvfb_run.found()
+  # Cargo tests skip GTK widget tests when no display is available; this runs
+  # the rendering tests under Xvfb and makes a missing display fail loudly.
+  test(
+    'Visual rendering',
+    xvfb_run,
+    # `env` layers the display settings over cargo_env, which must match the
+    # other cargo invocations so the test build is reused, not redone.
+    args: [
+      '-a', 'env',
+      'CONDUIT_REQUIRE_DISPLAY=1',
+      'GSETTINGS_BACKEND=memory',
+      'GDK_BACKEND=x11',
+      'GSK_RENDERER=cairo',
+      'GTK_A11Y=none',
+      cargo_bin.full_path(),
+    ] + cargo_test_args + ['--', 'visual_tests'],
+    env: cargo_env,
+    depends: [cargo_build],
+    suite: ['headless', 'visual'],
+    timeout: 1800,
+    is_parallel: false,
+  )
+endif
+
 if not headless_tests_option.disabled() and xvfb_run.found() and xfwm4.found() and \
    (xprop.found() or xdotool.found())
   test(

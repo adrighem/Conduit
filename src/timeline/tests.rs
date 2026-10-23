@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
-use gtk::{glib, Box, Button, Label, Orientation, Picture, TextView, ToggleButton, Widget};
+use gtk::{glib, Box, Button, Image, Label, Orientation, Picture, TextView, ToggleButton, Widget};
 
 use crate::message_markup::MessageRenderContext;
 use crate::models::{
@@ -367,10 +367,10 @@ fn cached_gif_picker_message_renders_titled_placeholder() {
     });
 }
 
-struct TempTestDir(PathBuf);
+pub(crate) struct TempTestDir(PathBuf);
 
 impl TempTestDir {
-    fn new(prefix: &str) -> Self {
+    pub(crate) fn new(prefix: &str) -> Self {
         static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -381,7 +381,7 @@ impl TempTestDir {
         Self(dir)
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -1820,15 +1820,12 @@ fn test_reaction_and_quick_bar_images_sized_to_32px() {
         assert_eq!(paintable.intrinsic_width(), 32);
         assert_eq!(paintable.intrinsic_height(), 32);
 
-        // 3. Add-reaction SVG widget sizing
+        // 3. Add-reaction pill icon: themed symbolic icon, emoji-height box
         let add_widget = load_add_reaction_widget();
-        let add_pic = add_widget.downcast::<Picture>().expect("expected Picture");
-        assert_eq!(add_pic.width_request(), 32);
-        assert_eq!(add_pic.height_request(), 32);
-        assert!(add_pic.can_shrink());
-        let add_paintable = add_pic.paintable().expect("expected paintable");
-        assert_eq!(add_paintable.intrinsic_width(), 32);
-        assert_eq!(add_paintable.intrinsic_height(), 32);
+        let add_icon = add_widget.downcast::<Image>().expect("expected Image");
+        assert_eq!(add_icon.icon_name().as_deref(), Some(ADD_REACTION_ICON));
+        assert_eq!(add_icon.pixel_size(), ADD_REACTION_ICON_SIZE);
+        assert_eq!(add_icon.height_request(), 32);
 
         // 4. Quick bar button sizing
         let quick_bar = Box::new(Orientation::Horizontal, 2);
@@ -1879,6 +1876,18 @@ fn test_reaction_and_quick_bar_images_sized_to_32px() {
         assert_eq!(btn_pic.width_request(), 32);
         assert_eq!(btn_pic.height_request(), 32);
         assert!(btn_pic.can_shrink());
+
+        // Quick bar add-reaction uses the same emoji-sized icon as the pills.
+        let add_btn = quick_bar
+            .observe_children()
+            .into_iter()
+            .filter_map(|w| w.ok()?.downcast::<Button>().ok())
+            .find(|b| b.tooltip_text().as_deref() == Some("Add reaction..."))
+            .expect("add reaction button");
+        let add_child = add_btn.child().expect("button child");
+        let add_child = add_child.downcast::<Image>().expect("expected Image");
+        assert_eq!(add_child.icon_name().as_deref(), Some(ADD_REACTION_ICON));
+        assert_eq!(add_child.pixel_size(), ADD_REACTION_ICON_SIZE);
     });
 }
 

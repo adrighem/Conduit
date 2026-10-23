@@ -62,10 +62,9 @@ pub(crate) fn rebuild_quick_bar(
         quick_bar.append(&btn);
     }
 
-    let add_pic = load_add_reaction_widget();
     let add_btn = Button::new();
     add_btn.set_focus_on_click(false);
-    add_btn.set_child(Some(&add_pic));
+    add_btn.set_child(Some(&load_add_reaction_widget()));
     add_btn.add_css_class("flat");
     add_btn.add_css_class("circular");
     add_btn.set_tooltip_text(Some("Add reaction..."));

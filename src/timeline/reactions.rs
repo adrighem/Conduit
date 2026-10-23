@@ -11,7 +11,10 @@ use crate::models::SlackMessage;
 
 pub const REACTION_EMOJI_SIZE: i32 = 32;
 
-pub const ADD_REACTION_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" width="32" height="32" fill="currentColor"><path fill="currentColor" d="M10.28 4.117a7 7 0 1 0 5.604 5.604A2.5 2.5 0 0 1 13 7.25v-.251h-.251a2.5 2.5 0 0 1-2.47-2.883Z"/><path fill="currentColor" fill-rule="evenodd" d="M15.5 1a.75.75 0 0 1 .75.75v2h2a.75.75 0 0 1 0 1.5h-2v2a.75.75 0 0 1-1.5 0v-2h-2a.75.75 0 0 1 0-1.5h2v-2A.75.75 0 0 1 15.5 1Zm-13 10a6.5 6.5 0 0 1 7.166-6.466.75.75 0 0 0 .152-1.493 8 8 0 1 0 7.14 7.139.75.75 0 0 0-1.492.152A6.525 6.525 0 0 1 15.5 11a6.5 6.5 0 1 1-13 0Zm4.25-.5a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Zm4.5 0a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5ZM9 15c1.277 0 2.553-.724 3.06-2.173.148-.426-.209-.827-.66-.827H6.6c-.452 0-.808.4-.66.827C6.448 14.276 7.724 15 9 15Z" clip-rule="evenodd"/></svg>"#;
+/// Themed symbolic icon (gresource) for every "Add reaction..." button.
+pub const ADD_REACTION_ICON: &str = "reaction-add-symbolic";
+/// Glyph size matching the visual weight of a 32px emoji.
+pub const ADD_REACTION_ICON_SIZE: i32 = 24;
 
 /// Wrapping row for chips and pills: natural-width children, 4px gaps.
 pub fn new_chip_wrap_box() -> adw::WrapBox {
@@ -69,28 +72,12 @@ pub fn load_custom_emoji_picture(path: &Path) -> Widget {
     pic.upcast::<Widget>()
 }
 
+/// Add-reaction icon for the quick bar and reaction pills: a symbolic icon
+/// sized to sit with the emoji next to it, boxed to the emoji height.
 pub fn load_add_reaction_widget() -> Widget {
-    let pic = Picture::new();
-    pic.set_size_request(32, 32);
-    pic.set_can_shrink(true);
-    pic.set_content_fit(gtk::ContentFit::Cover);
-    pic.add_css_class("reaction-emoji-image");
-
-    if let Ok(loader) = gdk_pixbuf::PixbufLoader::with_type("svg") {
-        if loader.write(ADD_REACTION_SVG.as_bytes()).is_ok() && loader.close().is_ok() {
-            if let Some(pixbuf) = loader.pixbuf() {
-                if let Some(scaled) = pixbuf.scale_simple(32, 32, gdk_pixbuf::InterpType::Bilinear)
-                {
-                    let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
-                    pic.set_paintable(Some(&texture));
-                    return pic.upcast::<Widget>();
-                }
-            }
-        }
-    }
-    let icon = Image::from_icon_name("list-add-symbolic");
-    icon.set_pixel_size(32);
-    icon.add_css_class("reaction-emoji-image");
+    let icon = Image::from_icon_name(ADD_REACTION_ICON);
+    icon.set_pixel_size(ADD_REACTION_ICON_SIZE);
+    icon.set_size_request(REACTION_EMOJI_SIZE, REACTION_EMOJI_SIZE);
     icon.upcast::<Widget>()
 }
 

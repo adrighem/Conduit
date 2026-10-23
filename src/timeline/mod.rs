@@ -9,6 +9,8 @@ pub mod row;
 pub(crate) mod tests;
 pub mod text;
 pub mod view;
+#[cfg(test)]
+mod visual_tests;
 
 pub use crate::message_markup::MessageRenderContext;
 pub use actions::*;
