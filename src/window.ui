@@ -415,9 +415,18 @@
                                       </object>
                                     </child>
                                     <child>
-                                      <object class="GtkToggleButton" id="sidebar_unread_filter_button">
+                                      <object class="GtkLabel" id="sidebar_unread_filter_label">
                                         <property name="label" translatable="yes">Unread</property>
+                                        <property name="mnemonic-widget">sidebar_unread_filter_switch</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkSwitch" id="sidebar_unread_filter_switch">
+                                        <property name="valign">center</property>
                                         <property name="tooltip-text" translatable="yes">Show Only Unread Conversations</property>
+                                        <accessibility>
+                                          <relation name="labelled-by">sidebar_unread_filter_label</relation>
+                                        </accessibility>
                                       </object>
                                     </child>
                                   </object>

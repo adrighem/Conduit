@@ -231,7 +231,7 @@ mod imp {
         #[template_child]
         pub sidebar_filter_entry: TemplateChild<gtk::SearchEntry>,
         #[template_child]
-        pub sidebar_unread_filter_button: TemplateChild<gtk::ToggleButton>,
+        pub sidebar_unread_filter_switch: TemplateChild<gtk::Switch>,
         #[template_child]
         pub conversation_list: TemplateChild<gtk::ListView>,
         #[template_child]
@@ -4462,11 +4462,12 @@ impl ConduitWindow {
         });
 
         let weak_window = self.downgrade();
-        imp.sidebar_unread_filter_button.connect_toggled(move |_| {
-            if let Some(window) = weak_window.upgrade() {
-                window.queue_ui_invalidations(UiInvalidations::SIDEBAR);
-            }
-        });
+        imp.sidebar_unread_filter_switch
+            .connect_active_notify(move |_| {
+                if let Some(window) = weak_window.upgrade() {
+                    window.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+                }
+            });
 
         self.connect_text_view_send_shortcut(&imp.message_entry.get(), |window| {
             window.post_current_message()
@@ -5960,6 +5961,7 @@ impl ConduitWindow {
         let top_nav_bg = theme.top_nav_bg.as_deref().unwrap_or(&theme.column_bg);
         let top_nav_text = theme.top_nav_text.as_deref().unwrap_or(&theme.text_color);
         let mention_badge = theme.mention_badge.as_deref().unwrap_or("#e01e5a");
+        let active_item = &theme.active_item;
         let pill_bg =
             hex_to_rgba(&theme.active_item, 0.15).unwrap_or_else(|| "#D6ECFF".to_string());
 
@@ -5995,7 +5997,8 @@ impl ConduitWindow {
              .unread-separator-label {{ color: {}; }}\n\
              .thread-reply-pill {{ background-color: {pill_bg}; color: {}; }}\n\
              .reaction-pill-active {{ background-color: {pill_bg}; color: {}; }}\n\
-             .presence-active {{ background-color: {}; color: {}; }}\n",
+             .presence-active {{ background-color: {}; color: {}; }}\n\
+             .conduit-themed-sidebar switch:checked {{ background-color: {active_item}; }}\n",
             theme.column_bg,
             theme.text_color,
             theme.text_color,
@@ -9235,7 +9238,7 @@ impl ConduitWindow {
             self.reset_composer_upload_progress(target);
         }
         imp.sidebar_filter_entry.set_text("");
-        imp.sidebar_unread_filter_button.set_active(false);
+        imp.sidebar_unread_filter_switch.set_active(false);
         imp.workspace_title_label.set_title(&gettext("Workspace"));
         imp.workspace_title_label.set_subtitle("");
         imp.workspace_title_label.set_tooltip_text(None);
@@ -10087,7 +10090,7 @@ impl ConduitWindow {
         if changed_channel_ids.is_empty() {
             return true;
         }
-        if self.imp().sidebar_unread_filter_button.is_active() {
+        if self.imp().sidebar_unread_filter_switch.is_active() {
             // Unread state changes add or remove rows, so membership is not
             // stable enough for incremental row updates.
             return false;
@@ -10409,7 +10412,7 @@ impl ConduitWindow {
                     active_huddle_channel_id: active_huddle_channel_id.as_deref(),
                     current_user_id: imp.current_user_id.borrow().as_deref(),
                     query: imp.sidebar_filter_entry.text().as_str(),
-                    unread_only: imp.sidebar_unread_filter_button.is_active(),
+                    unread_only: imp.sidebar_unread_filter_switch.is_active(),
                     unread_thread_channel_ids: Some(&unread_thread_channel_ids),
                     read_states: Some(&imp.workspace.read_states.borrow()),
                     draft_channel_ids: Some(&self.draft_channel_ids()),

@@ -2271,7 +2271,7 @@ fn window_template_preserves_adaptive_and_accessible_boundaries() {
         "<property name=\"name\">threads</property>",
         "<property name=\"name\">files</property>",
         "<property name=\"name\">saved</property>",
-        "GtkToggleButton\" id=\"sidebar_unread_filter_button",
+        "GtkSwitch\" id=\"sidebar_unread_filter_switch",
         "Show Only Unread Conversations",
         "GtkLabel\" id=\"message_status_label",
     ] {
