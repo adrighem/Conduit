@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn quick_reactions_rank_frequency_within_latest_twenty_uses() {
+fn quick_reactions_rank_frequency_within_history_limit() {
     let mut history = [
         "heart", "eyes", "thumbsup", "fire", "heart", "eyes", "thumbsup", "fire", "heart", "eyes",
         "thumbsup", "fire", "heart", "eyes", "thumbsup", "heart", "eyes", "heart", "heart",
@@ -10,7 +10,11 @@ fn quick_reactions_rank_frequency_within_latest_twenty_uses() {
     .into_iter()
     .map(str::to_string)
     .collect::<Vec<_>>();
-    history.extend((0..20).map(|_| "rocket".to_string()));
+    // Unresolvable once-used names fill the window without changing the top
+    // four; the rockets after it fall outside the history limit.
+    let filler = config::RECENT_REACTION_HISTORY_LIMIT - history.len();
+    history.extend((0..filler).map(|index| format!("unknown_{index}")));
+    history.extend((0..config::RECENT_REACTION_HISTORY_LIMIT).map(|_| "rocket".to_string()));
     let context = MessageRenderContext {
         recent_reactions: history,
         ..Default::default()

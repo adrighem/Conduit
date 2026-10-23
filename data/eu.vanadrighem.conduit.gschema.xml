@@ -39,7 +39,7 @@
 		<key name="recent-reactions" type="as">
 			<default>[]</default>
 			<summary>Recent message reaction history</summary>
-			<description>The 20 most recently added reaction names used to rank four message quick actions.</description>
+			<description>The 50 most recently added reaction names used to rank four message quick actions.</description>
 		</key>
 		<key name="last-conversation-v1" type="(ss)">
 			<default>('', '')</default>
