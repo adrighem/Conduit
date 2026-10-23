@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/adrighem/Conduit/compare/v0.7.1...v0.8.0) (2026-10-16)
+
+
+### Features
+
+* **timeline:** group consecutive messages from same author without header ([6820e44](https://github.com/adrighem/Conduit/commit/6820e4482e5121b2adb77e0343e46366db7c8043))
+
 ## [0.7.1](https://github.com/adrighem/Conduit/compare/v0.7.0...v0.7.1) (2026-10-14)
 
 
