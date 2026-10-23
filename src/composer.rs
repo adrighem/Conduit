@@ -1339,6 +1339,11 @@ pub fn search_mention_candidates(
         right_score
             .cmp(left_score)
             .then_with(|| {
+                MentionTarget::classify(&left.user_id)
+                    .suggestion_rank()
+                    .cmp(&MentionTarget::classify(&right.user_id).suggestion_rank())
+            })
+            .then_with(|| {
                 left.display_name
                     .to_lowercase()
                     .cmp(&right.display_name.to_lowercase())

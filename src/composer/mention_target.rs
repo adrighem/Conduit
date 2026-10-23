@@ -57,6 +57,16 @@ impl<'a> MentionTarget<'a> {
         matches!(self, Self::User(_))
     }
 
+    /// Suggestion order among equally good matches: people, then user
+    /// groups, then broadcasts, as Slack lists them.
+    pub fn suggestion_rank(self) -> u8 {
+        match self {
+            Self::User(_) => 0,
+            Self::UserGroup(_) => 1,
+            Self::Broadcast(_) => 2,
+        }
+    }
+
     /// The `rich_text_section` element Slack expects for this mention.
     pub fn rich_text_element(self) -> Value {
         match self {
@@ -226,5 +236,27 @@ mod tests {
             .map(|candidate| candidate.user_id)
             .collect::<Vec<_>>();
         assert_eq!(ids, ["here", "channel", "everyone"]);
+    }
+
+    #[test]
+    fn empty_query_lists_people_before_groups_and_broadcasts() {
+        let candidate = |id: &str, name: &str| MentionCandidate {
+            user_id: id.to_string(),
+            display_name: name.to_string(),
+            full_name: None,
+            username: None,
+            search_aliases: Vec::new(),
+        };
+        let candidates = [
+            candidate("channel", "channel"),
+            candidate("S1", "devs"),
+            candidate("U2", "Zed"),
+            candidate("U1", "Ada"),
+        ];
+        let ids = crate::composer::search_mention_candidates(&candidates, "", 10)
+            .into_iter()
+            .map(|candidate| candidate.user_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["U1", "U2", "S1", "channel"]);
     }
 }
