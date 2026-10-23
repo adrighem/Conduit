@@ -64,6 +64,22 @@ fn composer_completion_description_announces_person_and_position() {
 }
 
 #[test]
+fn composer_completion_description_announces_group_mentions() {
+    let entry = ComposerCompletionEntry::Mention(MentionCandidate {
+        user_id: "S1".to_string(),
+        display_name: "devs".to_string(),
+        full_name: Some("Developers".to_string()),
+        username: None,
+        search_aliases: Vec::new(),
+    });
+
+    assert_eq!(
+        composer_completion_description(&entry, 0, 2),
+        "Group suggestion 1 of 2: devs, Developers"
+    );
+}
+
+#[test]
 fn navigation_history_keeps_distinct_bounded_visits() {
     let mut history = Vec::new();
     let threads = MainNavigationTarget::Threads;

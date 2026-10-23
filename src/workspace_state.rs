@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
     slack_timestamp_is_after, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation,
-    SlackFile, SlackMessage, SlackUser,
+    SlackFile, SlackMessage, SlackUser, SlackUserGroup,
 };
 use crate::sidebar::{UserSearchAliases, UserStatuses};
 use crate::thread_catalog::ThreadCatalog;
@@ -89,6 +89,7 @@ impl WorkspaceLifecycle {
 #[derive(Debug, Default)]
 pub(crate) struct UserDirectoryState {
     pub(crate) discovered_users: RefCell<Vec<SlackUser>>,
+    pub(crate) user_groups: RefCell<Vec<SlackUserGroup>>,
     pub(crate) user_names: RefCell<Arc<HashMap<String, String>>>,
     pub(crate) user_full_names: RefCell<Arc<HashMap<String, String>>>,
     pub(crate) user_avatar_urls: RefCell<Arc<HashMap<String, String>>>,
@@ -103,10 +104,29 @@ pub(crate) struct UserDirectoryState {
 impl UserDirectoryState {
     pub(crate) fn reset(&self) {
         self.discovered_users.borrow_mut().clear();
+        self.user_groups.borrow_mut().clear();
         self.reset_projections();
         *self.user_group_names.borrow_mut() = Arc::default();
         *self.user_group_members.borrow_mut() = Arc::default();
         self.pending_user_ids.borrow_mut().clear();
+    }
+
+    /// Replaces the user-group directory and the label and member
+    /// projections that message rendering derives from it.
+    pub(crate) fn apply_user_groups(&self, groups: Vec<SlackUserGroup>) {
+        *self.user_group_names.borrow_mut() = Arc::new(
+            groups
+                .iter()
+                .map(|group| (group.id.clone(), group.mention_label()))
+                .collect(),
+        );
+        *self.user_group_members.borrow_mut() = Arc::new(
+            groups
+                .iter()
+                .map(|group| (group.id.clone(), group.users.clone()))
+                .collect(),
+        );
+        *self.user_groups.borrow_mut() = groups;
     }
 
     pub(crate) fn reset_projections(&self) -> HashSet<String> {
@@ -3447,6 +3467,31 @@ mod tests {
     }
 
     #[test]
+    fn applying_user_groups_projects_labels_and_members() {
+        let directory = UserDirectoryState::default();
+        directory.apply_user_groups(vec![SlackUserGroup {
+            id: "S1".into(),
+            handle: Some("@devs".into()),
+            name: Some("Developers".into()),
+            users: vec!["U1".into(), "U2".into()],
+        }]);
+
+        assert_eq!(
+            directory
+                .user_group_names
+                .borrow()
+                .get("S1")
+                .map(String::as_str),
+            Some("devs")
+        );
+        assert_eq!(
+            directory.user_group_members.borrow().get("S1"),
+            Some(&vec!["U1".to_string(), "U2".to_string()])
+        );
+        assert_eq!(directory.user_groups.borrow().len(), 1);
+    }
+
+    #[test]
     fn session_reset_clears_user_directory_state() {
         let session = WorkspaceSessionState::default();
         session
@@ -3475,11 +3520,18 @@ mod tests {
             .insert("S1".into(), vec!["U1".into()]);
         session
             .user_directory
+            .user_groups
+            .borrow_mut()
+            .push(SlackUserGroup::default());
+        session
+            .user_directory
             .pending_user_ids
             .borrow_mut()
             .insert("U2".into());
 
         session.reset();
+
+        assert!(session.user_directory.user_groups.borrow().is_empty());
 
         assert!(session.user_directory.discovered_users.borrow().is_empty());
         assert!(session.user_directory.user_names.borrow().is_empty());

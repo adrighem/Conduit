@@ -1632,7 +1632,6 @@ impl SlackUserStatus {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SlackUserGroup {
     pub id: String,
@@ -1643,7 +1642,6 @@ pub struct SlackUserGroup {
 }
 
 impl SlackUserGroup {
-    #[cfg(test)]
     pub fn mention_label(&self) -> String {
         self.handle
             .as_deref()

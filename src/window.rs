@@ -34,16 +34,17 @@ use crate::attention::AttentionDecision;
 use crate::attention_settings;
 use crate::auth;
 use crate::composer::{
-    channel_candidates, channel_token_at_caret, completion_key_action, composer_draft_from_message,
-    decode_rich_composer_draft, emoji_token_at_caret, encode_rich_composer_draft,
-    expand_composer_semantic_selection, hydrate_composer_mentions, mention_candidates,
+    all_mention_candidates, channel_candidates, channel_token_at_caret, completion_key_action,
+    composer_draft_from_message, decode_rich_composer_draft, emoji_token_at_caret,
+    encode_rich_composer_draft, expand_composer_semantic_selection, hydrate_composer_mentions,
     mention_token_at_caret, message_edit_key_action, replace_channel_token, replace_emoji_token,
     replace_mention_token, search_channel_candidates, search_mention_candidates,
     serialize_composer_semantics, text_view_enter_action, text_view_text, validate_slash_command,
     ChannelCandidate, ChannelToken, CompletionKeyAction, ComposerAttachmentDraft,
     ComposerBlockKind, ComposerBlockSpan, ComposerEntityKind, ComposerEntitySpan,
-    ComposerStyleSpan, ComposerTextStyle, EmojiToken, MentionCandidate, MentionSpan, MentionToken,
-    MessageEditKeyAction, RichComposerDraft, SlashCommandValidation, TextViewEnterAction,
+    ComposerStyleSpan, ComposerTextStyle, EmojiToken, MentionCandidate, MentionSpan, MentionTarget,
+    MentionToken, MessageEditKeyAction, RichComposerDraft, SlashCommandValidation,
+    TextViewEnterAction,
 };
 use crate::config;
 use crate::conversation_catalog::ConversationTitlesCache;
@@ -1246,6 +1247,14 @@ fn composer_emoji_preview(entry: &EmojiEntry) -> gtk::Widget {
     }
 }
 
+fn composer_mention_kind(candidate: &MentionCandidate) -> &'static str {
+    if MentionTarget::classify(&candidate.user_id).is_person() {
+        "Person"
+    } else {
+        "Group"
+    }
+}
+
 fn composer_person_detail(candidate: &MentionCandidate) -> Option<String> {
     let mut details = Vec::new();
     if let Some(full_name) = candidate
@@ -1286,7 +1295,13 @@ fn composer_completion_row(entry: &ComposerCompletionEntry) -> gtk::ListBoxRow {
             )]);
         }
         ComposerCompletionEntry::Mention(candidate) => {
-            let preview = gtk::Image::from_icon_name("avatar-default-symbolic");
+            let kind = composer_mention_kind(candidate);
+            let icon_name = if kind == "Person" {
+                "avatar-default-symbolic"
+            } else {
+                "system-users-symbolic"
+            };
+            let preview = gtk::Image::from_icon_name(icon_name);
             preview.set_pixel_size(24);
 
             let labels = gtk::Box::new(gtk::Orientation::Vertical, 1);
@@ -1305,10 +1320,10 @@ fn composer_completion_row(entry: &ComposerCompletionEntry) -> gtk::ListBoxRow {
             content.append(&preview);
             content.append(&labels);
             let accessible = detail.map_or_else(
-                || format!("Person: {}", candidate.display_name),
+                || format!("{kind}: {}", candidate.display_name),
                 |detail| {
                     format!(
-                        "Person: {}, {}",
+                        "{kind}: {}, {}",
                         candidate.display_name,
                         detail.replace("  ", ", ")
                     )
@@ -1365,7 +1380,8 @@ fn composer_completion_description(
                 .map(|detail| format!(", {}", detail.replace("  ", ", ")))
                 .unwrap_or_default();
             format!(
-                "Person suggestion {position}: {}{detail}",
+                "{} suggestion {position}: {}{detail}",
+                composer_mention_kind(candidate),
                 candidate.display_name
             )
         }
@@ -6942,6 +6958,16 @@ impl ConduitWindow {
         text_view.add_controller(controller);
     }
 
+    fn composer_mention_candidates(&self) -> Vec<MentionCandidate> {
+        let workspace = &self.imp().workspace;
+        let discovered_users = workspace.user_directory.discovered_users.borrow();
+        let known_users = workspace.users.borrow();
+        all_mention_candidates(
+            discovered_users.iter().chain(known_users.values()),
+            &workspace.user_directory.user_groups.borrow(),
+        )
+    }
+
     fn refresh_composer_completion(&self, target: ComposerTarget) {
         let text_view = self.composer_text_view(target);
         let buffer = text_view.buffer();
@@ -6954,14 +6980,7 @@ impl ConduitWindow {
             !self.composer_range_intersects_semantic(target, token.start, token.end)
         });
         let (token, entries) = if let Some(token) = mention_token {
-            let candidates = mention_candidates(
-                &self
-                    .imp()
-                    .workspace
-                    .user_directory
-                    .discovered_users
-                    .borrow(),
-            );
+            let candidates = self.composer_mention_candidates();
             let entries = search_mention_candidates(&candidates, &token.query, 10)
                 .into_iter()
                 .map(ComposerCompletionEntry::Mention)
@@ -6995,7 +7014,7 @@ impl ConduitWindow {
             (token.map(ComposerCompletionToken::Emoji), entries)
         };
         let completion_list_label = match token {
-            Some(ComposerCompletionToken::Mention(_)) => "Person suggestions",
+            Some(ComposerCompletionToken::Mention(_)) => "Mention suggestions",
             Some(ComposerCompletionToken::Channel(_)) => "Channel suggestions",
             _ => "Emoji suggestions",
         };
@@ -7315,6 +7334,15 @@ impl ConduitWindow {
                     .borrow_mut() = users;
                 self.refresh_open_conversation_picker();
                 self.refresh_open_people_picker(true);
+                for target in COMPOSER_TARGETS {
+                    self.refresh_composer_completion(target);
+                }
+            }
+            RuntimeEventKind::UserGroupsDiscovered(groups) => {
+                self.imp()
+                    .workspace
+                    .user_directory
+                    .apply_user_groups(groups);
                 for target in COMPOSER_TARGETS {
                     self.refresh_composer_completion(target);
                 }

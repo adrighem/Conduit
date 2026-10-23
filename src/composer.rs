@@ -37,6 +37,10 @@ pub fn text_view_text(text_view: &gtk::TextView) -> String {
     buffer.text(&start, &end, false).to_string()
 }
 
+mod mention_target;
+
+pub use mention_target::{all_mention_candidates, MentionTarget};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmojiToken {
     pub start: usize,
@@ -53,6 +57,7 @@ pub struct MentionToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MentionCandidate {
+    /// User, user group or broadcast ID; see [`MentionTarget`].
     pub user_id: String,
     pub display_name: String,
     pub full_name: Option<String>,
@@ -85,6 +90,7 @@ pub struct ChannelInsertion {
 pub struct MentionSpan {
     pub start: usize,
     pub end: usize,
+    /// User, user group or broadcast ID; see [`MentionTarget`].
     pub user_id: String,
     pub label: String,
 }
@@ -904,7 +910,7 @@ fn composer_inline_elements(
             .find(|mention| mention.start == segment_start && mention.end == segment_end)
         {
             elements.push(styled_rich_element(
-                json!({"type": "user", "user_id": mention.user_id}),
+                MentionTarget::classify(&mention.user_id).rich_text_element(),
                 style,
             ));
             continue;
@@ -1733,9 +1739,7 @@ pub fn serialize_composer_semantics(
         }
         match span {
             SemanticSpan::Mention(span) => {
-                serialized.push_str("<@");
-                serialized.push_str(&span.user_id);
-                serialized.push('>');
+                serialized.push_str(&MentionTarget::classify(&span.user_id).fallback_markup());
             }
             SemanticSpan::Entity(span) => match &span.kind {
                 ComposerEntityKind::Link { url } if span.label == *url => {
@@ -2801,6 +2805,53 @@ mod tests {
                 {"type": "text", "text": " "},
                 {"type": "user", "user_id": "UADA", "style": {"underline": true}},
                 {"type": "text", "text": " 👋"}
+            ])
+        );
+    }
+
+    #[test]
+    fn rich_payload_encodes_group_and_broadcast_mentions() {
+        let text = "@devs @here hi";
+        let candidates = all_mention_candidates(
+            [],
+            &[crate::models::SlackUserGroup {
+                id: "S1".into(),
+                handle: Some("devs".into()),
+                name: None,
+                users: Vec::new(),
+            }],
+        );
+        let group = &search_mention_candidates(&candidates, "devs", 1)[0];
+        let broadcast = &search_mention_candidates(&candidates, "here", 1)[0];
+        let first = replace_mention_token(
+            "@dev",
+            &mention_token_at_caret("@dev", 4).expect("group token"),
+            group,
+        );
+        assert_eq!(first.text, "@devs ");
+        let second = replace_mention_token(
+            &first.text,
+            &mention_token_at_caret("@devs @he", 9).expect("broadcast token"),
+            broadcast,
+        );
+        let draft = RichComposerDraft {
+            text: text.to_string(),
+            mentions: vec![first.span, second.span],
+            ..Default::default()
+        };
+
+        let payload = draft.slack_payload().expect("non-empty payload");
+        let blocks: serde_json::Value =
+            serde_json::from_str(&payload.blocks_json).expect("valid blocks JSON");
+
+        assert_eq!(payload.fallback_text, "<!subteam^S1> <!here> hi");
+        assert_eq!(
+            blocks[0]["elements"][0]["elements"],
+            serde_json::json!([
+                {"type": "usergroup", "usergroup_id": "S1"},
+                {"type": "text", "text": " "},
+                {"type": "broadcast", "range": "here"},
+                {"type": "text", "text": " hi"}
             ])
         );
     }

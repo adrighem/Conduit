@@ -33,7 +33,7 @@ use crate::message_handoff::{
 };
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
-    SlackMessage, SlackUser, SlackUserStatus, StoredToken,
+    SlackMessage, SlackUser, SlackUserGroup, SlackUserStatus, StoredToken,
 };
 use crate::realtime::RealtimeStatus;
 use crate::services::conversation_history::ConversationHistoryService;
@@ -798,6 +798,7 @@ pub enum RuntimeEventKind {
     ConversationsLoadFailed(RuntimeFailure),
     ConversationChannelsDiscovered(Vec<SlackConversation>),
     ConversationPeopleDiscovered(Vec<SlackUser>),
+    UserGroupsDiscovered(Vec<SlackUserGroup>),
     ConversationOpenCompleted {
         channel_id: String,
     },
@@ -960,12 +961,12 @@ impl RuntimeEventKind {
             Self::AttentionNotificationCandidate { .. } => {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
             }
-            Self::ConversationChannelsDiscovered(_) | Self::ConversationPeopleDiscovered(_) => {
-                OperationContext::new(
-                    RuntimeOperation::ConversationDiscovery,
-                    RuntimeTarget::Workspace,
-                )
-            }
+            Self::ConversationChannelsDiscovered(_)
+            | Self::ConversationPeopleDiscovered(_)
+            | Self::UserGroupsDiscovered(_) => OperationContext::new(
+                RuntimeOperation::ConversationDiscovery,
+                RuntimeTarget::Workspace,
+            ),
             Self::ConversationOpenCompleted { channel_id }
             | Self::ConversationUpdateCompleted { channel_id } => OperationContext::new(
                 RuntimeOperation::OpenConversation,
@@ -5010,6 +5011,16 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationPeopleDiscovered(users));
+            // Best-effort: tokens granted before `usergroups:read` was
+            // requested get `missing_scope`, which must not block discovery.
+            match api.user_groups().await {
+                Ok(groups) => context
+                    .events
+                    .send_event(RuntimeEventKind::UserGroupsDiscovered(groups)),
+                Err(error) => {
+                    crate::debug::log("runtime", &format!("UserGroupsFetchFailed error={error:#}"))
+                }
+            }
             let channels = api.discover_conversations().await?;
             context
                 .events
