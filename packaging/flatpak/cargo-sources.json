@@ -3330,6 +3330,32 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/sourceview5/sourceview5-0.9.1.crate",
+        "sha256": "f0e07d99b15f12767aa1c84870c45667f42bf24fd6a989dc70088e32854ef56e",
+        "dest": "cargo/vendor/sourceview5-0.9.1"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"f0e07d99b15f12767aa1c84870c45667f42bf24fd6a989dc70088e32854ef56e\", \"files\": {}}",
+        "dest": "cargo/vendor/sourceview5-0.9.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/sourceview5-sys/sourceview5-sys-0.9.0.crate",
+        "sha256": "4a3759467713554a8063faa380237ee2c753e89026bbe1b8e9611d991cb106ff",
+        "dest": "cargo/vendor/sourceview5-sys-0.9.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"4a3759467713554a8063faa380237ee2c753e89026bbe1b8e9611d991cb106ff\", \"files\": {}}",
+        "dest": "cargo/vendor/sourceview5-sys-0.9.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/sqlite-wasm-rs/sqlite-wasm-rs-0.5.5.crate",
         "sha256": "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75",
         "dest": "cargo/vendor/sqlite-wasm-rs-0.5.5"
