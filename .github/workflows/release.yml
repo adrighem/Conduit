@@ -241,7 +241,8 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False \
             --disablerepo=fedora-cisco-openh264 \
             appstream cargo cmake dbus-devel desktop-file-utils gcc gettext git \
-            gdk-pixbuf2-devel gtk4-devel libadwaita-devel meson ninja-build \
+            gdk-pixbuf2-devel gtk4-devel gtksourceview5-devel libadwaita-devel \
+            meson ninja-build \
             pkgconf-pkg-config python3-gobject rpm-build rpmlint rust
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

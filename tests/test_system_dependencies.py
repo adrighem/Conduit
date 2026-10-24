@@ -15,12 +15,16 @@ from pathlib import Path
 ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
 TARGET = "x86_64-unknown-linux-gnu"
 
-# -sys crate -> (pkg-config module, Debian/Ubuntu dev package).
-SYSTEM_LIBRARIES: dict[str, tuple[str, str]] = {
-    "gtk4-sys": ("gtk4", "libgtk-4-dev"),
-    "libadwaita-sys": ("libadwaita-1", "libadwaita-1-dev"),
-    "libdbus-sys": ("dbus-1", "libdbus-1-dev"),
-    "sourceview5-sys": ("gtksourceview-5", "libgtksourceview-5-dev"),
+# -sys crate -> (pkg-config module, Debian/Ubuntu package, Fedora package).
+SYSTEM_LIBRARIES: dict[str, tuple[str, str, str]] = {
+    "gtk4-sys": ("gtk4", "libgtk-4-dev", "gtk4-devel"),
+    "libadwaita-sys": ("libadwaita-1", "libadwaita-1-dev", "libadwaita-devel"),
+    "libdbus-sys": ("dbus-1", "libdbus-1-dev", "dbus-devel"),
+    "sourceview5-sys": (
+        "gtksourceview-5",
+        "libgtksourceview-5-dev",
+        "gtksourceview5-devel",
+    ),
 }
 # Crates whose library arrives with the dev packages above, is bundled, or
 # comes from libc.
@@ -47,6 +51,7 @@ DEBIAN_MANIFESTS = (
     ".github/workflows/release.yml",
     "packaging/debian/control",
 )
+FEDORA_MANIFESTS = (".github/workflows/release.yml",)
 RPM_SPEC = "packaging/rpm/conduit.spec"
 
 
@@ -78,14 +83,24 @@ def test_every_sys_crate_is_classified(crates: set[str]) -> None:
     )
 
 
+def mentions_package(manifest: str, package: str) -> bool:
+    text = (ROOT / manifest).read_text(encoding="utf-8")
+    return re.search(rf"(?<![\w.-]){re.escape(package)}(?![\w.-])", text) is not None
+
+
 def test_system_libraries_are_installed_everywhere(crates: set[str]) -> None:
     missing = []
     for crate in sorted(crates & SYSTEM_LIBRARIES.keys()):
-        module, package = SYSTEM_LIBRARIES[crate]
-        for manifest in DEBIAN_MANIFESTS:
-            text = (ROOT / manifest).read_text(encoding="utf-8")
-            if not re.search(rf"(?<![\w.-]){re.escape(package)}(?![\w.-])", text):
-                missing.append(f"{manifest}: {package}")
+        module, debian_package, fedora_package = SYSTEM_LIBRARIES[crate]
+        missing += [
+            f"{manifest}: {package}"
+            for manifests, package in (
+                (DEBIAN_MANIFESTS, debian_package),
+                (FEDORA_MANIFESTS, fedora_package),
+            )
+            for manifest in manifests
+            if not mentions_package(manifest, package)
+        ]
         if f"pkgconfig({module})" not in (ROOT / RPM_SPEC).read_text(encoding="utf-8"):
             missing.append(f"{RPM_SPEC}: pkgconfig({module})")
     assert not missing, "missing system build dependencies:\n  " + "\n  ".join(missing)
