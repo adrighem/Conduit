@@ -1,11 +1,43 @@
 # Changelog
 
-## [0.8.0](https://github.com/adrighem/Conduit/compare/v0.7.1...v0.8.0) (2026-10-16)
+## [0.8.0](https://github.com/adrighem/Conduit/compare/v0.7.1...v0.8.0) (2026-10-24)
+
+Headline: the message timeline is now a native GTK4 subsystem, replacing the webview runtime ([35658bf](https://github.com/adrighem/Conduit/commit/35658bfbaa8270de933ee716695e55f285cfb843)).
 
 
 ### Features
 
+* **reactions:** rank quick reactions over the last 50 uses ([b34f96e](https://github.com/adrighem/Conduit/commit/b34f96e149ac33ffbcedde6848cba4f932641402))
+* **sidebar:** make the Unread filter a switch ([3e3ac8e](https://github.com/adrighem/Conduit/commit/3e3ac8ed1936825bb39a507ea2e90fb4159163e3))
+* **timeline:** diff store items on update instead of rebuilding the list ([e480008](https://github.com/adrighem/Conduit/commit/e4800083a5c3758958ab07804577acdbbb16b97b))
 * **timeline:** group consecutive messages from same author without header ([6820e44](https://github.com/adrighem/Conduit/commit/6820e4482e5121b2adb77e0343e46366db7c8043))
+* **timeline:** share one animated-image player per file across rows ([8e6d8b4](https://github.com/adrighem/Conduit/commit/8e6d8b4cfd156cc05cd357ae369c5ba97de43eae))
+
+### Bug Fixes
+
+* **cache:** stop the asset index from serving stale misses ([afac91b](https://github.com/adrighem/Conduit/commit/afac91b35edc24d3612c603fa5fed2c5c124b7a6))
+* **ci:** install gtksourceview-5 dev headers for sourceview5-sys ([2913c08](https://github.com/adrighem/Conduit/commit/2913c0876444e69a242a1ff18a7be52b34b927ea))
+* **composer:** complete external people, user groups and broadcasts ([2b58910](https://github.com/adrighem/Conduit/commit/2b589101be266dc55d485047c2bf24b8870eff9d))
+* **composer:** list people before groups and broadcasts in @ suggestions ([43441a3](https://github.com/adrighem/Conduit/commit/43441a3df7016c2116a5d70bd04cac1a0f7f6ea2))
+* **net:** stop the Slack token from being replayed to a redirect target ([8e35909](https://github.com/adrighem/Conduit/commit/8e3590927c0ab21f806dfc9e5c101d258082b34b))
+* **packaging:** vendor sourceview5 crates for Flatpak, add RPM build dep ([8b68652](https://github.com/adrighem/Conduit/commit/8b686525299d314fa68a56b4291a49fdf04c6e26))
+* **reactions:** size the add-reaction icon between emoji and actions ([533196e](https://github.com/adrighem/Conduit/commit/533196e2e88ab58fd942fc6fbeed6593339bcff4))
+* **runtime:** keep forced mark-unread from desyncing with Slack ([d675f42](https://github.com/adrighem/Conduit/commit/d675f42ed1ff9154f3278e7e031d00bef50eb251))
+* **runtime:** stop forward-only guard from re-sticking the read cursor ([98744ac](https://github.com/adrighem/Conduit/commit/98744ac0ab2c7f49c547d294e14caa07874b615b))
+* **timeline:** back off after a failed older-history page load ([6d99620](https://github.com/adrighem/Conduit/commit/6d9962001c4aa45ae0720db7706ece80df4b23e0))
+* **timeline:** cap the row-centering retry loop ([e3eb249](https://github.com/adrighem/Conduit/commit/e3eb24958c742dac51d0096a9c713f45c55514bd))
+* **timeline:** never open a Slack-provided URL as a local path ([81cd0e1](https://github.com/adrighem/Conduit/commit/81cd0e1b6b02088684c7ab0bce3189eb87dda93e))
+* **timeline:** reject images that would decompress into a memory bomb ([8bf45d3](https://github.com/adrighem/Conduit/commit/8bf45d364de62fbc3afe305cb9295b8445ac0745))
+* **timeline:** render user group mentions and open their members ([2886bc7](https://github.com/adrighem/Conduit/commit/2886bc79ff6f23dda2717b8cf7b02a6cc0d07a10))
+* **timeline:** resolve text view from click gesture instead of capturing it ([7e32a4b](https://github.com/adrighem/Conduit/commit/7e32a4b59c4b8b4a46e22d5dab3131b368fd2c2b))
+* **timeline:** restore older-history paging lost in the native rewrite ([eba20cf](https://github.com/adrighem/Conduit/commit/eba20cf9c0c8cfd34431c5250947f37e9f59ccf8))
+* **timeline:** size message emoji like Slack, jumbo matches reactions ([9f8c1ab](https://github.com/adrighem/Conduit/commit/9f8c1ab6f35967621db94f00c5412ab4a165314f))
+* **ui:** close remaining decode-bomb and local-path gaps for images ([d124408](https://github.com/adrighem/Conduit/commit/d124408c02842695fb80e230a5e4840f61186dee))
+
+### Performance Improvements
+
+* **cache:** index the asset cache instead of rescanning it per row bind ([c8340ea](https://github.com/adrighem/Conduit/commit/c8340eabcc8cb245af6c6e8de3021aa9e02a0840))
+* **window:** cache conversation titles instead of rebuilding them per render ([745b113](https://github.com/adrighem/Conduit/commit/745b113c0779344db7774c0ca6e160db8fd60fdc))
 
 ## [0.7.1](https://github.com/adrighem/Conduit/compare/v0.7.0...v0.7.1) (2026-10-14)
 
