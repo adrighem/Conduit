@@ -233,7 +233,7 @@ fn scale_to_fit(pixbuf: &gdk_pixbuf::Pixbuf, max_side: i32) -> gdk_pixbuf::Pixbu
 /// Whether `path` is in a format that can hold several frames. Reads only the
 /// header, so static images skip a full animation decode.
 pub(crate) fn may_be_animated(path: &Path) -> bool {
-    gdk_pixbuf::Pixbuf::file_info(path)
+    file_info(path)
         .and_then(|(format, _, _)| format.name())
         .is_some_and(|name| matches!(name.as_str(), "gif" | "webp"))
 }
@@ -242,7 +242,7 @@ pub(crate) fn may_be_animated(path: &Path) -> bool {
 /// headers only. Unreadable or unrecognised files fail closed, so callers
 /// must not fall back to decoding them another way.
 pub(crate) fn within_decode_budget(path: &Path) -> bool {
-    let Some((format, width, height)) = gdk_pixbuf::Pixbuf::file_info(path) else {
+    let Some((format, width, height)) = file_info(path) else {
         return false;
     };
     let (Ok(width), Ok(height)) = (u64::try_from(width), u64::try_from(height)) else {
@@ -263,6 +263,19 @@ pub(crate) fn within_decode_budget(path: &Path) -> bool {
     };
     let pixels = width.saturating_mul(height).saturating_mul(frames);
     width > 0 && height > 0 && pixels <= MAX_DECODED_PIXELS
+}
+
+/// [`gdk_pixbuf::Pixbuf::file_info`], except that files whose own headers
+/// declare more than [`MAX_DECODED_PIXELS`] are refused first: gdk-pixbuf's
+/// glycin loaders abort the process on a large enough canvas, before any
+/// budget check could run. See [`crate::image_header`].
+pub(crate) fn file_info(path: &Path) -> Option<(gdk_pixbuf::PixbufFormat, i32, i32)> {
+    let oversized = crate::image_header::declared_dimensions(path)
+        .is_some_and(|(width, height)| u64::from(width) * u64::from(height) > MAX_DECODED_PIXELS);
+    if oversized {
+        return None;
+    }
+    gdk_pixbuf::Pixbuf::file_info(path)
 }
 
 /// Number of frames in a RIFF WebP: its `ANMF` chunks, or 1 for a still.
@@ -342,10 +355,12 @@ mod tests {
     #[test]
     fn oversized_image_is_rejected_before_decoding() {
         let path = write_temp("bomb.gif", &oversized_gif());
+        // Never hand this to gdk-pixbuf: its glycin loaders abort on it.
         assert_eq!(
-            gdk_pixbuf::Pixbuf::file_info(&path).map(|(_, w, h)| (w, h)),
+            crate::image_header::declared_dimensions(&path),
             Some((30000, 30000))
         );
+        assert!(file_info(&path).is_none());
         assert!(!within_decode_budget(&path));
         assert!(animated_paintable(&path, 18).is_none());
         assert!(!STATIC_FILES.with(|files| files.borrow().contains(&path)));

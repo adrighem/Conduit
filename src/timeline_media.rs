@@ -51,7 +51,7 @@ fn declared_size(image: &MessageImage) -> Option<(u32, u32)> {
 }
 
 fn file_size(path: &Path) -> Option<(u32, u32)> {
-    let (_, width, height) = gdk_pixbuf::Pixbuf::file_info(path)?;
+    let (_, width, height) = crate::animated_image::file_info(path)?;
     Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
 }
 
