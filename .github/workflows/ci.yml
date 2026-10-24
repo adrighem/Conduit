@@ -82,6 +82,11 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
+      - name: Packaging dependency checks
+        run: |
+          python3 tests/test_system_dependencies.py
+          python3 tests/test_release_automation.py
+
       - name: Lint GitHub Actions workflows
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
