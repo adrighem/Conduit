@@ -153,6 +153,7 @@ jobs:
             appstream build-essential ca-certificates cmake debhelper \
             desktop-file-utils gettext libadwaita-1-dev libdbus-1-dev \
             gir1.2-gdkpixbuf-2.0 libgdk-pixbuf-2.0-dev libgtk-4-dev \
+            libgtksourceview-5-dev \
             lintian meson ninja-build pkgconf \
             python3 python3-gi rustup
           rustup toolchain install "$RUST_VERSION" --profile minimal

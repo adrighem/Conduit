@@ -60,6 +60,7 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             libgstreamer1.0-dev \
             libgtk-4-dev \
+            libgtksourceview-5-dev \
             meson \
             ninja-build \
             pkg-config \

@@ -13,6 +13,7 @@ Build-Depends:
  libdbus-1-dev,
  libgdk-pixbuf-2.0-dev,
  libgtk-4-dev,
+ libgtksourceview-5-dev,
  meson,
  ninja-build,
  pkgconf,
