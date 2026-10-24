@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/adrighem/Conduit/compare/v0.8.0...v0.8.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* **release:** install gtksourceview5-devel for the Fedora RPM build ([1709b97](https://github.com/adrighem/Conduit/commit/1709b9795cef9ef4e4a98dba1bbfa32c5dab608c))
+
 ## [0.8.0](https://github.com/adrighem/Conduit/compare/v0.7.1...v0.8.0) (2026-10-24)
 
 Headline: the message timeline is now a native GTK4 subsystem, replacing the webview runtime ([35658bf](https://github.com/adrighem/Conduit/commit/35658bfbaa8270de933ee716695e55f285cfb843)).
