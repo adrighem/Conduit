@@ -15,6 +15,7 @@ pub(crate) struct QuickBarState<'a> {
     pub(crate) hovered: &'a Rc<RefCell<Option<HoveredMessage>>>,
     pub(crate) current_popover: &'a Rc<RefCell<Option<gtk::Popover>>>,
     pub(crate) bar_motion: &'a gtk::EventControllerMotion,
+    pub(crate) can_mark_unread: bool,
 }
 
 pub(crate) fn rebuild_quick_bar(
@@ -30,6 +31,7 @@ pub(crate) fn rebuild_quick_bar(
         hovered,
         current_popover,
         bar_motion,
+        can_mark_unread,
     } = *state;
     while let Some(child) = quick_bar.first_child() {
         quick_bar.remove(&child);
@@ -131,20 +133,6 @@ pub(crate) fn rebuild_quick_bar(
     }
     quick_bar.append(&forward_btn);
 
-    let unread_btn = Button::from_icon_name("mail-mark-unread-symbolic");
-    unread_btn.set_focus_on_click(false);
-    unread_btn.add_css_class("flat");
-    unread_btn.add_css_class("circular");
-    unread_btn.set_tooltip_text(Some("Mark unread"));
-    {
-        let ts = ts.to_string();
-        let on_action = on_action.clone();
-        unread_btn.connect_clicked(move |_| {
-            dispatch_timeline_action(&on_action, TimelineAction::MarkUnread(ts.clone()));
-        });
-    }
-    quick_bar.append(&unread_btn);
-
     let overflow_btn = gtk::MenuButton::new();
     overflow_btn.set_focus_on_click(false);
     overflow_btn.set_icon_name("view-more-symbolic");
@@ -205,6 +193,24 @@ pub(crate) fn rebuild_quick_bar(
         });
     }
     popover_box.append(&copy_details_btn);
+
+    if can_mark_unread {
+        let unread_btn = Button::with_label("Mark unread");
+        unread_btn.set_focus_on_click(false);
+        unread_btn.add_css_class("flat");
+        {
+            let ts = ts.to_string();
+            let on_action = on_action.clone();
+            let popover_weak = popover.downgrade();
+            unread_btn.connect_clicked(move |_| {
+                dispatch_timeline_action(&on_action, TimelineAction::MarkUnread(ts.clone()));
+                if let Some(p) = popover_weak.upgrade() {
+                    p.popdown();
+                }
+            });
+        }
+        popover_box.append(&unread_btn);
+    }
 
     popover.set_child(Some(&popover_box));
     *current_popover.borrow_mut() = Some(popover.clone());

@@ -123,6 +123,7 @@ impl NativeTimelineView {
         let on_action: ActionSlot = Rc::new(RefCell::new(None));
         let hovered: Rc<RefCell<Option<HoveredMessage>>> = Rc::new(RefCell::new(None));
         let hover_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let read_mark_target: ReadMarkTarget = Rc::new(RefCell::new(None));
         // Holds the quick-bar's current overflow popover (rebuilt fresh on
         // every hover). The hover-leave debounce below queries its live
         // `is_visible()` directly instead of a manually-toggled flag, so it
@@ -210,6 +211,7 @@ impl NativeTimelineView {
         let bar_motion_for_bind = bar_motion.clone();
         let quick_bar_for_bind = quick_bar.clone();
         let overlay_for_bind = overlay.clone();
+        let read_mark_target_for_bind = read_mark_target.clone();
         let bind_row: Rc<dyn Fn(&gtk::ListItem)> = Rc::new(move |item| {
             let _bind_timer = BindTimer::start();
             let msg_obj = item
@@ -282,6 +284,7 @@ impl NativeTimelineView {
                     let overlay = overlay_for_bind.clone();
                     let context_for_hover = context_clone.clone();
                     let on_action_for_hover = on_action_clone.clone();
+                    let read_mark_target = read_mark_target_for_bind.clone();
                     Rc::new(move |event| match event {
                         HoverEvent::Enter { row, ts, reactions } => {
                             hover_generation.set(hover_generation.get().wrapping_add(1));
@@ -322,6 +325,12 @@ impl NativeTimelineView {
                                         hovered: &hovered,
                                         current_popover: &current_popover,
                                         bar_motion: &bar_motion,
+                                        // Thread read state is local-only,
+                                        // so only conversations rewind.
+                                        can_mark_unread: read_mark_target
+                                            .borrow()
+                                            .as_ref()
+                                            .is_some_and(|(_, thread_ts)| thread_ts.is_none()),
                                     },
                                 );
                             }
@@ -487,7 +496,6 @@ impl NativeTimelineView {
         // and once after new content loads - never on a per-frame tick
         // callback, which would keep the compositor/display pipeline from
         // idling for a check that's a no-op nearly all the time.
-        let read_mark_target: ReadMarkTarget = Rc::new(RefCell::new(None));
         let latest_message_ts: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let read_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let read_candidate: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));

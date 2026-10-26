@@ -219,6 +219,7 @@ mod graphical {
                 hovered: &Rc::new(RefCell::new(None)),
                 current_popover: &Rc::new(RefCell::new(None)),
                 bar_motion: &gtk::EventControllerMotion::new(),
+                can_mark_unread: true,
             };
             rebuild_quick_bar(
                 &quick_bar,

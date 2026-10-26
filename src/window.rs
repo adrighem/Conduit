@@ -386,6 +386,7 @@ mod imp {
         pub(super) people_picker_view: RefCell<Option<PeoplePickerView>>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
         pub(super) pending_last_conversation: RefCell<Option<LastConversation>>,
+        pub(super) read_hold: RefCell<ReadHold>,
         pub status_expiry_generation: Cell<u64>,
         pub pending_profile_user_id: RefCell<Option<String>>,
         pub workspace_id: RefCell<Option<String>>,
@@ -3091,6 +3092,32 @@ fn resized_end_sidebar_fraction(
     })
 }
 
+/// Conversation the user marked unread while viewing it. Auto-read stays off
+/// for it until another conversation is selected, so the rewind is not undone
+/// by the rows still on screen.
+#[derive(Debug, Default)]
+struct ReadHold(Option<String>);
+
+impl ReadHold {
+    fn hold(&mut self, channel_id: &str) {
+        self.0 = Some(channel_id.to_string());
+    }
+
+    fn holds(&self, channel_id: &str) -> bool {
+        self.0.as_deref() == Some(channel_id)
+    }
+
+    fn release(&mut self, channel_id: &str) {
+        self.0.take_if(|held| held == channel_id);
+    }
+
+    /// Selecting another conversation ends the hold; reselecting the held one
+    /// keeps it.
+    fn select(&mut self, channel_id: &str) {
+        self.0.take_if(|held| held != channel_id);
+    }
+}
+
 /// Finds the earliest message timestamp strictly after `last_read`, i.e. the
 /// unread-separator anchor. `None` if there's no `last_read` or nothing
 /// unread. Pure/order-independent over `messages` (doesn't assume sorted).
@@ -3459,6 +3486,13 @@ impl ConduitWindow {
                     self.mark_thread_read(&channel_id, &thread_ts, &ts);
                 }
                 None => {
+                    if self.imp().read_hold.borrow().holds(&channel_id) {
+                        crate::debug::log(
+                            "readstate",
+                            &format!("auto mark held channel_id={channel_id} ts={ts}"),
+                        );
+                        return;
+                    }
                     self.mark_conversation_read(&channel_id, &ts);
                 }
             },
@@ -4324,8 +4358,15 @@ impl ConduitWindow {
         });
     }
 
-    /// Bold immediately; the coordinator derives the badge from history.
-    fn mark_conversation_unread(&self, channel_id: &str, ts: &str) {
+    /// Makes `message_ts` the first unread message and holds auto-read for
+    /// this conversation until another one is selected. Bold immediately;
+    /// the coordinator derives the badge from history.
+    fn mark_conversation_unread(&self, channel_id: &str, message_ts: &str) {
+        let Some(ts) = crate::models::slack_timestamp_just_before(message_ts) else {
+            return;
+        };
+        self.imp().read_hold.borrow_mut().hold(channel_id);
+        let ts = ts.as_str();
         let changed = self
             .imp()
             .workspace
@@ -4341,6 +4382,7 @@ impl ConduitWindow {
             ts: ts.to_string(),
         });
         self.queue_ui_invalidations(UiInvalidations::SIDEBAR | UiInvalidations::MAIN);
+        self.queue_unread_separator_refresh();
     }
 
     fn setup_sidebar_list(&self) {
@@ -10795,6 +10837,12 @@ impl ConduitWindow {
                 let Some(window) = weak_window.upgrade() else {
                     return;
                 };
+                // An explicit mark read ends a mark-unread hold.
+                window
+                    .imp()
+                    .read_hold
+                    .borrow_mut()
+                    .release(&channel_id_clone);
                 window.mark_conversation_read(&channel_id_clone, &target_ts);
             });
             menu.append(&mark_read_button);
@@ -12145,6 +12193,7 @@ impl ConduitWindow {
             &format!("select_conversation channel_id={channel_id} title={title}"),
         );
         let imp = self.imp();
+        imp.read_hold.borrow_mut().select(channel_id);
         self.withdraw_conversation_notification(channel_id);
         let current_messages = imp
             .workspace

@@ -2286,6 +2286,7 @@ mod graphical {
                 hovered: &hovered,
                 current_popover: &popover,
                 bar_motion: &motion,
+                can_mark_unread: true,
             };
 
             let mut context = test_context();
@@ -2334,6 +2335,54 @@ mod graphical {
             let add_child = add_child.downcast::<Image>().expect("expected Image");
             assert_eq!(add_child.icon_name().as_deref(), Some(ADD_REACTION_ICON));
             assert_eq!(add_child.pixel_size(), ADD_REACTION_ICON_SIZE);
+        });
+    }
+
+    #[test]
+    fn quick_bar_offers_mark_unread_in_overflow_menu_on_conversation_surfaces_only() {
+        run_gtk_test(|| {
+            let overflow_labels = |can_mark_unread: bool| {
+                let quick_bar = Box::new(Orientation::Horizontal, 2);
+                let on_action: ActionSlot = Rc::new(RefCell::new(None));
+                let popover = Rc::new(RefCell::new(None));
+                let state = crate::timeline::quick_actions::QuickBarState {
+                    on_action: &on_action,
+                    hover_generation: &Rc::new(Cell::new(0)),
+                    hovered: &Rc::new(RefCell::new(None)),
+                    current_popover: &popover,
+                    bar_motion: &gtk::EventControllerMotion::new(),
+                    can_mark_unread,
+                };
+                crate::timeline::quick_actions::rebuild_quick_bar(
+                    &quick_bar,
+                    "1700000000.000100",
+                    &[],
+                    &test_context(),
+                    &state,
+                );
+                assert!(
+                    !quick_bar
+                        .observe_children()
+                        .into_iter()
+                        .filter_map(|w| w.ok()?.downcast::<Button>().ok())
+                        .any(|b| b.tooltip_text().as_deref() == Some("Mark unread")),
+                    "mark unread lives in the overflow menu, not the bar"
+                );
+                let popover_box = popover
+                    .borrow()
+                    .as_ref()
+                    .and_then(|p: &gtk::Popover| p.child())
+                    .expect("overflow popover content");
+                popover_box
+                    .observe_children()
+                    .into_iter()
+                    .filter_map(|w| w.ok()?.downcast::<Button>().ok()?.label())
+                    .map(|label| label.to_string())
+                    .collect::<Vec<_>>()
+            };
+
+            assert!(overflow_labels(true).contains(&"Mark unread".to_string()));
+            assert!(!overflow_labels(false).contains(&"Mark unread".to_string()));
         });
     }
 

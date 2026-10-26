@@ -371,6 +371,20 @@ fn slack_timestamp_parts(value: &str) -> Option<(u64, &str)> {
     Some((seconds.parse().ok()?, fraction))
 }
 
+/// The Slack timestamp one microsecond before `ts`. A read watermark there
+/// leaves `ts` itself unread, without needing the previous message loaded.
+pub(crate) fn slack_timestamp_just_before(ts: &str) -> Option<String> {
+    let (seconds, fraction) = slack_timestamp_parts(ts)?;
+    if fraction.len() > 6 {
+        return None;
+    }
+    let micros = seconds
+        .checked_mul(1_000_000)?
+        .checked_add(format!("{fraction:0<6}").parse::<u64>().ok()?)?;
+    let before = micros.checked_sub(1)?;
+    Some(format!("{}.{:06}", before / 1_000_000, before % 1_000_000))
+}
+
 pub(crate) fn is_slack_timestamp(value: &str) -> bool {
     slack_timestamp_parts(value).is_some()
 }
@@ -1735,6 +1749,29 @@ impl SlackUserProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slack_timestamp_just_before_steps_back_one_microsecond() {
+        assert_eq!(
+            slack_timestamp_just_before("1700000000.000200").as_deref(),
+            Some("1700000000.000199")
+        );
+        assert_eq!(
+            slack_timestamp_just_before("1700000000.000000").as_deref(),
+            Some("1699999999.999999")
+        );
+        assert_eq!(
+            slack_timestamp_just_before("1700000000.5").as_deref(),
+            Some("1700000000.499999")
+        );
+        assert_eq!(
+            slack_timestamp_just_before("1700000000").as_deref(),
+            Some("1699999999.999999")
+        );
+        for invalid in ["", "abc", "0.000000", "1.0000001"] {
+            assert_eq!(slack_timestamp_just_before(invalid), None, "{invalid}");
+        }
+    }
 
     #[test]
     fn message_target_url_location_reads_channel_message_and_thread() {

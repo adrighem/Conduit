@@ -1177,6 +1177,33 @@ fn earliest_unread_ts_is_none_when_everything_is_read() {
 }
 
 #[test]
+fn read_hold_lasts_until_another_conversation_is_selected() {
+    let mut hold = ReadHold::default();
+    assert!(!hold.holds("C1"));
+
+    hold.hold("C1");
+    hold.select("C1");
+    assert!(
+        hold.holds("C1"),
+        "reselecting the held conversation keeps it"
+    );
+    assert!(!hold.holds("C2"));
+
+    hold.select("C2");
+    assert!(!hold.holds("C1"), "switching away resumes auto-read");
+}
+
+#[test]
+fn read_hold_ends_on_explicit_mark_read_of_that_conversation_only() {
+    let mut hold = ReadHold::default();
+    hold.hold("C1");
+    hold.release("C2");
+    assert!(hold.holds("C1"));
+    hold.release("C1");
+    assert!(!hold.holds("C1"));
+}
+
+#[test]
 fn earliest_unread_ts_is_none_for_empty_messages() {
     assert_eq!(earliest_unread_ts(Some("1710000000.000100"), &[]), None);
 }
