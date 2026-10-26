@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::search::{SearchField, SearchQuery, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT};
 
+mod slack_names;
+
 static UNICODE_BY_CANONICAL_NAME: LazyLock<HashMap<String, Option<&'static emojis::Emoji>>> =
     LazyLock::new(|| {
         let mut by_name = HashMap::new();
@@ -87,6 +89,9 @@ impl<'a> EmojiCatalog<'a> {
                 .and_then(|emoji| emoji.with_skin_tone(skin_tone))
                 .map(|emoji| EmojiValue::Unicode(emoji.as_str()));
         }
+        if let Some(emoji) = slack_names::emoji(name) {
+            return Some(EmojiValue::Unicode(emoji));
+        }
         emojis::get_by_shortcode(name)
             .or_else(|| {
                 UNICODE_BY_CANONICAL_NAME
@@ -96,7 +101,6 @@ impl<'a> EmojiCatalog<'a> {
             })
             .or_else(|| {
                 let fallback = match name {
-                    "robot_face" => Some("robot"),
                     "slight_smile" => Some("slightly_smiling_face"),
                     other => other.strip_suffix("_face"),
                 }?;
@@ -111,8 +115,9 @@ impl<'a> EmojiCatalog<'a> {
     pub fn entries(&self) -> Vec<EmojiEntry> {
         let mut entries = emojis::iter()
             .filter_map(|emoji| {
+                let name = slack_names::name_for_emoji(emoji.as_str()).or(emoji.shortcode())?;
                 Some(EmojiEntry {
-                    name: emoji.shortcode()?.to_string(),
+                    name: name.to_string(),
                     label: emoji.name().to_string(),
                     category: category_label(emoji.group()),
                     value: EmojiValue::Unicode(emoji.as_str()),
@@ -153,6 +158,9 @@ impl<'a> EmojiCatalog<'a> {
             }
             return name.to_string();
         }
+        if let Some(canonical) = slack_names::canonical_name(name) {
+            return canonical.to_string();
+        }
         if let Some(canonical) = emojis::get_by_shortcode(name)
             .or_else(|| {
                 UNICODE_BY_CANONICAL_NAME
@@ -160,7 +168,7 @@ impl<'a> EmojiCatalog<'a> {
                     .copied()
                     .flatten()
             })
-            .and_then(|e| e.shortcode())
+            .and_then(|e| slack_names::name_for_emoji(e.as_str()).or(e.shortcode()))
         {
             return canonical.to_string();
         }
@@ -455,6 +463,46 @@ mod tests {
     }
 
     #[test]
+    fn catalog_resolves_slack_names_the_emojis_crate_lacks_or_maps_differently() {
+        let custom = HashMap::new();
+        let catalog = EmojiCatalog::new(&custom);
+
+        for (name, expected) in [
+            ("hugging_face", "🤗"),
+            ("robot_face", "🤖"),
+            ("slight_smile", "🙂"),
+            ("flag-nl", "🇳🇱"),
+            ("male-technologist", "👨‍💻"),
+            ("face_with_cowboy_hat", "🤠"),
+            ("large_green_circle", "🟢"),
+            ("umbrella", "☂️"),
+            ("satellite", "🛰️"),
+            ("email", "✉️"),
+        ] {
+            assert_eq!(catalog.resolve(name), Some(EmojiValue::Unicode(expected)));
+        }
+        assert_eq!(
+            catalog.resolve("flag-nl::skin-tone-3"),
+            None,
+            "flags have no skin tones"
+        );
+    }
+
+    #[test]
+    fn picker_and_canonical_names_use_slack_names() {
+        let custom = HashMap::new();
+        let catalog = EmojiCatalog::new(&custom);
+
+        assert_eq!(catalog.canonical_name("hugs"), "hugging_face");
+        assert_eq!(catalog.canonical_name("envelope"), "email");
+        assert!(catalog
+            .entries()
+            .iter()
+            .any(|entry| entry.name == "hugging_face" && entry.value == EmojiValue::Unicode("🤗")));
+        assert!(!catalog.entries().iter().any(|entry| entry.name == "hugs"));
+    }
+
+    #[test]
     fn catalog_resolves_slack_skin_tone_modifier_sequences() {
         let custom = HashMap::from([("approval".to_string(), "alias:+1".to_string())]);
         let catalog = EmojiCatalog::new(&custom);
@@ -466,16 +514,12 @@ mod tests {
             ("+1::skin-tone-5", "👍🏾"),
             ("+1::skin-tone-6", "👍🏿"),
             ("approval::skin-tone-3", "👍🏼"),
+            ("skin-tone-3", "🏼"),
         ] {
             assert_eq!(catalog.resolve(name), Some(EmojiValue::Unicode(expected)));
         }
 
-        for name in [
-            "skin-tone-3",
-            "+1::skin-tone-1",
-            "+1::skin-tone-7",
-            "rocket::skin-tone-3",
-        ] {
+        for name in ["+1::skin-tone-1", "+1::skin-tone-7", "rocket::skin-tone-3"] {
             assert_eq!(catalog.resolve(name), None, "resolved {name}");
         }
     }
