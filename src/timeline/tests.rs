@@ -2210,7 +2210,13 @@ mod graphical {
         run_gtk_test(|| {
             let context = test_context();
             let catalog = crate::emoji::EmojiCatalog::new(&context.custom_emojis);
-            let widget = resolve_reaction_emoji_widget("thumbsup", "+1", &context, &catalog);
+            let widget = resolve_reaction_emoji_widget(
+                "thumbsup",
+                "+1",
+                &context,
+                &catalog,
+                REACTION_EMOJI_SIZE,
+            );
             let label = widget.downcast::<Label>().ok();
             assert!(label.is_some(), "expected Label for unicode reaction");
         });
@@ -2227,8 +2233,13 @@ mod graphical {
             );
             context.custom_emojis = Arc::new(emojis);
             let catalog = crate::emoji::EmojiCatalog::new(&context.custom_emojis);
-            let widget =
-                resolve_reaction_emoji_widget("custom_cat", ":custom_cat:", &context, &catalog);
+            let widget = resolve_reaction_emoji_widget(
+                "custom_cat",
+                ":custom_cat:",
+                &context,
+                &catalog,
+                REACTION_EMOJI_SIZE,
+            );
             let bin = widget.downcast::<adw::Bin>().ok();
             assert!(
                 bin.is_some(),
@@ -2238,14 +2249,14 @@ mod graphical {
     }
 
     #[test]
-    fn test_reaction_and_quick_bar_images_sized_to_32px() {
+    fn test_reaction_images_sized_to_32px_and_quick_bar_to_20px() {
         run_gtk_test(|| {
             assert_eq!(REACTION_EMOJI_SIZE, 32);
 
             // 1. Pixbuf scaling scales to 32px max
             let large_pixbuf =
                 gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 128, 64).unwrap();
-            let scaled = scale_reaction_pixbuf(&large_pixbuf);
+            let scaled = scale_reaction_pixbuf(&large_pixbuf, REACTION_EMOJI_SIZE);
             assert_eq!(scaled.width(), 32);
             assert_eq!(scaled.height(), 16);
 
@@ -2257,7 +2268,7 @@ mod graphical {
                 .savev(&img_path, "png", &[])
                 .expect("save");
 
-            let widget = load_custom_emoji_picture(&img_path);
+            let widget = load_custom_emoji_picture(&img_path, REACTION_EMOJI_SIZE);
             let pic = widget.downcast::<Picture>().expect("expected Picture");
             assert_eq!(pic.width_request(), 32);
             assert_eq!(pic.height_request(), 32);
@@ -2267,7 +2278,7 @@ mod graphical {
             assert_eq!(paintable.intrinsic_height(), 32);
 
             // 3. Add-reaction pill icon: themed symbolic icon, emoji-height box
-            let add_widget = load_add_reaction_widget();
+            let add_widget = load_add_reaction_widget(ADD_REACTION_ICON_SIZE, REACTION_EMOJI_SIZE);
             let add_icon = add_widget.downcast::<Image>().expect("expected Image");
             assert_eq!(add_icon.icon_name().as_deref(), Some(ADD_REACTION_ICON));
             assert_eq!(add_icon.pixel_size(), ADD_REACTION_ICON_SIZE);
@@ -2320,11 +2331,11 @@ mod graphical {
                 .expect("expected reaction button");
             let btn_child = btn.child().expect("button child");
             let btn_pic = btn_child.downcast::<Picture>().expect("picture child");
-            assert_eq!(btn_pic.width_request(), 32);
-            assert_eq!(btn_pic.height_request(), 32);
+            assert_eq!(btn_pic.width_request(), QUICK_BAR_EMOJI_SIZE);
+            assert_eq!(btn_pic.height_request(), QUICK_BAR_EMOJI_SIZE);
             assert!(btn_pic.can_shrink());
 
-            // Quick bar add-reaction uses the same emoji-sized icon as the pills.
+            // Quick bar add-reaction is sized like the bar's other action icons.
             let add_btn = quick_bar
                 .observe_children()
                 .into_iter()
@@ -2334,7 +2345,7 @@ mod graphical {
             let add_child = add_btn.child().expect("button child");
             let add_child = add_child.downcast::<Image>().expect("expected Image");
             assert_eq!(add_child.icon_name().as_deref(), Some(ADD_REACTION_ICON));
-            assert_eq!(add_child.pixel_size(), ADD_REACTION_ICON_SIZE);
+            assert_eq!(add_child.pixel_size(), QUICK_BAR_ADD_REACTION_ICON_SIZE);
         });
     }
 
@@ -2393,7 +2404,7 @@ mod graphical {
             for (name, format) in [("wide.png", "png"), ("wide.jpg", "jpeg")] {
                 let path = temp_dir.path().join(name);
                 save_test_image(&path, format, 96, 48);
-                let widget = load_custom_emoji_picture(&path);
+                let widget = load_custom_emoji_picture(&path, REACTION_EMOJI_SIZE);
                 let pic = widget.downcast::<Picture>().expect("expected Picture");
                 let paintable = pic.paintable().expect("expected paintable");
                 // GTK scales at render; layout still sees the 32 px fit.
@@ -2412,7 +2423,7 @@ mod graphical {
             let temp_dir = TempTestDir::new("reaction-pixbuf");
             let path = temp_dir.path().join("big.png");
             save_test_image(&path, "png", 256, 128);
-            let widget = load_custom_emoji_picture(&path);
+            let widget = load_custom_emoji_picture(&path, REACTION_EMOJI_SIZE);
             let pic = widget.downcast::<Picture>().expect("expected Picture");
             let paintable = pic.paintable().expect("expected paintable");
             assert_eq!(cached_reaction_size(&path), (32, 16));
@@ -2429,7 +2440,7 @@ mod graphical {
             save_test_image(&path, "png", 64, 64);
             let before = crate::debug::IMAGE_DECODES.get();
             for _ in 0..40 {
-                load_custom_emoji_picture(&path);
+                load_custom_emoji_picture(&path, REACTION_EMOJI_SIZE);
             }
             assert_eq!(crate::debug::IMAGE_DECODES.get() - before, 1);
         });

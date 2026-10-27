@@ -186,7 +186,7 @@ fn test_mrkdwn_to_pango_emoji() {
     let output = mrkdwn_to_pango(input, &context);
     assert_eq!(
         output,
-        "<span font_desc=\"22px\">😄</span> and :unknown_emoji:"
+        "<span font_desc=\"20px\">😄</span> and :unknown_emoji:"
     );
 
     let mut emojis = HashMap::new();

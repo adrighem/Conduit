@@ -10,12 +10,17 @@ use super::row::register_timeline_css;
 use crate::message_markup::MessageRenderContext;
 use crate::models::SlackMessage;
 
+/// Emoji in reaction pills and emoji-only ("jumbo") messages.
 pub const REACTION_EMOJI_SIZE: i32 = 32;
+/// Emoji in the hover quick bar, next to 16px action icons.
+pub const QUICK_BAR_EMOJI_SIZE: i32 = 20;
 
 /// Themed symbolic icon (gresource) for every "Add reaction..." button.
 pub const ADD_REACTION_ICON: &str = "reaction-add-symbolic";
 /// Glyph size matching the visual weight of a 32px emoji.
 pub const ADD_REACTION_ICON_SIZE: i32 = 24;
+/// Quick bar glyph size, matching its other action icons.
+pub const QUICK_BAR_ADD_REACTION_ICON_SIZE: i32 = 16;
 
 /// Wrapping row for chips and pills: natural-width children, 4px gaps.
 pub fn new_chip_wrap_box() -> adw::WrapBox {
@@ -34,10 +39,10 @@ pub fn fit_within(width: i32, height: i32, max: i32) -> (i32, i32) {
     (scale(width), scale(height))
 }
 
-/// Scales `pixbuf` so its longest side is `REACTION_EMOJI_SIZE`, keeping the
-/// aspect ratio so non-square custom emoji are not stretched.
-pub fn scale_reaction_pixbuf(pixbuf: &gdk_pixbuf::Pixbuf) -> gdk_pixbuf::Pixbuf {
-    let (width, height) = fit_within(pixbuf.width(), pixbuf.height(), REACTION_EMOJI_SIZE);
+/// Scales `pixbuf` so its longest side is `size`, keeping the aspect ratio so
+/// non-square custom emoji are not stretched.
+pub fn scale_reaction_pixbuf(pixbuf: &gdk_pixbuf::Pixbuf, size: i32) -> gdk_pixbuf::Pixbuf {
+    let (width, height) = fit_within(pixbuf.width(), pixbuf.height(), size);
     pixbuf
         .scale_simple(width, height, gdk_pixbuf::InterpType::Bilinear)
         .unwrap_or_else(|| pixbuf.clone())
@@ -49,21 +54,22 @@ pub fn scale_reaction_pixbuf(pixbuf: &gdk_pixbuf::Pixbuf) -> gdk_pixbuf::Pixbuf 
 const IN_PROCESS_EMOJI_MAX_SIDE: u32 = 128;
 
 mod imp {
-    use std::cell::OnceCell;
+    use std::cell::{Cell, OnceCell};
 
     use gtk::gdk;
     use gtk::glib;
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
 
-    use super::{fit_within, REACTION_EMOJI_SIZE};
+    use super::fit_within;
 
-    /// A texture that reports the `REACTION_EMOJI_SIZE` box it fits in as its
-    /// intrinsic size, so layout matches a pre-scaled emoji while GTK does
-    /// the scaling when it snapshots.
+    /// A texture that reports the `size` box it fits in as its intrinsic
+    /// size, so layout matches a pre-scaled emoji while GTK does the scaling
+    /// when it snapshots.
     #[derive(Default)]
     pub struct FittedTexture {
         pub(super) texture: OnceCell<gdk::Texture>,
+        pub(super) size: Cell<i32>,
     }
 
     #[glib::object_subclass]
@@ -78,7 +84,7 @@ mod imp {
     impl FittedTexture {
         fn fitted_size(&self) -> (i32, i32) {
             self.texture.get().map_or((0, 0), |texture| {
-                fit_within(texture.width(), texture.height(), REACTION_EMOJI_SIZE)
+                fit_within(texture.width(), texture.height(), self.size.get())
             })
         }
     }
@@ -109,21 +115,21 @@ glib::wrapper! {
         @implements gtk::gdk::Paintable;
 }
 
-/// `texture` as a paintable whose intrinsic size is its `REACTION_EMOJI_SIZE`
-/// fit. Textures that already have that size are used as they are.
-fn fit_reaction_texture(texture: gtk::gdk::Texture) -> gtk::gdk::Paintable {
-    let size = fit_within(texture.width(), texture.height(), REACTION_EMOJI_SIZE);
-    if size == (texture.width(), texture.height()) {
+/// `texture` as a paintable whose intrinsic size is its `size` fit. Textures
+/// that already have that size are used as they are.
+fn fit_reaction_texture(texture: gtk::gdk::Texture, size: i32) -> gtk::gdk::Paintable {
+    if fit_within(texture.width(), texture.height(), size) == (texture.width(), texture.height()) {
         return texture.upcast();
     }
     let fitted: FittedTexture = glib::Object::new();
+    fitted.imp().size.set(size);
     let _ = fitted.imp().texture.set(texture);
     fitted.upcast()
 }
 
 /// Decodes the emoji at `path`. Small PNG and JPEG go through GTK's own
 /// decoders, at the file's size; everything else through gdk-pixbuf (glycin),
-/// scaled to `REACTION_EMOJI_SIZE` at once.
+/// scaled to `REACTION_EMOJI_SIZE` (the largest emoji size) at once.
 fn decode_reaction_texture(path: &Path) -> Option<gtk::gdk::Texture> {
     use crate::image_header::ImageFormat;
     let in_process = matches!(
@@ -146,34 +152,37 @@ fn decode_reaction_texture(path: &Path) -> Option<gtk::gdk::Texture> {
         crate::debug::ImageLoader::Pixbuf,
         || {
             let pixbuf = gdk_pixbuf::Pixbuf::from_file(path).ok()?;
-            Some(scale_reaction_pixbuf(&pixbuf))
+            Some(scale_reaction_pixbuf(&pixbuf, REACTION_EMOJI_SIZE))
         },
     )?;
     Some(gtk::gdk::Texture::for_pixbuf(&scaled))
 }
 
-pub fn load_custom_emoji_picture(path: &Path) -> Widget {
-    let paintable =
-        crate::animated_image::animated_paintable(path, REACTION_EMOJI_SIZE).or_else(|| {
-            REACTION_TEXTURE_CACHE.with(|cache| {
-                let mut map = cache.borrow_mut();
-                if let Some(texture) = map.get(path) {
-                    return Some(fit_reaction_texture(texture));
-                }
-                if !crate::animated_image::within_decode_budget(path) {
-                    return None;
-                }
-                let texture = decode_reaction_texture(path)?;
-                map.insert(path.to_path_buf(), texture.clone());
-                Some(fit_reaction_texture(texture))
-            })
-        });
+/// Custom emoji image whose longest side is `size` pixels.
+pub fn load_custom_emoji_picture(path: &Path, size: i32) -> Widget {
+    let paintable = crate::animated_image::animated_paintable(path, size).or_else(|| {
+        REACTION_TEXTURE_CACHE.with(|cache| {
+            let mut map = cache.borrow_mut();
+            if let Some(texture) = map.get(path) {
+                return Some(fit_reaction_texture(texture, size));
+            }
+            if !crate::animated_image::within_decode_budget(path) {
+                return None;
+            }
+            let texture = decode_reaction_texture(path)?;
+            map.insert(path.to_path_buf(), texture.clone());
+            Some(fit_reaction_texture(texture, size))
+        })
+    });
     let pic = match paintable {
         Some(paintable) => Picture::for_paintable(&paintable),
         // Failed or over the decode budget: decoding again would not help.
         None => Picture::new(),
     };
-    pic.set_size_request(32, 32);
+    pic.set_size_request(size, size);
+    // Centered so a roomier parent (a quick bar button) cannot stretch it.
+    pic.set_halign(gtk::Align::Center);
+    pic.set_valign(gtk::Align::Center);
     pic.set_can_shrink(true);
     pic.set_content_fit(gtk::ContentFit::Contain);
     pic.add_css_class("reaction-emoji-image");
@@ -181,41 +190,52 @@ pub fn load_custom_emoji_picture(path: &Path) -> Widget {
 }
 
 /// Add-reaction icon for the quick bar and reaction pills: a symbolic icon
-/// sized to sit with the emoji next to it, boxed to the emoji height.
-pub fn load_add_reaction_widget() -> Widget {
+/// at `icon_size`, boxed to the `emoji_size` of the emoji next to it.
+pub fn load_add_reaction_widget(icon_size: i32, emoji_size: i32) -> Widget {
     let icon = Image::from_icon_name(ADD_REACTION_ICON);
-    icon.set_pixel_size(ADD_REACTION_ICON_SIZE);
-    icon.set_size_request(REACTION_EMOJI_SIZE, REACTION_EMOJI_SIZE);
+    icon.set_pixel_size(icon_size);
+    icon.set_size_request(emoji_size, emoji_size);
     icon.upcast::<Widget>()
 }
 
+/// Unicode emoji label whose glyph spans about `size` pixels, like a custom
+/// emoji image of the same size.
+fn unicode_emoji_label(text: &str, size: i32) -> Widget {
+    let label = Label::new(Some(text));
+    let attrs = gtk::pango::AttrList::new();
+    attrs.insert(gtk::pango::AttrSize::new_size_absolute(
+        crate::message_markup::emoji_font_px(size) * gtk::pango::SCALE,
+    ));
+    label.set_attributes(Some(&attrs));
+    label.add_css_class("reaction-emoji-unicode");
+    label.upcast()
+}
+
+/// Emoji widget for `clean_name` (falling back to `raw_name`) at `size` px.
 pub fn resolve_reaction_emoji_widget(
     clean_name: &str,
     raw_name: &str,
     context: &MessageRenderContext,
     emoji_catalog: &crate::emoji::EmojiCatalog,
+    size: i32,
 ) -> Widget {
     match emoji_catalog
         .resolve(clean_name)
         .or_else(|| emoji_catalog.resolve(raw_name))
     {
-        Some(crate::emoji::EmojiValue::Unicode(ch)) => {
-            let lbl = Label::new(Some(ch));
-            lbl.add_css_class("reaction-emoji-unicode");
-            lbl.upcast()
-        }
+        Some(crate::emoji::EmojiValue::Unicode(ch)) => unicode_emoji_label(ch, size),
         Some(crate::emoji::EmojiValue::CustomImage(ref url)) => {
             if let Some(path) = crate::emoji_picker_window::resolve_custom_emoji_cached_file(url)
                 .or_else(|| resolve_cached_asset_path(url, context))
             {
-                load_custom_emoji_picture(&path)
+                load_custom_emoji_picture(&path, size)
             } else {
                 let bin = adw::Bin::new();
-                bin.set_size_request(32, 32);
+                bin.set_size_request(size, size);
                 bin.set_halign(gtk::Align::Center);
                 bin.set_valign(gtk::Align::Center);
                 let icon = Image::from_icon_name("image-missing-symbolic");
-                icon.set_pixel_size(32);
+                icon.set_pixel_size(size);
                 icon.add_css_class("reaction-emoji-image");
                 bin.set_child(Some(&icon));
 
@@ -229,7 +249,7 @@ pub fn resolve_reaction_emoji_widget(
                         return;
                     };
                     if let Some(bin) = bin_weak.upgrade() {
-                        let pic = load_custom_emoji_picture(&path);
+                        let pic = load_custom_emoji_picture(&path, size);
                         bin.set_child(Some(&pic));
                     }
                 });
@@ -239,16 +259,12 @@ pub fn resolve_reaction_emoji_widget(
         }
         None => {
             if let Some(unicode) = emojis::get(clean_name).or_else(|| emojis::get(raw_name)) {
-                let lbl = Label::new(Some(unicode.as_str()));
-                lbl.add_css_class("reaction-emoji-unicode");
-                lbl.upcast()
+                unicode_emoji_label(unicode.as_str(), size)
             } else if !clean_name.is_ascii() {
-                let lbl = Label::new(Some(clean_name));
-                lbl.add_css_class("reaction-emoji-unicode");
-                lbl.upcast()
+                unicode_emoji_label(clean_name, size)
             } else {
                 let icon = Image::from_icon_name("image-missing-symbolic");
-                icon.set_pixel_size(32);
+                icon.set_pixel_size(size);
                 icon.add_css_class("reaction-emoji-image");
                 icon.upcast()
             }
@@ -273,8 +289,13 @@ pub fn build_reactions_widget(
         let count = r.count.unwrap_or(1);
         let clean_name = raw_name.trim_matches(':');
 
-        let emoji_widget =
-            resolve_reaction_emoji_widget(clean_name, raw_name, context, &emoji_catalog);
+        let emoji_widget = resolve_reaction_emoji_widget(
+            clean_name,
+            raw_name,
+            context,
+            &emoji_catalog,
+            REACTION_EMOJI_SIZE,
+        );
 
         let has_self = if let Some(ref my_id) = context.current_user_id {
             r.users.as_ref().is_some_and(|users| users.contains(my_id))
@@ -326,7 +347,7 @@ pub fn build_reactions_widget(
         wrap_box.append(&pill_button);
     }
 
-    let add_pic = load_add_reaction_widget();
+    let add_pic = load_add_reaction_widget(ADD_REACTION_ICON_SIZE, REACTION_EMOJI_SIZE);
     let add_btn = Button::new();
     add_btn.set_focus_on_click(false);
     add_btn.set_child(Some(&add_pic));

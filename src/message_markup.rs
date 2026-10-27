@@ -9,7 +9,7 @@ use crate::config;
 use crate::emoji::{EmojiCatalog, EmojiEntry};
 use crate::models::{SlackMessage, SlackUserStatus};
 use emoji::render_emoji_shortcode_pango;
-pub use emoji::{emoji_only_names, INLINE_EMOJI_SIZE};
+pub use emoji::{emoji_font_px, emoji_only_names, INLINE_EMOJI_SIZE};
 
 mod emoji;
 #[cfg(test)]

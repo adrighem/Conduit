@@ -43,7 +43,7 @@ pub fn register_timeline_css() {
             .author-menu-button > button { padding: 0; min-width: 0; min-height: 0; }
             .reaction-pill { padding: 2px 6px; min-width: 0; min-height: 0; border-radius: 12px; }
             .reaction-pill label { min-width: 0; }
-            .reaction-emoji-unicode { font-size: 32px; line-height: 1; }
+            .reaction-emoji-unicode { line-height: 1; }
             .reaction-emoji-image { margin-top: 3px; margin-bottom: 3px; }
             .timeline-attachment { border-left: 3px solid #e0e0e0; padding-left: 8px; margin-left: 4px; }
             .timeline-media-image { border-radius: 8px; }

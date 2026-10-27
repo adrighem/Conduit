@@ -181,6 +181,12 @@ fn find_widget(widget: &Widget, predicate: &dyn Fn(&Widget) -> bool) -> Option<W
     None
 }
 
+/// Whether a unicode emoji glyph's ink side is within 10% (at least 2px) of
+/// the custom emoji `size`; glyph artwork varies per emoji.
+fn near_emoji_size(ink: u32, size: u32) -> bool {
+    ink.abs_diff(size) <= (size / 10).max(2)
+}
+
 /// Larger side of the ink drawn by `widget` rendered alone.
 fn ink_side(window: &gtk::Window, widget: &impl IsA<Widget>) -> u32 {
     let ink = render(window, widget, None)
@@ -195,7 +201,7 @@ mod graphical {
     use super::*;
 
     #[test]
-    fn quick_bar_add_reaction_sits_between_emoji_and_action_icons() {
+    fn quick_bar_emoji_render_at_20px_with_add_reaction_at_action_icon_size() {
         run_gtk_test(|| {
             register_source_icons();
             // Same stylesheet as the app, so results do not depend on test order.
@@ -203,12 +209,20 @@ mod graphical {
 
             let temp_dir = TempTestDir::new("visual-quick-bar");
             let (context, img_url) = solid_emoji_context(&temp_dir);
-            let reactions = vec![crate::emoji::EmojiEntry {
-                name: "visual_solid".to_string(),
-                label: "visual_solid".to_string(),
-                category: "Workspace",
-                value: crate::emoji::EmojiValue::CustomImage(img_url),
-            }];
+            let reactions = vec![
+                crate::emoji::EmojiEntry {
+                    name: "visual_solid".to_string(),
+                    label: "visual_solid".to_string(),
+                    category: "Workspace",
+                    value: crate::emoji::EmojiValue::CustomImage(img_url),
+                },
+                crate::emoji::EmojiEntry {
+                    name: "white_check_mark".to_string(),
+                    label: "white check mark".to_string(),
+                    category: "Symbols",
+                    value: crate::emoji::EmojiValue::Unicode("✅"),
+                },
+            ];
 
             let quick_bar = Box::new(Orientation::Horizontal, 2);
             quick_bar.add_css_class("card");
@@ -232,27 +246,28 @@ mod graphical {
             let window = show_in_window(&quick_bar);
             render(&window, &quick_bar, Some("quick-bar"));
             let inks = ink_by_tooltip(&window, &quick_bar);
+            let bar_height = quick_bar.height();
             window.destroy();
 
-            let emoji = inks[":visual_solid:"];
-            let add = inks["Add reaction..."];
-            let reply = inks["Reply in thread"];
-            let emoji_side = emoji.width.max(emoji.height) as f32;
-            let add_side = add.width.max(add.height) as f32;
-            let reply_side = reply.width.max(reply.height) as f32;
-
+            let side = |name: &str| {
+                let ink = inks[name];
+                ink.width.max(ink.height)
+            };
+            let size = crate::timeline::reactions::QUICK_BAR_EMOJI_SIZE as u32;
+            assert_eq!(side(":visual_solid:"), size, "custom quick bar emoji");
             assert!(
-                emoji_side >= 32.0,
-                "reference emoji should be at least 32px: {emoji:?}"
+                near_emoji_size(side(":white_check_mark:"), size),
+                "unicode quick bar emoji {} should match custom ({size}px)",
+                side(":white_check_mark:")
             );
+            let add = side("Add reaction...");
+            let reply = side("Reply in thread");
             assert!(
-                (0.6..=0.85).contains(&(add_side / emoji_side)),
-                "add-reaction glyph {add:?} should be 60-85% of emoji {emoji:?}"
+                add >= reply && add < size,
+                "add-reaction glyph {add} should match action icons ({reply}) and stay below emoji ({size})"
             );
-            assert!(
-                add_side > reply_side,
-                "add-reaction glyph {add:?} should read larger than action icon {reply:?}"
-            );
+            // The emoji no longer set the bar height; the icon buttons do.
+            assert!(bar_height <= 40, "quick bar is {bar_height}px tall");
         });
     }
 
@@ -300,14 +315,12 @@ mod graphical {
                 jumbo_custom >= jumbo_size,
                 "jumbo custom emoji {jumbo_custom} should match reactions ({jumbo_size}px)"
             );
-            // Glyph ink depends on the emoji font; allow its padding either way.
-            let near = |ink: u32, target: u32| ink * 4 >= target * 3 && ink * 4 <= target * 5;
             assert!(
-                near(inline_unicode, inline_custom),
+                near_emoji_size(inline_unicode, inline_custom),
                 "inline unicode {inline_unicode} should match inline custom {inline_custom}"
             );
             assert!(
-                near(jumbo_unicode, jumbo_custom),
+                near_emoji_size(jumbo_unicode, jumbo_custom),
                 "jumbo unicode {jumbo_unicode} should match jumbo custom {jumbo_custom}"
             );
         });

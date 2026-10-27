@@ -12,6 +12,16 @@ use super::{escape_pango, MessageRenderContext};
 /// Pixel size of an emoji inside message text, unicode and custom alike.
 pub const INLINE_EMOJI_SIZE: i32 = 22;
 
+/// Color emoji fonts draw glyphs about 1.12x their font size (Noto Color
+/// Emoji), while custom emoji images fill their box exactly.
+const EMOJI_FONT_SCALE: f64 = 0.9;
+
+/// Font size at which a unicode emoji's glyph spans about `size` pixels, so
+/// it matches a custom emoji image rendered at `size`.
+pub fn emoji_font_px(size: i32) -> i32 {
+    (f64::from(size) * EMOJI_FONT_SCALE).round() as i32
+}
+
 /// Most emoji a message may hold and still render jumbo, as in Slack.
 pub const JUMBO_EMOJI_LIMIT: usize = 23;
 
@@ -26,7 +36,8 @@ pub(super) fn render_emoji_shortcode_pango(
     let catalog = EmojiCatalog::new(&context.custom_emojis);
     let rendered = match catalog.resolve(&resolved_code) {
         Some(EmojiValue::Unicode(val)) => format!(
-            "<span font_desc=\"{INLINE_EMOJI_SIZE}px\">{}</span>",
+            "<span font_desc=\"{}px\">{}</span>",
+            emoji_font_px(INLINE_EMOJI_SIZE),
             escape_pango(val)
         ),
         Some(EmojiValue::CustomImage(ref url)) => format!(
@@ -110,7 +121,8 @@ mod tests {
     fn unicode_shortcode_renders_at_inline_size() {
         let context = MessageRenderContext::default();
         let (pango, consumed) = render_emoji_shortcode_pango(":smile: hi", &context).unwrap();
-        assert_eq!(pango, "<span font_desc=\"22px\">😄</span>");
+        // A 20px font draws the glyph about 22px, the inline emoji size.
+        assert_eq!(pango, "<span font_desc=\"20px\">😄</span>");
         assert_eq!(consumed, ":smile:".len());
     }
 

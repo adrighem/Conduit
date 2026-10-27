@@ -532,7 +532,13 @@ fn build_jumbo_emoji_row(names: &[String], context: &MessageRenderContext) -> Wi
     let row = new_chip_wrap_box();
     row.add_css_class("jumbo-emoji");
     for name in names {
-        let widget = resolve_reaction_emoji_widget(name, name, context, &catalog);
+        let widget = resolve_reaction_emoji_widget(
+            name,
+            name,
+            context,
+            &catalog,
+            crate::timeline::reactions::REACTION_EMOJI_SIZE,
+        );
         widget.set_tooltip_text(Some(&format!(":{name}:")));
         row.append(&widget);
     }

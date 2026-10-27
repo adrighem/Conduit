@@ -5,7 +5,10 @@ use gtk::prelude::*;
 use gtk::{Box, Button, Orientation};
 
 use super::actions::{dispatch_timeline_action, ActionSlot, HoveredMessage, TimelineAction};
-use super::reactions::{load_add_reaction_widget, resolve_reaction_emoji_widget};
+use super::reactions::{
+    load_add_reaction_widget, resolve_reaction_emoji_widget, QUICK_BAR_ADD_REACTION_ICON_SIZE,
+    QUICK_BAR_EMOJI_SIZE,
+};
 use crate::message_markup::MessageRenderContext;
 
 /// Shared hover state the quick bar buttons need to cooperate with the row.
@@ -42,8 +45,13 @@ pub(crate) fn rebuild_quick_bar(
     for entry in reactions {
         let btn = Button::new();
         btn.set_focus_on_click(false);
-        let widget =
-            resolve_reaction_emoji_widget(&entry.name, &entry.name, context, &emoji_catalog);
+        let widget = resolve_reaction_emoji_widget(
+            &entry.name,
+            &entry.name,
+            context,
+            &emoji_catalog,
+            QUICK_BAR_EMOJI_SIZE,
+        );
         btn.set_child(Some(&widget));
         btn.add_css_class("flat");
         btn.add_css_class("circular");
@@ -66,7 +74,10 @@ pub(crate) fn rebuild_quick_bar(
 
     let add_btn = Button::new();
     add_btn.set_focus_on_click(false);
-    add_btn.set_child(Some(&load_add_reaction_widget()));
+    add_btn.set_child(Some(&load_add_reaction_widget(
+        QUICK_BAR_ADD_REACTION_ICON_SIZE,
+        QUICK_BAR_EMOJI_SIZE,
+    )));
     add_btn.add_css_class("flat");
     add_btn.add_css_class("circular");
     add_btn.set_tooltip_text(Some("Add reaction..."));
