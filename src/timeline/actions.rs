@@ -77,11 +77,7 @@ pub(crate) enum TimelineAction {
 
 #[derive(Clone, Debug)]
 pub enum HoverEvent {
-    Enter {
-        row: Widget,
-        ts: String,
-        reactions: Vec<crate::emoji::EmojiEntry>,
-    },
+    Enter { row: Widget, ts: String },
     Leave,
 }
 

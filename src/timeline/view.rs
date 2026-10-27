@@ -286,7 +286,7 @@ impl NativeTimelineView {
                     let on_action_for_hover = on_action_clone.clone();
                     let read_mark_target = read_mark_target_for_bind.clone();
                     Rc::new(move |event| match event {
-                        HoverEvent::Enter { row, ts, reactions } => {
+                        HoverEvent::Enter { row, ts } => {
                             hover_generation.set(hover_generation.get().wrapping_add(1));
                             // Overlay/hit-test boundary jitter right at the bar's own
                             // edge (e.g. over the overflow button) can fire a spurious
@@ -314,10 +314,12 @@ impl NativeTimelineView {
                                 return;
                             }
                             if let Some(ctx) = context_for_hover.borrow().as_ref() {
+                                // Read on hover, not at bind: reacting
+                                // changes them without rebuilding rows.
                                 rebuild_quick_bar(
                                     &quick_bar,
                                     &ts,
-                                    &reactions,
+                                    &crate::message_markup::recent_reactions(ctx),
                                     ctx,
                                     &QuickBarState {
                                         on_action: &on_action_for_hover,

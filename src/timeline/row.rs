@@ -830,7 +830,6 @@ pub(crate) fn build_timeline_message_widget(
         let motion = gtk::EventControllerMotion::new();
         let cb_enter = cb.clone();
         let ts = message.ts.clone();
-        let reactions = crate::message_markup::recent_reactions(context);
         motion.connect_enter(move |motion, _, _| {
             let Some(row) = motion.widget() else {
                 return;
@@ -838,7 +837,6 @@ pub(crate) fn build_timeline_message_widget(
             cb_enter(HoverEvent::Enter {
                 row,
                 ts: ts.clone(),
-                reactions: reactions.clone(),
             });
         });
         let cb_leave = cb.clone();

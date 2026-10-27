@@ -284,6 +284,15 @@ fn context_delta_reaches_only_rows_showing_the_change() {
     };
     assert!(read_on.delta_from(&previous).is_empty(), "view state only");
 
+    let reacted = MessageRenderContext {
+        recent_reactions: vec!["tada".to_string()],
+        ..previous.clone()
+    };
+    assert!(
+        reacted.delta_from(&previous).is_empty(),
+        "quick bar reads recent reactions on hover"
+    );
+
     let mut renamed = previous.clone();
     Arc::make_mut(&mut renamed.user_names).insert("U1".to_string(), "Ada L.".to_string());
     renamed.image_assets.insert(

@@ -117,7 +117,8 @@ where
 impl MessageRenderContext {
     /// Rows to rebuild when this context replaces `previous`. Directory
     /// changes reach only the rows that show the changed users or images;
-    /// `last_read` and `timeline_scroll` steer the view, not row content.
+    /// `last_read` and `timeline_scroll` steer the view, and the quick bar
+    /// reads `recent_reactions` on hover, so none of them is row content.
     pub(crate) fn delta_from(&self, previous: &Self) -> ContextDelta {
         let Self {
             user_names,
@@ -134,7 +135,7 @@ impl MessageRenderContext {
             timeline_scroll: _,
             image_assets,
             failed_image_urls,
-            recent_reactions,
+            recent_reactions: _,
             custom_emojis,
             last_read: _,
             unread_separator_ts,
@@ -146,7 +147,6 @@ impl MessageRenderContext {
                 || *user_group_members != previous.user_group_members
                 || *current_user_id != previous.current_user_id
                 || *thread_ts != previous.thread_ts
-                || *recent_reactions != previous.recent_reactions
                 || *custom_emojis != previous.custom_emojis,
             ..ContextDelta::default()
         };
