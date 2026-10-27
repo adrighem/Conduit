@@ -752,6 +752,51 @@ fn older_page_backoff_grows_caps_and_resets() {
     assert_eq!(backoff.fail(now), Duration::from_secs(2));
 }
 
+#[test]
+fn store_splices_replace_only_changed_rows() {
+    let message = |ts: &str, text: &str| SlackMessage {
+        ts: ts.to_string(),
+        user: Some("U123".to_string()),
+        text: Some(text.to_string()),
+        ..Default::default()
+    };
+    let items = |messages: &[SlackMessage]| {
+        messages
+            .iter()
+            .cloned()
+            .map(TimelineMessageObject::new)
+            .collect::<Vec<_>>()
+    };
+    let old = items(&[
+        message("1700000000.000100", "a"),
+        message("1700000000.000200", "b"),
+        message("1700000000.000300", "c"),
+    ]);
+    // First row edited, middle untouched, last removed, one appended.
+    let new = items(&[
+        message("1700000000.000100", "a edited"),
+        message("1700000000.000200", "b"),
+        message("1700000000.000400", "d"),
+    ]);
+
+    let splices = super::model::store_splices(&old, &new);
+    let summary = splices
+        .iter()
+        .map(|splice| (splice.position, splice.removed, splice.inserted.len()))
+        .collect::<Vec<_>>();
+    assert_eq!(summary, [(0, 1, 1), (2, 1, 1)]);
+
+    // Out-of-order input falls back to one span between prefix and suffix.
+    let shuffled = items(&[
+        message("1700000000.000200", "b"),
+        message("1700000000.000100", "a"),
+        message("1700000000.000300", "c"),
+    ]);
+    let splices = super::model::store_splices(&old, &shuffled);
+    assert_eq!(splices.len(), 1);
+    assert_eq!((splices[0].position, splices[0].removed), (0, 2));
+}
+
 /// Tests that create GTK widgets. They run only when
 /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
 mod graphical {
@@ -1685,6 +1730,79 @@ mod graphical {
             view.set_messages(&messages, &renamed, None);
             pump(50);
             assert_eq!(rebound_rows(&view, &before).len(), before.len());
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn fresh_copy_of_cached_message_keeps_its_row() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let fresh =
+                crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                    "ts": "1700000000.000100",
+                    "user": "U123",
+                    "text": "quoted",
+                    "blocks": [{"type": "rich_text", "elements": [{
+                        "type": "rich_text_quote",
+                        "elements": [{"type": "text", "text": "quoted"}]
+                    }]}]
+                }))
+                .into_message()
+                .expect("message should normalize");
+            let cached = cached_roundtrip(fresh.clone());
+            assert!(cached.blocks.is_none() && fresh.blocks.is_some());
+
+            let view = NativeTimelineView::new();
+            view.set_messages(std::slice::from_ref(&cached), &ctx, None);
+            let row = view.store.item(1);
+            view.set_messages(std::slice::from_ref(&fresh), &ctx, None);
+
+            assert_eq!(view.store.item(1), row, "row is kept");
+            let row = row
+                .and_downcast::<TimelineMessageObject>()
+                .expect("message row");
+            assert!(row.message().blocks.is_some(), "row holds the fresh copy");
+        });
+    }
+
+    #[test]
+    fn user_changes_rebuild_only_rows_that_show_them() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let messages = [("U123", "1700000000.000200"), ("U456", "1700000000.000100")]
+                .map(|(user, ts)| SlackMessage {
+                    ts: ts.to_string(),
+                    user: Some(user.to_string()),
+                    text: Some(format!("message {ts}")),
+                    ..Default::default()
+                })
+                .to_vec();
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(400, 500);
+            window.set_child(Some(view.widget()));
+            window.present();
+            view.set_messages(&messages, &ctx, None);
+            pump(300);
+            let before = bound_row_widgets(&view);
+            assert_eq!(before.len(), 2);
+
+            // A user no row shows: nothing to rebuild.
+            let mut unrelated = ctx.clone();
+            Arc::make_mut(&mut unrelated.user_names).insert("U999".to_string(), "Zed".to_string());
+            view.set_messages(&messages, &unrelated, None);
+            pump(50);
+            assert_eq!(rebound_rows(&view, &before), Vec::<String>::new());
+
+            let mut renamed = unrelated.clone();
+            Arc::make_mut(&mut renamed.user_names).insert("U456".to_string(), "Bea".to_string());
+            view.set_messages(&messages, &renamed, None);
+            pump(50);
+            assert_eq!(
+                rebound_rows(&view, &before),
+                vec!["1700000000.000100".to_string()]
+            );
             window.destroy();
         });
     }

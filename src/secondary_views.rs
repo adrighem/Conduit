@@ -23,7 +23,7 @@ pub(crate) use model::{
 };
 pub(crate) use search::search_rows;
 
-use crate::message_markup::MessageRenderContext;
+use crate::message_markup::{ContextDelta, MessageRenderContext};
 use rows::Dispatch;
 
 const STATUS_PAGE: &str = "status";
@@ -61,6 +61,29 @@ impl SecondaryRowObject {
     fn row(&self) -> Option<Rc<SecondaryRow>> {
         self.imp().row.borrow().clone()
     }
+
+    /// Swaps in `other`'s row without rebinding, for rows that render the same.
+    fn adopt_row(&self, other: &Self) {
+        *self.imp().row.borrow_mut() = other.row();
+    }
+}
+
+/// Store edits around `kept` (ascending pairs of old and new indices whose
+/// old item stays): `(position in old, removed, new index range)` each.
+fn splices_around(
+    kept: &[(usize, usize)],
+    old_len: usize,
+    new_len: usize,
+) -> Vec<(usize, usize, std::ops::Range<usize>)> {
+    let mut splices = Vec::new();
+    let (mut old_next, mut new_next) = (0, 0);
+    for &(old_index, new_index) in kept.iter().chain([&(old_len, new_len)]) {
+        if old_index > old_next || new_index > new_next {
+            splices.push((old_next, old_index - old_next, new_next..new_index));
+        }
+        (old_next, new_next) = (old_index + 1, new_index + 1);
+    }
+    splices
 }
 
 type ActionHandler = Rc<RefCell<Option<Dispatch>>>;
@@ -257,19 +280,69 @@ impl SecondaryView {
         let preserved_offset = (self.kind.get() == Some(kind)
             && self.stack.visible_child_name().as_deref() == Some(LIST_PAGE))
         .then(|| adjustment.value());
-        *self.context.borrow_mut() = context.clone();
+        let same_kind = self.kind.get() == Some(kind);
+        let delta = context.delta_from(&self.context.replace(context.clone()));
         self.kind.set(Some(kind));
         let objects = rows
             .into_iter()
             .map(SecondaryRowObject::new)
             .collect::<Vec<_>>();
-        self.store.splice(0, self.store.n_items(), &objects);
+        if same_kind {
+            self.splice_changed(&objects, &delta);
+        } else {
+            self.store.splice(0, self.store.n_items(), &objects);
+        }
         self.stack.set_visible_child_name(LIST_PAGE);
         self.list_view
             .update_property(&[gtk::accessible::Property::Label(&kind.title())]);
         glib::idle_add_local_once(move || {
             adjustment.set_value(preserved_offset.unwrap_or(0.0));
         });
+    }
+
+    /// Replaces only the rows that render differently: kept rows (common
+    /// prefix and suffix) keep their widgets, and with them any selection.
+    fn splice_changed(&self, objects: &[SecondaryRowObject], delta: &ContextDelta) {
+        let old = (0..self.store.n_items())
+            .filter_map(|index| self.store.item(index).and_downcast::<SecondaryRowObject>())
+            .collect::<Vec<_>>();
+        let context = self.context.borrow();
+        let keeps = |old: &SecondaryRowObject, new: &SecondaryRowObject| {
+            let (Some(old), Some(new)) = (old.row(), new.row()) else {
+                return false;
+            };
+            old.renders_same(&new)
+                && match new.message() {
+                    Some(message) => !delta.affects(message, &context.custom_emojis),
+                    None => delta.is_empty(),
+                }
+        };
+        let common = old.len().min(objects.len());
+        let prefix = (0..common)
+            .take_while(|&i| keeps(&old[i], &objects[i]))
+            .count();
+        let suffix = (0..common - prefix)
+            .take_while(|&i| keeps(&old[old.len() - 1 - i], &objects[objects.len() - 1 - i]))
+            .count();
+        let kept = (0..prefix)
+            .map(|i| (i, i))
+            .chain(
+                (0..suffix)
+                    .rev()
+                    .map(|i| (old.len() - 1 - i, objects.len() - 1 - i)),
+            )
+            .collect::<Vec<_>>();
+        for &(old_index, new_index) in &kept {
+            old[old_index].adopt_row(&objects[new_index]);
+        }
+        drop(context);
+        for (position, removed, range) in splices_around(&kept, old.len(), objects.len())
+            .into_iter()
+            .rev()
+        {
+            self.store
+                .splice(position as u32, removed as u32, &objects[range]);
+        }
     }
 
     fn show_status(
@@ -470,5 +543,41 @@ mod tests {
                 ));
             });
         }
+
+        #[test]
+        fn rerendering_keeps_rows_that_render_the_same() {
+            run_gtk_test(|| {
+                let view = SecondaryView::new();
+                let context = test_context();
+                let items = |view: &SecondaryView| {
+                    (0..view.store.n_items())
+                        .map(|index| view.store.item(index).expect("row"))
+                        .collect::<Vec<_>>()
+                };
+                view.show_rows(SecondaryKind::Threads, sample_rows(), &context);
+                let before = items(&view);
+
+                view.show_rows(SecondaryKind::Threads, sample_rows(), &context);
+                assert_eq!(items(&view), before);
+
+                let mut rows = sample_rows();
+                if let SecondaryRow::Thread(row) = &mut rows[0] {
+                    row.reply_count += 1;
+                }
+                view.show_rows(SecondaryKind::Threads, rows, &context);
+                let after = items(&view);
+                assert_ne!(after[0], before[0]);
+                assert_eq!(after[1..], before[1..]);
+            });
+        }
+    }
+
+    #[test]
+    fn splices_cover_everything_between_kept_items() {
+        assert_eq!(splices_around(&[(0, 0), (1, 1)], 2, 2), []);
+        assert_eq!(
+            splices_around(&[(1, 2)], 3, 3),
+            [(0, 1, 0..2), (2, 1, 3..3)]
+        );
     }
 }

@@ -20,7 +20,7 @@
 
 Freezes come from work on the GTK main thread. These rules keep known hitches out; the `perf_guard_*` tests enforce them. The display-free guards run in plain `cargo test perf_guard` and meson "Cargo tests"; the GTK-backed guards (timeline rebinds) are graphical and run in the "Graphical tests" Xvfb target, so a full check needs both runs.
 
-- Timeline re-renders rebind only rows whose inputs changed (`MessageRenderContext::same_row_inputs`). Never put per-render values (tokens, scroll intent, image maps) into row-compared context. An arriving image rebinds only the rows that use it.
+- Timeline re-renders rebind only rows a context change reaches (`MessageRenderContext::delta_from`) and keep rows whose message renders the same (`SlackMessage::renders_same`). Never put per-render values (tokens, scroll intent, image maps) into row-compared context. An arriving image rebinds only the rows that use it.
 - Never probe image headers with gdk-pixbuf on the GTK thread for PNG, GIF, JPEG or WebP: `Pixbuf::file_info` is an out-of-process glycin call of tens of milliseconds. Use `image_header::declared_header`.
 - Render the sidebar through `queue_ui_invalidations(UiInvalidations::SIDEBAR)` (one render per frame), not `render_conversations()`.
 - Keep startup network fan-out bounded: history prefetch is capped at 12 conversations, run 3 at a time, and skipped when the cache is current. Bulk background store writes delay realtime messages through `store_batch_admission`.

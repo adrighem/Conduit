@@ -260,3 +260,68 @@ fn render_context_equality_tracks_shared_directories_and_per_render_fields() {
     };
     assert_ne!(base, thread);
 }
+
+#[test]
+fn context_delta_reaches_only_rows_showing_the_change() {
+    let previous = MessageRenderContext {
+        user_names: Arc::new(HashMap::from([
+            ("U1".to_string(), "Ada".to_string()),
+            ("U2".to_string(), "Bob".to_string()),
+        ])),
+        user_avatar_urls: Arc::new(HashMap::from([(
+            "U2".to_string(),
+            "https://avatars.test/bob.png".to_string(),
+        )])),
+        last_read: Some("1700000000.000100".to_string()),
+        ..Default::default()
+    };
+    assert!(previous.delta_from(&previous.clone()).is_empty());
+
+    let read_on = MessageRenderContext {
+        last_read: Some("1700000000.000200".to_string()),
+        timeline_scroll: TimelineScrollBehavior::Bottom,
+        ..previous.clone()
+    };
+    assert!(read_on.delta_from(&previous).is_empty(), "view state only");
+
+    let mut renamed = previous.clone();
+    Arc::make_mut(&mut renamed.user_names).insert("U1".to_string(), "Ada L.".to_string());
+    renamed.image_assets.insert(
+        "https://avatars.test/bob.png".to_string(),
+        PathBuf::from("/tmp/bob.png"),
+    );
+    renamed.unread_separator_ts = Some("1700000000.000300".to_string());
+    let delta = renamed.delta_from(&previous);
+    assert!(!delta.all);
+    assert_eq!(
+        delta.user_ids,
+        HashSet::from(["U1".to_string(), "U2".to_string()])
+    );
+    assert_eq!(
+        delta.message_ts,
+        HashSet::from(["1700000000.000300".to_string()])
+    );
+
+    let by = |user: &str, ts: &str| SlackMessage {
+        ts: ts.to_string(),
+        user: Some(user.to_string()),
+        ..Default::default()
+    };
+    let custom_emojis = HashMap::new();
+    assert!(delta.affects(&by("U1", "1700000000.000100"), &custom_emojis));
+    assert!(delta.affects(&by("U3", "1700000000.000300"), &custom_emojis));
+    assert!(!delta.affects(&by("U3", "1700000000.000100"), &custom_emojis));
+}
+
+#[test]
+fn context_delta_rebuilds_everything_for_shared_catalogs() {
+    let previous = MessageRenderContext::default();
+    let current = MessageRenderContext {
+        custom_emojis: Arc::new(HashMap::from([(
+            "parrot".to_string(),
+            "https://emoji.test/parrot.gif".to_string(),
+        )])),
+        ..Default::default()
+    };
+    assert!(current.delta_from(&previous).all);
+}

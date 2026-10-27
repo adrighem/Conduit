@@ -163,6 +163,37 @@ pub(crate) enum SecondaryAction {
 }
 
 impl SecondaryRow {
+    /// Whether both rows render the same. Messages compare by what renders
+    /// (see [`SlackMessage::renders_same`]): a cached and a fresh copy match.
+    pub(crate) fn renders_same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Thread(row), Self::Thread(other)) => {
+                row.channel_id == other.channel_id
+                    && row.channel_title == other.channel_title
+                    && row.reply_count == other.reply_count
+                    && row.participants == other.participants
+                    && row.unread == other.unread
+                    && row.unread_count == other.unread_count
+                    && row.root.renders_same(&other.root)
+            }
+            (Self::Saved(row), Self::Saved(other)) => {
+                row.channel_id == other.channel_id
+                    && row.channel_title == other.channel_title
+                    && row.message.renders_same(&other.message)
+            }
+            _ => self == other,
+        }
+    }
+
+    /// The message the row renders as a timeline message, if any.
+    pub(crate) fn message(&self) -> Option<&SlackMessage> {
+        match self {
+            Self::Thread(row) => Some(&row.root),
+            Self::Saved(row) => Some(&row.message),
+            Self::Search(_) | Self::File(_) => None,
+        }
+    }
+
     /// What activating the row (click, Enter) does.
     pub(crate) fn primary_action(&self) -> Option<SecondaryAction> {
         match self {

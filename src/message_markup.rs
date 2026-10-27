@@ -54,12 +54,71 @@ pub struct MessageRenderContext {
     pub unread_separator_ts: Option<String>,
 }
 
+/// Timeline rows a render-context change reaches; see
+/// [`MessageRenderContext::delta_from`]. Rows outside it render the same, so
+/// they keep their widgets (and any text selection) across re-renders.
+#[derive(Debug, Default)]
+pub(crate) struct ContextDelta {
+    /// Something any row may show changed (channel or group names, emoji...).
+    pub(crate) all: bool,
+    pub(crate) user_ids: HashSet<String>,
+    pub(crate) image_keys: HashSet<String>,
+    pub(crate) message_ts: HashSet<String>,
+}
+
+impl ContextDelta {
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.all
+            && self.user_ids.is_empty()
+            && self.image_keys.is_empty()
+            && self.message_ts.is_empty()
+    }
+
+    pub(crate) fn affects(
+        &self,
+        message: &SlackMessage,
+        custom_emojis: &HashMap<String, String>,
+    ) -> bool {
+        if self.all || self.message_ts.contains(&message.ts) {
+            return true;
+        }
+        if !self.user_ids.is_empty()
+            && (crate::rendering::extract_user_ids(message)
+                .iter()
+                .chain(message.reply_users.iter().flatten())
+                .any(|user_id| self.user_ids.contains(user_id)))
+        {
+            return true;
+        }
+        let catalog = EmojiCatalog::new(custom_emojis);
+        self.image_keys
+            .iter()
+            .any(|key| crate::rendering::message_uses_image_asset(message, &catalog, key))
+    }
+}
+
+/// Keys added, removed or changed between `old` and `new`.
+fn changed_keys<'a, K, V>(
+    old: &'a HashMap<K, V>,
+    new: &'a HashMap<K, V>,
+) -> impl Iterator<Item = K> + 'a
+where
+    K: Eq + std::hash::Hash + Clone,
+    V: PartialEq,
+{
+    let changed = old
+        .iter()
+        .filter(|(key, value)| new.get(*key) != Some(*value))
+        .map(|(key, _)| key.clone());
+    let added = new.keys().filter(|key| !old.contains_key(*key)).cloned();
+    changed.chain(added)
+}
+
 impl MessageRenderContext {
-    /// Whether rows bound against `self` render the same against `other`,
-    /// so a re-render can keep them. Fields rows never read, and fields with
-    /// a targeted update path, are left out; the destructuring makes every
-    /// new field pick a side.
-    pub(crate) fn same_row_inputs(&self, other: &Self) -> bool {
+    /// Rows to rebuild when this context replaces `previous`. Directory
+    /// changes reach only the rows that show the changed users or images;
+    /// `last_read` and `timeline_scroll` steer the view, not row content.
+    pub(crate) fn delta_from(&self, previous: &Self) -> ContextDelta {
         let Self {
             user_names,
             user_full_names,
@@ -72,33 +131,81 @@ impl MessageRenderContext {
             user_group_members,
             current_user_id,
             thread_ts,
+            timeline_scroll: _,
+            image_assets,
+            failed_image_urls,
             recent_reactions,
             custom_emojis,
-            // Scroll intent of one render, read by the view only.
-            timeline_scroll: _,
-            // `update_image_asset` re-renders rows once an asset arrives or
-            // fails, so a re-render need not.
-            image_assets: _,
-            failed_image_urls: _,
-            // Rows read the derived `unread_separator_ts` only.
             last_read: _,
-            // Moving the separator changes only the rows that gain or lose
-            // it; `set_messages` and `set_unread_separator` rebind just those.
-            unread_separator_ts: _,
+            unread_separator_ts,
         } = self;
-        user_names == &other.user_names
-            && user_full_names == &other.user_full_names
-            && user_avatar_urls == &other.user_avatar_urls
-            && bot_user_ids == &other.bot_user_ids
-            && conversation_titles == &other.conversation_titles
-            && private_conversation_ids == &other.private_conversation_ids
-            && user_statuses == &other.user_statuses
-            && user_group_names == &other.user_group_names
-            && user_group_members == &other.user_group_members
-            && current_user_id == &other.current_user_id
-            && thread_ts == &other.thread_ts
-            && recent_reactions == &other.recent_reactions
-            && custom_emojis == &other.custom_emojis
+        let mut delta = ContextDelta {
+            all: *conversation_titles != previous.conversation_titles
+                || *private_conversation_ids != previous.private_conversation_ids
+                || *user_group_names != previous.user_group_names
+                || *user_group_members != previous.user_group_members
+                || *current_user_id != previous.current_user_id
+                || *thread_ts != previous.thread_ts
+                || *recent_reactions != previous.recent_reactions
+                || *custom_emojis != previous.custom_emojis,
+            ..ContextDelta::default()
+        };
+        if delta.all {
+            return delta;
+        }
+        if user_names != &previous.user_names {
+            delta
+                .user_ids
+                .extend(changed_keys(user_names, &previous.user_names));
+        }
+        if user_full_names != &previous.user_full_names {
+            delta
+                .user_ids
+                .extend(changed_keys(user_full_names, &previous.user_full_names));
+        }
+        if user_avatar_urls != &previous.user_avatar_urls {
+            delta
+                .user_ids
+                .extend(changed_keys(user_avatar_urls, &previous.user_avatar_urls));
+        }
+        if user_statuses != &previous.user_statuses {
+            delta
+                .user_ids
+                .extend(changed_keys(user_statuses, &previous.user_statuses));
+        }
+        if bot_user_ids != &previous.bot_user_ids {
+            delta.user_ids.extend(
+                bot_user_ids
+                    .symmetric_difference(&previous.bot_user_ids)
+                    .cloned(),
+            );
+        }
+        delta
+            .image_keys
+            .extend(changed_keys(image_assets, &previous.image_assets));
+        delta.image_keys.extend(
+            failed_image_urls
+                .symmetric_difference(&previous.failed_image_urls)
+                .cloned(),
+        );
+        // User avatars are image assets reached through the user directory.
+        if !delta.image_keys.is_empty() {
+            delta.user_ids.extend(
+                user_avatar_urls
+                    .iter()
+                    .filter(|(_, url)| delta.image_keys.contains(*url))
+                    .map(|(user_id, _)| user_id.clone()),
+            );
+        }
+        if *unread_separator_ts != previous.unread_separator_ts {
+            delta.message_ts.extend(
+                [unread_separator_ts, &previous.unread_separator_ts]
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+        }
+        delta
     }
 
     /// The user whose name and avatar head `message`: its author, or for an

@@ -69,7 +69,10 @@ use crate::models::{
     SlackUserStatus,
 };
 use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
-use crate::rendering;
+use crate::rendering::{
+    self, attachment_image_asset_request, bounded_image_asset_request,
+    document_image_asset_request, image_asset_request, message_uses_image_asset,
+};
 use crate::runtime::{
     preview_workspace_cache_key, preview_workspace_scope, AppRuntime, ChannelInfoResult,
     OperationContext, RequestId, RuntimeCommand, RuntimeCommandRejection, RuntimeEvent,
@@ -2715,53 +2718,6 @@ fn promoted_recent_reactions<'a>(
     promoted
 }
 
-fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
-    let is_video = file.supported_media_kind() == Some("video")
-        || file
-            .mimetype
-            .as_deref()
-            .is_some_and(|m| m.starts_with("video/"))
-        || file.thumb_video.is_some();
-    let url = if is_video {
-        file.thumb_video
-            .as_deref()
-            .or(file.thumb_720.as_deref())
-            .or(file.thumb_480.as_deref())
-            .or(file.thumb_360.as_deref())
-            .or(file.url_static_preview.as_deref())
-            .or_else(|| file.preview_url())?
-    } else {
-        file.preview_url()?
-    };
-    bounded_image_asset_request(url)
-}
-
-fn attachment_image_asset_request(
-    attachment: &crate::models::SlackAttachment,
-) -> Option<(String, String)> {
-    let url = attachment
-        .image_url
-        .as_deref()
-        .or(attachment.thumb_url.as_deref())?;
-    document_image_asset_request(url)
-}
-
-/// Document images (blocks, unfurls) keep the original URL as cache key but
-/// fetch via `preview_fetch_url`: direct for allowlisted hosts, otherwise
-/// through Slack's image proxy. Must agree with `timeline_media::fetchable_url`.
-fn document_image_asset_request(url: &str) -> Option<(String, String)> {
-    let (key, _) = bounded_image_asset_request(url)?;
-    let fetch_url = crate::image_proxy::preview_fetch_url(url)?;
-    Some((key, fetch_url))
-}
-
-fn bounded_image_asset_request(url: &str) -> Option<(String, String)> {
-    if url.is_empty() || url.len() > IMAGE_ASSET_SOURCE_MAX_BYTES {
-        return None;
-    }
-    Some((url.to_string(), url.to_string()))
-}
-
 fn retain_image_asset_request(
     requests: &mut HashMap<String, String>,
     request: Option<(String, String)>,
@@ -2895,63 +2851,6 @@ fn messages_showing_image_asset(
         })
         .map(|message| message.ts.clone())
         .collect()
-}
-
-fn message_uses_image_asset(
-    message: &SlackMessage,
-    catalog: &crate::emoji::EmojiCatalog,
-    key: &str,
-) -> bool {
-    message.avatar_url() == Some(key)
-            || message
-                .files
-                .as_ref()
-                .into_iter()
-                .flatten()
-                .filter_map(image_asset_request)
-                .any(|(candidate, _)| candidate == key)
-            || message
-                .attachments
-                .as_ref()
-                .into_iter()
-                .flatten()
-                .filter_map(attachment_image_asset_request)
-                .any(|(candidate, _)| candidate == key)
-            || message
-                .document
-                .image_urls()
-                .any(|candidate| candidate == key)
-            || message
-                .reactions
-                .as_ref()
-                .into_iter()
-                .flatten()
-                .any(|r| {
-                    r.name.as_deref().is_some_and(|name| {
-                        let clean_name = name.trim_matches(':');
-                        matches!(catalog.resolve(clean_name), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if url == key)
-                    })
-                })
-            || message.text.as_deref().is_some_and(|text| {
-                let mut rest = text;
-                while let Some(start) = rest.find(':') {
-                    rest = &rest[start + 1..];
-                    if let Some(end) = rest.find(':') {
-                        let code = &rest[..end];
-                        if !code.is_empty()
-                            && code.len() <= 64
-                            && code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
-                            && matches!(catalog.resolve(code), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if url == key)
-                        {
-                            return true;
-                        }
-                        rest = &rest[end + 1..];
-                    } else {
-                        break;
-                    }
-                }
-                false
-            })
 }
 
 /// Collects every user id the rendered messages depend on (author, mentions, reactions).

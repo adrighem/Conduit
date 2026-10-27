@@ -61,11 +61,41 @@ impl TimelineMessageObject {
         self.imp().message.borrow().clone()
     }
 
+    /// Runs `f` on the message without cloning it.
+    pub(crate) fn with_message<R>(&self, f: impl FnOnce(&SlackMessage) -> R) -> R {
+        f(&self.imp().message.borrow())
+    }
+
     /// Whether both objects render the same row (kind, header, message).
+    /// A day separator only shows its day, so its message's `ts` is enough.
     pub(crate) fn same_row(&self, other: &Self) -> bool {
-        self.is_day_separator() == other.is_day_separator()
-            && self.hide_header() == other.hide_header()
-            && *self.imp().message.borrow() == *other.imp().message.borrow()
+        if self.is_day_separator() || other.is_day_separator() {
+            return self.is_day_separator() == other.is_day_separator()
+                && self.imp().message.borrow().ts == other.imp().message.borrow().ts;
+        }
+        self.hide_header() == other.hide_header()
+            && self
+                .imp()
+                .message
+                .borrow()
+                .renders_same(&other.imp().message.borrow())
+    }
+
+    /// Store order: chronological, a day separator before its first message.
+    fn order_key(&self) -> (String, bool) {
+        (
+            self.imp().message.borrow().ts.clone(),
+            !self.is_day_separator(),
+        )
+    }
+
+    /// Takes `other`'s message without rebuilding the row, so a kept row
+    /// still holds the freshest copy (e.g. wire fields a cached copy lacks).
+    pub(crate) fn adopt_message(&self, other: &Self) {
+        let message = other.imp().message.borrow();
+        if *self.imp().message.borrow() != *message {
+            *self.imp().message.borrow_mut() = message.clone();
+        }
     }
 }
 
@@ -117,10 +147,100 @@ pub(crate) fn can_group_messages(previous: &SlackMessage, current: &SlackMessage
     (0.0..180.0).contains(&delta)
 }
 
+/// One store edit: at `position` (an index into the old items), replace
+/// `removed` items with `inserted`.
+#[derive(Debug)]
+pub(crate) struct StoreSplice {
+    pub(crate) position: usize,
+    pub(crate) removed: usize,
+    pub(crate) inserted: Vec<TimelineMessageObject>,
+}
+
+/// Edits turning `old` into `new` that keep every old row rendering the
+/// same, so its widget (focus, text selection) survives. Rows are matched by
+/// store order, and kept rows adopt the fresh message. Should either list
+/// not be strictly ordered, everything between the common prefix and
+/// suffix is replaced instead.
+pub(crate) fn store_splices(
+    old: &[TimelineMessageObject],
+    new: &[TimelineMessageObject],
+) -> Vec<StoreSplice> {
+    let old_keys = old
+        .iter()
+        .map(TimelineMessageObject::order_key)
+        .collect::<Vec<_>>();
+    let new_keys = new
+        .iter()
+        .map(TimelineMessageObject::order_key)
+        .collect::<Vec<_>>();
+    let ordered = |keys: &[(String, bool)]| keys.windows(2).all(|pair| pair[0] < pair[1]);
+    if !ordered(&old_keys) || !ordered(&new_keys) {
+        return span_splice(old, new);
+    }
+
+    let mut splices = Vec::new();
+    let mut pending: Option<StoreSplice> = None;
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() || j < new.len() {
+        let order = match (old_keys.get(i), new_keys.get(j)) {
+            (Some(old_key), Some(new_key)) => old_key.cmp(new_key),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, _) => std::cmp::Ordering::Greater,
+        };
+        if order == std::cmp::Ordering::Equal && old[i].same_row(&new[j]) {
+            old[i].adopt_message(&new[j]);
+            splices.extend(pending.take());
+            i += 1;
+            j += 1;
+            continue;
+        }
+        let splice = pending.get_or_insert_with(|| StoreSplice {
+            position: i,
+            removed: 0,
+            inserted: Vec::new(),
+        });
+        if order != std::cmp::Ordering::Greater {
+            splice.removed += 1;
+            i += 1;
+        }
+        if order != std::cmp::Ordering::Less {
+            splice.inserted.push(new[j].clone());
+            j += 1;
+        }
+    }
+    splices.extend(pending);
+    splices
+}
+
+fn span_splice(old: &[TimelineMessageObject], new: &[TimelineMessageObject]) -> Vec<StoreSplice> {
+    let max_common = old.len().min(new.len());
+    let prefix = (0..max_common)
+        .take_while(|&i| old[i].same_row(&new[i]))
+        .count();
+    let suffix = (0..max_common - prefix)
+        .take_while(|&i| old[old.len() - 1 - i].same_row(&new[new.len() - 1 - i]))
+        .count();
+    let kept = (0..prefix).chain(old.len() - suffix..old.len());
+    let kept_new = (0..prefix).chain(new.len() - suffix..new.len());
+    for (old_index, new_index) in kept.zip(kept_new) {
+        old[old_index].adopt_message(&new[new_index]);
+    }
+    let removed = old.len() - prefix - suffix;
+    let inserted = new[prefix..new.len() - suffix].to_vec();
+    if removed == 0 && inserted.is_empty() {
+        return Vec::new();
+    }
+    vec![StoreSplice {
+        position: prefix,
+        removed,
+        inserted,
+    }]
+}
+
 /// Chronological store items for `messages` (newest first on input): a day
 /// separator is inserted wherever the local calendar day changes. The store
-/// is only ever rebuilt wholesale from the message list (`set_messages`) or
-/// re-spliced item-for-item (`update_image_asset`), so separators are derived
+/// is only ever rebuilt from the message list (`set_messages`, which keeps
+/// unchanged rows via `store_splices`), so separators are derived
 /// here once and can never drift out of sync with inserts or prepends.
 /// Also returns the index of `focus_ts` within the resulting items.
 pub(crate) fn build_store_items(

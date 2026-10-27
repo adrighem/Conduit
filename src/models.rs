@@ -1054,6 +1054,75 @@ impl SlackMessage {
         }
     }
 
+    /// Whether both messages render the same: equal apart from the wire
+    /// content `discard_wire_content` drops, which current `author` and
+    /// `document` already capture. Cached copies lack it, fresh ones do not.
+    pub(crate) fn renders_same(&self, other: &Self) -> bool {
+        if self.content_version != MESSAGE_CONTENT_VERSION
+            || other.content_version != MESSAGE_CONTENT_VERSION
+        {
+            return self == other;
+        }
+        let Self {
+            kind,
+            subtype,
+            user,
+            username: _,
+            text,
+            ts,
+            client_msg_id,
+            thread_ts,
+            reply_count,
+            reply_users,
+            latest_reply,
+            subscribed,
+            last_read,
+            is_starred,
+            is_thread_broadcast,
+            edited,
+            reactions,
+            files,
+            blocks: _,
+            attachments: _,
+            bot_id: _,
+            app_id: _,
+            bot_profile: _,
+            icons: _,
+            is_ephemeral,
+            author,
+            document,
+            content_version: _,
+            no_notifications,
+            room,
+            call,
+            call_id,
+        } = self;
+        *kind == other.kind
+            && *subtype == other.subtype
+            && *user == other.user
+            && *text == other.text
+            && *ts == other.ts
+            && *client_msg_id == other.client_msg_id
+            && *thread_ts == other.thread_ts
+            && *reply_count == other.reply_count
+            && *reply_users == other.reply_users
+            && *latest_reply == other.latest_reply
+            && *subscribed == other.subscribed
+            && *last_read == other.last_read
+            && *is_starred == other.is_starred
+            && *is_thread_broadcast == other.is_thread_broadcast
+            && *edited == other.edited
+            && *reactions == other.reactions
+            && *files == other.files
+            && *is_ephemeral == other.is_ephemeral
+            && *author == other.author
+            && *document == other.document
+            && *no_notifications == other.no_notifications
+            && *room == other.room
+            && *call == other.call
+            && *call_id == other.call_id
+    }
+
     /// Returns the root timestamp when this message is a reply in a thread.
     ///
     /// Slack may set `thread_ts` to the message's own timestamp for a thread

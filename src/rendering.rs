@@ -1,6 +1,6 @@
 use crate::emoji::{EmojiCatalog, EmojiValue};
 use crate::message_markup::decode_html_entity_prefix;
-use crate::models::SlackMessage;
+use crate::models::{SlackFile, SlackMessage};
 use std::collections::HashMap;
 
 pub fn extract_user_ids(message: &SlackMessage) -> Vec<String> {
@@ -75,6 +75,112 @@ pub fn extract_mentions(text: &str, ids: &mut Vec<String>) {
         }
         rest = &rest[end + 1..];
     }
+}
+
+/// Whether `message` shows image asset `key`: avatar, file preview, unfurl,
+/// document image or custom emoji (reaction or `:name:` in text).
+pub(crate) fn message_uses_image_asset(
+    message: &SlackMessage,
+    catalog: &EmojiCatalog,
+    key: &str,
+) -> bool {
+    message.avatar_url() == Some(key)
+        || message
+            .files
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .filter_map(image_asset_request)
+            .any(|(candidate, _)| candidate == key)
+        || message
+            .attachments
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .filter_map(attachment_image_asset_request)
+            .any(|(candidate, _)| candidate == key)
+        || message
+            .document
+            .image_urls()
+            .any(|candidate| candidate == key)
+        || message
+            .reactions
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .any(|r| {
+                r.name.as_deref().is_some_and(|name| {
+                    let clean_name = name.trim_matches(':');
+                    matches!(catalog.resolve(clean_name), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if url == key)
+                })
+            })
+        || message.text.as_deref().is_some_and(|text| {
+            let mut rest = text;
+            while let Some(start) = rest.find(':') {
+                rest = &rest[start + 1..];
+                if let Some(end) = rest.find(':') {
+                    let code = &rest[..end];
+                    if !code.is_empty()
+                        && code.len() <= 64
+                        && code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+                        && matches!(catalog.resolve(code), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if url == key)
+                    {
+                        return true;
+                    }
+                    rest = &rest[end + 1..];
+                } else {
+                    break;
+                }
+            }
+            false
+        })
+}
+
+pub(crate) fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
+    let is_video = file.supported_media_kind() == Some("video")
+        || file
+            .mimetype
+            .as_deref()
+            .is_some_and(|m| m.starts_with("video/"))
+        || file.thumb_video.is_some();
+    let url = if is_video {
+        file.thumb_video
+            .as_deref()
+            .or(file.thumb_720.as_deref())
+            .or(file.thumb_480.as_deref())
+            .or(file.thumb_360.as_deref())
+            .or(file.url_static_preview.as_deref())
+            .or_else(|| file.preview_url())?
+    } else {
+        file.preview_url()?
+    };
+    bounded_image_asset_request(url)
+}
+
+pub(crate) fn attachment_image_asset_request(
+    attachment: &crate::models::SlackAttachment,
+) -> Option<(String, String)> {
+    let url = attachment
+        .image_url
+        .as_deref()
+        .or(attachment.thumb_url.as_deref())?;
+    document_image_asset_request(url)
+}
+
+/// Document images (blocks, unfurls) keep the original URL as cache key but
+/// fetch via `preview_fetch_url`: direct for allowlisted hosts, otherwise
+/// through Slack's image proxy. Must agree with `timeline_media::fetchable_url`.
+pub(crate) fn document_image_asset_request(url: &str) -> Option<(String, String)> {
+    let (key, _) = bounded_image_asset_request(url)?;
+    let fetch_url = crate::image_proxy::preview_fetch_url(url)?;
+    Some((key, fetch_url))
+}
+
+pub(crate) fn bounded_image_asset_request(url: &str) -> Option<(String, String)> {
+    if url.is_empty() || url.len() > crate::asset_server::IMAGE_ASSET_SOURCE_MAX_BYTES {
+        return None;
+    }
+    Some((url.to_string(), url.to_string()))
 }
 
 /// Converts Slack mrkdwn and stray HTML into plain text for desktop notifications.

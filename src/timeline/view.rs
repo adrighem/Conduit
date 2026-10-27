@@ -9,7 +9,7 @@ use gtk::{
     SignalListItemFactory, Widget,
 };
 
-use crate::message_markup::{MessageRenderContext, TimelineScrollBehavior};
+use crate::message_markup::{ContextDelta, MessageRenderContext, TimelineScrollBehavior};
 use crate::models::SlackMessage;
 
 use super::actions::*;
@@ -1004,7 +1004,6 @@ impl NativeTimelineView {
         if self.asset_update_pending.get() {
             return;
         }
-        self.asset_update_pending.set(true);
         let this = self.clone();
         glib::idle_add_local_once(move || {
             this.asset_update_pending.set(false);
@@ -1089,10 +1088,13 @@ impl NativeTimelineView {
         // Cheap: directory snapshots are shared `Arc`s, cloned by refcount and
         // compared by pointer first (see `MessageRenderContext`).
         let previous = self.context.replace(Some(context.clone()));
-        let rows_stale = previous
-            .as_ref()
-            .is_none_or(|previous| !previous.same_row_inputs(context));
-        let previous_anchor = previous.and_then(|previous| previous.unread_separator_ts);
+        let delta = previous.as_ref().map_or_else(
+            || ContextDelta {
+                all: true,
+                ..ContextDelta::default()
+            },
+            |previous| context.delta_from(previous),
+        );
         let previous_highlight = self.highlight_ts.borrow().clone();
         *self.latest_message_ts.borrow_mut() = messages.first().map(|msg| msg.ts.clone());
         self.reset_read_candidate();
@@ -1122,38 +1124,35 @@ impl NativeTimelineView {
         let (items, focus_index) = build_store_items(messages, focus_ts, unread_ts);
         let inserted = self.splice_changed_items(&items);
         let kept = |obj: &TimelineMessageObject| !inserted.iter().any(|new| new == obj);
-        let rebound = if rows_stale {
-            // Kept rows were built against the previous context.
-            self.rebind_rows("context", kept)
+        // Kept rows were built against the previous context; rebind those
+        // that render differently under the new one, or that gain or lose
+        // the focus highlight.
+        let mut moved = Vec::new();
+        if focus_ts.is_some() {
+            moved.extend(previous_highlight.as_deref());
+            moved.extend(focus_ts);
+        }
+        let rebound = if delta.is_empty() && moved.is_empty() {
+            0
         } else {
-            // Otherwise only kept rows that gain or lose the unread separator
-            // or the focus highlight differ.
-            let mut moved = Vec::new();
-            if previous_anchor != context.unread_separator_ts {
-                moved.extend(previous_anchor.as_deref());
-                moved.extend(unread_ts);
-            }
-            if focus_ts.is_some() {
-                moved.extend(previous_highlight.as_deref());
-                moved.extend(focus_ts);
-            }
-            if moved.is_empty() {
-                0
-            } else {
-                self.rebind_rows("other", |obj| {
-                    !obj.is_day_separator()
-                        && moved.contains(&obj.message().ts.as_str())
-                        && kept(obj)
-                })
-            }
+            self.rebind_rows("context", |obj| {
+                kept(obj)
+                    && (delta.all
+                        || !obj.is_day_separator()
+                            && obj.with_message(|message| {
+                                moved.contains(&message.ts.as_str())
+                                    || delta.affects(message, &context.custom_emojis)
+                            }))
+            })
         };
         if let Some(started) = started {
             crate::debug::log(
                 "performance",
                 &format!(
-                    "timeline_set_messages rows={} inserted={} rebound={rebound} context_changed={rows_stale} elapsed_ms={:.2}",
+                    "timeline_set_messages rows={} inserted={} rebound={rebound} context_changed={} elapsed_ms={:.2}",
                     items.len(),
                     inserted.len(),
+                    !delta.is_empty(),
                     started.elapsed().as_secs_f64() * 1_000.0
                 ),
             );
@@ -1219,34 +1218,29 @@ impl NativeTimelineView {
         });
     }
 
-    /// Replaces only run of store items differing from `items`, so
-    /// update to one message rebuilds one row instead of whole timeline.
-    /// Returns inserted items.
-    fn splice_changed_items<'a>(
-        &self,
-        items: &'a [TimelineMessageObject],
-    ) -> &'a [TimelineMessageObject] {
-        let old_len = self.store.n_items() as usize;
-        let old_at = |index: usize| {
-            self.store
-                .item(index as u32)
-                .and_downcast::<TimelineMessageObject>()
-        };
-        let max_common = old_len.min(items.len());
-        let prefix = (0..max_common)
-            .take_while(|&i| old_at(i).is_some_and(|old| old.same_row(&items[i])))
-            .count();
-        let suffix = (0..max_common - prefix)
-            .take_while(|&i| {
-                old_at(old_len - 1 - i).is_some_and(|old| old.same_row(&items[items.len() - 1 - i]))
+    /// Applies `items` to the store, keeping rows that render the same.
+    /// Returns the newly inserted items.
+    fn splice_changed_items(&self, items: &[TimelineMessageObject]) -> Vec<TimelineMessageObject> {
+        let old = (0..self.store.n_items())
+            .filter_map(|index| {
+                self.store
+                    .item(index)
+                    .and_downcast::<TimelineMessageObject>()
             })
-            .count();
-        let inserted = &items[prefix..items.len() - suffix];
-        let removed = old_len - prefix - suffix;
-        if removed > 0 || !inserted.is_empty() {
-            self.store.splice(prefix as u32, removed as u32, inserted);
+            .collect::<Vec<_>>();
+        let splices = store_splices(&old, items);
+        // Back to front, so earlier positions still index the old items.
+        for splice in splices.iter().rev() {
+            self.store.splice(
+                splice.position as u32,
+                splice.removed as u32,
+                &splice.inserted,
+            );
         }
-        inserted
+        splices
+            .into_iter()
+            .flat_map(|splice| splice.inserted)
+            .collect()
     }
 
     /// Shows a plain-text placeholder (loading state, empty state, error message) in place of
