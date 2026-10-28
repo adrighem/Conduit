@@ -6,15 +6,28 @@
  */
 
 //! Defensive parsing of Slack's undocumented `client.counts` payload into
-//! the read-state baseline consumed by `crate::unread_ledger`.
+//! the read-state baseline consumed by `crate::unread_ledger` and
+//! `crate::thread_catalog`.
+
+use std::collections::HashSet;
 
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::thread_catalog::ServerThreadCounts;
 use crate::unread_ledger::ServerReadCounts;
 
-/// The conversation arrays of a `client.counts` response. Items stay raw
-/// JSON so one malformed entry cannot reject the whole snapshot.
+/// One `client.counts` snapshot: per-conversation read state plus the
+/// followed-threads summary.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ClientCounts {
+    pub(crate) conversations: Vec<ServerReadCounts>,
+    pub(crate) threads: Option<ServerThreadCounts>,
+}
+
+/// The conversation arrays and thread summary of a `client.counts`
+/// response. Items stay raw JSON so one malformed entry cannot reject the
+/// whole snapshot.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ClientCountsPayload {
     #[serde(default)]
@@ -23,9 +36,46 @@ pub(crate) struct ClientCountsPayload {
     mpims: Vec<Value>,
     #[serde(default)]
     ims: Vec<Value>,
+    #[serde(default)]
+    threads: Option<Value>,
 }
 
 impl ClientCountsPayload {
+    /// `snapshot_ts` is when the request was sent, as a Slack timestamp.
+    pub(crate) fn into_client_counts(self, snapshot_ts: &str) -> ClientCounts {
+        ClientCounts {
+            conversations: self.server_read_counts(),
+            threads: self.server_thread_counts(snapshot_ts),
+        }
+    }
+
+    /// Every conversation key under `unread_count_by_channel` counts as
+    /// having unread threads, whatever its count. Unreads without that
+    /// breakdown cannot tell read threads apart, so they yield `None`.
+    fn server_thread_counts(&self, snapshot_ts: &str) -> Option<ServerThreadCounts> {
+        let threads = self.threads.as_ref()?;
+        let has_unreads = threads.get("has_unreads").and_then(Value::as_bool)?;
+        let unread_channel_ids = threads
+            .get("unread_count_by_channel")
+            .and_then(Value::as_object)
+            .map(|by_channel| {
+                by_channel
+                    .keys()
+                    .map(|channel_id| channel_id.trim())
+                    .filter(|channel_id| !channel_id.is_empty())
+                    .map(str::to_string)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        if has_unreads && unread_channel_ids.is_empty() {
+            return None;
+        }
+        Some(ServerThreadCounts {
+            unread_channel_ids,
+            snapshot_ts: snapshot_ts.to_string(),
+        })
+    }
+
     pub(crate) fn server_read_counts(&self) -> Vec<ServerReadCounts> {
         let channels = self.channels.iter().map(|entry| (entry, false));
         let direct = self
@@ -125,6 +175,56 @@ mod tests {
         assert_eq!(counts[3].mention_count, 4);
         assert_eq!(counts[3].unread_count, 4);
         assert_eq!(counts[3].last_read.as_deref(), Some("1.0"));
+    }
+
+    #[test]
+    fn thread_summary_lists_channels_with_unread_threads() {
+        let payload: ClientCountsPayload = serde_json::from_value(serde_json::json!({
+            "threads": {
+                "has_unreads": true,
+                "mention_count": 0,
+                "unread_count_by_channel": {"C1": 1, "D1": 0, " ": 2}
+            }
+        }))
+        .expect("deserializes");
+
+        let threads = payload
+            .into_client_counts("10.000000")
+            .threads
+            .expect("thread summary");
+
+        assert_eq!(
+            threads.unread_channel_ids,
+            HashSet::from(["C1".to_string(), "D1".to_string()])
+        );
+        assert_eq!(threads.snapshot_ts, "10.000000");
+    }
+
+    #[test]
+    fn thread_summary_without_unreads_lists_no_channels() {
+        let payload: ClientCountsPayload =
+            serde_json::from_value(serde_json::json!({"threads": {"has_unreads": false}}))
+                .expect("deserializes");
+
+        let threads = payload.into_client_counts("1.0").threads.expect("summary");
+
+        assert!(threads.unread_channel_ids.is_empty());
+    }
+
+    #[test]
+    fn thread_summary_is_dropped_when_it_cannot_name_unread_channels() {
+        for threads in [
+            serde_json::json!({"has_unreads": true}),
+            serde_json::json!({"unread_count_by_channel": {}}),
+        ] {
+            let payload: ClientCountsPayload =
+                serde_json::from_value(serde_json::json!({ "threads": threads }))
+                    .expect("deserializes");
+            assert_eq!(payload.into_client_counts("1.0").threads, None);
+        }
+        let payload: ClientCountsPayload =
+            serde_json::from_value(serde_json::json!({"ok": true})).expect("deserializes");
+        assert_eq!(payload.into_client_counts("1.0").threads, None);
     }
 
     #[test]

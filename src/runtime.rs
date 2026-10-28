@@ -6199,21 +6199,27 @@ async fn sync_client_counts(
     };
     crate::debug::log(
         "runtime",
-        &format!("ClientCountsLoaded conversations={}", counts.len()),
+        &format!(
+            "ClientCountsLoaded conversations={} unread_thread_channels={:?}",
+            counts.conversations.len(),
+            counts
+                .threads
+                .as_ref()
+                .map(|threads| threads.unread_channel_ids.len()),
+        ),
     );
-    if let Err(error) = workspace
-        .apply_persisted_and_publish(
-            store,
-            events,
-            MutationOrigin::WebApi,
-            WorkspaceMutation::CountsSnapshot(counts),
-        )
-        .await
-    {
-        crate::debug::log(
-            "store",
-            &format!("ClientCountsDeferred category={:?}", error.category()),
-        );
+    let mutations = std::iter::once(WorkspaceMutation::CountsSnapshot(counts.conversations))
+        .chain(counts.threads.map(WorkspaceMutation::ThreadCountsSnapshot));
+    for mutation in mutations {
+        if let Err(error) = workspace
+            .apply_persisted_and_publish(store, events, MutationOrigin::WebApi, mutation)
+            .await
+        {
+            crate::debug::log(
+                "store",
+                &format!("ClientCountsDeferred category={:?}", error.category()),
+            );
+        }
     }
 }
 
