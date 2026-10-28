@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
+use futures_util::{stream, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
@@ -32,8 +33,9 @@ use crate::message_handoff::{
     ResolvedMessageHandoff,
 };
 use crate::models::{
-    AuthInfo, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation, SlackFile,
-    SlackMessage, SlackUser, SlackUserGroup, SlackUserStatus, StoredToken,
+    slack_timestamp_is_after, AuthInfo, SavedItem, SearchMatch, SearchMessageLocation,
+    SlackConversation, SlackFile, SlackMessage, SlackUser, SlackUserGroup, SlackUserStatus,
+    StoredToken,
 };
 use crate::realtime::RealtimeStatus;
 use crate::services::conversation_history::ConversationHistoryService;
@@ -50,6 +52,7 @@ use crate::sync_scheduler::{
     ReplacementClass, RetryPolicy, SchedulerConfig, SyncDurability, SyncJob, SyncJobId,
     SyncPriority, SyncScheduler, SyncTargetKey, SyncTargetKind,
 };
+use crate::unread_ledger::ConversationReadState;
 use crate::workspace_pipeline::{
     ConversationMembershipSnapshot, MessageAttentionEffect, MessageMutationKind, MutationOrigin,
     SnapshotEnvelope, StoreBatch, StoreChange, WorkspaceAttentionContext, WorkspaceBootstrapData,
@@ -58,7 +61,12 @@ use crate::workspace_pipeline::{
 };
 use crate::workspace_state::WorkspaceLifecycleEvent;
 
+/// Total conversations prefetched at startup: huddles, then DMs with
+/// unreads, then the best-ranked remainder.
 const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
+/// Prefetches in flight at once. Slack rate-limits per method, and every
+/// completed prefetch takes the store admission lock, so keep this small.
+const CHANNEL_HISTORY_PREFETCH_CONCURRENCY: usize = 3;
 const CONVERSATION_MEMBER_PAGE_LIMIT: usize = 25;
 const NAVIGATION_TASK_CONCURRENCY: usize = 2;
 const INTERACTIVE_TASK_CONCURRENCY: usize = 8;
@@ -1279,6 +1287,24 @@ impl WorkspaceReducerAdapter {
             .expect("workspace coordinator lock poisoned")
             .conversation(channel_id)
             .cloned()
+    }
+
+    /// Ledger read states for the given conversations, under one lock.
+    fn read_states<'a>(
+        &self,
+        channel_ids: impl Iterator<Item = &'a str>,
+    ) -> HashMap<String, ConversationReadState> {
+        let coordinator = self
+            .coordinator
+            .lock()
+            .expect("workspace coordinator lock poisoned");
+        channel_ids
+            .filter_map(|channel_id| {
+                coordinator
+                    .read_state(channel_id)
+                    .map(|state| (channel_id.to_string(), state.clone()))
+            })
+            .collect()
     }
 
     fn message(&self, channel_id: &str, message_ts: &str) -> Option<SlackMessage> {
@@ -4950,19 +4976,27 @@ fn cached_conversation_user_ids(
 struct ChannelHistoryPrefetchCandidate {
     id: String,
     huddle_metadata: bool,
-    active_direct_message: bool,
+    unread_direct_message: bool,
     activity_score: f64,
     title: String,
 }
 
 #[cfg(test)]
 fn channel_history_prefetch_candidates(conversations: &[SlackConversation]) -> Vec<String> {
-    channel_history_prefetch_candidates_with_huddles(conversations, &HashSet::new())
+    channel_history_prefetch_candidates_with_huddles(
+        conversations,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
 }
 
+/// Picks at most `CHANNEL_HISTORY_PREFETCH_LIMIT` conversations: huddles
+/// first, then direct messages with unreads, then everything else by
+/// activity. Read-but-open DMs compete with channels in the last group.
 fn channel_history_prefetch_candidates_with_huddles(
     conversations: &[SlackConversation],
     current_huddle_channels: &HashSet<String>,
+    unread_channels: &HashSet<String>,
 ) -> Vec<String> {
     let mut candidates = conversations
         .iter()
@@ -4970,6 +5004,7 @@ fn channel_history_prefetch_candidates_with_huddles(
             channel_history_prefetch_candidate(
                 conversation,
                 current_huddle_channels.contains(&conversation.id),
+                unread_channels.contains(&conversation.id),
             )
         })
         .collect::<Vec<_>>();
@@ -4978,30 +5013,66 @@ fn channel_history_prefetch_candidates_with_huddles(
         right
             .huddle_metadata
             .cmp(&left.huddle_metadata)
-            .then_with(|| right.active_direct_message.cmp(&left.active_direct_message))
+            .then_with(|| right.unread_direct_message.cmp(&left.unread_direct_message))
             .then_with(|| right.activity_score.total_cmp(&left.activity_score))
             .then_with(|| left.title.cmp(&right.title))
             .then_with(|| left.id.cmp(&right.id))
     });
-    let (mut huddle_candidates, remaining): (Vec<_>, Vec<_>) = candidates
+    candidates.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT);
+    candidates
         .into_iter()
-        .partition(|candidate| candidate.huddle_metadata);
-    let (urgent_direct_messages, mut remaining): (Vec<_>, Vec<_>) = remaining
-        .into_iter()
-        .partition(|candidate| candidate.active_direct_message);
-    huddle_candidates.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT);
-    remaining.truncate(CHANNEL_HISTORY_PREFETCH_LIMIT.saturating_sub(huddle_candidates.len()));
-    huddle_candidates
-        .into_iter()
-        .chain(urgent_direct_messages)
-        .chain(remaining)
         .map(|candidate| candidate.id)
         .collect()
+}
+
+/// Whether a conversation has unread messages, from the ledger when it
+/// holds a baseline (`client.counts`), else from the conversation payload's
+/// `last_read` against its `latest`.
+fn conversation_has_unreads(
+    conversation: &SlackConversation,
+    read_state: Option<&ConversationReadState>,
+) -> bool {
+    if let Some(read_state) = read_state {
+        return read_state.has_unreads();
+    }
+    let last_read = conversation
+        .extra
+        .get("last_read")
+        .and_then(serde_json::Value::as_str)
+        .filter(|ts| !ts.is_empty());
+    match (conversation.latest_message_ts(), last_read) {
+        (Some(latest), Some(last_read)) => slack_timestamp_is_after(latest, last_read),
+        _ => false,
+    }
+}
+
+/// Newest message ts Slack reported for the conversation, ledger first.
+fn conversation_known_latest_ts<'a>(
+    conversation: &'a SlackConversation,
+    read_state: Option<&'a ConversationReadState>,
+) -> Option<&'a str> {
+    read_state
+        .and_then(ConversationReadState::latest_ts)
+        .or_else(|| conversation.latest_message_ts())
+        .filter(|ts| !ts.is_empty())
+}
+
+/// True when the cached history already ends at the conversation's latest
+/// message, so a refetch and rewrite would change nothing.
+fn prefetch_cache_is_current(cached: &[SlackMessage], latest_ts: Option<&str>) -> bool {
+    let Some(latest_ts) = latest_ts else {
+        return false;
+    };
+    SlackMessage::latest_ts(cached.iter()).is_some_and(|cached_ts| {
+        !slack_timestamp_is_after(&cached_ts, latest_ts)
+            && !slack_timestamp_is_after(latest_ts, &cached_ts)
+    })
 }
 
 fn channel_history_prefetch_candidate(
     conversation: &SlackConversation,
     current_huddle: bool,
+    has_unreads: bool,
 ) -> Option<ChannelHistoryPrefetchCandidate> {
     if conversation.is_archived.unwrap_or(false) {
         return None;
@@ -5025,7 +5096,7 @@ fn channel_history_prefetch_candidate(
     Some(ChannelHistoryPrefetchCandidate {
         id: conversation.id.clone(),
         huddle_metadata,
-        active_direct_message,
+        unread_direct_message: conversation.is_direct_message() && has_unreads,
         activity_score: conversation_activity_score(conversation),
         title: conversation.display_name().to_lowercase(),
     })
@@ -7776,78 +7847,133 @@ async fn prefetch_channel_histories_best_effort(
         return;
     };
 
-    let channel_ids =
-        channel_history_prefetch_candidates_with_huddles(conversations, current_huddle_channels);
+    let read_states = workspace.reducer.read_states(
+        conversations
+            .iter()
+            .map(|conversation| conversation.id.as_str()),
+    );
+    let unread_channels = conversations
+        .iter()
+        .filter(|conversation| {
+            conversation_has_unreads(conversation, read_states.get(&conversation.id))
+        })
+        .map(|conversation| conversation.id.clone())
+        .collect::<HashSet<_>>();
+    let channel_ids = channel_history_prefetch_candidates_with_huddles(
+        conversations,
+        current_huddle_channels,
+        &unread_channels,
+    );
     if channel_ids.is_empty() {
         return;
     }
+    let latest_by_channel = conversations
+        .iter()
+        .filter_map(|conversation| {
+            conversation_known_latest_ts(conversation, read_states.get(&conversation.id))
+                .map(|ts| (conversation.id.as_str(), ts))
+        })
+        .collect::<HashMap<_, _>>();
 
     crate::debug::log(
         "runtime",
         &format!("ChannelHistoryPrefetchStart count={}", channel_ids.len()),
     );
 
-    for channel_id in channel_ids {
-        match store.load_history(&channel_id).await {
-            Ok(Some(_)) => {
-                crate::debug::log(
-                    "runtime",
-                    &format!(
-                        "ChannelHistoryPrefetchRefreshing channel_id={channel_id} reason=cached"
-                    ),
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                crate::debug::log(
-                    "runtime",
-                    &format!("ChannelHistoryPrefetchCacheCheckFailed channel_id={channel_id} error={error:#}"),
-                );
-                continue;
-            }
-        }
+    // Everything runs inside this future, so dropping it (shutdown or
+    // session change) cancels all in-flight prefetches exactly as before.
+    // The futures are collected first: a lazy `map` closure over borrowed
+    // arguments trips higher-ranked `Send` inference in spawned tasks.
+    let prefetches = channel_ids
+        .iter()
+        .map(|channel_id| {
+            prefetch_channel_history_best_effort(
+                events,
+                api,
+                workspace,
+                store,
+                team_id,
+                huddles,
+                channel_id,
+                latest_by_channel.get(channel_id.as_str()).copied(),
+            )
+        })
+        .collect::<Vec<_>>();
+    stream::iter(prefetches)
+        .buffer_unordered(CHANNEL_HISTORY_PREFETCH_CONCURRENCY)
+        .collect::<()>()
+        .await;
+}
 
-        let base_revision = workspace.reducer.revision();
-        match api.history(&channel_id).await {
-            Ok(page) => {
-                if let Err(error) = publish_prefetched_history_snapshot(
-                    events,
-                    workspace.store,
-                    workspace.reducer,
-                    &channel_id,
-                    base_revision,
-                    page.messages.clone(),
-                )
-                .await
-                {
-                    crate::debug::log(
-                        "runtime",
-                        &format!(
-                            "CachedHistoryStoreFailed channel_id={channel_id} error={error:#}"
-                        ),
-                    );
-                }
-                if let Err(error) =
-                    observe_huddle_messages(huddles, team_id, &channel_id, &page.messages).await
-                {
-                    crate::debug::log(
-                        "huddle",
-                        &format!("HuddlePrefetchObservationFailed error={error}"),
-                    );
-                }
+/// Prefetches one conversation. Failures are logged, never propagated, so
+/// one bad channel cannot abort the others.
+#[allow(clippy::too_many_arguments)]
+async fn prefetch_channel_history_best_effort(
+    events: &RuntimeEventSender,
+    api: &SlackApi,
+    workspace: WorkspacePipelineContext<'_>,
+    store: &WorkspaceStore,
+    team_id: Option<&str>,
+    huddles: &HuddleActorHandle,
+    channel_id: &str,
+    latest_ts: Option<&str>,
+) {
+    match store.load_history(channel_id).await {
+        Ok(Some(cached)) if prefetch_cache_is_current(&cached, latest_ts) => {
+            crate::debug::log(
+                "runtime",
+                &format!("ChannelHistoryPrefetchSkipped channel_id={channel_id} reason=current"),
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            crate::debug::log(
+                "runtime",
+                &format!("ChannelHistoryPrefetchCacheCheckFailed channel_id={channel_id} error={error:#}"),
+            );
+            return;
+        }
+    }
+
+    let base_revision = workspace.reducer.revision();
+    match api.history(channel_id).await {
+        Ok(page) => {
+            if let Err(error) = publish_prefetched_history_snapshot(
+                events,
+                workspace.store,
+                workspace.reducer,
+                channel_id,
+                base_revision,
+                page.messages.clone(),
+            )
+            .await
+            {
                 crate::debug::log(
                     "runtime",
-                    &format!(
-                        "ChannelHistoryPrefetched channel_id={channel_id} messages={}",
-                        page.messages.len()
-                    ),
+                    &format!("CachedHistoryStoreFailed channel_id={channel_id} error={error:#}"),
                 );
             }
-            Err(error) => crate::debug::log(
+            if let Err(error) =
+                observe_huddle_messages(huddles, team_id, channel_id, &page.messages).await
+            {
+                crate::debug::log(
+                    "huddle",
+                    &format!("HuddlePrefetchObservationFailed error={error}"),
+                );
+            }
+            crate::debug::log(
                 "runtime",
-                &format!("ChannelHistoryPrefetchFailed channel_id={channel_id} error={error:#}"),
-            ),
+                &format!(
+                    "ChannelHistoryPrefetched channel_id={channel_id} messages={}",
+                    page.messages.len()
+                ),
+            );
         }
+        Err(error) => crate::debug::log(
+            "runtime",
+            &format!("ChannelHistoryPrefetchFailed channel_id={channel_id} error={error:#}"),
+        ),
     }
 }
 

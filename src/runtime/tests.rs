@@ -10095,7 +10095,7 @@ fn dm(id: &str, active: bool) -> SlackConversation {
 }
 
 #[test]
-fn channel_history_prefetch_candidates_prioritize_active_dms_and_recent_channels() {
+fn channel_history_prefetch_candidates_rank_open_dms_with_recent_channels() {
     let conversations = vec![
         channel("C-old", None),
         dm("D-active", true),
@@ -10106,11 +10106,11 @@ fn channel_history_prefetch_candidates_prioritize_active_dms_and_recent_channels
         private_channel("G-private", Some("1710000200.000000")),
     ];
 
-    // Active DMs lead, then channels by most recent activity. Idle DMs and
-    // archived conversations are not prefetched at all.
+    // Without unreads an open DM ranks by activity like any channel. Idle
+    // DMs and archived conversations are not prefetched at all.
     assert_eq!(
         channel_history_prefetch_candidates(&conversations),
-        vec!["D-active", "C-recent", "G-private", "C-stale", "C-old"]
+        vec!["C-recent", "G-private", "C-stale", "C-old", "D-active"]
     );
 }
 
@@ -10132,22 +10132,143 @@ fn channel_history_prefetch_candidates_are_bounded() {
     assert_eq!(candidates.last().map(String::as_str), Some("C3"));
 }
 
-#[test]
-fn channel_history_prefetch_always_includes_active_direct_messages() {
-    let mut conversations = (0..CHANNEL_HISTORY_PREFETCH_LIMIT + 3)
+fn message_at(ts: &str) -> SlackMessage {
+    SlackMessage {
+        ts: ts.to_string(),
+        ..Default::default()
+    }
+}
+
+fn dm_with_unreads(id: &str) -> SlackConversation {
+    let mut conversation = dm(id, true);
+    conversation.extra.insert(
+        "last_read".to_string(),
+        serde_json::json!("1710000000.000000"),
+    );
+    conversation
+        .extra
+        .insert("latest".to_string(), serde_json::json!("1710000500.000000"));
+    conversation
+}
+
+fn channels_by_activity(count: usize) -> Vec<SlackConversation> {
+    (0..count)
         .map(|index| {
             channel(
                 &format!("C{index}"),
                 Some(&format!("17100000{index:02}.000000")),
             )
         })
-        .collect::<Vec<_>>();
-    conversations.push(dm("D-urgent", true));
+        .collect()
+}
+
+#[test]
+fn channel_history_prefetch_ranks_unread_dms_above_channels_and_read_dms() {
+    let mut conversations = channels_by_activity(CHANNEL_HISTORY_PREFETCH_LIMIT + 3);
+    let mut read_dm = dm("D-read", true);
+    read_dm.extra.insert(
+        "updated".to_string(),
+        serde_json::json!("1710009999.000000"),
+    );
+    conversations.push(read_dm);
+    conversations.push(dm_with_unreads("D-unread"));
+    let unread = HashSet::from(["D-unread".to_string()]);
+
+    let candidates =
+        channel_history_prefetch_candidates_with_huddles(&conversations, &HashSet::new(), &unread);
+
+    assert_eq!(candidates.first().map(String::as_str), Some("D-unread"));
+    // The read DM no longer jumps the queue: it ranks by activity alone.
+    assert_eq!(candidates.get(1).map(String::as_str), Some("D-read"));
+}
+
+#[test]
+fn channel_history_prefetch_read_dms_compete_with_channels_by_activity() {
+    let mut conversations = channels_by_activity(CHANNEL_HISTORY_PREFETCH_LIMIT);
+    conversations.push(dm("D-read-stale", true));
 
     let candidates = channel_history_prefetch_candidates(&conversations);
 
-    assert_eq!(candidates.first().map(String::as_str), Some("D-urgent"));
-    assert_eq!(candidates.len(), CHANNEL_HISTORY_PREFETCH_LIMIT + 1);
+    assert_eq!(candidates.len(), CHANNEL_HISTORY_PREFETCH_LIMIT);
+    assert!(!candidates.contains(&"D-read-stale".to_string()));
+}
+
+#[test]
+fn channel_history_prefetch_total_never_exceeds_the_limit() {
+    let mut conversations = channels_by_activity(CHANNEL_HISTORY_PREFETCH_LIMIT * 2);
+    let mut unread = HashSet::new();
+    let mut huddles = HashSet::new();
+    for index in 0..CHANNEL_HISTORY_PREFETCH_LIMIT * 2 {
+        let id = format!("D{index}");
+        conversations.push(dm_with_unreads(&id));
+        unread.insert(id);
+    }
+    for index in 0..5 {
+        let id = format!("H{index}");
+        conversations.push(channel(&id, None));
+        huddles.insert(id);
+    }
+
+    let candidates =
+        channel_history_prefetch_candidates_with_huddles(&conversations, &huddles, &unread);
+
+    assert_eq!(candidates.len(), CHANNEL_HISTORY_PREFETCH_LIMIT);
+    let huddle_count = candidates.iter().filter(|id| id.starts_with('H')).count();
+    assert_eq!(huddle_count, 5);
+    assert!(candidates[..5].iter().all(|id| id.starts_with('H')));
+    assert!(candidates[5..].iter().all(|id| id.starts_with('D')));
+}
+
+#[test]
+fn conversation_unreads_prefer_the_ledger_and_fall_back_to_the_payload() {
+    let payload_unread = dm_with_unreads("D1");
+    assert!(conversation_has_unreads(&payload_unread, None));
+
+    let mut payload_read = dm_with_unreads("D2");
+    payload_read.extra.insert(
+        "last_read".to_string(),
+        serde_json::json!("1710000500.000000"),
+    );
+    assert!(!conversation_has_unreads(&payload_read, None));
+    assert!(!conversation_has_unreads(&dm("D3", true), None));
+
+    let read_ledger = ConversationReadState::default();
+    assert!(!conversation_has_unreads(
+        &payload_unread,
+        Some(&read_ledger)
+    ));
+    let unread_ledger = ConversationReadState {
+        server_has_unreads: true,
+        ..Default::default()
+    };
+    assert!(conversation_has_unreads(
+        &payload_read,
+        Some(&unread_ledger)
+    ));
+}
+
+#[test]
+fn prefetch_skips_history_whose_cache_already_ends_at_latest() {
+    let cached = vec![
+        message_at("1710000100.000100"),
+        message_at("1710000200.000200"),
+    ];
+
+    assert!(prefetch_cache_is_current(
+        &cached,
+        Some("1710000200.000200")
+    ));
+    assert!(!prefetch_cache_is_current(
+        &cached,
+        Some("1710000300.000000")
+    ));
+    assert!(!prefetch_cache_is_current(
+        &cached,
+        Some("1710000100.000100")
+    ));
+    // Unknown latest, or an empty cache, always fetches.
+    assert!(!prefetch_cache_is_current(&cached, None));
+    assert!(!prefetch_cache_is_current(&[], Some("1710000200.000200")));
 }
 
 #[test]
@@ -10186,8 +10307,11 @@ fn channel_history_prefetch_keeps_current_huddles_after_cache_redaction() {
         .collect::<Vec<_>>();
     let current_huddle_channels = HashSet::from(["C-huddle".to_string()]);
 
-    let candidates =
-        channel_history_prefetch_candidates_with_huddles(&conversations, &current_huddle_channels);
+    let candidates = channel_history_prefetch_candidates_with_huddles(
+        &conversations,
+        &current_huddle_channels,
+        &HashSet::new(),
+    );
 
     assert_eq!(candidates.first().map(String::as_str), Some("C-huddle"));
 }
