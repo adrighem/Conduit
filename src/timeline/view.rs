@@ -763,7 +763,7 @@ impl NativeTimelineView {
         container.append(&overlay);
         container.append(&placeholder_label);
 
-        Self {
+        let view = Self {
             container,
             scrolled_window,
             list_view,
@@ -791,7 +791,13 @@ impl NativeTimelineView {
             settle_generation: Rc::new(Cell::new(0)),
             surface_changed: Rc::new(Cell::new(false)),
             check_load_older,
-        }
+        };
+        schedule_day_rollover_rebind(
+            view.container.downgrade(),
+            view.bound_items.clone(),
+            view.bind_row.clone(),
+        );
+        view
     }
 
     /// Ends the older-page load of `channel_id`/`thread_ts` if this view
@@ -1453,6 +1459,57 @@ impl Default for NativeTimelineView {
 
 /// Moves focus from inside `item`'s row content to the row itself before the
 /// content is replaced, so focus survives and the list does not jump.
+/// Rows compute their day-relative timestamp and day labels ("Today") at
+/// bind time, and re-renders keep unchanged rows bound, so rebind them all
+/// once the local day rolls over. Stops when the view's widgets are gone.
+fn schedule_day_rollover_rebind(
+    container: glib::WeakRef<Box>,
+    bound_items: BoundItems,
+    bind_row: Rc<dyn Fn(&gtk::ListItem)>,
+) {
+    glib::timeout_add_seconds_local_once(seconds_until_local_midnight(), move || {
+        if container.upgrade().is_none() {
+            return;
+        }
+        let items = bound_items
+            .borrow()
+            .iter()
+            .filter_map(glib::WeakRef::upgrade)
+            .collect::<Vec<_>>();
+        for item in items {
+            keep_focus_on_row(&item);
+            bind_row(&item);
+        }
+        schedule_day_rollover_rebind(container, bound_items, bind_row);
+    });
+}
+
+/// Seconds until just past the next local midnight; an hour if the local
+/// time cannot be determined, so the rollover is retried rather than lost.
+fn seconds_until_local_midnight() -> u32 {
+    const FALLBACK_SECONDS: u32 = 3600;
+    let Ok(now) = glib::DateTime::now_local() else {
+        return FALLBACK_SECONDS;
+    };
+    let midnight = now.add_days(1).and_then(|tomorrow| {
+        glib::DateTime::from_local(
+            tomorrow.year(),
+            tomorrow.month(),
+            tomorrow.day_of_month(),
+            0,
+            0,
+            0.0,
+        )
+    });
+    match midnight {
+        Ok(midnight) => {
+            let micros = midnight.difference(&now).as_microseconds().max(0);
+            u32::try_from(micros / 1_000_000 + 1).unwrap_or(FALLBACK_SECONDS)
+        }
+        Err(_) => FALLBACK_SECONDS,
+    }
+}
+
 fn keep_focus_on_row(item: &gtk::ListItem) {
     let Some(child) = item.child() else {
         return;
@@ -1469,6 +1526,13 @@ fn keep_focus_on_row(item: &gtk::ListItem) {
 mod tests {
     use super::*;
     use crate::timeline::tests::{run_gtk_test, test_context};
+
+    #[test]
+    fn next_rollover_is_within_one_local_day() {
+        // A DST day can last 25 hours; the extra second lands past midnight.
+        let seconds = seconds_until_local_midnight();
+        assert!((1..=25 * 3600 + 1).contains(&seconds), "got {seconds}");
+    }
 
     fn pump(ms: u64) {
         let context = glib::MainContext::default();
