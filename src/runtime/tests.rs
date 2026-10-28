@@ -11499,6 +11499,7 @@ fn realtime_marked_events_reduce_to_workspace_patches() {
     let thread_marked_event = SocketModeEvent::ThreadMarked {
         channel_id: "C1".to_string(),
         thread_ts: "100.0".to_string(),
+        last_read: None,
     };
     let reduction = reduce_realtime_workspace_event(&workspace, &thread_marked_event)
         .expect("thread marked reduction expected");

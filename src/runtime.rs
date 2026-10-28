@@ -6145,6 +6145,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 WorkspaceMutation::ThreadRead {
                     channel_id: channel_id.clone(),
                     root_ts: thread_ts.clone(),
+                    last_read: None,
                 },
             )
             .await;
@@ -6216,6 +6217,58 @@ async fn sync_client_counts(
     }
 }
 
+/// Fetches the most recently active followed threads so their server-side
+/// read positions catch up with reads made on other clients while this one
+/// was offline. Best effort, like `sync_client_counts`.
+async fn sync_followed_thread_reads(
+    events: &RuntimeEventSender,
+    api: &SlackApi,
+    store: Option<&WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
+) {
+    let page = match api.followed_threads_page(None).await {
+        Ok(page) => page,
+        Err(error) => {
+            crate::debug::log(
+                "runtime",
+                &format!(
+                    "FollowedThreadReadsLoadFailed category={:?}",
+                    error.category()
+                ),
+            );
+            return;
+        }
+    };
+    crate::debug::log(
+        "runtime",
+        &format!(
+            "FollowedThreadReadsLoaded threads={} with_last_read={}",
+            page.threads.len(),
+            page.threads
+                .iter()
+                .filter(|(_, root)| root.last_read.is_some())
+                .count()
+        ),
+    );
+    if let Err(error) = workspace
+        .apply_persisted_and_publish(
+            store,
+            events,
+            MutationOrigin::WebApi,
+            WorkspaceMutation::FollowedThreadsObserved(page.threads),
+        )
+        .await
+    {
+        crate::debug::log(
+            "store",
+            &format!(
+                "FollowedThreadReadsDeferred category={:?}",
+                error.category()
+            ),
+        );
+    }
+}
+
 async fn run_socket_mode(
     credentials: socket_mode::SocketModeCredentials,
     events: RuntimeEventSender,
@@ -6276,6 +6329,13 @@ async fn run_socket_mode(
                     if connected_before.swap(true, std::sync::atomic::Ordering::SeqCst) {
                         tokio::spawn(async move {
                             sync_client_counts(
+                                &connected_events,
+                                &counts_api,
+                                counts_store.as_ref(),
+                                &counts_workspace,
+                            )
+                            .await;
+                            sync_followed_thread_reads(
                                 &connected_events,
                                 &counts_api,
                                 counts_store.as_ref(),
@@ -6546,9 +6606,11 @@ fn realtime_workspace_mutation(event: &SocketModeEvent) -> Option<WorkspaceMutat
         SocketModeEvent::ThreadMarked {
             channel_id,
             thread_ts,
+            last_read,
         } => Some(WorkspaceMutation::ThreadRead {
             channel_id: channel_id.clone(),
             root_ts: thread_ts.clone(),
+            last_read: last_read.clone(),
         }),
         SocketModeEvent::RefreshConversations => None,
     }
@@ -7552,6 +7614,8 @@ async fn load_conversations_best_effort_with_api(
                 WorkspaceLifecycleEvent::SyncCompleted,
             ));
             sync_client_counts(events, api, workspace.store.as_ref(), workspace.reducer).await;
+            sync_followed_thread_reads(events, api, workspace.store.as_ref(), workspace.reducer)
+                .await;
             let current_huddle_channels = conversations
                 .iter()
                 .filter(|conversation| conversation.has_huddle_metadata())
