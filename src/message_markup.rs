@@ -7,9 +7,7 @@ use std::sync::Arc;
 
 use crate::config;
 use crate::emoji::{EmojiCatalog, EmojiEntry};
-use crate::message_handoff::{MessageControlHandle, MessageRef};
 use crate::models::{SlackMessage, SlackUserStatus};
-use crate::rich_message::MessageControlKey;
 use emoji::render_emoji_shortcode_pango;
 pub use emoji::{emoji_only_names, INLINE_EMOJI_SIZE};
 
@@ -28,7 +26,7 @@ const QUICK_REACTION_LIMIT: usize = 4;
 /// Cloning a context only bumps their refcounts, and the derived `PartialEq`
 /// checks them by pointer before contents (`Arc<T: Eq>` short-circuits on
 /// `Arc::ptr_eq`), so comparing two renders of an unchanged workspace only
-/// walks the per-render fields (thread, unread anchor, images, controls).
+/// walks the per-render fields (thread, unread anchor, images).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MessageRenderContext {
     pub user_names: Arc<HashMap<String, String>>,
@@ -54,12 +52,55 @@ pub struct MessageRenderContext {
     /// Computed once per conversation/thread-open and held fixed across
     /// re-renders - see `ConduitWindow::unread_separator_anchor_ts`.
     pub unread_separator_ts: Option<String>,
-    pub(crate) message_control_handles: HashMap<MessageRef, MessageControlHandle>,
-    pub(crate) message_control_action_handles:
-        HashMap<(MessageRef, MessageControlKey), MessageControlHandle>,
 }
 
 impl MessageRenderContext {
+    /// Whether rows bound against `self` render the same against `other`,
+    /// so a re-render can keep them. Fields rows never read, and fields with
+    /// a targeted update path, are left out; the destructuring makes every
+    /// new field pick a side.
+    pub(crate) fn same_row_inputs(&self, other: &Self) -> bool {
+        let Self {
+            user_names,
+            user_full_names,
+            user_avatar_urls,
+            bot_user_ids,
+            conversation_titles,
+            private_conversation_ids,
+            user_statuses,
+            user_group_names,
+            user_group_members,
+            current_user_id,
+            thread_ts,
+            recent_reactions,
+            custom_emojis,
+            // Scroll intent of one render, read by the view only.
+            timeline_scroll: _,
+            // `update_image_asset` re-renders rows once an asset arrives or
+            // fails, so a re-render need not.
+            image_assets: _,
+            failed_image_urls: _,
+            // Rows read the derived `unread_separator_ts` only.
+            last_read: _,
+            // Moving the separator changes only the rows that gain or lose
+            // it; `set_messages` and `set_unread_separator` rebind just those.
+            unread_separator_ts: _,
+        } = self;
+        user_names == &other.user_names
+            && user_full_names == &other.user_full_names
+            && user_avatar_urls == &other.user_avatar_urls
+            && bot_user_ids == &other.bot_user_ids
+            && conversation_titles == &other.conversation_titles
+            && private_conversation_ids == &other.private_conversation_ids
+            && user_statuses == &other.user_statuses
+            && user_group_names == &other.user_group_names
+            && user_group_members == &other.user_group_members
+            && current_user_id == &other.current_user_id
+            && thread_ts == &other.thread_ts
+            && recent_reactions == &other.recent_reactions
+            && custom_emojis == &other.custom_emojis
+    }
+
     /// The user whose name and avatar head `message`: its author, or for an
     /// app-posted message the invoking person (e.g. `/giphy`), provided the
     /// directory knows that user and does not flag them as a bot. Anything

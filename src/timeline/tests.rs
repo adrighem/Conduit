@@ -74,8 +74,6 @@ pub(crate) fn test_context() -> MessageRenderContext {
         custom_emojis: Arc::default(),
         last_read: None,
         unread_separator_ts: None,
-        message_control_handles: HashMap::default(),
-        message_control_action_handles: HashMap::default(),
     }
 }
 
@@ -1266,6 +1264,95 @@ fn in_place_updates_keep_scroll_and_focus_on_clicked_row() {
             .state_flags()
             .contains(gtk::StateFlags::FOCUS_WITHIN));
         assert_eq!(view.store.item(0), first_item, "store items are kept");
+        window.destroy();
+    });
+}
+
+/// Bound message rows and their widgets; a rebind replaces the widget.
+fn bound_row_widgets(view: &NativeTimelineView) -> Vec<(String, Widget)> {
+    view.bound_items
+        .borrow()
+        .iter()
+        .filter_map(glib::WeakRef::upgrade)
+        .filter_map(|item| {
+            let obj = item.item().and_downcast::<TimelineMessageObject>()?;
+            let child = item.child()?;
+            (!obj.is_day_separator()).then(|| (obj.message().ts, child))
+        })
+        .collect()
+}
+
+/// Timestamps whose bound widget differs from `before`.
+fn rebound_rows(view: &NativeTimelineView, before: &[(String, Widget)]) -> Vec<String> {
+    let after = bound_row_widgets(view);
+    before
+        .iter()
+        .filter(|(ts, widget)| {
+            after
+                .iter()
+                .find(|(after_ts, _)| after_ts == ts)
+                .is_some_and(|(_, after_widget)| after_widget != widget)
+        })
+        .map(|(ts, _)| ts.clone())
+        .collect()
+}
+
+#[test]
+fn re_render_rebinds_only_rows_whose_inputs_changed() {
+    run_gtk_test(|| {
+        let ctx = test_context();
+        let messages = (0..40)
+            .rev()
+            .map(|i| SlackMessage {
+                ts: format!("1700000{i:03}.000100"),
+                user: Some("U123".to_string()),
+                text: Some(format!("message {i}")),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let view = NativeTimelineView::new();
+        let window = gtk::Window::new();
+        window.set_default_size(400, 500);
+        window.set_child(Some(view.widget()));
+        window.present();
+        view.set_messages(&messages, &ctx, None);
+        pump_main_context(300);
+        let before = bound_row_widgets(&view);
+        assert!(!before.is_empty(), "rows are bound");
+
+        view.set_messages(&messages, &ctx.clone(), None);
+        pump_main_context(50);
+        assert_eq!(rebound_rows(&view, &before), Vec::<String>::new());
+
+        // Image, read mark and scroll intent changes have their own paths.
+        let mut images = ctx.clone();
+        images
+            .image_assets
+            .insert("https://example.com/a.png".into(), PathBuf::from("/a"));
+        images
+            .failed_image_urls
+            .insert("https://example.com/b.png".into());
+        images.last_read = Some(messages[5].ts.clone());
+        images.timeline_scroll = crate::message_markup::TimelineScrollBehavior::Bottom;
+        view.set_messages(&messages, &images, None);
+        pump_main_context(50);
+        assert_eq!(rebound_rows(&view, &before), Vec::<String>::new());
+
+        // Moving the unread separator rebuilds only the row that gains it.
+        let anchor = before[before.len() / 2].0.clone();
+        let mut unread = images.clone();
+        unread.unread_separator_ts = Some(anchor.clone());
+        view.set_messages(&messages, &unread, None);
+        pump_main_context(50);
+        assert_eq!(rebound_rows(&view, &before), vec![anchor]);
+
+        // A directory change reaches every row.
+        let before = bound_row_widgets(&view);
+        let mut renamed = unread.clone();
+        renamed.user_names = Arc::new(HashMap::from([("U123".to_string(), "Bob".to_string())]));
+        view.set_messages(&messages, &renamed, None);
+        pump_main_context(50);
+        assert_eq!(rebound_rows(&view, &before).len(), before.len());
         window.destroy();
     });
 }

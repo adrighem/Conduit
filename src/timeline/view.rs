@@ -1066,7 +1066,12 @@ impl NativeTimelineView {
         self.scrolled_window.set_visible(true);
         // Cheap: directory snapshots are shared `Arc`s, cloned by refcount and
         // compared by pointer first (see `MessageRenderContext`).
-        let context_changed = self.context.replace(Some(context.clone())).as_ref() != Some(context);
+        let previous = self.context.replace(Some(context.clone()));
+        let rows_stale = previous
+            .as_ref()
+            .is_none_or(|previous| !previous.same_row_inputs(context));
+        let previous_anchor = previous.and_then(|previous| previous.unread_separator_ts);
+        let previous_highlight = self.highlight_ts.borrow().clone();
         *self.latest_message_ts.borrow_mut() = messages.first().map(|msg| msg.ts.clone());
         self.reset_read_candidate();
         // Removing the focused row would hand focus to GTK's fallback, which
@@ -1094,17 +1099,37 @@ impl NativeTimelineView {
         let unread_ts = context.unread_separator_ts.as_deref();
         let (items, focus_index) = build_store_items(messages, focus_ts, unread_ts);
         let inserted = self.splice_changed_items(&items);
-        // Kept rows were built against the previous context.
-        let rebound = if context_changed {
-            self.rebind_rows("context", |obj| !inserted.iter().any(|new| new == obj))
+        let kept = |obj: &TimelineMessageObject| !inserted.iter().any(|new| new == obj);
+        let rebound = if rows_stale {
+            // Kept rows were built against the previous context.
+            self.rebind_rows("context", kept)
         } else {
-            0
+            // Otherwise only kept rows that gain or lose the unread separator
+            // or the focus highlight differ.
+            let mut moved = Vec::new();
+            if previous_anchor != context.unread_separator_ts {
+                moved.extend(previous_anchor.as_deref());
+                moved.extend(unread_ts);
+            }
+            if focus_ts.is_some() {
+                moved.extend(previous_highlight.as_deref());
+                moved.extend(focus_ts);
+            }
+            if moved.is_empty() {
+                0
+            } else {
+                self.rebind_rows("other", |obj| {
+                    !obj.is_day_separator()
+                        && moved.contains(&obj.message().ts.as_str())
+                        && kept(obj)
+                })
+            }
         };
         if let Some(started) = started {
             crate::debug::log(
                 "performance",
                 &format!(
-                    "timeline_set_messages rows={} inserted={} rebound={rebound} context_changed={context_changed} elapsed_ms={:.2}",
+                    "timeline_set_messages rows={} inserted={} rebound={rebound} context_changed={rows_stale} elapsed_ms={:.2}",
                     items.len(),
                     inserted.len(),
                     started.elapsed().as_secs_f64() * 1_000.0
