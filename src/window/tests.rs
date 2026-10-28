@@ -2960,6 +2960,51 @@ fn cached_canonical_image_remains_eligible_for_dom_asset_patch() {
 }
 
 #[test]
+fn message_user_ids_cover_author_mentions_and_reactions() {
+    let message = SlackMessage {
+        ts: "1710000000.000100".to_string(),
+        user: Some("U1".to_string()),
+        text: Some("hi <@U2|bob>".to_string()),
+        reactions: Some(vec![crate::models::SlackReaction {
+            name: Some("eyes".to_string()),
+            users: Some(vec!["U3".to_string()]),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let mut ids = HashSet::new();
+    collect_message_user_ids(&[message], &mut ids);
+    let expected = ["U1", "U2", "U3"].map(String::from).into_iter().collect();
+    assert_eq!(ids, expected);
+}
+
+#[test]
+fn thread_root_user_ids_include_reply_users() {
+    let root = SlackMessage {
+        ts: "1710000000.000100".to_string(),
+        user: Some("U1".to_string()),
+        reply_users: Some(vec!["U4".to_string()]),
+        ..Default::default()
+    };
+    let mut ids = HashSet::new();
+    collect_thread_root_user_ids(&root, &mut ids);
+    assert!(ids.contains("U1") && ids.contains("U4"));
+}
+
+#[test]
+fn search_result_user_ids_include_author_and_mentions() {
+    let result = SearchMatch {
+        user: Some("U1".to_string()),
+        text: Some("ping <@U9> and <@U8|al>".to_string()),
+        ..Default::default()
+    };
+    let mut ids = HashSet::new();
+    collect_search_result_user_ids(&result, &mut ids);
+    let expected = ["U1", "U8", "U9"].map(String::from).into_iter().collect();
+    assert_eq!(ids, expected);
+}
+
+#[test]
 fn forward_message_payload_uses_permalink_when_visible() {
     let public_channel = SlackConversation {
         id: "C123".to_string(),

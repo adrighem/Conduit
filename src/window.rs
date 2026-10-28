@@ -2892,28 +2892,27 @@ fn messages_use_image_asset(
     })
 }
 
-fn messages_use_user(messages: &[SlackMessage], user_id: &str) -> bool {
-    messages.iter().any(|message| {
-        rendering::extract_user_ids(message)
-            .iter()
-            .any(|id| id == user_id)
-    })
+/// Collects every user id the rendered messages depend on (author, mentions, reactions).
+fn collect_message_user_ids(messages: &[SlackMessage], out: &mut HashSet<String>) {
+    for message in messages {
+        out.extend(rendering::extract_user_ids(message));
+    }
 }
 
-fn messages_use_user_in_reactions(messages: &[SlackMessage], user_id: &str) -> bool {
-    messages.iter().any(|message| {
-        message
-            .reactions
-            .as_ref()
-            .into_iter()
-            .flatten()
-            .any(|reaction| {
-                reaction
-                    .users
-                    .as_ref()
-                    .is_some_and(|users| users.iter().any(|id| id == user_id))
-            })
-    })
+/// Collects the user ids a followed-thread root row depends on (reply avatars included).
+fn collect_thread_root_user_ids(message: &SlackMessage, out: &mut HashSet<String>) {
+    collect_message_user_ids(std::slice::from_ref(message), out);
+    out.extend(message.reply_users.iter().flatten().cloned());
+}
+
+/// Collects the user ids a search result row depends on (author and text mentions).
+fn collect_search_result_user_ids(result: &SearchMatch, out: &mut HashSet<String>) {
+    out.extend(result.user.iter().cloned());
+    if let Some(text) = result.text.as_deref() {
+        let mut mentions = Vec::new();
+        rendering::extract_mentions(text, &mut mentions);
+        out.extend(mentions);
+    }
 }
 
 fn message_permalink(workspace_url: &str, channel_id: &str, ts: &str) -> Option<String> {
@@ -9774,16 +9773,23 @@ impl ConduitWindow {
         let (main_uses_asset, thread_uses_asset, main_view) = {
             let custom_emojis = self.imp().custom_emojis.borrow();
             let main_uses = self.main_view_uses_image_asset(&custom_emojis, key)
-                || avatar_user_ids
-                    .iter()
-                    .any(|user_id| self.main_view_uses_user(user_id));
+                || (!avatar_user_ids.is_empty() && {
+                    let main_user_ids = self.main_view_user_ids();
+                    avatar_user_ids
+                        .iter()
+                        .any(|user_id| main_user_ids.contains(user_id))
+                });
             let state = self.imp().workspace.view.borrow();
             let thread_messages = state.current_thread_messages();
             let thread_uses = state.selected_thread_ts().is_some()
                 && (messages_use_image_asset(thread_messages, &custom_emojis, key)
-                    || avatar_user_ids
-                        .iter()
-                        .any(|user_id| messages_use_user(thread_messages, user_id)));
+                    || (!avatar_user_ids.is_empty() && {
+                        let mut thread_user_ids = HashSet::new();
+                        collect_message_user_ids(thread_messages, &mut thread_user_ids);
+                        avatar_user_ids
+                            .iter()
+                            .any(|user_id| thread_user_ids.contains(user_id))
+                    }));
             (main_uses, thread_uses, state.main_view())
         };
 
@@ -9990,9 +9996,7 @@ impl ConduitWindow {
         }
         let mut affected_user_ids = affected_user_ids.into_iter().collect::<Vec<_>>();
         affected_user_ids.sort();
-        for user_id in &affected_user_ids {
-            self.patch_user_on_timelines(user_id);
-        }
+        self.patch_users_on_timelines(&affected_user_ids);
         self.update_huddle_surface();
         self.queue_user_projection_invalidations(&affected_user_ids);
         self.flush_pending_message_notifications();
@@ -10285,9 +10289,7 @@ impl ConduitWindow {
         for target in COMPOSER_TARGETS {
             self.refresh_composer_mention_names(target);
         }
-        for user_id in &changed_user_ids {
-            self.patch_user_on_timelines(user_id);
-        }
+        self.patch_users_on_timelines(&changed_user_ids);
         self.update_huddle_surface();
         self.queue_user_projection_invalidations(&changed_user_ids);
         self.flush_pending_message_notifications();
@@ -10319,62 +10321,59 @@ impl ConduitWindow {
                     .keys()
                     .cloned()
                     .collect::<Vec<_>>();
-                for user_id in &user_ids {
-                    window.patch_user_on_timelines(user_id);
-                }
+                window.patch_users_on_timelines(&user_ids);
                 window.queue_user_projection_invalidations(&user_ids);
                 window.schedule_status_expiry();
             }
         });
     }
 
-    fn main_view_uses_user(&self, user_id: &str) -> bool {
+    /// User ids the active main view renders, computed once per call.
+    fn main_view_user_ids(&self) -> HashSet<String> {
         let state = self.imp().workspace.view.borrow();
+        let mut user_ids = HashSet::new();
         match state.main_view() {
-            MainMessageView::Conversation => state.visible_channel_id().is_some_and(|channel_id| {
-                messages_use_user(state.channel_messages(channel_id), user_id)
-            }),
-            MainMessageView::Threads => {
-                let observed = self.followed_thread_roots();
-                observed.iter().any(|(_, message)| {
-                    messages_use_user(std::slice::from_ref(message), user_id)
-                        || messages_use_user_in_reactions(std::slice::from_ref(message), user_id)
-                        || message
-                            .reply_users
-                            .iter()
-                            .flatten()
-                            .any(|candidate| candidate == user_id)
-                }) || {
-                    let conversations = self.imp().workspace.conversations.borrow();
-                    observed.iter().any(|(channel_id, _)| {
-                        conversations.get(channel_id).is_some_and(|conversation| {
-                            conversation
-                                .display_user_ids()
-                                .iter()
-                                .any(|candidate| candidate == user_id)
-                        })
-                    })
+            MainMessageView::Conversation => {
+                if let Some(channel_id) = state.visible_channel_id() {
+                    collect_message_user_ids(state.channel_messages(channel_id), &mut user_ids);
                 }
             }
-            MainMessageView::Search => state.search_results().iter().any(|result| {
-                result.user.as_deref() == Some(user_id)
-                    || result
-                        .text
-                        .as_deref()
-                        .is_some_and(|text| text.contains(&format!("<@{user_id}>")))
-            }),
-            MainMessageView::Saved => state.saved_items().iter().any(|item| {
-                item.message.as_ref().is_some_and(|message| {
-                    messages_use_user(std::slice::from_ref(message), user_id)
-                        || messages_use_user_in_reactions(std::slice::from_ref(message), user_id)
-                })
-            }),
-            MainMessageView::Files => state
-                .files()
-                .iter()
-                .any(|file| file.user.as_deref() == Some(user_id)),
-            MainMessageView::Placeholder => false,
+            MainMessageView::Threads => {
+                let observed = self.followed_thread_roots();
+                for (_, message) in &observed {
+                    collect_thread_root_user_ids(message, &mut user_ids);
+                }
+                let conversations = self.imp().workspace.conversations.borrow();
+                let channel_ids = observed
+                    .iter()
+                    .map(|(channel_id, _)| channel_id.as_str())
+                    .collect::<HashSet<_>>();
+                for channel_id in channel_ids {
+                    if let Some(conversation) = conversations.get(channel_id) {
+                        user_ids.extend(conversation.display_user_ids());
+                    }
+                }
+            }
+            MainMessageView::Search => {
+                for result in state.search_results() {
+                    collect_search_result_user_ids(result, &mut user_ids);
+                }
+            }
+            MainMessageView::Saved => {
+                for message in state
+                    .saved_items()
+                    .iter()
+                    .filter_map(|item| item.message.as_ref())
+                {
+                    collect_message_user_ids(std::slice::from_ref(message), &mut user_ids);
+                }
+            }
+            MainMessageView::Files => {
+                user_ids.extend(state.files().iter().filter_map(|file| file.user.clone()));
+            }
+            MainMessageView::Placeholder => {}
         }
+        user_ids
     }
 
     fn main_view_uses_image_asset(
@@ -10404,40 +10403,30 @@ impl ConduitWindow {
         }
     }
 
-    fn patch_user_on_timelines(&self, user_id: &str) {
-        let main_view_uses_user = self.main_view_uses_user(user_id);
-        let (
-            main_view,
-            main_conversation_uses_user,
-            main_reaction_user,
-            thread_uses_user,
-            thread_reaction_user,
-        ) = {
+    /// Queues at most one main and one thread re-render for a batch of changed users.
+    fn patch_users_on_timelines<'a>(&self, user_ids: impl IntoIterator<Item = &'a String>) {
+        let user_ids = user_ids.into_iter().collect::<Vec<_>>();
+        if user_ids.is_empty() {
+            return;
+        }
+        let (mut main_user_ids, thread_user_ids) = {
             let state = self.imp().workspace.view.borrow();
-            let main_messages = state
-                .visible_channel_id()
-                .map(|channel_id| state.channel_messages(channel_id));
-            let thread_messages = state
-                .selected_thread_ts()
-                .map(|_| state.current_thread_messages());
-            (
-                state.main_view(),
-                main_messages.is_some_and(|messages| messages_use_user(messages, user_id)),
-                main_messages
-                    .is_some_and(|messages| messages_use_user_in_reactions(messages, user_id)),
-                thread_messages.is_some_and(|messages| messages_use_user(messages, user_id)),
-                thread_messages
-                    .is_some_and(|messages| messages_use_user_in_reactions(messages, user_id)),
-            )
+            let mut main_user_ids = HashSet::new();
+            if let Some(channel_id) = state.visible_channel_id() {
+                collect_message_user_ids(state.channel_messages(channel_id), &mut main_user_ids);
+            }
+            let mut thread_user_ids = HashSet::new();
+            if state.selected_thread_ts().is_some() {
+                collect_message_user_ids(state.current_thread_messages(), &mut thread_user_ids);
+            }
+            (main_user_ids, thread_user_ids)
         };
+        main_user_ids.extend(self.main_view_user_ids());
 
-        if main_reaction_user
-            || main_conversation_uses_user
-            || (main_view != MainMessageView::Conversation && main_view_uses_user)
-        {
+        if user_ids.iter().any(|id| main_user_ids.contains(*id)) {
             self.queue_ui_invalidations(UiInvalidations::MAIN);
         }
-        if thread_reaction_user || thread_uses_user {
+        if user_ids.iter().any(|id| thread_user_ids.contains(*id)) {
             self.queue_ui_invalidations(UiInvalidations::THREAD);
         }
     }

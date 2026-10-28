@@ -35,7 +35,7 @@ pub fn extract_user_ids(message: &SlackMessage) -> Vec<String> {
     ids
 }
 
-fn extract_mentions(text: &str, ids: &mut Vec<String>) {
+pub fn extract_mentions(text: &str, ids: &mut Vec<String>) {
     let mut rest = text;
     while let Some(start) = rest.find("<@") {
         rest = &rest[start + 2..];
