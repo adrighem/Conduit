@@ -53,8 +53,10 @@ pub fn load_custom_emoji_picture(path: &Path) -> Widget {
                 if !crate::animated_image::within_decode_budget(path) {
                     return None;
                 }
-                let pixbuf = gdk_pixbuf::Pixbuf::from_file(path).ok()?;
-                let scaled = scale_reaction_pixbuf(&pixbuf);
+                let scaled = crate::debug::trace_image_decode("pixbuf", || {
+                    let pixbuf = gdk_pixbuf::Pixbuf::from_file(path).ok()?;
+                    Some(scale_reaction_pixbuf(&pixbuf))
+                })?;
                 let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
                 map.insert(path.to_path_buf(), texture.clone());
                 Some(texture.upcast())

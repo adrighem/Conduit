@@ -5786,7 +5786,9 @@ fn message_authority_uses_canonical_batches_and_keeps_queue_fallback_explicit() 
         .split_once("#[derive(Debug, Clone, Copy, PartialEq, Eq)]")
         .unwrap()
         .0;
-    assert!(socket_persistence.contains("store_batch_admission.lock().await"));
+    assert!(
+        socket_persistence.contains("acquire_store_admission(&workspace.store_batch_admission)")
+    );
     assert!(socket_persistence.contains("recover_persisted_admitted(Some(store))"));
     assert!(socket_persistence.contains("apply_and_enqueue("));
     assert!(!socket_persistence.contains("store_merged_history("));

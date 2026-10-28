@@ -363,9 +363,11 @@ pub struct SlackApi {
 }
 
 async fn send_tracked_slack_request(
+    label: &str,
     request: reqwest::RequestBuilder,
 ) -> reqwest::Result<reqwest::Response> {
     crate::debug::pipeline_counters().record_api_request();
+    crate::debug::record_api_request_method(label);
     request.send().await
 }
 
@@ -1366,7 +1368,7 @@ impl SlackApi {
         } else {
             self.http.get(url)
         };
-        let response = send_tracked_slack_request(request)
+        let response = send_tracked_slack_request("download_preview", request)
             .await
             .context("failed to download Slack preview asset")?
             .error_for_status()
@@ -1423,11 +1425,14 @@ impl SlackApi {
     /// after a successful download and never contains a partial response.
     pub async fn download_media(&self, url: &str, destination: &Path) -> Result<DownloadedMedia> {
         ensure_trusted_slack_download_url(url)?;
-        let response = send_tracked_slack_request(self.authenticated_request(Method::GET, url))
-            .await
-            .context("failed to download Slack media")?
-            .error_for_status()
-            .context("Slack media returned an HTTP error")?;
+        let response = send_tracked_slack_request(
+            "download_media",
+            self.authenticated_request(Method::GET, url),
+        )
+        .await
+        .context("failed to download Slack media")?
+        .error_for_status()
+        .context("Slack media returned an HTTP error")?;
 
         let mime_type = response
             .headers()
@@ -1527,11 +1532,14 @@ impl SlackApi {
         }
 
         progress(DownloadProgressUpdate::new(0.05, "Starting download"));
-        let response = send_tracked_slack_request(self.authenticated_request(Method::GET, url))
-            .await
-            .context("failed to download Slack attachment")?
-            .error_for_status()
-            .context("Slack attachment returned an HTTP error")?;
+        let response = send_tracked_slack_request(
+            "download_attachment",
+            self.authenticated_request(Method::GET, url),
+        )
+        .await
+        .context("failed to download Slack attachment")?
+        .error_for_status()
+        .context("Slack attachment returned an HTTP error")?;
         let expected_size = response.content_length();
         ensure_attachment_size(expected_size)?;
 
@@ -1799,11 +1807,14 @@ impl SlackApi {
                 &format!("Uploading {filename}"),
             ));
             self.ensure_trusted_upload_url(&upload.upload_url)?;
-            send_tracked_slack_request(self.http.post(&upload.upload_url).body(bytes))
-                .await
-                .context("failed to upload file bytes to Slack upload URL")?
-                .error_for_status()
-                .context("Slack upload URL returned an HTTP error")?;
+            send_tracked_slack_request(
+                "upload_bytes",
+                self.http.post(&upload.upload_url).body(bytes),
+            )
+            .await
+            .context("failed to upload file bytes to Slack upload URL")?
+            .error_for_status()
+            .context("Slack upload URL returned an HTTP error")?;
             pending_files.push(json!({ "id": upload.file_id, "title": filename }));
             progress(UploadProgressUpdate::new(base + span, "File data uploaded"));
         }
@@ -1855,6 +1866,7 @@ impl SlackApi {
 
         loop {
             let response = send_tracked_slack_request(
+                method,
                 self.authenticated_request(Method::POST, &url)
                     .timeout(API_REQUEST_TIMEOUT)
                     .form(&form),
@@ -1947,7 +1959,7 @@ impl SlackApi {
         if let Some(user_agent) = user_agent {
             request = request.header(USER_AGENT, user_agent);
         }
-        let response = send_tracked_slack_request(request)
+        let response = send_tracked_slack_request(method, request)
             .await
             .with_context(|| format!("failed to call Slack method {method}"))?;
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
