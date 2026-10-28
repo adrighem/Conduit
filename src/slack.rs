@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::auth::browser_session_cookie_header;
-use crate::client_counts::ClientCountsPayload;
+use crate::client_counts::{ClientCounts, ClientCountsPayload};
 use crate::http_client;
 use crate::models::{
     AuthInfo, SavedItem, SearchMatch, SlackAttachment, SlackConversation, SlackFile, SlackMessage,
@@ -25,7 +25,6 @@ use crate::search::{
     SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
 };
 use crate::slack_message_wire::{deserialize_message, deserialize_messages};
-use crate::unread_ledger::ServerReadCounts;
 
 const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MEDIA_DOWNLOAD_BYTES: u64 = MAX_UPLOAD_BYTES;
@@ -89,6 +88,20 @@ fn browser_action_client_token() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("web-{milliseconds}")
+}
+
+/// How far `client.counts` snapshots trust the local clock: replies within
+/// this margin of the request keep their local unread state.
+const CLIENT_COUNTS_CLOCK_MARGIN: Duration = Duration::from_secs(10);
+
+/// The request time of a `client.counts` snapshot as a Slack timestamp,
+/// backed off by `CLIENT_COUNTS_CLOCK_MARGIN` against clock skew.
+fn client_counts_snapshot_ts() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .saturating_sub(CLIENT_COUNTS_CLOCK_MARGIN);
+    format!("{}.{:06}", now.as_secs(), now.subsec_micros())
 }
 
 fn parse_private_action_json(value: &str) -> Result<Value> {
@@ -1090,8 +1103,10 @@ impl SlackApi {
         Ok(followed_threads_page(response, cursor.as_deref()))
     }
 
-    /// Read-state baseline for every conversation (`client.counts`).
-    pub async fn client_counts(&self) -> Result<Vec<ServerReadCounts>> {
+    /// Read-state baseline for every conversation and followed thread
+    /// (`client.counts`).
+    pub async fn client_counts(&self) -> Result<ClientCounts> {
+        let snapshot_ts = client_counts_snapshot_ts();
         let response: ClientCountsResponse = self
             .post_form(
                 "client.counts",
@@ -1102,7 +1117,7 @@ impl SlackApi {
                 ],
             )
             .await?;
-        Ok(response.payload.server_read_counts())
+        Ok(response.payload.into_client_counts(&snapshot_ts))
     }
 
     pub async fn open_direct_message(&self, user_id: &str) -> Result<SlackConversation> {

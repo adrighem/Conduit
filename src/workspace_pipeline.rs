@@ -19,7 +19,7 @@ use crate::attention::{
     DeliveryState, MessageMutation, ThreadRelationship,
 };
 use crate::models::{slack_timestamp_is_after, SlackConversation, SlackMessage, SlackUser};
-use crate::thread_catalog::{ThreadCatalog, ThreadKey, ThreadRecord};
+use crate::thread_catalog::{ServerThreadCounts, ThreadCatalog, ThreadKey, ThreadRecord};
 use crate::unread_ledger::{
     message_signal, own_post_reads_conversation, ConversationReadState, MessageSignal,
     ServerReadCounts, UnreadLedger,
@@ -194,6 +194,9 @@ pub(crate) enum WorkspaceMutation {
     ThreadCatalogChanged(Vec<ThreadRecord>),
     /// Roots from Slack's followed-threads list (`subscriptions.thread.getView`).
     FollowedThreadsObserved(Vec<(String, SlackMessage)>),
+    /// `client.counts` followed-threads summary; clears local thread
+    /// unreads Slack reports as read.
+    ThreadCountsSnapshot(ServerThreadCounts),
     /// Marks a thread read. `last_read: None` means fully read up to its
     /// latest known reply, which the runtime syncs to Slack with
     /// `subscriptions.thread.mark`. `Some` carries another client's read
@@ -627,6 +630,9 @@ impl WorkspaceCoordinator {
             WorkspaceMutation::ThreadCatalogChanged(records) => self.apply_thread_catalog(records),
             WorkspaceMutation::FollowedThreadsObserved(roots) => {
                 self.apply_followed_threads(&roots, origin)
+            }
+            WorkspaceMutation::ThreadCountsSnapshot(counts) => {
+                self.apply_thread_counts_snapshot(&counts)
             }
             WorkspaceMutation::ThreadRead {
                 channel_id,
@@ -2103,6 +2109,22 @@ impl WorkspaceCoordinator {
             revision,
             vec![WorkspaceChange::ThreadCatalogChanged(delta)],
             store_changes,
+        )
+    }
+
+    fn apply_thread_counts_snapshot(
+        &mut self,
+        counts: &ServerThreadCounts,
+    ) -> Option<WorkspaceReduction> {
+        let delta = self.thread_catalog.apply_server_thread_counts(counts);
+        if delta.is_empty() {
+            return None;
+        }
+        let revision = self.next_revision();
+        self.commit(
+            revision,
+            vec![WorkspaceChange::ThreadCatalogChanged(delta.clone())],
+            vec![StoreChange::ThreadRecordsUpserted(delta)],
         )
     }
 

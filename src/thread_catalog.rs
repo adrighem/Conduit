@@ -21,6 +21,17 @@ impl ThreadKey {
     }
 }
 
+/// The followed-threads summary of a `client.counts` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerThreadCounts {
+    /// Conversations Slack says still hold unread threads; threads anywhere
+    /// else are read.
+    pub(crate) unread_channel_ids: HashSet<String>,
+    /// When the snapshot was requested. Replies newer than this may have
+    /// arrived after Slack built it, so they keep their local state.
+    pub(crate) snapshot_ts: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadRecord {
     pub(crate) key: ThreadKey,
@@ -222,6 +233,30 @@ impl ThreadCatalog {
         let before = (record.last_read.clone(), record.read_reply_count);
         record.mark_read();
         before != (record.last_read.clone(), record.read_reply_count)
+    }
+
+    /// Marks read every locally unread thread `client.counts` reports as
+    /// read: outside the conversations with unread threads, and with no
+    /// reply newer than the snapshot. Returns the changed records.
+    pub(crate) fn apply_server_thread_counts(
+        &mut self,
+        counts: &ServerThreadCounts,
+    ) -> Vec<ThreadRecord> {
+        let mut changed = Vec::new();
+        for record in self.records.values_mut() {
+            let covered_by_snapshot = record
+                .latest_reply
+                .as_deref()
+                .is_some_and(|latest| !slack_timestamp_is_after(latest, &counts.snapshot_ts));
+            if record.has_unread_replies()
+                && covered_by_snapshot
+                && !counts.unread_channel_ids.contains(&record.key.channel_id)
+            {
+                record.mark_read();
+                changed.push(record.clone());
+            }
+        }
+        changed
     }
 
     /// Thread inbox roots in Slack's followed-threads order. Before the first
@@ -642,6 +677,50 @@ mod tests {
 
         assert!(record.has_unread_replies());
         assert_eq!(record.unread_reply_count(), 1);
+    }
+
+    #[test]
+    fn server_thread_counts_clear_threads_slack_reports_read() {
+        let mut catalog = ThreadCatalog::default();
+        for (channel_id, root_ts, latest) in [
+            ("C1", "1.0", "5.0"),  // read on Slack: cleared
+            ("C2", "1.0", "5.0"),  // C2 still has unread threads: kept
+            ("C1", "2.0", "50.0"), // reply after the snapshot: kept
+        ] {
+            let mut record =
+                ThreadRecord::placeholder(ThreadKey::new(channel_id, root_ts).unwrap());
+            record.reply_count = 1;
+            record.latest_reply = Some(latest.into());
+            catalog.upsert_records([record]);
+        }
+
+        let changed = catalog.apply_server_thread_counts(&ServerThreadCounts {
+            unread_channel_ids: HashSet::from(["C2".to_string()]),
+            snapshot_ts: "10.0".into(),
+        });
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].key, ThreadKey::new("C1", "1.0").unwrap());
+        assert!(!catalog.get("C1", "1.0").unwrap().has_unread_replies());
+        assert!(catalog.get("C2", "1.0").unwrap().has_unread_replies());
+        assert!(catalog.get("C1", "2.0").unwrap().has_unread_replies());
+    }
+
+    #[test]
+    fn server_thread_counts_skip_threads_already_read() {
+        let mut catalog = ThreadCatalog::default();
+        let mut record = ThreadRecord::placeholder(ThreadKey::new("C1", "1.0").unwrap());
+        record.reply_count = 1;
+        record.latest_reply = Some("5.0".into());
+        record.mark_read();
+        catalog.upsert_records([record]);
+
+        let changed = catalog.apply_server_thread_counts(&ServerThreadCounts {
+            unread_channel_ids: HashSet::new(),
+            snapshot_ts: "10.0".into(),
+        });
+
+        assert!(changed.is_empty());
     }
 
     #[test]
