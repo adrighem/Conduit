@@ -821,6 +821,9 @@ pub struct SlackMessage {
     pub latest_reply: Option<String>,
     #[serde(default)]
     pub subscribed: Option<bool>,
+    /// Thread roots only: the user's server-side read position in the thread.
+    #[serde(default)]
+    pub last_read: Option<String>,
     pub is_starred: Option<bool>,
     #[serde(default)]
     pub is_thread_broadcast: Option<bool>,

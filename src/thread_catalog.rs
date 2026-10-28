@@ -96,6 +96,35 @@ impl ThreadRecord {
         self.read_reply_count = self.reply_count;
     }
 
+    /// Adopts Slack's read position when it is ahead of the local one, so
+    /// reads from other clients land even when `thread_marked` was missed.
+    /// Returns whether the record changed.
+    pub(crate) fn merge_server_last_read(&mut self, server_last_read: &str) -> bool {
+        let server_last_read = server_last_read.trim();
+        if server_last_read.is_empty()
+            || self
+                .last_read
+                .as_deref()
+                .is_some_and(|local| !slack_timestamp_is_after(server_last_read, local))
+        {
+            return false;
+        }
+        self.last_read = Some(server_last_read.to_string());
+        let read_replies = if self.has_unread_replies() {
+            self.seen_reply_ts
+                .iter()
+                .filter(|ts| !slack_timestamp_is_after(ts, server_last_read))
+                .count() as u64
+        } else {
+            self.reply_count
+        };
+        self.read_reply_count = self
+            .read_reply_count
+            .max(read_replies)
+            .min(self.reply_count);
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn is_known_subscribed(&self) -> bool {
         self.subscribed == Some(true)
@@ -439,6 +468,9 @@ fn merge_root_metadata(record: &mut ThreadRecord, root: &SlackMessage) {
             .cloned(),
     );
     record.root = Some(root.clone());
+    if let Some(server_last_read) = root.last_read.as_deref() {
+        record.merge_server_last_read(server_last_read);
+    }
 }
 
 #[cfg(test)]
@@ -559,6 +591,56 @@ mod tests {
         // A new reply arrives without another mark_read() call.
         record.reply_count = 6;
         record.latest_reply = Some("6.0".into());
+        assert_eq!(record.unread_reply_count(), 1);
+    }
+
+    #[test]
+    fn followed_root_with_server_last_read_clears_unread_from_another_client() {
+        let mut catalog = ThreadCatalog::default();
+        let mut followed = root("1.0", 3);
+        followed.latest_reply = Some("3.0".into());
+        followed.last_read = Some("3.0".into());
+
+        let record = catalog.observe_followed_root("C1", &followed).unwrap();
+
+        assert!(!record.has_unread_replies());
+        assert_eq!(record.unread_reply_count(), 0);
+        assert_eq!(record.last_read.as_deref(), Some("3.0"));
+    }
+
+    #[test]
+    fn server_last_read_only_moves_the_local_mark_forward() {
+        let mut record = ThreadRecord::placeholder(ThreadKey::new("C1", "1.0").unwrap());
+        record.reply_count = 5;
+        record.latest_reply = Some("5.0".into());
+        record.mark_read();
+
+        assert!(!record.merge_server_last_read("2.0"));
+        assert!(!record.merge_server_last_read("5.0"));
+        assert!(!record.merge_server_last_read(" "));
+        assert_eq!(record.last_read.as_deref(), Some("5.0"));
+        assert_eq!(record.unread_reply_count(), 0);
+    }
+
+    #[test]
+    fn partial_server_last_read_counts_only_seen_replies_it_covers() {
+        let mut catalog = ThreadCatalog::default();
+        catalog.observe_thread(
+            "C1",
+            "1.0",
+            &[
+                root("1.0", 3),
+                reply("2.0", "1.0", "U1"),
+                reply("3.0", "1.0", "U2"),
+                reply("4.0", "1.0", "U1"),
+            ],
+            true,
+        );
+        let mut record = catalog.get("C1", "1.0").unwrap().clone();
+
+        assert!(record.merge_server_last_read("3.0"));
+
+        assert!(record.has_unread_replies());
         assert_eq!(record.unread_reply_count(), 1);
     }
 

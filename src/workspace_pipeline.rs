@@ -194,11 +194,14 @@ pub(crate) enum WorkspaceMutation {
     ThreadCatalogChanged(Vec<ThreadRecord>),
     /// Roots from Slack's followed-threads list (`subscriptions.thread.getView`).
     FollowedThreadsObserved(Vec<(String, SlackMessage)>),
-    /// Marks a thread fully read up to its latest known reply. The runtime
-    /// syncs it to Slack with `subscriptions.thread.mark`.
+    /// Marks a thread read. `last_read: None` means fully read up to its
+    /// latest known reply, which the runtime syncs to Slack with
+    /// `subscriptions.thread.mark`. `Some` carries another client's read
+    /// position from `thread_marked`; it only ever moves the mark forward.
     ThreadRead {
         channel_id: String,
         root_ts: String,
+        last_read: Option<String>,
     },
     /// `client.counts` baseline for every conversation it lists.
     CountsSnapshot(Vec<ServerReadCounts>),
@@ -628,7 +631,8 @@ impl WorkspaceCoordinator {
             WorkspaceMutation::ThreadRead {
                 channel_id,
                 root_ts,
-            } => self.apply_thread_read(&channel_id, &root_ts),
+                last_read,
+            } => self.apply_thread_read(&channel_id, &root_ts, last_read.as_deref()),
             WorkspaceMutation::CountsSnapshot(counts) => self.apply_counts_snapshot(&counts),
             WorkspaceMutation::ConversationMarked { channel_id, ts } => {
                 self.apply_conversation_marked(&channel_id, &ts)
@@ -2102,7 +2106,12 @@ impl WorkspaceCoordinator {
         )
     }
 
-    fn apply_thread_read(&mut self, channel_id: &str, root_ts: &str) -> Option<WorkspaceReduction> {
+    fn apply_thread_read(
+        &mut self,
+        channel_id: &str,
+        root_ts: &str,
+        last_read: Option<&str>,
+    ) -> Option<WorkspaceReduction> {
         let mut records = self.thread_catalog.to_records();
         let record = match records
             .iter_mut()
@@ -2123,7 +2132,12 @@ impl WorkspaceCoordinator {
                 records.last_mut()?
             }
         };
-        record.mark_read();
+        match last_read {
+            Some(last_read) => {
+                record.merge_server_last_read(last_read);
+            }
+            None => record.mark_read(),
+        }
         self.apply_thread_catalog(records)
     }
 
@@ -3460,6 +3474,25 @@ mod tests {
     }
 
     #[test]
+    fn thread_read_from_another_client_keeps_replies_after_its_mark_unread() {
+        let mut coordinator = WorkspaceCoordinator::default();
+        let mut record = ThreadRecord::placeholder(ThreadKey::new("C1", "100.0").unwrap());
+        record.reply_count = 2;
+        record.latest_reply = Some("120.0".to_string());
+        coordinator.apply(WorkspaceMutation::ThreadCatalogChanged(vec![record]));
+
+        coordinator.apply(WorkspaceMutation::ThreadRead {
+            channel_id: "C1".to_string(),
+            root_ts: "100.0".to_string(),
+            last_read: Some("110.0".to_string()),
+        });
+
+        let rec = coordinator.thread_catalog.get("C1", "100.0").unwrap();
+        assert_eq!(rec.last_read.as_deref(), Some("110.0"));
+        assert!(rec.has_unread_replies());
+    }
+
+    #[test]
     fn thread_read_mutation_marks_thread_read_and_updates_catalog() {
         let mut coordinator = WorkspaceCoordinator::default();
         let key = ThreadKey::new("C1", "100.0").unwrap();
@@ -3476,6 +3509,7 @@ mod tests {
             .apply(WorkspaceMutation::ThreadRead {
                 channel_id: "C1".to_string(),
                 root_ts: "100.0".to_string(),
+                last_read: None,
             })
             .expect("reduction expected");
 

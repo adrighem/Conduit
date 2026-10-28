@@ -61,6 +61,7 @@ pub enum SocketModeEvent {
     ThreadMarked {
         channel_id: String,
         thread_ts: String,
+        last_read: Option<String>,
     },
 }
 
@@ -468,6 +469,7 @@ fn thread_marked_event(event: &Value) -> Option<SocketModeEvent> {
     Some(SocketModeEvent::ThreadMarked {
         channel_id: non_empty_str(subscription, "channel")?.to_string(),
         thread_ts: non_empty_str(subscription, "thread_ts")?.to_string(),
+        last_read: non_empty_str(subscription, "last_read").map(ToString::to_string),
     })
 }
 
@@ -680,6 +682,7 @@ mod tests {
             Some(SocketModeEvent::ThreadMarked {
                 channel_id: "C1".to_string(),
                 thread_ts: "1710000000.000100".to_string(),
+                last_read: Some("1710000000.000300".to_string()),
             })
         );
     }
