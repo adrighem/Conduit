@@ -9,7 +9,7 @@ use crate::rich_message::{MessageAuthor, MessageDocument, MessageNode, MESSAGE_C
 
 const CONVERSATION_MEMBER_KEYS: [&str; 2] = ["members", "users"];
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredToken {
     pub access_token: String,
     pub token_type: Option<String>,
