@@ -3005,6 +3005,34 @@ fn search_result_user_ids_include_author_and_mentions() {
 }
 
 #[test]
+fn messages_showing_image_asset_lists_only_rows_using_the_key() {
+    let emoji_url = "https://emoji.slack-edge.com/T1/party/abc.png".to_string();
+    let custom_emojis = HashMap::from([("party".to_string(), emoji_url.clone())]);
+    let message = |ts: &str, user: &str, text: &str| SlackMessage {
+        ts: ts.to_string(),
+        user: Some(user.to_string()),
+        text: Some(text.to_string()),
+        ..Default::default()
+    };
+    let messages = [
+        message("1.0", "U1", "plain"),
+        message("2.0", "U2", "party :party: time"),
+        message("3.0", "U3", "plain"),
+    ];
+    let showing = |key: &str, users: &[&str]| {
+        let users = users.iter().map(ToString::to_string).collect::<Vec<_>>();
+        messages_showing_image_asset(&messages, &custom_emojis, key, &users)
+    };
+
+    assert_eq!(showing(&emoji_url, &[]), HashSet::from(["2.0".to_string()]));
+    assert_eq!(
+        showing("https://avatars.example/u3.png", &["U3"]),
+        HashSet::from(["3.0".to_string()])
+    );
+    assert!(showing("https://example.com/unused.png", &[]).is_empty());
+}
+
+#[test]
 fn forward_message_payload_uses_permalink_when_visible() {
     let public_channel = SlackConversation {
         id: "C123".to_string(),

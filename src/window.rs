@@ -2838,8 +2838,43 @@ fn messages_use_image_asset(
     key: &str,
 ) -> bool {
     let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
-    messages.iter().any(|message| {
-        message.avatar_url() == Some(key)
+    messages
+        .iter()
+        .any(|message| message_uses_image_asset(message, &catalog, key))
+}
+
+/// Timestamps of the messages whose rows show image asset `key`, either
+/// directly or as the avatar of one of `avatar_user_ids`. The single source
+/// of truth for which timeline rows an arriving image must re-render.
+fn messages_showing_image_asset(
+    messages: &[SlackMessage],
+    custom_emojis: &HashMap<String, String>,
+    key: &str,
+    avatar_user_ids: &[String],
+) -> HashSet<String> {
+    let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
+    messages
+        .iter()
+        .filter(|message| {
+            message_uses_image_asset(message, &catalog, key)
+                || (!avatar_user_ids.is_empty() && {
+                    let mut user_ids = HashSet::new();
+                    collect_message_user_ids(std::slice::from_ref(message), &mut user_ids);
+                    avatar_user_ids
+                        .iter()
+                        .any(|user_id| user_ids.contains(user_id))
+                })
+        })
+        .map(|message| message.ts.clone())
+        .collect()
+}
+
+fn message_uses_image_asset(
+    message: &SlackMessage,
+    catalog: &crate::emoji::EmojiCatalog,
+    key: &str,
+) -> bool {
+    message.avatar_url() == Some(key)
             || message
                 .files
                 .as_ref()
@@ -2889,7 +2924,6 @@ fn messages_use_image_asset(
                 }
                 false
             })
-    })
 }
 
 /// Collects every user id the rendered messages depend on (author, mentions, reactions).
@@ -9770,7 +9804,7 @@ impl ConduitWindow {
             .iter()
             .filter_map(|(user_id, url)| (url == key).then_some(user_id.clone()))
             .collect::<Vec<_>>();
-        let (main_uses_asset, timeline_uses_asset, thread_uses_asset, main_view) = {
+        let (main_uses_asset, timeline_rows, thread_rows, main_view) = {
             let custom_emojis = self.imp().custom_emojis.borrow();
             let main_uses = self.main_view_uses_image_asset(&custom_emojis, key)
                 || (!avatar_user_ids.is_empty() && {
@@ -9782,33 +9816,37 @@ impl ConduitWindow {
             let state = self.imp().workspace.view.borrow();
             // The conversation timeline keeps its rows while another main
             // view shows, and its re-renders leave image changes to this path.
-            let timeline_uses = state.last_channel_id().is_some_and(|channel_id| {
-                let messages = state.channel_messages(channel_id);
-                messages_use_image_asset(messages, &custom_emojis, key)
-                    || (!avatar_user_ids.is_empty() && {
-                        let mut timeline_user_ids = HashSet::new();
-                        collect_message_user_ids(messages, &mut timeline_user_ids);
-                        avatar_user_ids
-                            .iter()
-                            .any(|user_id| timeline_user_ids.contains(user_id))
-                    })
-            });
-            let thread_messages = state.current_thread_messages();
-            let thread_uses = state.selected_thread_ts().is_some()
-                && (messages_use_image_asset(thread_messages, &custom_emojis, key)
-                    || (!avatar_user_ids.is_empty() && {
-                        let mut thread_user_ids = HashSet::new();
-                        collect_message_user_ids(thread_messages, &mut thread_user_ids);
-                        avatar_user_ids
-                            .iter()
-                            .any(|user_id| thread_user_ids.contains(user_id))
-                    }));
-            (main_uses, timeline_uses, thread_uses, state.main_view())
+            let timeline_rows = state
+                .last_channel_id()
+                .map(|channel_id| {
+                    messages_showing_image_asset(
+                        state.channel_messages(channel_id),
+                        &custom_emojis,
+                        key,
+                        &avatar_user_ids,
+                    )
+                })
+                .unwrap_or_default();
+            let thread_rows = if state.selected_thread_ts().is_some() {
+                messages_showing_image_asset(
+                    state.current_thread_messages(),
+                    &custom_emojis,
+                    key,
+                    &avatar_user_ids,
+                )
+            } else {
+                HashSet::new()
+            };
+            (main_uses, timeline_rows, thread_rows, state.main_view())
         };
+        let thread_uses_asset = !thread_rows.is_empty();
 
         let native_timeline = self.imp().native_timeline_view.borrow().clone();
-        if let Some(timeline) = native_timeline.as_ref().filter(|_| timeline_uses_asset) {
-            timeline.update_image_asset(&self.message_html_context(None));
+        if let Some(timeline) = native_timeline
+            .as_ref()
+            .filter(|_| !timeline_rows.is_empty())
+        {
+            timeline.update_image_asset(&self.message_html_context(None), timeline_rows);
         }
         if main_uses_asset
             && (main_view != MainMessageView::Conversation || native_timeline.is_none())
@@ -9818,7 +9856,9 @@ impl ConduitWindow {
         if thread_uses_asset {
             let native_timeline = self.thread_pane().native_timeline_view.borrow().clone();
             match native_timeline {
-                Some(timeline) => timeline.update_image_asset(&self.message_html_context(None)),
+                Some(timeline) => {
+                    timeline.update_image_asset(&self.message_html_context(None), thread_rows)
+                }
                 None => self.queue_ui_invalidations(UiInvalidations::THREAD),
             }
         }
