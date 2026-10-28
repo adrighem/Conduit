@@ -698,7 +698,7 @@ impl NativeTimelineView {
                 let x = (bounds.x() + bounds.width() - bar_w as f32 - 8.0)
                     .max(4.0)
                     .min(max_x.max(4.0));
-                let y = (bounds.y() + 4.0).max(0.0);
+                let y = bounds.y().max(0.0);
                 Some(gtk::gdk::Rectangle::new(
                     x.round() as i32,
                     y.round() as i32,
