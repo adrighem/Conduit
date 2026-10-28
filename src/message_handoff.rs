@@ -230,19 +230,7 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         surface: TimelineSurfaceId,
         messages: impl IntoIterator<Item = MessageRef>,
     ) -> Result<HashMap<MessageRef, MessageControlHandle>, HandleRegistrationError> {
-        let revoked = self
-            .active
-            .iter()
-            .filter_map(|(target, (_, handle))| {
-                (target.surface == surface).then_some(handle.clone())
-            })
-            .collect::<Vec<_>>();
-        self.active.retain(|target, _| target.surface != surface);
-        for handle in revoked {
-            self.entries.remove(&handle);
-            self.claimed.remove(&handle);
-        }
-
+        self.revoke(|target| target.surface == surface);
         self.revision = self.revision.next();
         let revision = self.revision;
         let mut registered = HashMap::new();
@@ -274,34 +262,16 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         surface: TimelineSurfaceId,
         messages: impl IntoIterator<Item = (MessageRef, Vec<MessageControlKey>)>,
     ) -> Result<HashMap<MessageControlTarget, MessageControlHandle>, HandleRegistrationError> {
-        let revoked = self
-            .active
-            .iter()
-            .filter_map(|(target, (_, handle))| {
-                (target.surface == surface).then_some(handle.clone())
-            })
-            .collect::<Vec<_>>();
-        self.active.retain(|target, _| target.surface != surface);
-        for handle in revoked {
-            self.entries.remove(&handle);
-            self.claimed.remove(&handle);
-        }
-
-        self.revision = self.revision.next();
-        let revision = self.revision;
+        self.revoke(|target| target.surface == surface);
         let mut registered = HashMap::new();
         let mut unique = HashSet::new();
         for (message, control_keys) in messages {
-            if !unique.insert(message.clone()) {
-                continue;
-            }
-            let fallback = MessageControlTarget::handoff(surface, message.clone());
-            let handle = self.register(fallback.clone(), revision)?;
-            registered.insert(fallback, handle);
-            for key in control_keys {
-                let target = MessageControlTarget::control(surface, message.clone(), key);
-                let handle = self.register(target.clone(), revision)?;
-                registered.insert(target, handle);
+            if unique.insert(message.clone()) {
+                registered.extend(self.replace_message_with_controls(
+                    surface,
+                    message,
+                    control_keys,
+                )?);
             }
         }
         Ok(registered)
@@ -317,31 +287,41 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         self.revision = self.revision.next();
         let revision = self.revision;
         let mut registered = HashMap::new();
-        let fallback = MessageControlTarget::handoff(surface, message.clone());
-        let handle = self.register(fallback.clone(), revision)?;
-        registered.insert(fallback, handle);
-        for key in control_keys {
-            let target = MessageControlTarget::control(surface, message.clone(), key);
-            let handle = self.register(target.clone(), revision)?;
+        let targets = std::iter::once(MessageControlTarget::handoff(surface, message.clone()))
+            .chain(
+                control_keys
+                    .into_iter()
+                    .map(|key| MessageControlTarget::control(surface, message.clone(), key)),
+            );
+        for target in targets {
+            // An in-flight handle survived `remove_message`; keep it so the
+            // next click still finds it claimed.
+            let handle = match self.active.get(&target) {
+                Some((_, handle)) => handle.clone(),
+                None => self.register(target.clone(), revision)?,
+            };
             registered.insert(target, handle);
         }
         Ok(registered)
     }
 
     pub(crate) fn remove_message(&mut self, surface: TimelineSurfaceId, message: &MessageRef) {
-        let revoked = self
-            .active
-            .iter()
-            .filter_map(|(target, (_, handle))| {
-                (target.surface == surface && &target.message == message).then_some(handle.clone())
-            })
-            .collect::<Vec<_>>();
-        self.active
-            .retain(|target, _| target.surface != surface || &target.message != message);
-        for handle in revoked {
-            self.entries.remove(&handle);
-            self.claimed.remove(&handle);
-        }
+        self.revoke(|target| target.surface == surface && &target.message == message);
+    }
+
+    /// Revokes the handles whose target matches, except claimed ones: an
+    /// action in flight keeps its handle until `complete` or `release`, so a
+    /// re-render cannot drop the guard against dispatching it twice.
+    fn revoke(&mut self, matches: impl Fn(&MessageControlTarget) -> bool) {
+        let claimed = &self.claimed;
+        let entries = &mut self.entries;
+        self.active.retain(|target, (_, handle)| {
+            if !matches(target) || claimed.contains(handle) {
+                return true;
+            }
+            entries.remove(handle);
+            false
+        });
     }
 
     pub(crate) fn active_control_handle(
@@ -886,6 +866,56 @@ mod tests {
         registry.complete(&handle);
         assert!(!registry.claim(&handle), "completed handles are gone");
         assert_eq!(registry.message_for(&handle), None);
+    }
+
+    #[test]
+    fn re_render_keeps_an_in_flight_claim() {
+        let mut registry = registry(&[
+            "33333333333333333333333333333333",
+            "44444444444444444444444444444444",
+            "55555555555555555555555555555555",
+        ]);
+        let message = target("C123", "1710000000.000100");
+        let document = MessageDocument::new(
+            vec![MessageNode::Actions(vec![MessageControl::new(
+                "Send", None,
+            )])],
+            None,
+        );
+        let keys = document.control_keys();
+        registry
+            .replace_message_with_controls(TimelineSurfaceId::Main, message.clone(), keys.clone())
+            .unwrap();
+        let handle = registry
+            .active_control_handle(TimelineSurfaceId::Main, &message, keys[0])
+            .unwrap();
+        assert!(registry.claim(&handle));
+
+        // The message re-renders (e.g. the app edits it) and then leaves
+        // the surface while its action is still in flight.
+        registry
+            .replace_message_with_controls(TimelineSurfaceId::Main, message.clone(), keys.clone())
+            .unwrap();
+        registry
+            .replace_surface_with_controls(TimelineSurfaceId::Main, [])
+            .unwrap();
+
+        let current = registry
+            .active_control_handle(TimelineSurfaceId::Main, &message, keys[0])
+            .expect("in-flight handle stays registered");
+        assert_eq!(current, handle);
+        assert!(!registry.claim(&current), "second dispatch is rejected");
+        assert_eq!(registry.message_for(&handle), Some(message.clone()));
+
+        registry.complete(&handle);
+        registry
+            .replace_surface_with_controls(TimelineSurfaceId::Main, [])
+            .unwrap();
+        assert_eq!(
+            registry.active_control_handle(TimelineSurfaceId::Main, &message, keys[0]),
+            None,
+            "re-rendering drops idle handles"
+        );
     }
 
     fn registry(tokens: &[&str]) -> MessageControlRegistry<SequenceTokenSource> {
