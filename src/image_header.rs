@@ -10,29 +10,59 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
+/// Container format recognised from an image's magic bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageFormat {
+    Png,
+    Gif,
+    Jpeg,
+    Webp,
+}
+
+impl ImageFormat {
+    /// Whether the format can hold several frames. Like gdk-pixbuf, an
+    /// animated PNG counts as a still PNG.
+    pub(crate) fn may_be_animated(self) -> bool {
+        matches!(self, Self::Gif | Self::Webp)
+    }
+}
+
 /// Width and height declared by the PNG, GIF, JPEG or WebP at `path`. `None`
 /// for other formats and for files too short or malformed to say.
 pub(crate) fn declared_dimensions(path: &Path) -> Option<(u32, u32)> {
-    let mut reader = BufReader::new(File::open(path).ok()?);
-    dimensions(&mut reader)
+    declared_header(path).map(|(_, width, height)| (width, height))
 }
 
-fn dimensions(reader: &mut (impl Read + Seek)) -> Option<(u32, u32)> {
+/// Format and declared canvas size of the image at `path`. Reads a few
+/// header bytes, so unlike gdk-pixbuf's out-of-process glycin probe it is
+/// cheap enough to call on the GTK thread for every bound row.
+pub(crate) fn declared_header(path: &Path) -> Option<(ImageFormat, u32, u32)> {
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    header(&mut reader)
+}
+
+fn header(reader: &mut (impl Read + Seek)) -> Option<(ImageFormat, u32, u32)> {
     let mut magic = [0u8; 12];
     reader.read_exact(&mut magic).ok()?;
-    match magic {
-        [0x89, b'P', b'N', b'G', ..] => png(reader),
-        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', w0, w1, h0, h1, ..] => Some((
-            u32::from(u16::from_le_bytes([w0, w1])),
-            u32::from(u16::from_le_bytes([h0, h1])),
-        )),
+    let (format, (width, height)) = match magic {
+        [0x89, b'P', b'N', b'G', ..] => (ImageFormat::Png, png(reader)?),
+        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', w0, w1, h0, h1, ..] => (
+            ImageFormat::Gif,
+            (
+                u32::from(u16::from_le_bytes([w0, w1])),
+                u32::from(u16::from_le_bytes([h0, h1])),
+            ),
+        ),
         [0xff, 0xd8, ..] => {
             reader.seek(std::io::SeekFrom::Start(2)).ok()?;
-            jpeg(reader)
+            (ImageFormat::Jpeg, jpeg(reader)?)
         }
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P'] => webp(reader),
-        _ => None,
-    }
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P'] => {
+            (ImageFormat::Webp, webp(reader)?)
+        }
+        _ => return None,
+    };
+    Some((format, width, height))
 }
 
 /// IHDR always comes first: 4-byte length, "IHDR", then big-endian width
@@ -114,7 +144,25 @@ mod tests {
     use super::*;
 
     fn dims(bytes: &[u8]) -> Option<(u32, u32)> {
-        dimensions(&mut std::io::Cursor::new(bytes))
+        header(&mut std::io::Cursor::new(bytes)).map(|(_, width, height)| (width, height))
+    }
+
+    fn format(bytes: &[u8]) -> Option<ImageFormat> {
+        header(&mut std::io::Cursor::new(bytes)).map(|(format, _, _)| format)
+    }
+
+    #[test]
+    fn names_the_format_and_whether_it_may_animate() {
+        assert_eq!(format(&encoded("png", 2, 2)), Some(ImageFormat::Png));
+        assert_eq!(format(&encoded("jpeg", 2, 2)), Some(ImageFormat::Jpeg));
+        assert_eq!(
+            format(b"GIF89a\x02\x00\x02\x00\x80\x00\x00"),
+            Some(ImageFormat::Gif)
+        );
+        assert!(ImageFormat::Gif.may_be_animated());
+        assert!(ImageFormat::Webp.may_be_animated());
+        assert!(!ImageFormat::Png.may_be_animated());
+        assert!(!ImageFormat::Jpeg.may_be_animated());
     }
 
     fn encoded(format: &str, width: i32, height: i32) -> Vec<u8> {
