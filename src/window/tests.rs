@@ -242,6 +242,21 @@ fn repeated_ui_invalidations_require_only_one_scheduled_flush() {
 }
 
 #[test]
+fn synchronous_sidebar_render_clears_only_the_pending_sidebar_flag() {
+    let mut pending = UiInvalidations::default();
+    pending.insert(UiInvalidations::SIDEBAR | UiInvalidations::MAIN);
+
+    pending.remove(UiInvalidations::SIDEBAR);
+
+    assert!(!pending.contains(UiInvalidations::SIDEBAR));
+    assert!(pending.contains(UiInvalidations::MAIN));
+    pending.remove(UiInvalidations::MAIN);
+    assert!(pending.is_empty());
+    pending.remove(UiInvalidations::SIDEBAR);
+    assert!(pending.is_empty());
+}
+
+#[test]
 fn coalesced_ui_invalidation_flush_drains_each_surface_once() {
     let mut pending = UiInvalidations::default();
     assert!(pending.insert(UiInvalidations::SIDEBAR));

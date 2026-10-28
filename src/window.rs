@@ -127,6 +127,12 @@ impl UiInvalidations {
     pub fn take(&mut self) -> Self {
         std::mem::take(self)
     }
+
+    /// Drops `invalidations` from the pending set, for surfaces that were
+    /// just rendered synchronously and no longer need their queued flush.
+    pub fn remove(&mut self, invalidations: Self) {
+        self.0 &= !invalidations.0;
+    }
 }
 
 impl std::ops::BitOr for UiInvalidations {
@@ -7888,6 +7894,22 @@ impl ConduitWindow {
         });
     }
 
+    /// Coalesces a full sidebar rebuild into the next frame flush. The
+    /// rebuild reads current workspace state when it runs, and nothing in the
+    /// callers depends on the list store being up to date before then.
+    fn queue_sidebar_render(&self) {
+        self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
+    }
+
+    /// Queues the sidebar render after a main-view switch. The navigation
+    /// toggle group, composer visibility and back button are cheap and give
+    /// immediate feedback, so they stay synchronous; only the expensive
+    /// sidebar rebuild (which clears the stale row selection) is deferred.
+    fn queue_sidebar_render_after_view_change(&self) {
+        self.sync_workspace_chrome();
+        self.queue_sidebar_render();
+    }
+
     fn flush_ui_invalidations(&self) {
         let mut pending = self.imp().pending_ui_invalidations.get();
         let invalidations = pending.take();
@@ -8087,7 +8109,7 @@ impl ConduitWindow {
                 }
                 imp.workspace.view.borrow_mut().show_search();
                 self.render_closed_thread();
-                self.render_conversations();
+                self.queue_sidebar_render_after_view_change();
                 self.rerender_current_main_messages();
                 imp.workspace_split.set_show_content(true);
             }
@@ -8111,7 +8133,7 @@ impl ConduitWindow {
             self.imp().message_title.set_title(&title);
             self.show_message_placeholder(&title);
             self.render_closed_thread();
-            self.render_conversations();
+            self.queue_sidebar_render_after_view_change();
         }
         self.imp().workspace_split.set_show_content(true);
     }
@@ -8165,7 +8187,7 @@ impl ConduitWindow {
         self.imp().workspace.view.borrow_mut().start_files();
         self.render_closed_thread();
         self.imp().message_title.set_title(&title);
-        self.render_conversations();
+        self.queue_sidebar_render_after_view_change();
         self.show_secondary_loading(
             crate::secondary_views::SecondaryKind::Files,
             loading_message,
@@ -8183,7 +8205,7 @@ impl ConduitWindow {
         self.imp().workspace.view.borrow_mut().start_saved();
         self.imp().message_title.set_title(&title);
         self.render_closed_thread();
-        self.render_conversations();
+        self.queue_sidebar_render_after_view_change();
         self.show_secondary_loading(
             crate::secondary_views::SecondaryKind::Saved,
             &gettext("Loading saved items"),
@@ -8205,7 +8227,7 @@ impl ConduitWindow {
         self.imp().workspace.view.borrow_mut().start_search();
         let title = gettext("Search results");
         self.render_closed_thread();
-        self.render_conversations();
+        self.queue_sidebar_render_after_view_change();
         self.imp().message_title.set_title(&title);
         self.show_secondary_loading(
             crate::secondary_views::SecondaryKind::Search,
@@ -9847,7 +9869,7 @@ impl ConduitWindow {
         }
         if !application.read_state_changed_ids().is_empty() && !application.conversation_reset() {
             if !self.render_changed_conversations(application.read_state_changed_ids()) {
-                self.render_conversations();
+                self.queue_sidebar_render();
             }
             self.refresh_unread_separators();
             let visible_changed = self
@@ -10076,7 +10098,7 @@ impl ConduitWindow {
         let has_conversations = !imp.workspace.conversations.borrow().is_empty();
         *imp.sidebar_error.borrow_mut() = Some(error.to_string());
         if sidebar_error_change_needs_render(has_conversations) {
-            self.render_conversations();
+            self.queue_sidebar_render();
         }
     }
 
@@ -10117,7 +10139,10 @@ impl ConduitWindow {
     fn sync_conversations_from_catalog(&self) {
         *self.imp().sidebar_error.borrow_mut() = None;
         self.request_conversation_user_names();
-        self.render_conversations();
+        // Restore, notification and URI intents below select from workspace
+        // state, not the sidebar store, and sidebar selection never navigates
+        // (only `connect_activate` does), so the rebuild can wait for the tick.
+        self.queue_sidebar_render();
         self.refresh_current_conversation_title();
         self.finish_conversation_catalog_sync();
     }
@@ -10126,7 +10151,7 @@ impl ConduitWindow {
         *self.imp().sidebar_error.borrow_mut() = None;
         self.request_changed_conversation_user_names(changed_channel_ids);
         if structure_changed || !self.render_changed_conversations(changed_channel_ids) {
-            self.render_conversations();
+            self.queue_sidebar_render();
         }
         if self.selected_channel_id().as_ref().is_some_and(|selected| {
             changed_channel_ids
@@ -10436,8 +10461,16 @@ impl ConduitWindow {
             .collect()
     }
 
+    /// Renders the full sidebar immediately. Call sites that do not need the
+    /// store rebuilt synchronously should use `queue_sidebar_render` instead
+    /// so bursts of changes cost one render per frame.
     fn render_conversations(&self) {
         let started = Instant::now();
+        // This render covers any queued sidebar flush, so drop it rather than
+        // rebuilding the same rows again on the next tick.
+        let mut pending = self.imp().pending_ui_invalidations.get();
+        pending.remove(UiInvalidations::SIDEBAR);
+        self.imp().pending_ui_invalidations.set(pending);
         self.sync_workspace_chrome();
         let thread_summaries = self.unread_thread_summaries();
         let unread_thread_channel_ids = thread_summaries
@@ -11969,7 +12002,10 @@ impl ConduitWindow {
         self.set_composer_canonical_text(ComposerTarget::Thread, "");
         self.close_thread_pane();
         imp.workspace_split.set_show_content(true);
-        self.render_conversations();
+        // Deferred so the timeline paints first; the row highlight is derived
+        // from workspace state at flush time and the composer focus below is
+        // unaffected by the sidebar store.
+        self.queue_sidebar_render_after_view_change();
 
         match outcome.decision {
             ConversationSelectionDecision::RenderCurrent
@@ -12331,7 +12367,7 @@ impl ConduitWindow {
 
     fn populate_files(&self, files: Vec<SlackFile>) {
         let kind = crate::secondary_views::SecondaryKind::Files;
-        self.render_conversations();
+        self.queue_sidebar_render();
         if self.imp().workspace.view.borrow().files_loading() {
             self.show_secondary_loading(kind, &gettext("Loading files"));
             return;
