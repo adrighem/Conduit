@@ -51,6 +51,9 @@ fn declared_size(image: &MessageImage) -> Option<(u32, u32)> {
 }
 
 fn file_size(path: &Path) -> Option<(u32, u32)> {
+    if let Some(size) = crate::image_header::declared_dimensions(path) {
+        return Some(size);
+    }
     let (_, width, height) = crate::animated_image::file_info(path)?;
     Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
 }

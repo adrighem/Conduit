@@ -231,8 +231,12 @@ fn scale_to_fit(pixbuf: &gdk_pixbuf::Pixbuf, max_side: i32) -> gdk_pixbuf::Pixbu
 }
 
 /// Whether `path` is in a format that can hold several frames. Reads only the
-/// header, so static images skip a full animation decode.
+/// header, so static images skip a full animation decode. Formats our own
+/// header parser knows skip gdk-pixbuf's much slower glycin probe.
 pub(crate) fn may_be_animated(path: &Path) -> bool {
+    if let Some((format, _, _)) = crate::image_header::declared_header(path) {
+        return format.may_be_animated();
+    }
     file_info(path)
         .and_then(|(format, _, _)| format.name())
         .is_some_and(|name| matches!(name.as_str(), "gif" | "webp"))
@@ -242,15 +246,28 @@ pub(crate) fn may_be_animated(path: &Path) -> bool {
 /// headers only. Unreadable or unrecognised files fail closed, so callers
 /// must not fall back to decoding them another way.
 pub(crate) fn within_decode_budget(path: &Path) -> bool {
-    let Some((format, width, height)) = file_info(path) else {
-        return false;
-    };
-    let (Ok(width), Ok(height)) = (u64::try_from(width), u64::try_from(height)) else {
+    let header = crate::image_header::declared_header(path)
+        .map(|(format, width, height)| {
+            (
+                format == crate::image_header::ImageFormat::Webp,
+                u64::from(width),
+                u64::from(height),
+            )
+        })
+        .or_else(|| {
+            let (format, width, height) = file_info(path)?;
+            Some((
+                format.name().is_some_and(|name| name == "webp"),
+                u64::try_from(width).ok()?,
+                u64::try_from(height).ok()?,
+            ))
+        });
+    let Some((is_webp, width, height)) = header else {
         return false;
     };
     // The WebP loader decodes every frame up front; gdk-pixbuf keeps GIF
     // frames compressed and composites them on demand, so they cost one.
-    let frames = if format.name().is_some_and(|name| name == "webp") {
+    let frames = if is_webp {
         let Some(frames) = std::fs::File::open(path)
             .ok()
             .and_then(|file| webp_frame_count(std::io::BufReader::new(file)))
