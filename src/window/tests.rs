@@ -242,7 +242,31 @@ fn repeated_ui_invalidations_require_only_one_scheduled_flush() {
 }
 
 #[test]
-fn synchronous_sidebar_render_clears_only_the_pending_sidebar_flag() {
+fn perf_guard_full_sidebar_renders_only_come_from_the_frame_flush() {
+    // A full sidebar render rebuilds every conversation row (40-95 ms with
+    // ~1500 conversations). Callers queue `UiInvalidations::SIDEBAR` so a
+    // burst of changes costs one render per frame.
+    let source = include_str!("../window.rs");
+    assert_eq!(
+        source.matches("self.render_conversations()").count(),
+        1,
+        "only flush_ui_invalidations may render the sidebar directly; queue \
+         UiInvalidations::SIDEBAR instead"
+    );
+}
+
+#[test]
+fn perf_guard_timeline_renders_register_no_message_control_handles() {
+    // Fresh per-render handle tokens made every render context differ, so
+    // every re-render rebound every timeline row. Handles are registered on
+    // click instead.
+    let source = include_str!("../window.rs");
+    assert!(!source.contains("replace_message_control_handles("));
+    assert!(!source.contains("message_control_handles:"));
+}
+
+#[test]
+fn perf_guard_synchronous_sidebar_render_clears_only_the_pending_sidebar_flag() {
     let mut pending = UiInvalidations::default();
     pending.insert(UiInvalidations::SIDEBAR | UiInvalidations::MAIN);
 

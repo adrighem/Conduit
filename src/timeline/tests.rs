@@ -109,6 +109,12 @@ pub(crate) fn run_gtk_test<F: FnOnce() + Send + 'static>(f: F) {
     });
 
     let Some(tx) = sender.as_ref() else {
+        // Meson's Xvfb runs set this so GTK-backed tests, perf guards
+        // included, cannot pass silently without a display.
+        assert!(
+            std::env::var_os("CONDUIT_REQUIRE_DISPLAY").is_none(),
+            "GTK failed to initialise but CONDUIT_REQUIRE_DISPLAY is set"
+        );
         return;
     };
 
@@ -1298,7 +1304,7 @@ fn rebound_rows(view: &NativeTimelineView, before: &[(String, Widget)]) -> Vec<S
 }
 
 #[test]
-fn image_arrival_rebinds_only_rows_that_use_it() {
+fn perf_guard_image_arrival_rebinds_only_rows_that_use_it() {
     run_gtk_test(|| {
         let ctx = test_context();
         let messages = (0..40)
@@ -1340,7 +1346,7 @@ fn image_arrival_rebinds_only_rows_that_use_it() {
 }
 
 #[test]
-fn re_render_rebinds_only_rows_whose_inputs_changed() {
+fn perf_guard_re_render_rebinds_only_rows_whose_inputs_changed() {
     run_gtk_test(|| {
         let ctx = test_context();
         let messages = (0..40)
