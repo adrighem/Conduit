@@ -285,11 +285,21 @@ pub(crate) fn within_decode_budget(path: &Path) -> bool {
     width > 0 && height > 0 && pixels <= MAX_DECODED_PIXELS
 }
 
+#[cfg(test)]
+thread_local! {
+    /// gdk-pixbuf header probes made on this thread. With glycin each is an
+    /// out-of-process call of tens of milliseconds, so perf guards assert
+    /// that hot paths for the formats Slack serves never make one.
+    pub(crate) static GLYCIN_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// [`gdk_pixbuf::Pixbuf::file_info`], except that files whose own headers
 /// declare more than [`MAX_DECODED_PIXELS`] are refused first: gdk-pixbuf's
 /// glycin loaders abort the process on a large enough canvas, before any
 /// budget check could run. See [`crate::image_header`].
 pub(crate) fn file_info(path: &Path) -> Option<(gdk_pixbuf::PixbufFormat, i32, i32)> {
+    #[cfg(test)]
+    GLYCIN_PROBES.with(|probes| probes.set(probes.get() + 1));
     let oversized = crate::image_header::declared_dimensions(path)
         .is_some_and(|(width, height)| u64::from(width) * u64::from(height) > MAX_DECODED_PIXELS);
     if oversized {
@@ -320,7 +330,7 @@ fn webp_frame_count(mut reader: impl std::io::Read + std::io::Seek) -> Option<u6
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// 1x1 GIF89a.
@@ -330,6 +340,56 @@ mod tests {
         let path = std::env::temp_dir().join(format!("conduit-{}-{name}", std::process::id()));
         std::fs::write(&path, bytes).expect("write temp image");
         path
+    }
+
+    /// Runs `probe` and returns how many gdk-pixbuf header probes it made.
+    pub(crate) fn glycin_probes_during(probe: impl FnOnce()) -> usize {
+        let before = GLYCIN_PROBES.with(std::cell::Cell::get);
+        probe();
+        GLYCIN_PROBES.with(std::cell::Cell::get) - before
+    }
+
+    #[test]
+    fn perf_guard_known_image_formats_skip_the_glycin_probe() {
+        let encoded = |format: &str| {
+            gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 4, 3)
+                .expect("allocate pixbuf")
+                .save_to_bufferv(format, &[])
+                .expect("encode image")
+        };
+        // 64x32 lossless WebP header: (64 - 1) | (32 - 1) << 14.
+        let bits = (63u32 | 31 << 14).to_le_bytes();
+        let mut webp = b"RIFF\x1a\0\0\0WEBPVP8L\x0a\0\0\0\x2f".to_vec();
+        webp.extend_from_slice(&bits);
+        webp.extend_from_slice(&[0; 5]);
+        let files = [
+            write_temp("guard.png", &encoded("png")),
+            write_temp("guard.jpg", &encoded("jpeg")),
+            write_temp("guard.gif", GIF),
+            write_temp("guard.webp", &webp),
+        ];
+
+        let probes = glycin_probes_during(|| {
+            for path in &files {
+                may_be_animated(path);
+                within_decode_budget(path);
+            }
+        });
+
+        for path in &files {
+            let _ = std::fs::remove_file(path);
+        }
+        assert_eq!(probes, 0, "known formats must not reach gdk-pixbuf's probe");
+    }
+
+    #[test]
+    fn perf_guard_counts_the_glycin_fallback_for_unknown_formats() {
+        let path = write_temp("guard.unknown", b"neither PNG, GIF, JPEG nor WebP");
+        let probes = glycin_probes_during(|| {
+            may_be_animated(&path);
+        });
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(probes, 1, "the guard counter must see the fallback probe");
     }
 
     #[test]

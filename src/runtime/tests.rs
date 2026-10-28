@@ -10194,7 +10194,7 @@ fn channel_history_prefetch_read_dms_compete_with_channels_by_activity() {
 }
 
 #[test]
-fn channel_history_prefetch_total_never_exceeds_the_limit() {
+fn perf_guard_channel_history_prefetch_total_never_exceeds_the_limit() {
     let mut conversations = channels_by_activity(CHANNEL_HISTORY_PREFETCH_LIMIT * 2);
     let mut unread = HashSet::new();
     let mut huddles = HashSet::new();

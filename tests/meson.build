@@ -111,6 +111,28 @@ if not headless_tests_option.disabled() and xvfb_run.found()
     timeout: 1800,
     is_parallel: false,
   )
+
+  # Count-based guards against GTK-thread hitches: full timeline rebinds,
+  # gdk-pixbuf/glycin header probes, synchronous sidebar renders and
+  # uncapped startup prefetch. See AGENTS.md.
+  test(
+    'Performance guards',
+    xvfb_run,
+    args: [
+      '-a', 'env',
+      'CONDUIT_REQUIRE_DISPLAY=1',
+      'GSETTINGS_BACKEND=memory',
+      'GDK_BACKEND=x11',
+      'GSK_RENDERER=cairo',
+      'GTK_A11Y=none',
+      cargo_bin.full_path(),
+    ] + cargo_test_args + ['--', 'perf_guard'],
+    env: cargo_env,
+    depends: [cargo_build],
+    suite: ['headless', 'performance'],
+    timeout: 600,
+    is_parallel: false,
+  )
 endif
 
 if not headless_tests_option.disabled() and xvfb_run.found() and xfwm4.found() and \

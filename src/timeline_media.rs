@@ -185,6 +185,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn perf_guard_display_size_of_known_formats_skips_the_glycin_probe() {
+        let bytes = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 40, 9)
+            .expect("allocate pixbuf")
+            .save_to_bufferv("png", &[])
+            .expect("encode image");
+        let path = std::env::temp_dir().join(format!(
+            "conduit-{}-guard-display-size.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).expect("write temp image");
+
+        let mut size = None;
+        let probes = crate::animated_image::tests::glycin_probes_during(|| {
+            size = file_size(&path);
+        });
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(size, Some((40, 9)));
+        assert_eq!(probes, 0);
+    }
+
+    #[test]
     fn fit_keeps_small_images_at_natural_size() {
         assert_eq!(fit_image_size(200, 150), (200, 150));
     }
