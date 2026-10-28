@@ -9770,7 +9770,7 @@ impl ConduitWindow {
             .iter()
             .filter_map(|(user_id, url)| (url == key).then_some(user_id.clone()))
             .collect::<Vec<_>>();
-        let (main_uses_asset, thread_uses_asset, main_view) = {
+        let (main_uses_asset, timeline_uses_asset, thread_uses_asset, main_view) = {
             let custom_emojis = self.imp().custom_emojis.borrow();
             let main_uses = self.main_view_uses_image_asset(&custom_emojis, key)
                 || (!avatar_user_ids.is_empty() && {
@@ -9780,6 +9780,19 @@ impl ConduitWindow {
                         .any(|user_id| main_user_ids.contains(user_id))
                 });
             let state = self.imp().workspace.view.borrow();
+            // The conversation timeline keeps its rows while another main
+            // view shows, and its re-renders leave image changes to this path.
+            let timeline_uses = state.last_channel_id().is_some_and(|channel_id| {
+                let messages = state.channel_messages(channel_id);
+                messages_use_image_asset(messages, &custom_emojis, key)
+                    || (!avatar_user_ids.is_empty() && {
+                        let mut timeline_user_ids = HashSet::new();
+                        collect_message_user_ids(messages, &mut timeline_user_ids);
+                        avatar_user_ids
+                            .iter()
+                            .any(|user_id| timeline_user_ids.contains(user_id))
+                    })
+            });
             let thread_messages = state.current_thread_messages();
             let thread_uses = state.selected_thread_ts().is_some()
                 && (messages_use_image_asset(thread_messages, &custom_emojis, key)
@@ -9790,17 +9803,17 @@ impl ConduitWindow {
                             .iter()
                             .any(|user_id| thread_user_ids.contains(user_id))
                     }));
-            (main_uses, thread_uses, state.main_view())
+            (main_uses, timeline_uses, thread_uses, state.main_view())
         };
 
-        if main_uses_asset {
-            let native_timeline = self.imp().native_timeline_view.borrow().clone();
-            match native_timeline {
-                Some(timeline) if main_view == MainMessageView::Conversation => {
-                    timeline.update_image_asset(&self.message_html_context(None));
-                }
-                _ => self.queue_ui_invalidations(UiInvalidations::MAIN),
-            }
+        let native_timeline = self.imp().native_timeline_view.borrow().clone();
+        if let Some(timeline) = native_timeline.as_ref().filter(|_| timeline_uses_asset) {
+            timeline.update_image_asset(&self.message_html_context(None));
+        }
+        if main_uses_asset
+            && (main_view != MainMessageView::Conversation || native_timeline.is_none())
+        {
+            self.queue_ui_invalidations(UiInvalidations::MAIN);
         }
         if thread_uses_asset {
             let native_timeline = self.thread_pane().native_timeline_view.borrow().clone();
@@ -12064,10 +12077,7 @@ impl ConduitWindow {
         }
         self.request_image_assets(messages.iter());
         let mut context = self.message_html_context(None);
-        (
-            context.message_control_handles,
-            context.message_control_action_handles,
-        ) = self.replace_message_control_handles(TimelineSurfaceId::Main, channel_id, &messages);
+        self.prune_message_control_handles(TimelineSurfaceId::Main, channel_id, &messages);
         context.timeline_scroll = scroll_behavior;
         context.unread_separator_ts = earliest_unread_ts(context.last_read.as_deref(), &messages);
         let active_open_generation = imp
@@ -12205,10 +12215,7 @@ impl ConduitWindow {
         let imp = self.imp();
         self.request_image_assets(messages.iter());
         let mut context = self.message_html_context(Some(ts));
-        (
-            context.message_control_handles,
-            context.message_control_action_handles,
-        ) = self.replace_message_control_handles(TimelineSurfaceId::Thread, channel_id, &messages);
+        self.prune_message_control_handles(TimelineSurfaceId::Thread, channel_id, &messages);
         context.timeline_scroll = scroll_behavior;
         let thread_last_read = imp
             .workspace
@@ -13719,46 +13726,25 @@ impl ConduitWindow {
         self.message_html_context_with_image_keys(thread_ts, None)
     }
 
-    fn replace_message_control_handles(
+    /// Forgets the action handles of messages no longer on `surface`.
+    /// Handles are minted on demand when a control is clicked, never per
+    /// render: fresh tokens would make every render look changed.
+    fn prune_message_control_handles(
         &self,
         surface: TimelineSurfaceId,
         channel_id: &str,
         messages: &[SlackMessage],
-    ) -> (
-        HashMap<MessageRef, crate::message_handoff::MessageControlHandle>,
-        HashMap<
-            (MessageRef, crate::rich_message::MessageControlKey),
-            crate::message_handoff::MessageControlHandle,
-        >,
     ) {
-        let targets = messages
+        let live = messages
             .iter()
-            .filter_map(|message| {
-                Some((
-                    MessageRef::new(channel_id, message.ts.clone()).ok()?,
-                    message_action_control_keys(message, self.browser_message_actions_available()),
-                ))
-            })
-            .collect::<Vec<_>>();
-        let registered = self
-            .imp()
+            .map(|message| message.ts.as_str())
+            .collect::<HashSet<_>>();
+        self.imp()
             .message_control_registry
             .borrow_mut()
-            .replace_surface_with_controls(surface, targets)
-            .unwrap_or_default();
-        let mut fallback = HashMap::new();
-        let mut controls = HashMap::new();
-        for (target, handle) in registered {
-            match target.selection() {
-                crate::message_handoff::MessageControlSelection::MessageHandoff => {
-                    fallback.insert(target.message().clone(), handle);
-                }
-                crate::message_handoff::MessageControlSelection::Control(key) => {
-                    controls.insert((target.message().clone(), key), handle);
-                }
-            }
-        }
-        (fallback, controls)
+            .retain_surface_messages(surface, |message| {
+                message.channel_id() == channel_id && live.contains(message.timestamp())
+            });
     }
 
     /// Moves the "New" separators to the first message after the current
@@ -13884,8 +13870,6 @@ impl ConduitWindow {
                 .collect(),
             recent_reactions,
             custom_emojis: imp.custom_emojis.borrow().clone(),
-            message_control_handles: HashMap::new(),
-            message_control_action_handles: HashMap::new(),
         }
     }
 

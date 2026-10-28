@@ -145,10 +145,7 @@ impl MessageControlTarget {
         }
     }
 
-    pub(crate) fn message(&self) -> &MessageRef {
-        &self.message
-    }
-
+    #[cfg(test)]
     pub(crate) fn selection(&self) -> MessageControlSelection {
         self.selection
     }
@@ -257,24 +254,15 @@ impl<T: HandleTokenSource> MessageControlRegistry<T> {
         self.register(MessageControlTarget::handoff(surface, message), revision)
     }
 
-    pub(crate) fn replace_surface_with_controls(
+    /// Drops the handles of `surface` whose message `keep` rejects, e.g.
+    /// messages that left the rendered timeline, so the registry stays
+    /// bounded without minting handles per render. In-flight handles stay.
+    pub(crate) fn retain_surface_messages(
         &mut self,
         surface: TimelineSurfaceId,
-        messages: impl IntoIterator<Item = (MessageRef, Vec<MessageControlKey>)>,
-    ) -> Result<HashMap<MessageControlTarget, MessageControlHandle>, HandleRegistrationError> {
-        self.revoke(|target| target.surface == surface);
-        let mut registered = HashMap::new();
-        let mut unique = HashSet::new();
-        for (message, control_keys) in messages {
-            if unique.insert(message.clone()) {
-                registered.extend(self.replace_message_with_controls(
-                    surface,
-                    message,
-                    control_keys,
-                )?);
-            }
-        }
-        Ok(registered)
+        keep: impl Fn(&MessageRef) -> bool,
+    ) {
+        self.revoke(|target| target.surface == surface && !keep(&target.message));
     }
 
     pub(crate) fn replace_message_with_controls(
@@ -869,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn re_render_keeps_an_in_flight_claim() {
+    fn re_render_and_prune_keep_an_in_flight_claim() {
         let mut registry = registry(&[
             "33333333333333333333333333333333",
             "44444444444444444444444444444444",
@@ -896,9 +884,7 @@ mod tests {
         registry
             .replace_message_with_controls(TimelineSurfaceId::Main, message.clone(), keys.clone())
             .unwrap();
-        registry
-            .replace_surface_with_controls(TimelineSurfaceId::Main, [])
-            .unwrap();
+        registry.retain_surface_messages(TimelineSurfaceId::Main, |_| false);
 
         let current = registry
             .active_control_handle(TimelineSurfaceId::Main, &message, keys[0])
@@ -908,13 +894,11 @@ mod tests {
         assert_eq!(registry.message_for(&handle), Some(message.clone()));
 
         registry.complete(&handle);
-        registry
-            .replace_surface_with_controls(TimelineSurfaceId::Main, [])
-            .unwrap();
+        registry.retain_surface_messages(TimelineSurfaceId::Main, |_| false);
         assert_eq!(
             registry.active_control_handle(TimelineSurfaceId::Main, &message, keys[0]),
             None,
-            "re-rendering drops idle handles"
+            "pruning drops idle handles"
         );
     }
 
