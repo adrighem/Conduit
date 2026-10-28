@@ -877,7 +877,7 @@ fn test_timeline_message_widget_all_gtk() {
         timeline_view.set_messages(&[msg1, msg2], &ctx, None);
         // Two same-day messages: one leading day separator plus both rows.
         assert_eq!(timeline_view.store.n_items(), 3);
-        timeline_view.update_image_asset(&ctx);
+        timeline_view.update_image_asset(&ctx, HashSet::new());
         assert_eq!(timeline_view.store.n_items(), 3);
 
         // Moving the unread separator rebuilds rows in place.
@@ -1248,7 +1248,7 @@ fn in_place_updates_keep_scroll_and_focus_on_clicked_row() {
         pump(100);
         let first_item = view.store.item(0);
 
-        view.update_image_asset(&ctx);
+        view.update_image_asset(&ctx, messages.iter().map(|m| m.ts.clone()).collect());
         pump(300);
         let focused_ts = messages[1].ts.clone();
         view.set_unread_separator(Some(focused_ts));
@@ -1295,6 +1295,48 @@ fn rebound_rows(view: &NativeTimelineView, before: &[(String, Widget)]) -> Vec<S
         })
         .map(|(ts, _)| ts.clone())
         .collect()
+}
+
+#[test]
+fn image_arrival_rebinds_only_rows_that_use_it() {
+    run_gtk_test(|| {
+        let ctx = test_context();
+        let messages = (0..40)
+            .rev()
+            .map(|i| SlackMessage {
+                ts: format!("1700000{i:03}.000100"),
+                user: Some("U123".to_string()),
+                text: Some(format!("message {i}")),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let view = NativeTimelineView::new();
+        let window = gtk::Window::new();
+        window.set_default_size(400, 500);
+        window.set_child(Some(view.widget()));
+        window.present();
+        view.set_messages(&messages, &ctx, None);
+        pump_main_context(300);
+        let before = bound_row_widgets(&view);
+        let (first, second) = (before[0].0.clone(), before[1].0.clone());
+
+        // Two arrivals in one idle coalesce into one rebind of both rows.
+        view.update_image_asset(&ctx, HashSet::from([first.clone()]));
+        view.update_image_asset(&ctx, HashSet::from([second.clone()]));
+        pump_main_context(50);
+        let mut rebound = rebound_rows(&view, &before);
+        rebound.sort();
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(rebound, expected);
+
+        // An arrival nothing shows rebinds nothing.
+        let before = bound_row_widgets(&view);
+        view.update_image_asset(&ctx, HashSet::new());
+        pump_main_context(50);
+        assert_eq!(rebound_rows(&view, &before), Vec::<String>::new());
+        window.destroy();
+    });
 }
 
 #[test]

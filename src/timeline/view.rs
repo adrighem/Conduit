@@ -65,6 +65,8 @@ pub struct NativeTimelineView {
     pub(crate) context: Rc<RefCell<Option<MessageRenderContext>>>,
     on_action: ActionSlot,
     asset_update_pending: Rc<Cell<bool>>,
+    /// Timestamps of rows waiting for the queued image re-render.
+    asset_update_rows: Rc<RefCell<HashSet<String>>>,
     read_mark_target: ReadMarkTarget,
     latest_message_ts: Rc<RefCell<Option<String>>>,
     read_candidate: Rc<RefCell<Option<String>>>,
@@ -772,6 +774,7 @@ impl NativeTimelineView {
             context,
             on_action,
             asset_update_pending: Rc::new(Cell::new(false)),
+            asset_update_rows: Rc::default(),
             read_mark_target,
             latest_message_ts,
             read_candidate,
@@ -975,10 +978,11 @@ impl NativeTimelineView {
         *self.on_action.borrow_mut() = Some(Rc::new(f));
     }
 
-    /// Re-renders bound rows after an image asset arrived, keeping scroll
-    /// position and focus. Only the image fields of `context` are taken; the
-    /// rest (unread anchor, thread) belongs to the rendered conversation.
-    pub fn update_image_asset(&self, context: &MessageRenderContext) {
+    /// Re-renders the bound rows of messages `uses_asset` after an image asset
+    /// arrived, keeping scroll position and focus. Arrivals within one idle
+    /// are coalesced. Only the image fields of `context` are taken; the rest
+    /// (unread anchor, thread) belongs to the rendered conversation.
+    pub fn update_image_asset(&self, context: &MessageRenderContext, uses_asset: HashSet<String>) {
         {
             let mut current = self.context.borrow_mut();
             let Some(current) = current.as_mut() else {
@@ -988,6 +992,7 @@ impl NativeTimelineView {
             current.failed_image_urls = context.failed_image_urls.clone();
             current.user_avatar_urls = context.user_avatar_urls.clone();
         }
+        self.asset_update_rows.borrow_mut().extend(uses_asset);
         if self.asset_update_pending.get() {
             return;
         }
@@ -995,7 +1000,10 @@ impl NativeTimelineView {
         let this = self.clone();
         glib::idle_add_local_once(move || {
             this.asset_update_pending.set(false);
-            this.rebind_rows("image_asset", |obj| !obj.is_day_separator());
+            let rows = std::mem::take(&mut *this.asset_update_rows.borrow_mut());
+            this.rebind_rows("image_asset", |obj| {
+                !obj.is_day_separator() && rows.contains(&obj.message().ts)
+            });
         });
     }
 
