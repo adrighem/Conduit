@@ -1387,7 +1387,7 @@ impl WorkspaceReducerAdapter {
         origin: MutationOrigin,
         mutation: WorkspaceMutation,
     ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
-        let _admission = self.store_batch_admission.lock().await;
+        let _admission = acquire_store_admission(&self.store_batch_admission).await;
         self.apply_persisted_admitted(store, origin, mutation).await
     }
 
@@ -1497,7 +1497,7 @@ impl WorkspaceReducerAdapter {
         mutation: WorkspaceMutation,
         completion: Option<RuntimeEventKind>,
     ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
-        let _admission = self.store_batch_admission.lock().await;
+        let _admission = acquire_store_admission(&self.store_batch_admission).await;
         self.apply_persisted_and_publish_admitted(store, events, origin, mutation, completion)
             .await
     }
@@ -4618,7 +4618,7 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
     let Some(store) = connection.workspace_store.as_ref() else {
         return;
     };
-    let _admission = connection.workspace.store_batch_admission.lock().await;
+    let _admission = acquire_store_admission(&connection.workspace.store_batch_admission).await;
     #[cfg(test)]
     if let Some(gate) = connection.cached_bootstrap_load_gate.as_ref() {
         gate.wait_before_send();
@@ -7290,6 +7290,26 @@ async fn persist_realtime_events(
     }
 }
 
+/// Acquires the store batch admission lock, logging waits of 5 ms or more
+/// as `store_admission_wait elapsed_ms=<n>` when debug logging is on.
+async fn acquire_store_admission(
+    admission: &tokio::sync::Mutex<()>,
+) -> tokio::sync::MutexGuard<'_, ()> {
+    if !crate::debug::enabled() {
+        return admission.lock().await;
+    }
+    let started = std::time::Instant::now();
+    let guard = admission.lock().await;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    if elapsed_ms >= 5.0 {
+        crate::debug::log(
+            "performance",
+            &format!("store_admission_wait elapsed_ms={elapsed_ms:.2}"),
+        );
+    }
+    guard
+}
+
 /// Serializes socket message authority with interactive history snapshots.
 ///
 /// Older recovered patches publish first. The current typed patch then carries
@@ -7301,7 +7321,7 @@ async fn persist_socket_message(
     workspace: &WorkspaceReducerAdapter,
     message_event: crate::socket_mode::SocketModeMessageEvent,
 ) {
-    let _admission = workspace.store_batch_admission.lock().await;
+    let _admission = acquire_store_admission(&workspace.store_batch_admission).await;
 
     let recovered = match workspace.recover_persisted_admitted(Some(store)).await {
         Ok(reductions) => reductions,
@@ -7572,7 +7592,7 @@ async fn apply_conversation_membership_snapshot(
         ));
     }
 
-    let _admission = workspace.store_batch_admission.lock().await;
+    let _admission = acquire_store_admission(&workspace.store_batch_admission).await;
     if let Some(store) = workspace_store {
         store.validate_conversation_cache().await?;
         if store.conversation_cache_needs_repair() {
@@ -7866,7 +7886,7 @@ async fn publish_history_snapshot_with_completion(
     append_older: bool,
     cached: bool,
 ) -> std::result::Result<Vec<WorkspaceReduction>, StoreError> {
-    let _admission = workspace.store_batch_admission.lock().await;
+    let _admission = acquire_store_admission(&workspace.store_batch_admission).await;
     let reductions = workspace
         .apply_persisted_and_publish_admitted(
             workspace_store.as_ref(),

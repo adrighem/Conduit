@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -10,6 +11,8 @@ use tracing_subscriber::Registry;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static FILTER_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 static PIPELINE_COUNTERS: PipelineCounters = PipelineCounters::new();
+static API_METHOD_COUNTS: std::sync::Mutex<BTreeMap<String, u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
 #[derive(Default)]
 pub(crate) struct PipelineCounters {
@@ -150,6 +153,7 @@ pub(crate) fn trace_pipeline_counter_sample(
 ) -> PipelineCountersSnapshot {
     let current = PIPELINE_COUNTERS.snapshot();
     let delta = current.delta_since(baseline);
+    trace_api_requests_by_method(interval_seconds);
     tracing::debug!(
         target: "conduit::pipeline",
         event = "pipeline_counter_sample",
@@ -203,6 +207,67 @@ pub fn set_enabled(enabled: bool) {
 
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// Runs an image decode and logs it when it took at least 4 ms, since the
+/// callers run on the GTK thread. Costs nothing but a flag check when debug
+/// logging is off.
+pub(crate) fn trace_image_decode<T>(kind: &str, decode: impl FnOnce() -> T) -> T {
+    if !enabled() {
+        return decode();
+    }
+    let started = std::time::Instant::now();
+    let result = decode();
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    if elapsed_ms >= 4.0 {
+        log(
+            "performance",
+            &format!("image_decode kind={kind} elapsed_ms={elapsed_ms:.2}"),
+        );
+    }
+    result
+}
+
+/// Counts one Slack API request for `label` (a method name or a fixed
+/// bucket) when debug logging is on. Bounded: at most 64 distinct labels.
+pub(crate) fn record_api_request_method(label: &str) {
+    if !enabled() {
+        return;
+    }
+    let mut counts = API_METHOD_COUNTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(count) = counts.get_mut(label) {
+        *count = count.saturating_add(1);
+    } else if counts.len() < 64 {
+        counts.insert(label.to_string(), 1);
+    } else {
+        let other = counts.entry("other".to_string()).or_insert(0);
+        *other = other.saturating_add(1);
+    }
+}
+
+/// Logs and resets the per-method API request counts for the last interval.
+fn trace_api_requests_by_method(interval_seconds: u64) {
+    let mut sorted = {
+        let mut counts = API_METHOD_COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *counts).into_iter().collect::<Vec<_>>()
+    };
+    if sorted.is_empty() {
+        return;
+    }
+    sorted.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let breakdown = sorted
+        .iter()
+        .map(|(method, count)| format!("{method}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    log(
+        "performance",
+        &format!("api_requests_by_method interval_seconds={interval_seconds} {breakdown}"),
+    );
 }
 
 pub fn log(scope: &str, message: &str) {

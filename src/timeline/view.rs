@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::Instant;
 
 use adw::prelude::*;
 use gtk::{
@@ -16,6 +17,43 @@ use super::dwell::*;
 use super::model::*;
 use super::quick_actions::*;
 use super::row::*;
+
+thread_local! {
+    /// Row binds and their total cost since the last idle flush, plus whether
+    /// that flush is scheduled (debug only).
+    static BIND_STATS: Cell<(u32, f64, bool)> = const { Cell::new((0, 0.0, false)) };
+}
+
+/// Times one row bind and folds it into [`BIND_STATS`] on drop, so every exit
+/// path of the bind closure is counted. Logged once per main-loop idle as
+/// `timeline_binds count=<n> elapsed_ms=<total>`.
+struct BindTimer(Option<Instant>);
+
+impl BindTimer {
+    fn start() -> Self {
+        Self(crate::debug::enabled().then(Instant::now))
+    }
+}
+
+impl Drop for BindTimer {
+    fn drop(&mut self) {
+        let Some(started) = self.0 else {
+            return;
+        };
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let (count, total, scheduled) = BIND_STATS.get();
+        BIND_STATS.set((count + 1, total + elapsed_ms, true));
+        if !scheduled {
+            glib::idle_add_local_once(|| {
+                let (count, total, _) = BIND_STATS.replace((0, 0.0, false));
+                crate::debug::log(
+                    "performance",
+                    &format!("timeline_binds count={count} elapsed_ms={total:.2}"),
+                );
+            });
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct NativeTimelineView {
@@ -171,6 +209,7 @@ impl NativeTimelineView {
         let quick_bar_for_bind = quick_bar.clone();
         let overlay_for_bind = overlay.clone();
         let bind_row: Rc<dyn Fn(&gtk::ListItem)> = Rc::new(move |item| {
+            let _bind_timer = BindTimer::start();
             let msg_obj = item
                 .item()
                 .and_then(|obj| obj.downcast::<TimelineMessageObject>().ok())
@@ -825,13 +864,17 @@ impl NativeTimelineView {
     /// Re-renders the row of message `ts`, e.g. to re-enable its controls
     /// after an action finished.
     pub(crate) fn refresh_message(&self, ts: &str) {
-        self.rebind_rows(|obj| !obj.is_day_separator() && obj.message().ts == ts);
+        self.rebind_rows("other", |obj| {
+            !obj.is_day_separator() && obj.message().ts == ts
+        });
     }
 
     /// Rebuilds the bound rows matching `matches` in place. Store items are
     /// kept: replacing them destroys the focused row, and GTK's focus fallback
     /// then scrolls the list to its first item.
-    fn rebind_rows(&self, matches: impl Fn(&TimelineMessageObject) -> bool) {
+    fn rebind_rows(&self, reason: &str, matches: impl Fn(&TimelineMessageObject) -> bool) -> usize {
+        let started = crate::debug::enabled().then(Instant::now);
+        let mut rebound = 0;
         let items = self
             .bound_items
             .borrow()
@@ -847,7 +890,18 @@ impl NativeTimelineView {
             }
             keep_focus_on_row(&item);
             (self.bind_row)(&item);
+            rebound += 1;
         }
+        if let Some(started) = started {
+            crate::debug::log(
+                "performance",
+                &format!(
+                    "timeline_rebind reason={reason} rows={rebound} elapsed_ms={:.2}",
+                    started.elapsed().as_secs_f64() * 1_000.0
+                ),
+            );
+        }
+        rebound
     }
 
     /// Whether messages with replies show a footer that opens their thread.
@@ -935,7 +989,7 @@ impl NativeTimelineView {
         let this = self.clone();
         glib::idle_add_local_once(move || {
             this.asset_update_pending.set(false);
-            this.rebind_rows(|obj| !obj.is_day_separator());
+            this.rebind_rows("image_asset", |obj| !obj.is_day_separator());
         });
     }
 
@@ -990,7 +1044,7 @@ impl NativeTimelineView {
         let changed = self.update_store_grouping(anchor_ts.as_deref());
         // Rows scrolled out of view pick the new anchor up from the context
         // when they are bound again.
-        self.rebind_rows(|obj| {
+        self.rebind_rows("other", |obj| {
             if obj.is_day_separator() {
                 return false;
             }
@@ -1007,6 +1061,7 @@ impl NativeTimelineView {
         context: &MessageRenderContext,
         focus_ts: Option<&str>,
     ) {
+        let started = crate::debug::enabled().then(Instant::now);
         self.placeholder_label.set_visible(false);
         self.scrolled_window.set_visible(true);
         // Cheap: directory snapshots are shared `Arc`s, cloned by refcount and
@@ -1040,8 +1095,21 @@ impl NativeTimelineView {
         let (items, focus_index) = build_store_items(messages, focus_ts, unread_ts);
         let inserted = self.splice_changed_items(&items);
         // Kept rows were built against the previous context.
-        if context_changed {
-            self.rebind_rows(|obj| !inserted.iter().any(|new| new == obj));
+        let rebound = if context_changed {
+            self.rebind_rows("context", |obj| !inserted.iter().any(|new| new == obj))
+        } else {
+            0
+        };
+        if let Some(started) = started {
+            crate::debug::log(
+                "performance",
+                &format!(
+                    "timeline_set_messages rows={} inserted={} rebound={rebound} context_changed={context_changed} elapsed_ms={:.2}",
+                    items.len(),
+                    inserted.len(),
+                    started.elapsed().as_secs_f64() * 1_000.0
+                ),
+            );
         }
 
         let list_view = self.list_view.clone();

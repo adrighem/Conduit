@@ -1035,6 +1035,8 @@ fn composer_format_toolbar_width(control_count: usize) -> i32 {
 
 use crate::asset_server::*;
 
+static SIDEBAR_RENDER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn log_performance(started: Instant, message: impl FnOnce(f64) -> String) {
     if crate::debug::enabled() {
         crate::debug::log(
@@ -10485,8 +10487,10 @@ impl ConduitWindow {
         ));
         log_performance(started, |elapsed_ms| {
             format!(
-                "sidebar_render conversations={} elapsed_ms={:.2}",
-                conversation_count, elapsed_ms
+                "sidebar_render render_seq={} conversations={} elapsed_ms={:.2}",
+                SIDEBAR_RENDER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                conversation_count,
+                elapsed_ms
             )
         });
     }
