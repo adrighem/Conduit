@@ -3739,57 +3739,75 @@ fn dispatch_command(
                 WorkspaceLifecycleEvent::ConnectRequested,
             ));
             events.send_status("Checking secure storage");
-            let token = match TokenStore.load() {
-                Ok(Some(token)) => {
-                    if token.should_refresh() {
-                        events.send_status("Refreshing Slack session");
-                    }
-                    Some(token)
-                }
-                Ok(None) => match browser_session_token_from_env() {
-                    Ok(Some(token)) => {
-                        events.send_status("Importing Slack browser session");
-                        Some(token)
-                    }
-                    Ok(None) => None,
-                    Err(error) => {
-                        send_lifecycle_failure(&events, &error);
-                        return;
-                    }
-                },
-                Err(error) => {
-                    send_lifecycle_failure(&events, &error);
-                    return;
-                }
-            };
-
-            let Some(token) = token else {
-                events.send_event(RuntimeEventKind::WorkspaceLifecycle(
-                    WorkspaceLifecycleEvent::SignedOut,
-                ));
-                events.send_event(RuntimeEventKind::SignedOut);
-                return;
-            };
-            let failure_context = if token.browser_cookie_d.is_some() {
-                AuthenticationFailureContext::BrowserSession
-            } else {
-                AuthenticationFailureContext::Default
-            };
+            let state_for_task = Arc::clone(state);
             let oauth = oauth.clone();
-            spawn_authentication_task(
+            let limits = limits.clone();
+            spawn_request_task(
                 state,
-                identity,
-                events,
-                limits.clone(),
-                lease,
-                failure_context,
+                TrackedRequest::new(
+                    identity,
+                    OperationContext::new(RuntimeOperation::Authenticate, RuntimeTarget::Workspace),
+                ),
                 async move {
-                    let token = if token.should_refresh() {
-                        oauth.refresh(&token).await?
-                    } else {
-                        token
+                    let _lease = lease;
+                    // The keyring talks to the secret service over D-Bus and can block.
+                    let loaded = tokio::task::spawn_blocking(|| TokenStore.load())
+                        .await
+                        .map_err(|error| anyhow!("keyring read task failed: {error}"))
+                        .and_then(|result| result);
+                    let (token, persisted) = match loaded {
+                        Ok(Some(token)) => {
+                            if token.should_refresh() {
+                                events.send_status("Refreshing Slack session");
+                            }
+                            (Some(token.clone()), Some(token))
+                        }
+                        Ok(None) => match browser_session_token_from_env() {
+                            Ok(Some(token)) => {
+                                events.send_status("Importing Slack browser session");
+                                (Some(token), None)
+                            }
+                            Ok(None) => (None, None),
+                            Err(error) => {
+                                send_lifecycle_failure(&events, &error);
+                                return;
+                            }
+                        },
+                        Err(error) => {
+                            send_lifecycle_failure(&events, &error);
+                            return;
+                        }
                     };
-                    authenticate_token(token).await
+
+                    let Some(token) = token else {
+                        events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+                            WorkspaceLifecycleEvent::SignedOut,
+                        ));
+                        events.send_event(RuntimeEventKind::SignedOut);
+                        return;
+                    };
+                    let failure_context = if token.browser_cookie_d.is_some() {
+                        AuthenticationFailureContext::BrowserSession
+                    } else {
+                        AuthenticationFailureContext::Default
+                    };
+                    run_authentication(
+                        &state_for_task,
+                        identity,
+                        events,
+                        limits,
+                        failure_context,
+                        persisted,
+                        async move {
+                            let token = if token.should_refresh() {
+                                oauth.refresh(&token).await?
+                            } else {
+                                token
+                            };
+                            authenticate_token(token).await
+                        },
+                    )
+                    .await;
                 },
             );
         }
@@ -3858,7 +3876,11 @@ fn dispatch_command(
         }
         RuntimeCommand::SignOut => {
             debug_assert!(lease.is_none());
-            finish_sign_out(&events, TokenStore.clear());
+            let cleared = {
+                let _keyring = lock_keyring();
+                TokenStore.clear()
+            };
+            finish_sign_out(&events, cleared);
         }
         RuntimeCommand::Disconnect => {
             debug_assert!(lease.is_none());
@@ -3899,6 +3921,16 @@ fn dispatch_command(
             });
         }
     }
+}
+
+/// Serializes keyring writes and clears so a token save that started before
+/// sign-out cannot land after the clear.
+static KEYRING_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_keyring() -> std::sync::MutexGuard<'static, ()> {
+    KEYRING_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn finish_sign_out(events: &RuntimeEventSender, clear_result: Result<()>) {
@@ -3949,7 +3981,6 @@ fn spawn_authentication_task<F>(
     F: Future<Output = Result<(StoredToken, SlackApi, AuthInfo)>> + Send + 'static,
 {
     let state_for_task = Arc::clone(state);
-    let execution_limits = limits.clone();
     spawn_request_task(
         state,
         TrackedRequest::new(
@@ -3958,127 +3989,187 @@ fn spawn_authentication_task<F>(
         ),
         async move {
             let _lease = lease;
-            let _execution_permit = execution_limits.acquire(RuntimeTaskLane::Interactive).await;
-            let result = future.await;
-            match result {
-                Ok((token, api, auth)) => {
-                    let (huddles, huddle_receiver) = huddle_actor_channel();
-                    let connection = {
-                        let mut runtime_state =
-                            state_for_task.lock().expect("runtime state lock poisoned");
-                        if runtime_state.active_session != identity.session {
-                            return;
-                        }
-                        if let Err(error) = TokenStore.save(&token) {
-                            send_lifecycle_failure(&events, &error);
-                            return;
-                        }
-                        let read_flusher = ReadFlusherHandle::new(
-                            Arc::new(Mutex::new(ReadFlusherQueue::new())),
-                            Arc::new(Notify::new()),
-                        );
-                        let workspace = WorkspaceReducerAdapter::default()
-                            .with_read_flusher(read_flusher.clone());
-                        workspace.update_attention_context(
-                            runtime_state.attention_context(auth.user_id.clone()),
-                        );
-                        workspace.update_attention_preferences(
-                            runtime_state.attention_preferences.clone(),
-                        );
-                        let workspace_store_scope = workspace_store_id(&auth);
-                        let image_cache_scope = preview_workspace_scope(&auth);
-                        let connection = RuntimeConnection {
-                            slack: api,
-                            workspace_url: auth.url.clone(),
-                            workspace_store: Some(WorkspaceStore::new(
-                                config::state_cache_dir(),
-                                &workspace_store_scope,
-                            )),
-                            image_cache_scope,
-                            workspace,
-                            current_user_id: auth.user_id.clone(),
-                            user_cache: Arc::new(Mutex::new(HashMap::new())),
-                            message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(
-                                256,
-                            ))),
-                            conversation_star_sync: ConversationStarSyncGate::default(),
-                            user_status_sync: UserStatusSync::default(),
-                            team_id: auth.team_id.clone(),
-                            huddles,
-                            read_flusher,
-                            scheduler: Arc::new(Mutex::new(SyncScheduler::new(
-                                SchedulerConfig::new(256, 8, 5).unwrap(),
-                            ))),
-                            pending_jobs: Arc::new(Mutex::new(HashMap::new())),
-                            next_job_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                            #[cfg(test)]
-                            cached_bootstrap_load_gate: None,
-                        };
-                        runtime_state.connection = Some(connection.clone());
-                        connection
-                    };
+            run_authentication(
+                &state_for_task,
+                identity,
+                events,
+                limits,
+                failure_context,
+                None,
+                future,
+            )
+            .await;
+        },
+    );
+}
 
-                    events.send_event(RuntimeEventKind::WorkspaceLifecycle(
-                        WorkspaceLifecycleEvent::Authenticated,
-                    ));
-                    events.send_event(RuntimeEventKind::Authenticated(auth));
-                    let icon_api = connection.slack.clone();
-                    let icon_events = events.clone();
-                    tokio::spawn(async move {
-                        match icon_api.team_icon_url().await {
-                            Ok(Some(url)) => {
-                                icon_events.send_event(RuntimeEventKind::WorkspaceIconLoaded(url));
-                            }
-                            Ok(None) => {}
-                            Err(error) => crate::debug::log(
-                                "runtime",
-                                &format!("WorkspaceIconLoadFailed error={error:#}"),
-                            ),
-                        }
-                    });
-                    let theme_api = connection.slack.clone();
-                    let theme_events = events.clone();
-                    let theme_store = connection.workspace_store.clone();
-                    tokio::spawn(async move {
-                        match theme_api.fetch_sidebar_theme().await {
-                            Ok(Some(theme)) => {
-                                if let Some(store) = theme_store.as_ref() {
-                                    if let Err(error) = store.store_sidebar_theme(&theme).await {
-                                        crate::debug::log(
-                                            "store",
-                                            &format!("SidebarThemePersistFailed error={error:#}"),
-                                        );
-                                    }
-                                }
-                                theme_events
-                                    .send_event(RuntimeEventKind::WorkspaceThemeLoaded(theme));
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
+/// Authenticates, persists the token off the runtime lock, and starts the workspace tasks.
+///
+/// `persisted` is the token already stored in the keyring, so an unchanged token is not
+/// written back on every start.
+async fn run_authentication<F>(
+    state_for_task: &Arc<Mutex<RuntimeState>>,
+    identity: RuntimeIdentity,
+    events: RuntimeEventSender,
+    limits: RuntimeTaskLimits,
+    failure_context: AuthenticationFailureContext,
+    persisted: Option<StoredToken>,
+    future: F,
+) where
+    F: Future<Output = Result<(StoredToken, SlackApi, AuthInfo)>> + Send + 'static,
+{
+    let _execution_permit = limits.acquire(RuntimeTaskLane::Interactive).await;
+    let result = future.await;
+    match result {
+        Ok((token, api, auth)) => {
+            let (huddles, huddle_receiver) = huddle_actor_channel();
+            let session_is_active = || {
+                state_for_task
+                    .lock()
+                    .expect("runtime state lock poisoned")
+                    .active_session
+                    == identity.session
+            };
+            if !session_is_active() {
+                return;
+            }
+            if persisted.as_ref() != Some(&token) {
+                // Keyring writes block on D-Bus, so they never run under the state lock.
+                // `KEYRING_LOCK` orders the write against sign-out's clear, and the
+                // session check inside it keeps a superseded session from writing
+                // its token back after the user signed out.
+                let token = token.clone();
+                let state = Arc::clone(state_for_task);
+                let session = identity.session;
+                let saved = tokio::task::spawn_blocking(move || {
+                    let _keyring = lock_keyring();
+                    let active = state
+                        .lock()
+                        .expect("runtime state lock poisoned")
+                        .active_session
+                        == session;
+                    if active {
+                        TokenStore.save(&token).map(|()| true)
+                    } else {
+                        Ok(false)
+                    }
+                })
+                .await
+                .map_err(|error| anyhow!("keyring write task failed: {error}"))
+                .and_then(|result| result);
+                match saved {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(error) => {
+                        send_lifecycle_failure(&events, &error);
+                        return;
+                    }
+                }
+            }
+            let connection = {
+                let mut runtime_state = state_for_task.lock().expect("runtime state lock poisoned");
+                if runtime_state.active_session != identity.session {
+                    return;
+                }
+                let read_flusher = ReadFlusherHandle::new(
+                    Arc::new(Mutex::new(ReadFlusherQueue::new())),
+                    Arc::new(Notify::new()),
+                );
+                let workspace =
+                    WorkspaceReducerAdapter::default().with_read_flusher(read_flusher.clone());
+                workspace.update_attention_context(
+                    runtime_state.attention_context(auth.user_id.clone()),
+                );
+                workspace.update_attention_preferences(runtime_state.attention_preferences.clone());
+                let workspace_store_scope = workspace_store_id(&auth);
+                let image_cache_scope = preview_workspace_scope(&auth);
+                let connection = RuntimeConnection {
+                    slack: api,
+                    workspace_url: auth.url.clone(),
+                    workspace_store: Some(WorkspaceStore::new(
+                        config::state_cache_dir(),
+                        &workspace_store_scope,
+                    )),
+                    image_cache_scope,
+                    workspace,
+                    current_user_id: auth.user_id.clone(),
+                    user_cache: Arc::new(Mutex::new(HashMap::new())),
+                    message_handoffs: Arc::new(Mutex::new(MessageHandoffResolver::new(256))),
+                    conversation_star_sync: ConversationStarSyncGate::default(),
+                    user_status_sync: UserStatusSync::default(),
+                    team_id: auth.team_id.clone(),
+                    huddles,
+                    read_flusher,
+                    scheduler: Arc::new(Mutex::new(SyncScheduler::new(
+                        SchedulerConfig::new(256, 8, 5).unwrap(),
+                    ))),
+                    pending_jobs: Arc::new(Mutex::new(HashMap::new())),
+                    next_job_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    #[cfg(test)]
+                    cached_bootstrap_load_gate: None,
+                };
+                runtime_state.connection = Some(connection.clone());
+                connection
+            };
+
+            events.send_event(RuntimeEventKind::WorkspaceLifecycle(
+                WorkspaceLifecycleEvent::Authenticated,
+            ));
+            events.send_event(RuntimeEventKind::Authenticated(auth));
+            let icon_api = connection.slack.clone();
+            let icon_events = events.clone();
+            tokio::spawn(async move {
+                match icon_api.team_icon_url().await {
+                    Ok(Some(url)) => {
+                        icon_events.send_event(RuntimeEventKind::WorkspaceIconLoaded(url));
+                    }
+                    Ok(None) => {}
+                    Err(error) => crate::debug::log(
+                        "runtime",
+                        &format!("WorkspaceIconLoadFailed error={error:#}"),
+                    ),
+                }
+            });
+            let theme_api = connection.slack.clone();
+            let theme_events = events.clone();
+            let theme_store = connection.workspace_store.clone();
+            tokio::spawn(async move {
+                match theme_api.fetch_sidebar_theme().await {
+                    Ok(Some(theme)) => {
+                        if let Some(store) = theme_store.as_ref() {
+                            if let Err(error) = store.store_sidebar_theme(&theme).await {
                                 crate::debug::log(
-                                    "runtime",
-                                    &format!("SidebarThemeLoadFailed error={error:#}"),
+                                    "store",
+                                    &format!("SidebarThemePersistFailed error={error:#}"),
                                 );
                             }
                         }
-                    });
-                    spawn_workspace_tasks(
-                        &state_for_task,
-                        identity,
-                        events,
-                        connection,
-                        limits,
-                        huddle_receiver,
-                    )
-                    .await;
+                        theme_events.send_event(RuntimeEventKind::WorkspaceThemeLoaded(theme));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        crate::debug::log(
+                            "runtime",
+                            &format!("SidebarThemeLoadFailed error={error:#}"),
+                        );
+                    }
                 }
-                Err(error) => {
-                    let failure = authentication_failure(failure_context, &error);
-                    send_lifecycle_failure_with(&events, &error, failure);
-                }
-            }
-        },
-    );
+            });
+            spawn_workspace_tasks(
+                state_for_task,
+                identity,
+                events,
+                connection,
+                limits,
+                huddle_receiver,
+            )
+            .await;
+        }
+        Err(error) => {
+            let failure = authentication_failure(failure_context, &error);
+            send_lifecycle_failure_with(&events, &error, failure);
+        }
+    }
 }
 
 async fn spawn_workspace_tasks(
