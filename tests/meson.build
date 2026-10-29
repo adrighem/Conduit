@@ -89,48 +89,29 @@ test(
 )
 
 if not headless_tests_option.disabled() and xvfb_run.found()
-  # Cargo tests skip GTK widget tests when no display is available; this runs
-  # the rendering tests under Xvfb and makes a missing display fail loudly.
+  # Graphical tests (visual rendering, GTK widget tests and the GTK-backed
+  # perf guards) skip themselves in 'Cargo tests', which has no display. This
+  # is the one place they run: CONDUIT_GRAPHICAL_TESTS makes a missing display
+  # fail loudly, and the `graphical::` filter selects exactly those tests so
+  # nothing from 'Cargo tests' runs twice. See AGENTS.md.
   test(
-    'Visual rendering',
+    'Graphical tests',
     xvfb_run,
     # `env` layers the display settings over cargo_env, which must match the
     # other cargo invocations so the test build is reused, not redone.
     args: [
       '-a', 'env',
-      'CONDUIT_REQUIRE_DISPLAY=1',
+      'CONDUIT_GRAPHICAL_TESTS=1',
       'GSETTINGS_BACKEND=memory',
       'GDK_BACKEND=x11',
       'GSK_RENDERER=cairo',
       'GTK_A11Y=none',
       cargo_bin.full_path(),
-    ] + cargo_test_args + ['--', 'visual_tests'],
+    ] + cargo_test_args + ['--', 'graphical::'],
     env: cargo_env,
     depends: [cargo_build],
-    suite: ['headless', 'visual'],
+    suite: ['headless', 'graphical'],
     timeout: 1800,
-    is_parallel: false,
-  )
-
-  # Count-based guards against GTK-thread hitches: full timeline rebinds,
-  # gdk-pixbuf/glycin header probes, synchronous sidebar renders and
-  # uncapped startup prefetch. See AGENTS.md.
-  test(
-    'Performance guards',
-    xvfb_run,
-    args: [
-      '-a', 'env',
-      'CONDUIT_REQUIRE_DISPLAY=1',
-      'GSETTINGS_BACKEND=memory',
-      'GDK_BACKEND=x11',
-      'GSK_RENDERER=cairo',
-      'GTK_A11Y=none',
-      cargo_bin.full_path(),
-    ] + cargo_test_args + ['--', 'perf_guard'],
-    env: cargo_env,
-    depends: [cargo_build],
-    suite: ['headless', 'performance'],
-    timeout: 600,
     is_parallel: false,
   )
 endif

@@ -3,9 +3,22 @@
 - Conduit intentionally supports one connected Slack workspace. Treat single-workspace operation as a product boundary, not as a temporary limitation or a future multi-workspace roadmap gap.
 - Run `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` before every push. Enforce via `.git/hooks/pre-push`.
 
+## Testing
+
+- Graphical tests (anything that creates GTK widgets or windows, or needs a display) skip themselves unless `CONDUIT_GRAPHICAL_TESTS=1`. Plain `cargo test` never initialises GTK or opens a window. Never run them on a desktop session.
+- Put every graphical test in a `mod graphical` and start its body with `run_gtk_test(...)` (`src/timeline/tests.rs`). The module path is what selects them, so a graphical test outside `graphical::` would run with the plain suite.
+- The pre-push hook and CI run them under Xvfb. The filter selects exactly the graphical tests:
+
+  ```sh
+  xvfb-run -a env CONDUIT_GRAPHICAL_TESTS=1 GDK_BACKEND=x11 GSK_RENDERER=cairo GSETTINGS_BACKEND=memory GTK_A11Y=none cargo test graphical::
+  ```
+
+  With the variable set, a GTK that cannot initialise fails the test instead of skipping. Meson runs the same command as the "Graphical tests" target (`meson test --suite graphical`); "Cargo tests" runs everything else once, without a display.
+- Wait on conditions with the shared `pump_until` (and `pump` for a fixed settle) from `src/timeline/tests.rs`, not ad-hoc loops or sleeps.
+
 ## Performance
 
-Freezes come from work on the GTK main thread. These rules keep known hitches out; the `perf_guard_*` tests enforce them (`cargo test perf_guard`, and the "Performance guards" meson test under Xvfb in CI).
+Freezes come from work on the GTK main thread. These rules keep known hitches out; the `perf_guard_*` tests enforce them. The display-free guards run in plain `cargo test perf_guard` and meson "Cargo tests"; the GTK-backed guards (timeline rebinds) are graphical and run in the "Graphical tests" Xvfb target, so a full check needs both runs.
 
 - Timeline re-renders rebind only rows whose inputs changed (`MessageRenderContext::same_row_inputs`). Never put per-render values (tokens, scroll intent, image maps) into row-compared context. An arriving image rebinds only the rows that use it.
 - Never probe image headers with gdk-pixbuf on the GTK thread for PNG, GIF, JPEG or WebP: `Pixbuf::file_info` is an out-of-process glycin call of tens of milliseconds. Use `image_header::declared_header`.
