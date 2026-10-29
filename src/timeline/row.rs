@@ -13,10 +13,8 @@ use crate::models::{SlackFile, SlackMessage};
 use super::actions::{
     ActionHandler, HoverEvent, OpenMediaCallback, TimelineAction, ToggleReactionCallback,
 };
-use super::cache::decode::deferred_texture_picture;
-use super::cache::{
-    get_or_load_texture, is_media_collapsed, resolve_cached_asset_path, set_media_collapsed,
-};
+use super::cache::decode::{deferred_texture_picture, set_avatar_image_when_mapped};
+use super::cache::{is_media_collapsed, resolve_cached_asset_path, set_media_collapsed};
 use super::reactions::build_reactions_widget;
 use super::text::{create_message_text_widget, render_text_content};
 
@@ -473,10 +471,8 @@ pub fn build_avatar_widget(message: &SlackMessage, context: &MessageRenderContex
     if let Some(url) = avatar_source_url {
         // Only cached downloads: `url` comes from Slack (icon_url, bot icons)
         // and must never be opened as a local path.
-        let texture =
-            resolve_cached_asset_path(url, context).and_then(|path| get_or_load_texture(&path));
-        if let Some(texture) = texture {
-            avatar.set_custom_image(Some(texture.upcast_ref::<gtk::gdk::Paintable>()));
+        if let Some(path) = resolve_cached_asset_path(url, context) {
+            set_avatar_image_when_mapped(&avatar, &path);
         }
     }
     avatar.upcast::<Widget>()

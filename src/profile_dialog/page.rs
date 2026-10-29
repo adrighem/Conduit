@@ -76,12 +76,8 @@ impl ProfileDialog {
     fn build_header(&self, model: &ProfileViewModel, input: &ProfileInput) -> gtk::Box {
         let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
         let avatar = adw::Avatar::new(96, Some(&model.display_name), true);
-        if let Some(texture) = input
-            .avatar_path
-            .as_deref()
-            .and_then(crate::timeline_message_widget::get_or_load_texture)
-        {
-            avatar.set_custom_image(Some(&texture));
+        if let Some(path) = input.avatar_path.as_deref() {
+            crate::timeline::cache::decode::set_avatar_image_when_mapped(&avatar, path);
         }
         avatar.set_halign(gtk::Align::Center);
         header.append(&avatar);

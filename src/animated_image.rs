@@ -247,15 +247,13 @@ fn scale_to_fit(pixbuf: &gdk_pixbuf::Pixbuf, max_side: i32) -> gdk_pixbuf::Pixbu
 }
 
 /// Whether `path` is in a format that can hold several frames. Reads only the
-/// header, so static images skip a full animation decode. Formats our own
-/// header parser knows skip gdk-pixbuf's much slower glycin probe.
+/// header, so static images skip a full animation decode. Our own parser
+/// knows GIF and WebP, the only animated formats gdk-pixbuf plays, so any
+/// other file is static: it never reaches gdk-pixbuf's glycin probe here, on
+/// the GTK thread, but in the worker that judges its decode budget.
 pub(crate) fn may_be_animated(path: &Path) -> bool {
-    if let Some((format, _, _)) = crate::image_header::declared_header(path) {
-        return format.may_be_animated();
-    }
-    file_info(path)
-        .and_then(|(format, _, _)| format.name())
-        .is_some_and(|name| matches!(name.as_str(), "gif" | "webp"))
+    crate::image_header::declared_header(path)
+        .is_some_and(|(format, _, _)| format.may_be_animated())
 }
 
 /// Whether `path` decodes to at most [`MAX_DECODED_PIXELS`], judged from its
@@ -401,10 +399,20 @@ pub(crate) mod tests {
     fn perf_guard_counts_the_glycin_fallback_for_unknown_formats() {
         let path = write_temp("guard.unknown", b"neither PNG, GIF, JPEG nor WebP");
         let probes = glycin_probes_during(|| {
-            may_be_animated(&path);
+            within_decode_budget(&path);
         });
         let _ = std::fs::remove_file(&path);
         assert_eq!(probes, 1, "the guard counter must see the fallback probe");
+    }
+
+    #[test]
+    fn perf_guard_unknown_formats_are_static_without_a_glycin_probe() {
+        let path = write_temp("guard-static.unknown", b"neither PNG, GIF, JPEG nor WebP");
+        let probes = glycin_probes_during(|| {
+            assert!(!may_be_animated(&path));
+        });
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(probes, 0, "the GTK thread must not probe unknown formats");
     }
 
     #[test]

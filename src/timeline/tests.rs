@@ -534,7 +534,7 @@ impl ManualDecodes {
         let mut finished = Vec::new();
         while let Some(key) = self.0.running().first().cloned() {
             assert!(finished.len() < 1000, "decodes keep coming");
-            self.0.complete(0, decode::decode_texture_file(&key.path));
+            self.0.complete(0, decode::decode_key(&key));
             finished.push(key);
         }
         finished
@@ -707,6 +707,70 @@ fn save_test_image(path: &Path, format: &str, width: i32, height: i32) {
         .expect("pixbuf")
         .savev(path, format, &[])
         .expect("save");
+}
+
+/// Shows `widget` in a window until its pictures have asked for their
+/// decodes, then lets `decodes` finish them. Returns the window.
+fn show_and_decode(decodes: &ManualDecodes, widget: &impl IsA<Widget>) -> gtk::Window {
+    let window = gtk::Window::new();
+    window.set_child(Some(widget));
+    window.present();
+    pump_until(500, || !decodes.0.running().is_empty());
+    decodes.finish_all();
+    window
+}
+
+fn decode_reaction_on_a_worker(path: &Path) -> Result<gtk::gdk::Texture, decode::DecodeError> {
+    let key = decode::TextureKey {
+        path: path.to_path_buf(),
+        spec: decode::TextureSpec::Reaction,
+    };
+    std::thread::spawn(move || decode::decode_key(&key))
+        .join()
+        .expect("worker panicked")
+}
+
+#[test]
+fn reaction_emoji_are_scaled_in_the_worker() {
+    let temp_dir = TempTestDir::new("reaction-worker");
+    // Over 128 px: decoded by gdk-pixbuf and scaled before leaving the worker.
+    let large = temp_dir.path().join("large.png");
+    save_test_image(&large, "png", 256, 128);
+    let texture = decode_reaction_on_a_worker(&large).expect("scaled");
+    assert_eq!((texture.width(), texture.height()), (32, 16));
+    // Small PNG and JPEG keep their size; GTK scales them when it paints.
+    for (name, format) in [("small.png", "png"), ("small.jpg", "jpeg")] {
+        let path = temp_dir.path().join(name);
+        save_test_image(&path, format, 96, 48);
+        let texture = decode_reaction_on_a_worker(&path).expect("in process");
+        assert_eq!((texture.width(), texture.height()), (96, 48), "{name}");
+    }
+    let missing = temp_dir.path().join("missing.png");
+    assert!(matches!(
+        decode_reaction_on_a_worker(&missing),
+        Err(decode::DecodeError::Transient(_))
+    ));
+    let junk = temp_dir.path().join("junk.png");
+    std::fs::write(&junk, b"\x89PNG\r\n\x1a\n not really").expect("write junk");
+    assert!(matches!(
+        decode_reaction_on_a_worker(&junk),
+        Err(decode::DecodeError::Permanent(_))
+    ));
+}
+
+#[test]
+fn memory_texture_keeps_the_pixbuf_pixels() {
+    for alpha in [false, true] {
+        let pixbuf =
+            gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, alpha, 8, 3, 2).expect("pixbuf");
+        pixbuf.fill(0x1020_30ff);
+        let texture = crate::timeline::reactions::memory_texture(&pixbuf);
+        assert_eq!((texture.width(), texture.height()), (3, 2));
+        let mut pixels = vec![0u8; 3 * 2 * 4];
+        texture.download(&mut pixels, 3 * 4);
+        // Cairo ARGB32 in native byte order: B, G, R, A on little endian.
+        assert_eq!(&pixels[..4], &[0x30, 0x20, 0x10, 0xff], "alpha {alpha}");
+    }
 }
 
 fn cached_reaction_size(path: &Path) -> (i32, i32) {
@@ -2518,6 +2582,7 @@ mod graphical {
     #[test]
     fn test_small_png_and_jpeg_reaction_emoji_decode_in_process_at_32px_layout() {
         run_gtk_test(|| {
+            let decodes = ManualDecodes::install();
             let temp_dir = TempTestDir::new("reaction-in-process");
             for (name, format) in [("wide.png", "png"), ("wide.jpg", "jpeg")] {
                 let path = temp_dir.path().join(name);
@@ -2525,12 +2590,17 @@ mod graphical {
                 let widget = load_custom_emoji_picture(&path, REACTION_EMOJI_SIZE);
                 let pic = widget.downcast::<Picture>().expect("expected Picture");
                 let paintable = pic.paintable().expect("expected paintable");
-                // GTK scales at render; layout still sees the 32 px fit.
+                // The 32 px fit holds before the decode lands...
+                assert_eq!(paintable.intrinsic_width(), 32, "{name}");
+                assert_eq!(paintable.intrinsic_height(), 16, "{name}");
+                let window = show_and_decode(&decodes, &pic);
+                // ...and after: GTK scales at render.
                 assert_eq!(cached_reaction_size(&path), (96, 48), "{name}");
                 assert_eq!(paintable.intrinsic_width(), 32, "{name}");
                 assert_eq!(paintable.intrinsic_height(), 16, "{name}");
                 assert_eq!(pic.width_request(), 32);
                 assert_eq!(pic.height_request(), 32);
+                window.destroy();
             }
         });
     }
@@ -2538,29 +2608,158 @@ mod graphical {
     #[test]
     fn test_large_png_reaction_emoji_keeps_the_pixbuf_scaled_path() {
         run_gtk_test(|| {
+            let decodes = ManualDecodes::install();
             let temp_dir = TempTestDir::new("reaction-pixbuf");
             let path = temp_dir.path().join("big.png");
             save_test_image(&path, "png", 256, 128);
             let widget = load_custom_emoji_picture(&path, REACTION_EMOJI_SIZE);
             let pic = widget.downcast::<Picture>().expect("expected Picture");
             let paintable = pic.paintable().expect("expected paintable");
+            assert_eq!(paintable.intrinsic_width(), 32);
+            assert_eq!(paintable.intrinsic_height(), 16);
+            let window = show_and_decode(&decodes, &pic);
             assert_eq!(cached_reaction_size(&path), (32, 16));
             assert_eq!(paintable.intrinsic_width(), 32);
             assert_eq!(paintable.intrinsic_height(), 16);
+            window.destroy();
         });
     }
 
     #[test]
     fn perf_guard_reaction_emoji_decodes_once_per_file() {
         run_gtk_test(|| {
+            let decodes = ManualDecodes::install();
             let temp_dir = TempTestDir::new("reaction-once");
             let path = temp_dir.path().join("once.png");
             save_test_image(&path, "png", 64, 64);
-            let before = crate::debug::IMAGE_DECODES.get();
+            let pills = Box::new(Orientation::Horizontal, 0);
             for _ in 0..40 {
-                load_custom_emoji_picture(&path, REACTION_EMOJI_SIZE);
+                pills.append(&load_custom_emoji_picture(&path, REACTION_EMOJI_SIZE));
             }
-            assert_eq!(crate::debug::IMAGE_DECODES.get() - before, 1);
+            // The quick bar shows the same emoji smaller, from the same decode.
+            let quick = load_custom_emoji_picture(&path, QUICK_BAR_EMOJI_SIZE)
+                .downcast::<Picture>()
+                .expect("picture");
+            pills.append(&quick);
+            let window = gtk::Window::new();
+            window.set_child(Some(&pills));
+            window.present();
+            pump_until(500, || !decodes.0.running().is_empty());
+            assert_eq!(decodes.finish_all().len(), 1, "one decode serves all 41");
+            let quick = quick.paintable().expect("paintable");
+            assert_eq!(
+                (quick.intrinsic_width(), quick.intrinsic_height()),
+                (QUICK_BAR_EMOJI_SIZE, QUICK_BAR_EMOJI_SIZE),
+                "each picture keeps its own size"
+            );
+            // Built again once cached: no decode at all.
+            load_custom_emoji_picture(&path, QUICK_BAR_EMOJI_SIZE);
+            assert!(decodes.0.running().is_empty());
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn perf_guard_reactions_and_avatars_decode_off_the_gtk_thread() {
+        run_gtk_test(|| {
+            let decodes = ManualDecodes::install();
+            let assets = AssetCacheTestDir::new("avatar-guard");
+            let emoji_dir = TempTestDir::new("reaction-guard");
+            // In-process, pixbuf-scaled and static-GIF reaction emoji.
+            let mut emojis = HashMap::new();
+            let mut reactions = Vec::new();
+            for (name, format, side) in [
+                ("small", "png", 64),
+                ("large", "png", 256),
+                ("photo", "jpeg", 300),
+            ] {
+                let path = emoji_dir.path().join(format!("{name}.{format}"));
+                save_test_image(&path, format, side, side / 2);
+                let url = format!("https://example.com/guard-{name}.{format}");
+                crate::emoji_picker_window::invalidate_or_set_custom_emoji_cached_file(
+                    &url,
+                    path.clone(),
+                );
+                emojis.insert(name.to_string(), url);
+                reactions.push(crate::models::SlackReaction {
+                    name: Some(name.to_string()),
+                    count: Some(1),
+                    ..Default::default()
+                });
+            }
+            let mut ctx = test_context();
+            ctx.custom_emojis = Arc::new(emojis);
+            // Avatars: a PNG, and a format the header parser does not know,
+            // whose budget check needs gdk-pixbuf's glycin probe.
+            let mut messages = Vec::new();
+            for (i, (name, bytes)) in [
+                ("avatar.png", None),
+                (
+                    "avatar.webp",
+                    Some(b"neither PNG, GIF, JPEG nor WebP".to_vec()),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let path = assets.0.join(name);
+                match bytes {
+                    Some(bytes) => std::fs::write(&path, bytes).expect("write avatar"),
+                    None => save_test_image(&path, "png", 72, 72),
+                }
+                let url = format!("https://avatars.slack-edge.com/guard-{i}.png");
+                ctx.image_assets.insert(url.clone(), path);
+                messages.push(SlackMessage {
+                    ts: format!("1700000000.00010{i}"),
+                    icons: Some(crate::models::SlackIcons {
+                        image_72: Some(url),
+                        ..Default::default()
+                    }),
+                    reactions: Some(reactions.clone()),
+                    ..Default::default()
+                });
+            }
+
+            let column = Box::new(Orientation::Vertical, 0);
+            let window = gtk::Window::new();
+            window.set_child(Some(&column));
+            window.present();
+            let decodes_before = crate::debug::IMAGE_DECODES.get();
+            let probes = crate::animated_image::tests::glycin_probes_during(|| {
+                for message in &messages {
+                    column.append(&build_avatar_widget(message, &ctx));
+                    column.append(&build_reactions_widget(message, &ctx, None).expect("pills"));
+                }
+                pump_until(500, || decodes.0.running().len() == decode::MAX_IN_FLIGHT);
+            });
+            assert_eq!(
+                crate::debug::IMAGE_DECODES.get() - decodes_before,
+                0,
+                "reactions and avatars must leave decodes to the workers"
+            );
+            assert_eq!(probes, 0, "no glycin header probe on the GTK thread");
+
+            // Completion paints in place, in the slots reserved for them.
+            decodes.finish_all();
+            pump(20);
+            let avatars: Vec<adw::Avatar> = descendants(column.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<adw::Avatar>().ok())
+                .collect();
+            assert_eq!(avatars.len(), 2);
+            assert!(avatars[0].custom_image().is_some(), "the PNG avatar shows");
+            assert!(avatars[1].custom_image().is_none(), "the junk avatar fails");
+            let pictures = deferred_pictures(column.upcast_ref());
+            assert_eq!(pictures.len(), 6, "every reaction waited in place");
+            for (picture, deferred) in &pictures {
+                assert!(deferred.texture().is_some(), "no reaction stays pending");
+                assert_eq!(
+                    (deferred.intrinsic_width(), deferred.intrinsic_height()),
+                    (32, 16)
+                );
+                assert_eq!(picture.width_request(), 32);
+            }
+            window.destroy();
         });
     }
 
