@@ -57,25 +57,76 @@ impl PickerRefreshGate {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PeoplePickerRow {
+/// A person the people picker lists; the lowercased name is computed once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeoplePickerPerson {
     pub user_id: String,
-    pub searchable_name: String,
-    pub check: gtk::CheckButton,
-    pub row: gtk::ListBoxRow,
+    pub name: String,
+    searchable_name: String,
+}
+
+impl PeoplePickerPerson {
+    pub fn new(user_id: String, name: String) -> Self {
+        let searchable_name = name.to_lowercase();
+        Self {
+            user_id,
+            name,
+            searchable_name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeoplePickerEntry {
+    Person(PeoplePickerPerson),
+    Placeholder(String),
+}
+
+impl PeoplePickerEntry {
+    fn key(&self) -> PickerEntryKey<'_> {
+        match self {
+            Self::Person(person) => PickerEntryKey::Item(&person.user_id),
+            Self::Placeholder(text) => PickerEntryKey::Placeholder(text),
+        }
+    }
+}
+
+/// The entries the people picker shows for `people` and the lowercased,
+/// trimmed search `query`: the people whose name contains it, or a
+/// placeholder while there is nobody to list.
+pub fn people_picker_list_entries(
+    people: &[PeoplePickerPerson],
+    discovery_complete: bool,
+    query: &str,
+) -> Vec<PeoplePickerEntry> {
+    if people.is_empty() {
+        return vec![PeoplePickerEntry::Placeholder(gettext(
+            if discovery_complete {
+                "No people available"
+            } else {
+                "Loading people…"
+            },
+        ))];
+    }
+    people
+        .iter()
+        .filter(|person| query.is_empty() || person.searchable_name.contains(query))
+        .cloned()
+        .map(PeoplePickerEntry::Person)
+        .collect()
 }
 
 #[derive(Debug, Clone)]
 pub struct PeoplePickerView {
-    pub list: gtk::ListBox,
+    pub model: PeoplePickerModel,
     pub search: gtk::SearchEntry,
     pub confirm: gtk::Button,
-    pub rows: Rc<RefCell<Vec<PeoplePickerRow>>>,
     pub excluded_user_ids: HashSet<String>,
     pub discovery_complete: Rc<std::cell::Cell<bool>>,
-    /// The `(user id, name)` rows currently listed, so an unchanged
-    /// directory refresh skips the rebuild.
-    pub shown: Rc<RefCell<Vec<(String, String)>>>,
+    /// Everyone currently listed (before the search filter), so an unchanged
+    /// directory refresh skips the update and a search filters without a
+    /// directory rescan.
+    pub shown: Rc<RefCell<Vec<PeoplePickerPerson>>>,
 }
 
 /// The `(user id, name)` rows the people picker lists, sorted by name. Each
@@ -181,14 +232,17 @@ pub fn picker_edits(
     previous: &[ConversationPickerListEntry],
     next: &[ConversationPickerListEntry],
 ) -> Option<PickerEdits> {
-    let previous_keys = previous
-        .iter()
-        .map(ConversationPickerListEntry::key)
-        .collect::<Vec<_>>();
-    let next_keys = next
-        .iter()
-        .map(ConversationPickerListEntry::key)
-        .collect::<Vec<_>>();
+    keyed_edits(previous, next, ConversationPickerListEntry::key)
+}
+
+/// [`picker_edits`] for any list whose entries have a stable key.
+fn keyed_edits<'a, T: PartialEq, K: Copy + Eq + std::hash::Hash>(
+    previous: &'a [T],
+    next: &'a [T],
+    key: impl Fn(&'a T) -> K,
+) -> Option<PickerEdits> {
+    let previous_keys = previous.iter().map(&key).collect::<Vec<_>>();
+    let next_keys = next.iter().map(&key).collect::<Vec<_>>();
     let next_set = next_keys.iter().copied().collect::<HashSet<_>>();
     let mut remaining = previous_keys.iter().copied().collect::<HashSet<_>>();
     if next_set.len() != next_keys.len() || remaining.len() != previous_keys.len() {
@@ -439,6 +493,245 @@ impl ConversationPickerModel {
     }
 }
 
+/// The people picker list. Like the conversation picker it is a virtualized
+/// `GtkListView`: a refresh splices only the added and removed people, and
+/// the checked people live in a set, not in row widgets, so they stay checked
+/// across refreshes, scrolling and searches.
+#[derive(Clone)]
+pub struct PeoplePickerModel {
+    pub list: gtk::ListView,
+    store: gio::ListStore,
+    entries: Rc<RefCell<Vec<PeoplePickerEntry>>>,
+    query: Rc<RefCell<Option<String>>>,
+    checked: Rc<RefCell<HashSet<String>>>,
+    /// Containers of the currently bound person rows, by user id.
+    bound: Rc<RefCell<HashMap<String, adw::Bin>>>,
+}
+
+impl std::fmt::Debug for PeoplePickerModel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PeoplePickerModel")
+            .field("list", &self.list)
+            .field("entries", &self.entries.borrow().len())
+            .finish_non_exhaustive()
+    }
+}
+
+fn people_picker_row_widget(
+    entry: &PeoplePickerEntry,
+    checked: &Rc<RefCell<HashSet<String>>>,
+    on_checked_changed: &Rc<dyn Fn(bool)>,
+) -> gtk::Widget {
+    match entry {
+        PeoplePickerEntry::Person(person) => {
+            let check = gtk::CheckButton::with_label(&person.name);
+            check.set_margin_top(6);
+            check.set_margin_bottom(6);
+            check.set_margin_start(9);
+            check.set_margin_end(9);
+            check.set_active(checked.borrow().contains(&person.user_id));
+            let (checked, on_checked_changed) = (checked.clone(), on_checked_changed.clone());
+            let user_id = person.user_id.clone();
+            check.connect_toggled(move |check| {
+                if check.is_active() {
+                    checked.borrow_mut().insert(user_id.clone());
+                } else {
+                    checked.borrow_mut().remove(&user_id);
+                }
+                on_checked_changed(!checked.borrow().is_empty());
+            });
+            check.upcast()
+        }
+        PeoplePickerEntry::Placeholder(text) => {
+            let label = gtk::Label::new(Some(text));
+            label.set_margin_top(12);
+            label.set_margin_bottom(12);
+            label.set_margin_start(12);
+            label.set_margin_end(12);
+            label.set_xalign(0.0);
+            label.add_css_class("dim-label");
+            label.upcast()
+        }
+    }
+}
+
+impl PeoplePickerModel {
+    /// `on_checked_changed(any_checked)` runs after a person is checked or
+    /// unchecked.
+    pub fn new(on_checked_changed: impl Fn(bool) + 'static) -> Self {
+        let on_checked_changed: Rc<dyn Fn(bool)> = Rc::new(on_checked_changed);
+        let checked = Rc::new(RefCell::new(HashSet::<String>::new()));
+        let bound = Rc::new(RefCell::new(HashMap::<String, adw::Bin>::new()));
+        let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(|_, object| {
+            if let Some(list_item) = object.downcast_ref::<gtk::ListItem>() {
+                list_item.set_selectable(false);
+                list_item.set_activatable(false);
+                list_item.set_child(Some(&adw::Bin::new()));
+            }
+        });
+        {
+            let checked = checked.clone();
+            let bound = bound.clone();
+            let on_checked_changed = on_checked_changed.clone();
+            factory.connect_bind(move |_, object| {
+                let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
+                    return;
+                };
+                let Some(boxed) = list_item.item().and_downcast::<glib::BoxedAnyObject>() else {
+                    return;
+                };
+                let Some(bin) = list_item.child().and_downcast::<adw::Bin>() else {
+                    return;
+                };
+                let entry = boxed.borrow::<PeoplePickerEntry>();
+                bin.set_child(Some(&people_picker_row_widget(
+                    &entry,
+                    &checked,
+                    &on_checked_changed,
+                )));
+                if let PeoplePickerEntry::Person(person) = &*entry {
+                    bound.borrow_mut().insert(person.user_id.clone(), bin);
+                }
+            });
+        }
+        {
+            let bound = bound.clone();
+            factory.connect_unbind(move |_, object| {
+                let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
+                    return;
+                };
+                let Some(bin) = list_item.child().and_downcast::<adw::Bin>() else {
+                    return;
+                };
+                bin.set_child(None::<&gtk::Widget>);
+                bound.borrow_mut().retain(|_, bound_bin| *bound_bin != bin);
+            });
+        }
+        let list = gtk::ListView::new(
+            Some(gtk::NoSelection::new(Some(store.clone()))),
+            Some(factory),
+        );
+        list.add_css_class("navigation-sidebar");
+        Self {
+            list,
+            store,
+            entries: Rc::default(),
+            query: Rc::default(),
+            checked,
+            bound,
+        }
+    }
+
+    /// Shows `next` for the search `query`. A new query replaces the list
+    /// and returns to the top; a data refresh for the same query splices
+    /// only the people added or removed and keeps the scroll position.
+    pub fn show(&self, query: &str, next: Vec<PeoplePickerEntry>) {
+        let same_query = self.query.borrow().as_deref() == Some(query);
+        *self.query.borrow_mut() = Some(query.to_string());
+        let edits = same_query
+            .then(|| keyed_edits(&self.entries.borrow(), &next, PeoplePickerEntry::key))
+            .flatten();
+        match edits {
+            Some(edits) => self.apply(&edits, next),
+            None => self.replace(next),
+        }
+    }
+
+    fn replace(&self, next: Vec<PeoplePickerEntry>) {
+        let objects = next
+            .iter()
+            .cloned()
+            .map(glib::BoxedAnyObject::new)
+            .collect::<Vec<_>>();
+        self.store.splice(0, self.store.n_items(), &objects);
+        *self.entries.borrow_mut() = next;
+        if self.store.n_items() > 0 {
+            self.list.scroll_to(0, gtk::ListScrollFlags::NONE, None);
+        }
+    }
+
+    fn apply(&self, edits: &PickerEdits, next: Vec<PeoplePickerEntry>) {
+        for splice in &edits.splices {
+            let objects = next[splice.inserted.clone()]
+                .iter()
+                .cloned()
+                .map(glib::BoxedAnyObject::new)
+                .collect::<Vec<_>>();
+            self.store
+                .splice(splice.position as u32, splice.removed as u32, &objects);
+        }
+        // A renamed person edits the stored entry and the bound row's label
+        // in place: replacing the store item would shift the scroll anchor.
+        for &position in &edits.updates {
+            let entry = &next[position];
+            if let Some(boxed) = self
+                .store
+                .item(position as u32)
+                .and_downcast::<glib::BoxedAnyObject>()
+            {
+                *boxed.borrow_mut::<PeoplePickerEntry>() = entry.clone();
+            }
+            if let PeoplePickerEntry::Person(person) = entry {
+                let check = self
+                    .bound
+                    .borrow()
+                    .get(&person.user_id)
+                    .and_then(|bin| bin.child())
+                    .and_downcast::<gtk::CheckButton>();
+                if let Some(check) = check {
+                    check.set_label(Some(&person.name));
+                }
+            }
+        }
+        *self.entries.borrow_mut() = next;
+    }
+
+    /// Forgets checked people who are no longer listed.
+    pub fn retain_checked(&self, listed: &HashSet<String>) {
+        self.checked.borrow_mut().retain(|id| listed.contains(id));
+    }
+
+    pub fn has_checked(&self) -> bool {
+        !self.checked.borrow().is_empty()
+    }
+
+    /// The checked people among `people`, in list order.
+    pub fn checked_in(&self, people: &[PeoplePickerPerson]) -> Vec<String> {
+        let checked = self.checked.borrow();
+        people
+            .iter()
+            .filter(|person| checked.contains(&person.user_id))
+            .map(|person| person.user_id.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn bound_check(&self, user_id: &str) -> Option<gtk::CheckButton> {
+        let bin = self.bound.borrow().get(user_id).cloned()?;
+        bin.child().and_downcast::<gtk::CheckButton>()
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> u32 {
+        self.store.n_items()
+    }
+
+    #[cfg(test)]
+    pub fn bound_count(&self) -> usize {
+        self.bound.borrow().len()
+    }
+
+    #[cfg(test)]
+    pub fn bound_ids(&self) -> Vec<String> {
+        let mut ids = self.bound.borrow().keys().cloned().collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+}
+
 pub fn picker_sections(
     include_discovery: bool,
     source: sidebar::ConversationPickerSource<'_>,
@@ -638,6 +931,84 @@ mod tests {
         assert_eq!(picker_edits(&previous, &duplicate), None);
     }
 
+    fn person(index: usize, name: &str) -> PeoplePickerPerson {
+        PeoplePickerPerson::new(format!("U{index:05}"), format!("{name} {index:05}"))
+    }
+
+    fn people(name: &str, ids: impl IntoIterator<Item = usize>) -> Vec<PeoplePickerPerson> {
+        ids.into_iter().map(|index| person(index, name)).collect()
+    }
+
+    fn person_entries(people: &[PeoplePickerPerson], query: &str) -> Vec<PeoplePickerEntry> {
+        people_picker_list_entries(people, true, query)
+    }
+
+    #[test]
+    fn perf_guard_people_refresh_splices_only_changed_people() {
+        let previous = person_entries(&people("Team", 0..2_000), "");
+        let mut next_people = people("Team", (0..2_000).filter(|index| index % 500 != 7));
+        next_people.insert(300, person(90_000, "New"));
+        next_people.insert(1_200, person(90_001, "New"));
+        let renamed = next_people
+            .iter()
+            .position(|person| person.user_id == "U00998")
+            .expect("person survives");
+        next_people[renamed] = PeoplePickerPerson::new("U00998".to_string(), "Renamed".to_string());
+        let next = person_entries(&next_people, "");
+
+        let edits = keyed_edits(&previous, &next, PeoplePickerEntry::key).expect("keys are unique");
+        let mut applied = previous.clone();
+        for splice in &edits.splices {
+            applied.splice(
+                splice.position..splice.position + splice.removed,
+                next[splice.inserted.clone()].iter().cloned(),
+            );
+        }
+        for &position in &edits.updates {
+            applied[position] = next[position].clone();
+        }
+        assert_eq!(applied, next);
+        let touched = edits
+            .splices
+            .iter()
+            .map(|splice| splice.removed + splice.inserted.len())
+            .sum::<usize>();
+        assert_eq!(touched, 6, "four removals and two insertions: {edits:?}");
+        assert_eq!(edits.updates, vec![renamed]);
+    }
+
+    #[test]
+    fn people_picker_list_filters_by_name_and_explains_an_empty_directory() {
+        let everyone = vec![
+            PeoplePickerPerson::new("U1".to_string(), "Ada Lovelace".to_string()),
+            PeoplePickerPerson::new("U2".to_string(), "Grace Hopper".to_string()),
+            PeoplePickerPerson::new("U3".to_string(), "Zoë Ada".to_string()),
+        ];
+        let ids = |query: &str| {
+            person_entries(&everyone, query)
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    PeoplePickerEntry::Person(person) => Some(person.user_id),
+                    PeoplePickerEntry::Placeholder(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(""), ["U1", "U2", "U3"]);
+        assert_eq!(ids("ada"), ["U1", "U3"]);
+        assert_eq!(ids("zoë"), ["U3"]);
+        assert!(ids("nobody").is_empty());
+        assert!(matches!(
+            people_picker_list_entries(&[], false, "ada").as_slice(),
+            [PeoplePickerEntry::Placeholder(_)]
+        ));
+        assert_ne!(
+            people_picker_list_entries(&[], false, ""),
+            people_picker_list_entries(&[], true, ""),
+            "loading and empty read differently"
+        );
+    }
+
     /// Tests that create GTK widgets. They run only when
     /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
     mod graphical {
@@ -781,6 +1152,126 @@ mod tests {
                 model.show("team-1", channel_entries("team", 100..200));
                 pump(100);
                 assert_eq!(adjustment.value(), 0.0, "a new query starts at the top");
+                window.close();
+            });
+        }
+
+        fn people_picker_window(model: &PeoplePickerModel) -> (gtk::Window, gtk::ScrolledWindow) {
+            let scroller = gtk::ScrolledWindow::new();
+            scroller.set_child(Some(&model.list));
+            let window = gtk::Window::builder()
+                .default_width(400)
+                .default_height(300)
+                .child(&scroller)
+                .build();
+            (window, scroller)
+        }
+
+        #[test]
+        fn people_picker_refresh_keeps_checked_people_and_scroll_position() {
+            run_gtk_test(|| {
+                let any_checked = Rc::new(Cell::new(false));
+                let model = PeoplePickerModel::new({
+                    let any_checked = any_checked.clone();
+                    move |any| any_checked.set(any)
+                });
+                let (window, scroller) = people_picker_window(&model);
+                let everyone = people("Team", 0..2_000);
+                model.show("", person_entries(&everyone, ""));
+                window.present();
+                pump_until(5000, || window.height() > 0);
+                pump_until(5000, || model.bound_check("U00001").is_some());
+                assert!(
+                    model.bound_count() < 500,
+                    "{} rows bound for 2000 people",
+                    model.bound_count()
+                );
+
+                model
+                    .bound_check("U00001")
+                    .expect("top row is bound")
+                    .set_active(true);
+                assert!(any_checked.get());
+                let adjustment = scroller.vadjustment();
+                model
+                    .list
+                    .scroll_to(1_000, gtk::ListScrollFlags::NONE, None);
+                pump_until(5000, || model.bound_check("U00001").is_none());
+                pump(50);
+                let value_before = adjustment.value();
+                assert!(value_before > 0.0, "the picker never scrolled");
+                let ids = model.bound_ids();
+                let target = ids[ids.len() / 2].clone();
+                model
+                    .bound_check(&target)
+                    .expect("a mid-list row is bound")
+                    .set_active(true);
+
+                // People come and go above and below the viewport (net zero
+                // above it), and one visible person is renamed.
+                let mut next = people(
+                    "Team",
+                    (0..2_000).filter(|index| ![10, 20, 1_900].contains(index)),
+                );
+                next.insert(5, person(90_000, "New"));
+                next.insert(15, person(90_001, "New"));
+                next.insert(1_950, person(90_002, "New"));
+                let renamed = next
+                    .iter()
+                    .position(|person| person.user_id == target)
+                    .expect("checked person survives");
+                next[renamed] = PeoplePickerPerson::new(target.clone(), "Renamed".to_string());
+                model.show("", person_entries(&next, ""));
+                pump(100);
+
+                assert_eq!(model.len() as usize, next.len());
+                assert!(
+                    (adjustment.value() - value_before).abs() < 1.0,
+                    "scroll moved from {value_before} to {}",
+                    adjustment.value()
+                );
+                let mut expected = vec!["U00001".to_string(), target.clone()];
+                expected.sort();
+                assert_eq!(
+                    model.checked_in(&next),
+                    expected,
+                    "checked people were lost"
+                );
+                let check = model.bound_check(&target).expect("row stays bound");
+                assert!(check.is_active(), "the checkbox lost its state");
+                assert_eq!(check.label().as_deref(), Some("Renamed"));
+
+                // A person who leaves is no longer checked.
+                let remaining = people("Team", 2..2_000);
+                model.retain_checked(
+                    &remaining
+                        .iter()
+                        .map(|person| person.user_id.clone())
+                        .collect(),
+                );
+                assert_eq!(model.checked_in(&remaining), std::slice::from_ref(&target));
+
+                // A search replaces the list and a cleared search brings the
+                // checked people back checked.
+                model.show("team 00001", person_entries(&everyone, "team 00001"));
+                pump(100);
+                assert_eq!(adjustment.value(), 0.0, "a new query starts at the top");
+                model.show("", person_entries(&everyone, ""));
+                pump(100);
+                let position = everyone
+                    .iter()
+                    .position(|person| person.user_id == target)
+                    .expect("target is listed");
+                model
+                    .list
+                    .scroll_to(position as u32, gtk::ListScrollFlags::NONE, None);
+                pump_until(5000, || model.bound_check(&target).is_some());
+                assert!(
+                    model
+                        .bound_check(&target)
+                        .is_some_and(|check| check.is_active()),
+                    "a person checked before a search is checked after it"
+                );
                 window.close();
             });
         }

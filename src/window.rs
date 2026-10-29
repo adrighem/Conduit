@@ -11572,17 +11572,19 @@ impl ConduitWindow {
         let search = gtk::SearchEntry::new();
         search.set_placeholder_text(Some(&gettext("Search people")));
         container.append(&search);
-        let list = gtk::ListBox::new();
-        list.set_selection_mode(gtk::SelectionMode::None);
+        let confirm = gtk::Button::with_label(confirm_label);
+        confirm.add_css_class("suggested-action");
+        confirm.set_sensitive(false);
+        let confirm_for_checks = confirm.clone();
+        let model = PeoplePickerModel::new(move |any_checked| {
+            confirm_for_checks.set_sensitive(any_checked);
+        });
+        let list = model.list.clone();
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_vexpand(true);
         scroller.set_child(Some(&list));
         container.append(&scroller);
-        let confirm = gtk::Button::with_label(confirm_label);
-        confirm.add_css_class("suggested-action");
-        confirm.set_sensitive(false);
         container.append(&confirm);
-        let rows = Rc::new(RefCell::new(Vec::<PeoplePickerRow>::new()));
         let has_discovered_people = !self
             .imp()
             .workspace
@@ -11590,14 +11592,15 @@ impl ConduitWindow {
             .discovered_users
             .borrow()
             .is_empty();
+        let shown = Rc::<RefCell<Vec<PeoplePickerPerson>>>::default();
+        let discovery_complete = Rc::new(Cell::new(has_discovered_people));
         *self.imp().people_picker_view.borrow_mut() = Some(PeoplePickerView {
-            list: list.clone(),
+            model: model.clone(),
             search: search.clone(),
             confirm: confirm.clone(),
-            rows: rows.clone(),
             excluded_user_ids: excluded_user_ids.iter().cloned().collect(),
-            discovery_complete: Rc::new(Cell::new(has_discovered_people)),
-            shown: Rc::default(),
+            discovery_complete: discovery_complete.clone(),
+            shown: shown.clone(),
         });
         self.imp()
             .people_picker_refresh
@@ -11613,7 +11616,7 @@ impl ConduitWindow {
                 .people_picker_view
                 .borrow()
                 .as_ref()
-                .is_some_and(|view| view.list == *list);
+                .is_some_and(|view| view.model.list == *list);
             let mut gate = window.imp().people_picker_refresh.get();
             let rebuild = is_active && gate.shown();
             window.imp().people_picker_refresh.set(gate);
@@ -11622,25 +11625,25 @@ impl ConduitWindow {
             }
         });
 
-        let rows_for_search = rows.clone();
+        let model_for_search = model.clone();
+        let shown_for_search = shown.clone();
+        let complete_for_search = discovery_complete.clone();
         search.connect_search_changed(move |search| {
             let query = search.text().trim().to_lowercase();
-            for person in rows_for_search.borrow().iter() {
-                person
-                    .row
-                    .set_visible(query.is_empty() || person.searchable_name.contains(&query));
-            }
+            model_for_search.show(
+                &query,
+                people_picker_list_entries(
+                    &shown_for_search.borrow(),
+                    complete_for_search.get(),
+                    &query,
+                ),
+            );
         });
         let weak_window = self.downgrade();
         let dialog_for_submit = dialog.clone();
         let on_submit = Rc::new(on_submit);
         confirm.connect_clicked(move |_| {
-            let user_ids = rows
-                .borrow()
-                .iter()
-                .filter(|person| person.check.is_active())
-                .map(|person| person.user_id.clone())
-                .collect::<Vec<_>>();
+            let user_ids = model.checked_in(&shown.borrow());
             if let Some(window) = weak_window.upgrade() {
                 if on_submit(&window, user_ids) {
                     dialog_for_submit.close();
@@ -11655,7 +11658,7 @@ impl ConduitWindow {
                 let mut active = window.imp().people_picker_view.borrow_mut();
                 if active
                     .as_ref()
-                    .is_some_and(|view| view.list == list_for_close)
+                    .is_some_and(|view| view.model.list == list_for_close)
                 {
                     active.take();
                 }
@@ -11683,19 +11686,12 @@ impl ConduitWindow {
             return;
         };
         let mut gate = self.imp().people_picker_refresh.get();
-        let rebuild = gate.request(view.list.is_mapped());
+        let rebuild = gate.request(view.model.list.is_mapped());
         self.imp().people_picker_refresh.set(gate);
         if !rebuild {
             return;
         }
         let discovery_complete = view.discovery_complete.get();
-        let selected_user_ids = view
-            .rows
-            .borrow()
-            .iter()
-            .filter(|person| person.check.is_active())
-            .map(|person| person.user_id.clone())
-            .collect::<HashSet<_>>();
         let current_user_id = self.imp().current_user_id.borrow().clone();
         let people = people_picker_entries(
             &self
@@ -11706,58 +11702,29 @@ impl ConduitWindow {
                 .borrow(),
             current_user_id.as_deref(),
             &view.excluded_user_ids,
-        );
+        )
+        .into_iter()
+        .map(|(user_id, name)| PeoplePickerPerson::new(user_id, name))
+        .collect::<Vec<_>>();
         if !people.is_empty() && *view.shown.borrow() == people {
             return;
         }
+        view.model.retain_checked(
+            &people
+                .iter()
+                .map(|person| person.user_id.clone())
+                .collect::<HashSet<_>>(),
+        );
         view.shown.borrow_mut().clone_from(&people);
 
-        self.clear_list(&view.list);
-        view.rows.borrow_mut().clear();
-        if people.is_empty() {
-            view.confirm.set_sensitive(false);
-            self.append_placeholder(
-                &view.list,
-                &gettext(if discovery_complete {
-                    "No people available"
-                } else {
-                    "Loading people…"
-                }),
-            );
-            return;
-        }
-
+        // Only people added, removed or renamed since the last refresh touch
+        // the list; checked people, the scroll position and the search stay.
         let query = view.search.text().trim().to_lowercase();
-        for (user_id, name) in people {
-            let searchable_name = name.to_lowercase();
-            let check = gtk::CheckButton::with_label(&name);
-            check.set_margin_top(6);
-            check.set_margin_bottom(6);
-            check.set_margin_start(9);
-            check.set_margin_end(9);
-            check.set_active(selected_user_ids.contains(&user_id));
-            let row = gtk::ListBoxRow::new();
-            row.set_child(Some(&check));
-            row.set_visible(query.is_empty() || searchable_name.contains(&query));
-            view.list.append(&row);
-            view.rows.borrow_mut().push(PeoplePickerRow {
-                user_id,
-                searchable_name,
-                check: check.clone(),
-                row,
-            });
-            let rows = view.rows.clone();
-            let confirm = view.confirm.clone();
-            check.connect_toggled(move |_| {
-                confirm.set_sensitive(rows.borrow().iter().any(|person| person.check.is_active()));
-            });
-        }
-        view.confirm.set_sensitive(
-            view.rows
-                .borrow()
-                .iter()
-                .any(|person| person.check.is_active()),
+        view.model.show(
+            &query,
+            people_picker_list_entries(&people, discovery_complete, &query),
         );
+        view.confirm.set_sensitive(view.model.has_checked());
     }
 
     fn show_new_channel_dialog(&self) {
@@ -13710,20 +13677,6 @@ impl ConduitWindow {
                 channel_id: channel_id.to_string(),
             })
         }
-    }
-
-    fn clear_list(&self, list: &gtk::ListBox) {
-        while let Some(child) = list.first_child() {
-            list.remove(&child);
-        }
-    }
-
-    fn append_placeholder(&self, list: &gtk::ListBox, text: &str) {
-        let row = gtk::ListBoxRow::new();
-        row.set_selectable(false);
-        row.set_activatable(false);
-        row.set_child(Some(&self.placeholder_label(text)));
-        list.append(&row);
     }
 
     fn placeholder_label(&self, text: &str) -> gtk::Label {
