@@ -81,11 +81,28 @@ fn show_in_window(content: &impl IsA<Widget>) -> gtk::Window {
         assert!(Instant::now() < deadline, "widget was never laid out");
         context.iteration(false);
     }
-    // Let icon and texture loads settle before rendering.
+    // Let icon and texture loads settle before rendering. Static images
+    // decode on worker threads, so wait for those to land.
     for _ in 0..20 {
         context.iteration(false);
     }
+    while has_pending_decode(content.upcast_ref()) && Instant::now() < deadline {
+        context.iteration(false);
+        std::thread::sleep(Duration::from_millis(1));
+    }
     window
+}
+
+/// Whether a picture under `widget` still waits on an off-thread decode.
+fn has_pending_decode(widget: &Widget) -> bool {
+    find_widget(widget, &|candidate| {
+        candidate
+            .downcast_ref::<gtk::Picture>()
+            .and_then(|picture| picture.paintable())
+            .and_downcast::<crate::timeline::cache::decode::DeferredTexture>()
+            .is_some_and(|deferred| deferred.texture().is_none())
+    })
+    .is_some()
 }
 
 /// Rasterizes `widget` with the window's renderer, saving it as `name`.png
