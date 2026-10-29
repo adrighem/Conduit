@@ -408,7 +408,8 @@ fn read_test_messages() -> Vec<SlackMessage> {
         .collect()
 }
 
-fn pump_main_context(ms: u64) {
+/// Spins the default main context for `ms` milliseconds.
+pub(crate) fn pump(ms: u64) {
     let context = glib::MainContext::default();
     let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     while std::time::Instant::now() < end {
@@ -419,10 +420,10 @@ fn pump_main_context(ms: u64) {
 
 /// Pumps until `done` holds or `ms` elapse, so a loaded test run still
 /// gets the first layout and dwell in.
-fn pump_main_context_until(ms: u64, done: impl Fn() -> bool) {
+pub(crate) fn pump_until(ms: u64, done: impl Fn() -> bool) {
     let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     while !done() && std::time::Instant::now() < end {
-        pump_main_context(10);
+        pump(10);
     }
 }
 
@@ -432,7 +433,7 @@ fn pump_main_context_until(ms: u64, done: impl Fn() -> bool) {
 /// in the same turn as `present()` would open at its oldest row there.
 fn present_and_wait_for_layout(window: &gtk::Window) {
     window.present();
-    pump_main_context_until(5000, || window.height() > 0);
+    pump_until(5000, || window.height() > 0);
     assert!(window.height() > 0, "window was never laid out");
 }
 
@@ -441,7 +442,7 @@ fn present_and_wait_for_layout(window: &gtk::Window) {
 fn wait_until_at_bottom(view: &NativeTimelineView) {
     let vadj = view.scrolled_window.vadjustment();
     let at_bottom = || vadj.value() > 0.0 && vadj.upper() - vadj.page_size() - vadj.value() < 1.0;
-    pump_main_context_until(5000, at_bottom);
+    pump_until(5000, at_bottom);
     assert!(
         at_bottom(),
         "opens at the newest message: value {} of upper {} page {}",
@@ -1342,12 +1343,7 @@ mod graphical {
             window.set_child(Some(view.widget()));
             window.present();
             view.set_messages(&messages, &ctx, Some(&target));
-            let context = glib::MainContext::default();
-            let end = std::time::Instant::now() + std::time::Duration::from_millis(400);
-            while std::time::Instant::now() < end {
-                context.iteration(false);
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
+            pump(400);
 
             let highlighted = view
                 .bound_items
@@ -1391,14 +1387,6 @@ mod graphical {
     #[test]
     fn recheck_read_redispatches_visible_rows_and_pauses_while_inactive() {
         run_gtk_test(|| {
-            fn pump(ms: u64) {
-                let context = glib::MainContext::default();
-                let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-                while std::time::Instant::now() < end {
-                    context.iteration(false);
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            }
             let ctx = test_context();
             let messages = (0..3)
                 .rev()
@@ -1464,14 +1452,14 @@ mod graphical {
             window.present();
             view.set_read_mark_target("C1", None);
             view.set_messages(&messages, &ctx, None);
-            pump_main_context_until(5000, || !marks.borrow().is_empty());
+            pump_until(5000, || !marks.borrow().is_empty());
             assert_eq!(marks.borrow().len(), 1);
 
             // Rechecks arriving faster than the dwell (e.g. a busy thread
             // catalog) must not keep restarting the pending dwell.
             for _ in 0..10 {
                 view.recheck_read();
-                pump_main_context(30);
+                pump(30);
             }
             assert!(
                 marks.borrow().len() >= 2,
@@ -1498,20 +1486,20 @@ mod graphical {
             window.present();
             view.set_read_mark_target("C1", None);
             view.set_messages(&messages, &ctx, None);
-            pump_main_context_until(5000, || !marks.borrow().is_empty());
+            pump_until(5000, || !marks.borrow().is_empty());
             assert_eq!(marks.borrow().len(), 1);
 
             // A dwell started while visible must not fire once hidden.
             view.recheck_read();
             stack.set_visible_child_name("media");
-            pump_main_context(400);
+            pump(400);
             assert_eq!(marks.borrow().len(), 1);
 
             // Refocus while another page shows: still nothing to mark.
             view.set_window_active(false);
             view.set_window_active(true);
             view.recheck_read();
-            pump_main_context(400);
+            pump(400);
             assert_eq!(marks.borrow().len(), 1);
             window.destroy();
         });
@@ -1520,14 +1508,6 @@ mod graphical {
     #[test]
     fn in_place_updates_keep_scroll_and_focus_on_clicked_row() {
         run_gtk_test(|| {
-            fn pump(ms: u64) {
-                let context = glib::MainContext::default();
-                let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-                while std::time::Instant::now() < end {
-                    context.iteration(false);
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            }
             let ctx = test_context();
             // Newest first, as conversations are stored; all on one day.
             let messages = (0..150)
@@ -1603,14 +1583,14 @@ mod graphical {
             window.set_child(Some(view.widget()));
             window.present();
             view.set_messages(&messages, &ctx, None);
-            pump_main_context(300);
+            pump(300);
             let before = bound_row_widgets(&view);
             let (first, second) = (before[0].0.clone(), before[1].0.clone());
 
             // Two arrivals in one idle coalesce into one rebind of both rows.
             view.update_image_asset(&ctx, HashSet::from([first.clone()]));
             view.update_image_asset(&ctx, HashSet::from([second.clone()]));
-            pump_main_context(50);
+            pump(50);
             let mut rebound = rebound_rows(&view, &before);
             rebound.sort();
             let mut expected = vec![first, second];
@@ -1620,7 +1600,7 @@ mod graphical {
             // An arrival nothing shows rebinds nothing.
             let before = bound_row_widgets(&view);
             view.update_image_asset(&ctx, HashSet::new());
-            pump_main_context(50);
+            pump(50);
             assert_eq!(rebound_rows(&view, &before), Vec::<String>::new());
             window.destroy();
         });
@@ -1645,12 +1625,12 @@ mod graphical {
             window.set_child(Some(view.widget()));
             window.present();
             view.set_messages(&messages, &ctx, None);
-            pump_main_context(300);
+            pump(300);
             let before = bound_row_widgets(&view);
             assert!(!before.is_empty(), "rows are bound");
 
             view.set_messages(&messages, &ctx.clone(), None);
-            pump_main_context(50);
+            pump(50);
             assert_eq!(rebound_rows(&view, &before), Vec::<String>::new());
 
             // Image, read mark and scroll intent changes have their own paths.
@@ -1664,7 +1644,7 @@ mod graphical {
             images.last_read = Some(messages[5].ts.clone());
             images.timeline_scroll = crate::message_markup::TimelineScrollBehavior::Bottom;
             view.set_messages(&messages, &images, None);
-            pump_main_context(50);
+            pump(50);
             assert_eq!(rebound_rows(&view, &before), Vec::<String>::new());
 
             // Moving the unread separator rebuilds only the row that gains it.
@@ -1672,7 +1652,7 @@ mod graphical {
             let mut unread = images.clone();
             unread.unread_separator_ts = Some(anchor.clone());
             view.set_messages(&messages, &unread, None);
-            pump_main_context(50);
+            pump(50);
             assert_eq!(rebound_rows(&view, &before), vec![anchor]);
 
             // A directory change reaches every row.
@@ -1680,7 +1660,7 @@ mod graphical {
             let mut renamed = unread.clone();
             renamed.user_names = Arc::new(HashMap::from([("U123".to_string(), "Bob".to_string())]));
             view.set_messages(&messages, &renamed, None);
-            pump_main_context(50);
+            pump(50);
             assert_eq!(rebound_rows(&view, &before).len(), before.len());
             window.destroy();
         });
@@ -1733,7 +1713,7 @@ mod graphical {
 
             let before = crate::debug::IMAGE_DECODES.get();
             view.set_messages(&messages, &ctx, None);
-            pump_main_context(300);
+            pump(300);
             assert_eq!(
                 crate::debug::IMAGE_DECODES.get() - before,
                 0,
@@ -1748,7 +1728,7 @@ mod graphical {
             // Completion paints in place: no row is rebound.
             let rows = bound_row_widgets(&view);
             let finished = decodes.finish_all();
-            pump_main_context(50);
+            pump(50);
             assert_eq!(rebound_rows(&view, &rows), Vec::<String>::new());
             let emoji_decodes = finished.iter().filter(|key| key.path == emoji_path).count();
             assert_eq!(emoji_decodes, 1, "one decode serves every inline emoji");
@@ -1794,7 +1774,7 @@ mod graphical {
             let window = gtk::Window::new();
             window.set_child(Some(&picture));
             window.present();
-            pump_main_context_until(500, || !decodes.0.running().is_empty());
+            pump_until(500, || !decodes.0.running().is_empty());
             assert_eq!(decodes.0.running().len(), 1);
 
             // Unmapped before the decode lands: cached, not applied.
@@ -1804,7 +1784,7 @@ mod graphical {
 
             // Mapped again: served from the cache at once, no second decode.
             window.present();
-            pump_main_context_until(500, || deferred.texture().is_some());
+            pump_until(500, || deferred.texture().is_some());
             assert!(deferred.texture().is_some());
             assert!(decodes.0.running().is_empty());
             assert_eq!(
@@ -2443,10 +2423,8 @@ mod graphical {
         run_gtk_test(|| {
             // A real, loadable PNG on disk: the old fallback would have opened it
             // straight from the Slack-provided `icon_url`.
-            let png = std::env::temp_dir().join(format!(
-                "conduit-avatar-local-path-{}.png",
-                std::process::id()
-            ));
+            let temp_dir = TempTestDir::new("avatar-local-path");
+            let png = temp_dir.path().join("avatar.png");
             gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, true, 8, 4, 4)
                 .unwrap()
                 .savev(&png, "png", &[])
@@ -2467,22 +2445,12 @@ mod graphical {
                     .unwrap();
                 assert!(avatar.custom_image().is_none(), "{url}");
             }
-
-            let _ = std::fs::remove_file(png);
         });
     }
 
     #[test]
     fn scrolling_near_top_requests_older_page_and_prepend_keeps_position() {
         run_gtk_test(|| {
-            fn pump(ms: u64) {
-                let context = glib::MainContext::default();
-                let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-                while std::time::Instant::now() < end {
-                    context.iteration(false);
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            }
             // Newest first, as conversations are stored; all on one day.
             fn page(range: std::ops::Range<u32>) -> Vec<SlackMessage> {
                 range
@@ -2525,7 +2493,7 @@ mod graphical {
 
             let vadj = view.scrolled_window.vadjustment();
             vadj.set_value(vadj.lower() + vadj.page_size() / 4.0);
-            pump_main_context_until(2000, || !requests.borrow().is_empty());
+            pump_until(2000, || !requests.borrow().is_empty());
             assert_eq!(*requests.borrow(), vec!["C1:None".to_string()]);
 
             // While the page is in flight, further scrolling does not re-request.
@@ -2542,7 +2510,7 @@ mod graphical {
                 crate::message_markup::TimelineScrollBehavior::PreservePrepend;
             view.set_messages(&page(0..200), &prepend, None);
             view.finish_loading_older("C1", None);
-            pump_main_context_until(2000, || vadj.upper() > upper_before);
+            pump_until(2000, || vadj.upper() > upper_before);
             // Past the settle, whose paging check must see the anchored offset.
             pump(300);
 
@@ -2565,14 +2533,6 @@ mod graphical {
     #[test]
     fn failed_older_page_backs_off_instead_of_rerequesting() {
         run_gtk_test(|| {
-            fn pump(ms: u64) {
-                let context = glib::MainContext::default();
-                let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-                while std::time::Instant::now() < end {
-                    context.iteration(false);
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            }
             let messages: Vec<SlackMessage> = (0..200u32)
                 .rev()
                 .map(|i| SlackMessage {
@@ -2609,7 +2569,7 @@ mod graphical {
 
             let vadj = view.scrolled_window.vadjustment();
             vadj.set_value(vadj.lower() + vadj.page_size() / 4.0);
-            pump_main_context_until(2000, || requests.get() > 0);
+            pump_until(2000, || requests.get() > 0);
             assert_eq!(requests.get(), 1);
 
             // The page fails while the user still sits near the top: no retry
@@ -2627,7 +2587,7 @@ mod graphical {
             view.set_read_mark_target("C2", None);
             view.set_read_mark_target("C1", None);
             vadj.set_value(vadj.value() - 1.0);
-            pump_main_context_until(2000, || requests.get() > 1);
+            pump_until(2000, || requests.get() > 1);
             assert_eq!(requests.get(), 2, "a fresh surface pages again");
             window.destroy();
         });

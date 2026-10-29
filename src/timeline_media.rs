@@ -189,11 +189,7 @@ mod tests {
             .expect("allocate pixbuf")
             .save_to_bufferv("png", &[])
             .expect("encode image");
-        let path = std::env::temp_dir().join(format!(
-            "conduit-{}-guard-display-size.png",
-            std::process::id()
-        ));
-        std::fs::write(&path, bytes).expect("write temp image");
+        let path = crate::animated_image::tests::write_temp("guard-display-size.png", &bytes);
 
         let mut size = None;
         let probes = crate::animated_image::tests::glycin_probes_during(|| {

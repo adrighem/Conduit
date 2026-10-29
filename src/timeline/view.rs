@@ -1551,34 +1551,13 @@ fn keep_focus_on_row(item: &gtk::ListItem) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timeline::tests::{run_gtk_test, test_context};
+    use crate::timeline::tests::{pump, pump_until, run_gtk_test, test_context};
 
     #[test]
     fn next_rollover_is_within_one_local_day() {
         // A DST day can last 25 hours; the extra second lands past midnight.
         let seconds = seconds_until_local_midnight();
         assert!((1..=25 * 3600 + 1).contains(&seconds), "got {seconds}");
-    }
-
-    fn pump(ms: u64) {
-        let context = glib::MainContext::default();
-        let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-        while std::time::Instant::now() < end {
-            context.iteration(false);
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-    }
-
-    /// Pumps the loop until `done` is set or `max_ms` elapses, whichever
-    /// comes first, so a regression that never sets `done` fails the test
-    /// instead of hanging it.
-    fn pump_until_done(done: &Rc<Cell<bool>>, max_ms: u64) {
-        let context = glib::MainContext::default();
-        let end = std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
-        while std::time::Instant::now() < end && !done.get() {
-            context.iteration(false);
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
     }
 
     /// Tests that create GTK widgets. They run only when
@@ -1624,7 +1603,7 @@ mod tests {
                     view.store.n_items(),
                 );
 
-                pump_until_done(&done, 2_000);
+                pump_until(2_000, || done.get());
                 let elapsed = start.elapsed();
 
                 assert!(
