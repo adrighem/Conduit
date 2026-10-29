@@ -732,7 +732,7 @@ pub(crate) mod decode {
         Transient(String),
     }
 
-    /// How a texture is decoded. Part of the dedupe key, so scaled decodes
+    /// How an image is decoded. Part of the dedupe key, so scaled decodes
     /// can join later without sharing a full-size result.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub(crate) enum TextureSpec {
@@ -741,18 +741,55 @@ pub(crate) mod decode {
         /// scaled to [`crate::timeline::reactions::REACTION_EMOJI_SIZE`] in
         /// the worker.
         Reaction,
+        /// A GIF or WebP loaded as an animation, by gdk-pixbuf's own task
+        /// thread. One per file: players per display size share it.
+        Animation,
     }
 
     impl TextureSpec {
-        fn cache(self) -> &'static std::thread::LocalKey<RefCell<BoundedTextureCache>> {
+        fn cache(self) -> Option<&'static std::thread::LocalKey<RefCell<BoundedTextureCache>>> {
             match self {
-                Self::Full => &TEXTURE_CACHE,
-                Self::Reaction => &REACTION_TEXTURE_CACHE,
+                Self::Full => Some(&TEXTURE_CACHE),
+                Self::Reaction => Some(&REACTION_TEXTURE_CACHE),
+                Self::Animation => None,
             }
         }
 
+        /// The cached texture of `path` for this spec. Animations are not
+        /// cached here; their players are (see [`crate::animated_image`]).
         pub(crate) fn cached(self, path: &Path) -> Option<gdk::Texture> {
-            self.cache().with(|cache| cache.borrow_mut().get(path))
+            self.cache()?.with(|cache| cache.borrow_mut().get(path))
+        }
+    }
+
+    /// What a decode produced.
+    #[derive(Debug, Clone)]
+    pub(crate) enum Decoded {
+        Texture(gdk::Texture),
+        Animation(gdk_pixbuf::PixbufAnimation),
+        /// An animation request found a single frame: decode it as a still.
+        Still,
+    }
+
+    fn lookup(key: &TextureKey) -> Option<Decoded> {
+        if key.spec == TextureSpec::Animation {
+            return crate::animated_image::is_known_static(&key.path).then_some(Decoded::Still);
+        }
+        key.spec.cached(&key.path).map(Decoded::Texture)
+    }
+
+    fn store(key: &TextureKey, decoded: &Decoded) {
+        match decoded {
+            Decoded::Texture(texture) => {
+                if let Some(cache) = key.spec.cache() {
+                    cache.with(|cache| {
+                        cache.borrow_mut().insert(key.path.clone(), texture.clone());
+                    });
+                }
+            }
+            Decoded::Still => crate::animated_image::remember_static(&key.path),
+            // Held by its players only: a WebP animation keeps every frame.
+            Decoded::Animation(_) => {}
         }
     }
 
@@ -1074,7 +1111,8 @@ pub(crate) mod decode {
         state.failed.insert(key, failure);
     }
 
-    /// Decodes `key` as its spec asks. Runs on a worker thread.
+    /// Decodes the still `key` as its spec asks. Runs on a worker thread.
+    /// Animations load through [`load_animation`] instead.
     pub(crate) fn decode_key(key: &TextureKey) -> Result<gdk::Texture, DecodeError> {
         match key.spec {
             TextureSpec::Full => decode_texture_file(&key.path),
@@ -1082,6 +1120,9 @@ pub(crate) mod decode {
                 let bytes = read_within_budget(&key.path)?;
                 crate::timeline::reactions::decode_reaction_bytes(bytes, &key.path)
             }
+            TextureSpec::Animation => Err(DecodeError::Permanent(
+                "animations are not decoded to a texture".into(),
+            )),
         }
     }
 
@@ -1133,15 +1174,54 @@ pub(crate) mod decode {
         }
     }
 
+    /// The worker half of an animation load: reads `path` once, judges the
+    /// budget on those bytes and counts their frames from the headers.
+    /// `None` for a still, which needs no animation decoder.
+    pub(crate) fn read_animation(path: &Path) -> Result<Option<Vec<u8>>, DecodeError> {
+        let bytes = read_within_budget(path)?;
+        let frames = crate::image_header::frame_count(&mut std::io::Cursor::new(&bytes));
+        Ok((frames != Some(1)).then_some(bytes))
+    }
+
+    fn animated_or_still(animation: gdk_pixbuf::PixbufAnimation) -> Decoded {
+        if animation.is_static_image() {
+            Decoded::Still
+        } else {
+            Decoded::Animation(animation)
+        }
+    }
+
+    /// Loads the animation at `path`: the bytes are read and judged in a
+    /// worker, then those same bytes are decoded by gdk-pixbuf's task
+    /// thread. Completes on the GTK thread.
+    async fn load_animation(path: PathBuf) -> Result<Decoded, DecodeError> {
+        let Some(bytes) = gio::spawn_blocking(move || read_animation(&path))
+            .await
+            .unwrap_or_else(|_| Err(DecodeError::Permanent("read panicked".into())))?
+        else {
+            return Ok(Decoded::Still);
+        };
+        let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_owned(bytes));
+        gdk_pixbuf::PixbufAnimation::from_stream_future(&stream)
+            .await
+            .map(animated_or_still)
+            .map_err(|error| classify_glib_error(&error))
+    }
+
     /// Decodes on GIO's blocking pool and completes on the GTK thread.
     struct GioExecutor;
 
-    impl DecodeExecutor<TextureKey, gdk::Texture> for GioExecutor {
-        fn spawn(&self, key: TextureKey, done: Done<gdk::Texture>) {
+    impl DecodeExecutor<TextureKey, Decoded> for GioExecutor {
+        fn spawn(&self, key: TextureKey, done: Done<Decoded>) {
             glib::spawn_future_local(async move {
-                let result = gio::spawn_blocking(move || decode_key(&key))
-                    .await
-                    .unwrap_or_else(|_| Err(DecodeError::Permanent("decode panicked".into())));
+                let result = if key.spec == TextureSpec::Animation {
+                    load_animation(key.path).await
+                } else {
+                    gio::spawn_blocking(move || decode_key(&key))
+                        .await
+                        .unwrap_or_else(|_| Err(DecodeError::Permanent("decode panicked".into())))
+                        .map(Decoded::Texture)
+                };
                 done(result);
             });
         }
@@ -1155,30 +1235,20 @@ pub(crate) mod decode {
         }
     }
 
-    type TextureScheduler = Scheduler<TextureKey, gdk::Texture>;
+    type ImageScheduler = Scheduler<TextureKey, Decoded>;
 
-    fn texture_scheduler(
-        executor: Rc<dyn DecodeExecutor<TextureKey, gdk::Texture>>,
-    ) -> TextureScheduler {
-        Scheduler::new(
-            executor,
-            |key: &TextureKey| key.spec.cached(&key.path),
-            |key: &TextureKey, texture: &gdk::Texture| {
-                key.spec.cache().with(|cache| {
-                    cache.borrow_mut().insert(key.path.clone(), texture.clone());
-                });
-            },
-        )
+    fn image_scheduler(executor: Rc<dyn DecodeExecutor<TextureKey, Decoded>>) -> ImageScheduler {
+        Scheduler::new(executor, lookup, store)
     }
 
     thread_local! {
-        static SCHEDULER: RefCell<Option<TextureScheduler>> = const { RefCell::new(None) };
+        static SCHEDULER: RefCell<Option<ImageScheduler>> = const { RefCell::new(None) };
     }
 
-    fn scheduler() -> TextureScheduler {
+    fn scheduler() -> ImageScheduler {
         SCHEDULER.with(|slot| {
             slot.borrow_mut()
-                .get_or_insert_with(|| texture_scheduler(Rc::new(GioExecutor)))
+                .get_or_insert_with(|| image_scheduler(Rc::new(GioExecutor)))
                 .clone()
         })
     }
@@ -1199,7 +1269,16 @@ pub(crate) mod decode {
         ticket: &DecodeTicket,
         deliver: impl FnOnce(&gdk::Texture) + 'static,
     ) -> Requested<gdk::Texture> {
-        scheduler().request(texture_key(path, spec), ticket, deliver)
+        let requested = scheduler().request(texture_key(path, spec), ticket, move |decoded| {
+            if let Decoded::Texture(texture) = decoded {
+                deliver(texture);
+            }
+        });
+        match requested {
+            Requested::Ready(Decoded::Texture(texture)) => Requested::Ready(texture),
+            Requested::Pending => Requested::Pending,
+            Requested::Ready(_) | Requested::Failed => Requested::Failed,
+        }
     }
 
     /// Whether decoding `path` as `spec` is known to fail, so a row can skip
@@ -1274,22 +1353,25 @@ pub(crate) mod decode {
         use gtk::{gdk, glib};
 
         #[derive(Default)]
-        pub struct DeferredTexture {
-            pub(super) texture: RefCell<Option<gdk::Texture>>,
+        pub struct DeferredPaintable {
+            /// The decoded texture or animation player, once it arrives.
+            pub(super) content: RefCell<Option<gdk::Paintable>>,
+            /// Forwards a player's frames as this paintable's own.
+            pub(super) frames: RefCell<Option<glib::SignalHandlerId>>,
             /// Size the image's header declares, shown until it decodes.
             pub(super) declared: Cell<(i32, i32)>,
             /// Longest side the intrinsic size is fitted to; 0 keeps it.
             pub(super) fit: Cell<i32>,
         }
 
-        impl DeferredTexture {
+        impl DeferredPaintable {
             pub(super) fn size(&self) -> (i32, i32) {
                 let (width, height) = self
-                    .texture
+                    .content
                     .borrow()
                     .as_ref()
-                    .map_or(self.declared.get(), |texture| {
-                        (texture.width(), texture.height())
+                    .map_or(self.declared.get(), |content| {
+                        (content.intrinsic_width(), content.intrinsic_height())
                     });
                 let fit = self.fit.get();
                 if fit > 0 && width > 0 && height > 0 {
@@ -1301,18 +1383,27 @@ pub(crate) mod decode {
         }
 
         #[glib::object_subclass]
-        impl ObjectSubclass for DeferredTexture {
-            const NAME: &'static str = "ConduitDeferredTexture";
-            type Type = super::DeferredTexture;
+        impl ObjectSubclass for DeferredPaintable {
+            const NAME: &'static str = "ConduitDeferredPaintable";
+            type Type = super::DeferredPaintable;
             type Interfaces = (gdk::Paintable,);
         }
 
-        impl ObjectImpl for DeferredTexture {}
+        impl ObjectImpl for DeferredPaintable {
+            fn dispose(&self) {
+                // Players are shared: do not leave a handler on one.
+                if let (Some(content), Some(handler)) =
+                    (self.content.borrow().as_ref(), self.frames.take())
+                {
+                    content.disconnect(handler);
+                }
+            }
+        }
 
-        impl PaintableImpl for DeferredTexture {
+        impl PaintableImpl for DeferredPaintable {
             fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
-                if let Some(texture) = self.texture.borrow().as_ref() {
-                    texture.snapshot(snapshot, width, height);
+                if let Some(content) = self.content.borrow().as_ref() {
+                    content.snapshot(snapshot, width, height);
                 }
             }
 
@@ -1327,15 +1418,15 @@ pub(crate) mod decode {
     }
 
     glib::wrapper! {
-        /// A static image that paints nothing at its declared size until its
-        /// texture arrives, then paints in place: a picture showing it keeps
-        /// its layout and its row is never rebound. With a fit, both sizes
-        /// are fitted to it and GTK scales the texture when it paints.
-        pub struct DeferredTexture(ObjectSubclass<imp::DeferredTexture>)
+        /// An image that paints nothing at its declared size until its
+        /// texture or animation arrives, then paints in place: a picture
+        /// showing it keeps its layout and its row is never rebound. With a
+        /// fit, both sizes are fitted to it and GTK scales when it paints.
+        pub struct DeferredPaintable(ObjectSubclass<imp::DeferredPaintable>)
             @implements gdk::Paintable;
     }
 
-    impl DeferredTexture {
+    impl DeferredPaintable {
         fn new(declared: (i32, i32), fit: i32) -> Self {
             let paintable: Self = glib::Object::new();
             paintable.imp().declared.set(declared);
@@ -1343,21 +1434,35 @@ pub(crate) mod decode {
             paintable
         }
 
-        /// `texture`, laid out as if its longest side were `fit`.
-        pub(crate) fn fitted(texture: &gdk::Texture, fit: i32) -> Self {
-            let paintable = Self::new((texture.width(), texture.height()), fit);
-            paintable.imp().texture.replace(Some(texture.clone()));
+        /// `content`, laid out as if its longest side were `fit`.
+        pub(crate) fn fitted(content: &gdk::Paintable, fit: i32) -> Self {
+            let paintable = Self::new((0, 0), fit);
+            paintable.set_content(content);
             paintable
         }
 
-        pub(crate) fn texture(&self) -> Option<gdk::Texture> {
-            self.imp().texture.borrow().clone()
+        /// The texture or player shown, once it has arrived.
+        pub(crate) fn content(&self) -> Option<gdk::Paintable> {
+            self.imp().content.borrow().clone()
         }
 
-        fn set_texture(&self, texture: &gdk::Texture) {
-            let before = self.imp().size();
-            self.imp().texture.replace(Some(texture.clone()));
-            if before != self.imp().size() {
+        fn set_content(&self, content: &gdk::Paintable) {
+            let imp = self.imp();
+            let before = imp.size();
+            if let (Some(old), Some(handler)) = (imp.content.take(), imp.frames.take()) {
+                old.disconnect(handler);
+            }
+            if !content.is::<gdk::Texture>() {
+                let weak = self.downgrade();
+                let handler = content.connect_invalidate_contents(move |_| {
+                    if let Some(paintable) = weak.upgrade() {
+                        paintable.invalidate_contents();
+                    }
+                });
+                imp.frames.replace(Some(handler));
+            }
+            imp.content.replace(Some(content.clone()));
+            if before != imp.size() {
                 // Header unknown or wrong: the one case that relayouts.
                 self.invalidate_size();
             }
@@ -1366,60 +1471,123 @@ pub(crate) mod decode {
     }
 
     /// A picture of the static image at `path`. A cached texture shows at
-    /// once; otherwise the picture holds a [`DeferredTexture`] sized from the
-    /// image header and requests the decode only while it is mapped. Unmapping
-    /// makes the request stale, and mapping again requests it anew.
+    /// once; otherwise the picture holds a [`DeferredPaintable`] sized from
+    /// the image header and requests the decode only while it is mapped.
+    /// Unmapping makes the request stale, and mapping again requests it anew.
     pub(crate) fn deferred_texture_picture(path: &Path) -> gtk::Picture {
         if let Some(texture) = TextureSpec::Full.cached(path) {
             return gtk::Picture::for_paintable(&texture);
         }
-        deferred_picture(path, TextureSpec::Full, 0)
+        deferred_picture(path, TextureSpec::Full, 0, None)
     }
 
     /// A picture of `path` decoded as `spec` asks, waiting in a
-    /// [`DeferredTexture`] fitted to `fit` (0 for none) until mapped and
-    /// decoded. Callers check the cache for `spec` first.
-    pub(crate) fn deferred_picture(path: &Path, spec: TextureSpec, fit: i32) -> gtk::Picture {
-        if texture_failed(path, spec) {
+    /// [`DeferredPaintable`] fitted to `fit` (0 for none) until mapped and
+    /// decoded. With `animate_at`, a GIF or WebP first loads as an animation
+    /// played for that display size, and only a still falls back to `spec`.
+    /// Callers check the caches first.
+    pub(crate) fn deferred_picture(
+        path: &Path,
+        spec: TextureSpec,
+        fit: i32,
+        animate_at: Option<i32>,
+    ) -> gtk::Picture {
+        let animate_at = animate_at.filter(|_| crate::animated_image::may_animate(path));
+        let failed = match animate_at {
+            Some(_) => texture_failed(path, TextureSpec::Animation),
+            None => texture_failed(path, spec),
+        };
+        if failed {
             // Decoding again would not help.
             return gtk::Picture::new();
         }
         let declared = crate::image_header::declared_dimensions(path)
             .and_then(|(width, height)| {
-                Some((i32::try_from(width).ok()?, i32::try_from(height).ok()?))
+                let (width, height) = (i32::try_from(width).ok()?, i32::try_from(height).ok()?);
+                Some(match animate_at {
+                    Some(size) => crate::animated_image::frame_size(width, height, size),
+                    None => (width, height),
+                })
             })
             .unwrap_or((0, 0));
-        let paintable = DeferredTexture::new(declared, fit);
+        let paintable = DeferredPaintable::new(declared, fit);
         let picture = gtk::Picture::for_paintable(&paintable);
         let ticket = DecodeTicket::default();
-        let weak = paintable.downgrade();
-        let path = path.to_path_buf();
+        let request = DeferredRequest {
+            target: paintable.downgrade(),
+            path: path.to_path_buf(),
+            spec,
+            animate_at,
+        };
         let on_map = ticket.clone();
-        picture.connect_map(move |_| request_into(&weak, &path, spec, &on_map));
+        picture.connect_map(move |_| request.send(&on_map));
         picture.connect_unmap(move |_| ticket.invalidate());
         picture
     }
 
-    fn request_into(
-        weak: &glib::WeakRef<DeferredTexture>,
-        path: &Path,
+    /// What a [`DeferredPaintable`] waits for.
+    #[derive(Clone)]
+    struct DeferredRequest {
+        target: glib::WeakRef<DeferredPaintable>,
+        path: PathBuf,
         spec: TextureSpec,
-        ticket: &DecodeTicket,
-    ) {
-        let Some(paintable) = weak.upgrade() else {
-            return;
-        };
-        if paintable.texture().is_some() {
-            return;
-        }
-        let target = weak.clone();
-        let requested = request_texture(path, spec, ticket, move |texture| {
-            if let Some(paintable) = target.upgrade() {
-                paintable.set_texture(texture);
+        animate_at: Option<i32>,
+    }
+
+    impl DeferredRequest {
+        fn send(&self, ticket: &DecodeTicket) {
+            let Some(paintable) = self.target.upgrade() else {
+                return;
+            };
+            if paintable.content().is_some() {
+                return;
             }
-        });
-        if let Requested::Ready(texture) = requested {
-            paintable.set_texture(&texture);
+            if let Some(size) = self.animate_at {
+                if let Some(player) = crate::animated_image::existing_player(&self.path, size) {
+                    paintable.set_content(&player);
+                    return;
+                }
+                let request = self.clone();
+                // Weak, so a dropped picture's request still dies with it.
+                let next = Rc::downgrade(&ticket.0);
+                let key = texture_key(&self.path, TextureSpec::Animation);
+                let requested = scheduler().request(key, ticket, move |decoded| {
+                    if let Some(next) = next.upgrade() {
+                        request.animation_arrived(decoded, &DecodeTicket(next));
+                    }
+                });
+                if let Requested::Ready(decoded) = requested {
+                    self.animation_arrived(&decoded, ticket);
+                }
+                return;
+            }
+            let target = self.target.clone();
+            let requested = request_texture(&self.path, self.spec, ticket, move |texture| {
+                if let Some(paintable) = target.upgrade() {
+                    paintable.set_content(texture.upcast_ref());
+                }
+            });
+            if let Requested::Ready(texture) = requested {
+                paintable.set_content(texture.upcast_ref());
+            }
+        }
+
+        fn animation_arrived(&self, decoded: &Decoded, ticket: &DecodeTicket) {
+            let (Some(paintable), Some(size)) = (self.target.upgrade(), self.animate_at) else {
+                return;
+            };
+            match decoded {
+                Decoded::Animation(animation) => {
+                    let player = crate::animated_image::player(&self.path, size, animation);
+                    paintable.set_content(&player);
+                }
+                // One frame after all: decode it as a still.
+                Decoded::Still | Decoded::Texture(_) => DeferredRequest {
+                    animate_at: None,
+                    ..self.clone()
+                }
+                .send(ticket),
+            }
         }
     }
 
@@ -1428,15 +1596,31 @@ pub(crate) mod decode {
     /// count decodes start from here.
     #[cfg(test)]
     pub(crate) fn install_texture_executor_for_tests(
-        executor: Rc<dyn DecodeExecutor<TextureKey, gdk::Texture>>,
+        executor: Rc<dyn DecodeExecutor<TextureKey, Decoded>>,
     ) {
-        SCHEDULER.with(|slot| *slot.borrow_mut() = Some(texture_scheduler(executor)));
+        SCHEDULER.with(|slot| *slot.borrow_mut() = Some(image_scheduler(executor)));
     }
 
     /// Back to a fresh scheduler on the real worker pool.
     #[cfg(test)]
     pub(crate) fn reset_texture_decoder_for_tests() {
         SCHEDULER.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    /// What the real executor would produce for `key`, computed here and
+    /// now, for tests standing in for the workers.
+    #[cfg(test)]
+    pub(crate) fn decode_now_for_tests(key: &TextureKey) -> Result<Decoded, DecodeError> {
+        if key.spec != TextureSpec::Animation {
+            return decode_key(key).map(Decoded::Texture);
+        }
+        let Some(bytes) = read_animation(&key.path)? else {
+            return Ok(Decoded::Still);
+        };
+        let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_owned(bytes));
+        gdk_pixbuf::PixbufAnimation::from_stream(&stream, gio::Cancellable::NONE)
+            .map(animated_or_still)
+            .map_err(|error| classify_glib_error(&error))
     }
 
     /// Records jobs and timers; the test completes them in any order.

@@ -89,8 +89,8 @@ fn has_pending_decode(widget: &Widget) -> bool {
         candidate
             .downcast_ref::<gtk::Picture>()
             .and_then(|picture| picture.paintable())
-            .and_downcast::<crate::timeline::cache::decode::DeferredTexture>()
-            .is_some_and(|deferred| deferred.texture().is_none())
+            .and_downcast::<crate::timeline::cache::decode::DeferredPaintable>()
+            .is_some_and(|deferred| deferred.content().is_none())
     })
     .is_some()
 }
