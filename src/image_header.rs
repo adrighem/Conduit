@@ -41,7 +41,9 @@ pub(crate) fn declared_header(path: &Path) -> Option<(ImageFormat, u32, u32)> {
     header(&mut reader)
 }
 
-fn header(reader: &mut (impl Read + Seek)) -> Option<(ImageFormat, u32, u32)> {
+/// [`declared_header`] for an image already in memory, e.g. a `Cursor` over
+/// the bytes a worker is about to decode.
+pub(crate) fn header(reader: &mut (impl Read + Seek)) -> Option<(ImageFormat, u32, u32)> {
     let mut magic = [0u8; 12];
     reader.read_exact(&mut magic).ok()?;
     let (format, (width, height)) = match magic {
