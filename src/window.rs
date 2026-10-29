@@ -9460,16 +9460,27 @@ impl ConduitWindow {
         if imp.workspace_icon_url.borrow().as_deref() != Some(key) {
             return;
         }
-        let texture = imp
+        let Some(path) = imp
             .image_assets
             .borrow()
             .path(key)
             .and_then(crate::timeline_message_widget::verified_cached_asset_path)
-            .and_then(|path| crate::timeline_message_widget::get_or_load_texture(&path));
-        if let Some(texture) = texture {
-            imp.workspace_avatar
-                .set_custom_image(Some(texture.upcast_ref::<gtk::gdk::Paintable>()));
-        }
+        else {
+            return;
+        };
+        let weak = self.downgrade();
+        let key = key.to_string();
+        crate::timeline::cache::decode::with_texture(&path, move |texture| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let imp = window.imp();
+            // The workspace may have changed while it decoded.
+            if imp.workspace_icon_url.borrow().as_deref() == Some(key.as_str()) {
+                imp.workspace_avatar
+                    .set_custom_image(Some(texture.upcast_ref::<gtk::gdk::Paintable>()));
+            }
+        });
     }
 
     /// Unread-thread count on the Threads rail button: followed threads with

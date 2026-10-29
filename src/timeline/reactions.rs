@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
-use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, Box, Button, Image, Label, Orientation, Picture, Widget};
 
 use super::actions::ToggleReactionCallback;
-use super::cache::{resolve_cached_asset_path, REACTION_TEXTURE_CACHE};
+use super::cache::decode::{
+    classify_glib_error, deferred_picture, DecodeError, DeferredTexture, TextureSpec,
+};
+use super::cache::resolve_cached_asset_path;
 use super::row::register_timeline_css;
 use crate::message_markup::MessageRenderContext;
 use crate::models::SlackMessage;
@@ -53,131 +55,79 @@ pub fn scale_reaction_pixbuf(pixbuf: &gdk_pixbuf::Pixbuf, size: i32) -> gdk_pixb
 /// files take the pixbuf path, which caches only its 32 px result.
 const IN_PROCESS_EMOJI_MAX_SIDE: u32 = 128;
 
-mod imp {
-    use std::cell::{Cell, OnceCell};
-
-    use gtk::gdk;
-    use gtk::glib;
-    use gtk::prelude::*;
-    use gtk::subclass::prelude::*;
-
-    use super::fit_within;
-
-    /// A texture that reports the `size` box it fits in as its intrinsic
-    /// size, so layout matches a pre-scaled emoji while GTK does the scaling
-    /// when it snapshots.
-    #[derive(Default)]
-    pub struct FittedTexture {
-        pub(super) texture: OnceCell<gdk::Texture>,
-        pub(super) size: Cell<i32>,
-    }
-
-    #[glib::object_subclass]
-    impl ObjectSubclass for FittedTexture {
-        const NAME: &'static str = "ConduitFittedTexture";
-        type Type = super::FittedTexture;
-        type Interfaces = (gdk::Paintable,);
-    }
-
-    impl ObjectImpl for FittedTexture {}
-
-    impl FittedTexture {
-        fn fitted_size(&self) -> (i32, i32) {
-            self.texture.get().map_or((0, 0), |texture| {
-                fit_within(texture.width(), texture.height(), self.size.get())
-            })
-        }
-    }
-
-    impl PaintableImpl for FittedTexture {
-        fn flags(&self) -> gdk::PaintableFlags {
-            gdk::PaintableFlags::SIZE | gdk::PaintableFlags::CONTENTS
-        }
-
-        fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
-            if let Some(texture) = self.texture.get() {
-                texture.snapshot(snapshot, width, height);
-            }
-        }
-
-        fn intrinsic_width(&self) -> i32 {
-            self.fitted_size().0
-        }
-
-        fn intrinsic_height(&self) -> i32 {
-            self.fitted_size().1
-        }
-    }
-}
-
-glib::wrapper! {
-    pub struct FittedTexture(ObjectSubclass<imp::FittedTexture>)
-        @implements gtk::gdk::Paintable;
-}
-
-/// `texture` as a paintable whose intrinsic size is its `size` fit. Textures
-/// that already have that size are used as they are.
+/// `texture` as a paintable whose intrinsic size is its `size` fit, so layout
+/// matches a pre-scaled emoji while GTK does the scaling when it snapshots.
+/// Textures that already have that size are used as they are.
 fn fit_reaction_texture(texture: gtk::gdk::Texture, size: i32) -> gtk::gdk::Paintable {
     if fit_within(texture.width(), texture.height(), size) == (texture.width(), texture.height()) {
         return texture.upcast();
     }
-    let fitted: FittedTexture = glib::Object::new();
-    fitted.imp().size.set(size);
-    let _ = fitted.imp().texture.set(texture);
-    fitted.upcast()
+    DeferredTexture::fitted(&texture, size).upcast()
 }
 
-/// Decodes the emoji at `path`. Small PNG and JPEG go through GTK's own
-/// decoders, at the file's size; everything else through gdk-pixbuf (glycin),
-/// scaled to `REACTION_EMOJI_SIZE` (the largest emoji size) at once.
-fn decode_reaction_texture(path: &Path) -> Option<gtk::gdk::Texture> {
+/// Decodes reaction emoji `bytes`, read from `path`, once for every emoji
+/// size. Small PNG and JPEG go through GTK's own decoders, at the file's
+/// size; everything else through gdk-pixbuf (glycin), scaled to
+/// `REACTION_EMOJI_SIZE` (the largest emoji size) here, so the GTK thread
+/// never scales. Runs on a worker thread.
+pub(crate) fn decode_reaction_bytes(
+    bytes: Vec<u8>,
+    path: &Path,
+) -> Result<gtk::gdk::Texture, DecodeError> {
     use crate::image_header::ImageFormat;
     let in_process = matches!(
-        crate::image_header::declared_header(path),
+        crate::image_header::header(&mut std::io::Cursor::new(&bytes)),
         Some((ImageFormat::Png | ImageFormat::Jpeg, width, height))
             if width.max(height) <= IN_PROCESS_EMOJI_MAX_SIDE
     );
+    let bytes = glib::Bytes::from_owned(bytes);
     if in_process {
         return crate::debug::trace_image_decode(
             "texture",
             path,
             crate::debug::ImageLoader::Texture,
-            || gtk::gdk::Texture::from_filename(path),
+            || gtk::gdk::Texture::from_bytes(&bytes),
         )
-        .ok();
+        .map_err(|error| classify_glib_error(&error));
     }
-    let scaled = crate::debug::trace_image_decode(
-        "pixbuf",
-        path,
-        crate::debug::ImageLoader::Pixbuf,
-        || {
-            let pixbuf = gdk_pixbuf::Pixbuf::from_file(path).ok()?;
-            Some(scale_reaction_pixbuf(&pixbuf, REACTION_EMOJI_SIZE))
-        },
-    )?;
-    Some(gtk::gdk::Texture::for_pixbuf(&scaled))
+    let scaled =
+        crate::debug::trace_image_decode("pixbuf", path, crate::debug::ImageLoader::Pixbuf, || {
+            let stream = gtk::gio::MemoryInputStream::from_bytes(&bytes);
+            gdk_pixbuf::Pixbuf::from_stream(&stream, gtk::gio::Cancellable::NONE)
+                .map(|pixbuf| scale_reaction_pixbuf(&pixbuf, REACTION_EMOJI_SIZE))
+        })
+        .map_err(|error| classify_glib_error(&error))?;
+    Ok(memory_texture(&scaled))
+}
+
+/// `pixbuf`'s pixels as a `gdk::MemoryTexture`, which unlike the pixbuf may
+/// leave the worker thread that made it.
+pub(crate) fn memory_texture(pixbuf: &gdk_pixbuf::Pixbuf) -> gtk::gdk::Texture {
+    let format = if pixbuf.has_alpha() {
+        gtk::gdk::MemoryFormat::R8g8b8a8
+    } else {
+        gtk::gdk::MemoryFormat::R8g8b8
+    };
+    let stride = usize::try_from(pixbuf.rowstride()).unwrap_or(0);
+    gtk::gdk::MemoryTexture::new(
+        pixbuf.width(),
+        pixbuf.height(),
+        format,
+        &pixbuf.read_pixel_bytes(),
+        stride,
+    )
+    .upcast()
 }
 
 /// Custom emoji image whose longest side is `size` pixels.
 pub fn load_custom_emoji_picture(path: &Path, size: i32) -> Widget {
-    let paintable = crate::animated_image::animated_paintable(path, size).or_else(|| {
-        REACTION_TEXTURE_CACHE.with(|cache| {
-            let mut map = cache.borrow_mut();
-            if let Some(texture) = map.get(path) {
-                return Some(fit_reaction_texture(texture, size));
-            }
-            if !crate::animated_image::within_decode_budget(path) {
-                return None;
-            }
-            let texture = decode_reaction_texture(path)?;
-            map.insert(path.to_path_buf(), texture.clone());
-            Some(fit_reaction_texture(texture, size))
-        })
-    });
-    let pic = match paintable {
+    let pic = match crate::animated_image::animated_paintable(path, size) {
         Some(paintable) => Picture::for_paintable(&paintable),
-        // Failed or over the decode budget: decoding again would not help.
-        None => Picture::new(),
+        None => match TextureSpec::Reaction.cached(path) {
+            Some(texture) => Picture::for_paintable(&fit_reaction_texture(texture, size)),
+            // Decoded off the GTK thread once mapped, in the `size` slot.
+            None => deferred_picture(path, TextureSpec::Reaction, size),
+        },
     };
     pic.set_size_request(size, size);
     // Centered so a roomier parent (a quick bar button) cannot stretch it.

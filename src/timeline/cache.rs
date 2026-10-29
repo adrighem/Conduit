@@ -708,7 +708,7 @@ pub(crate) mod decode {
     use gtk::subclass::prelude::*;
     use gtk::{gdk, gio, glib};
 
-    use super::TEXTURE_CACHE;
+    use super::{BoundedTextureCache, REACTION_TEXTURE_CACHE, TEXTURE_CACHE};
 
     /// Decodes running at once: each may be a sandboxed glycin subprocess,
     /// and GIO's worker pool is shared with file I/O.
@@ -737,6 +737,23 @@ pub(crate) mod decode {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub(crate) enum TextureSpec {
         Full,
+        /// A reaction emoji: small PNG and JPEG at full size, anything else
+        /// scaled to [`crate::timeline::reactions::REACTION_EMOJI_SIZE`] in
+        /// the worker.
+        Reaction,
+    }
+
+    impl TextureSpec {
+        fn cache(self) -> &'static std::thread::LocalKey<RefCell<BoundedTextureCache>> {
+            match self {
+                Self::Full => &TEXTURE_CACHE,
+                Self::Reaction => &REACTION_TEXTURE_CACHE,
+            }
+        }
+
+        pub(crate) fn cached(self, path: &Path) -> Option<gdk::Texture> {
+            self.cache().with(|cache| cache.borrow_mut().get(path))
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1057,13 +1074,32 @@ pub(crate) mod decode {
         state.failed.insert(key, failure);
     }
 
-    /// Reads `path` once, checks the decode budget on those bytes and
-    /// decodes them. Runs on a worker thread.
-    pub(crate) fn decode_texture_file(path: &Path) -> Result<gdk::Texture, DecodeError> {
+    /// Decodes `key` as its spec asks. Runs on a worker thread.
+    pub(crate) fn decode_key(key: &TextureKey) -> Result<gdk::Texture, DecodeError> {
+        match key.spec {
+            TextureSpec::Full => decode_texture_file(&key.path),
+            TextureSpec::Reaction => {
+                let bytes = read_within_budget(&key.path)?;
+                crate::timeline::reactions::decode_reaction_bytes(bytes, &key.path)
+            }
+        }
+    }
+
+    /// Reads `path` once and checks the decode budget on those bytes, which
+    /// are then the only ones decoded. Formats the header parser does not
+    /// know fall back to gdk-pixbuf's probe here, in the worker.
+    fn read_within_budget(path: &Path) -> Result<Vec<u8>, DecodeError> {
         let bytes = read_capped(path, MAX_ASSET_BYTES)?;
         if !crate::animated_image::bytes_within_decode_budget(&bytes, path) {
             return Err(DecodeError::Permanent("over the decode budget".into()));
         }
+        Ok(bytes)
+    }
+
+    /// Reads `path` once, checks the decode budget on those bytes and
+    /// decodes them. Runs on a worker thread.
+    pub(crate) fn decode_texture_file(path: &Path) -> Result<gdk::Texture, DecodeError> {
+        let bytes = read_within_budget(path)?;
         crate::debug::trace_image_decode(
             "texture",
             path,
@@ -1103,7 +1139,7 @@ pub(crate) mod decode {
     impl DecodeExecutor<TextureKey, gdk::Texture> for GioExecutor {
         fn spawn(&self, key: TextureKey, done: Done<gdk::Texture>) {
             glib::spawn_future_local(async move {
-                let result = gio::spawn_blocking(move || decode_texture_file(&key.path))
+                let result = gio::spawn_blocking(move || decode_key(&key))
                     .await
                     .unwrap_or_else(|_| Err(DecodeError::Permanent("decode panicked".into())));
                 done(result);
@@ -1126,9 +1162,9 @@ pub(crate) mod decode {
     ) -> TextureScheduler {
         Scheduler::new(
             executor,
-            |key: &TextureKey| TEXTURE_CACHE.with(|cache| cache.borrow_mut().get(&key.path)),
+            |key: &TextureKey| key.spec.cached(&key.path),
             |key: &TextureKey, texture: &gdk::Texture| {
-                TEXTURE_CACHE.with(|cache| {
+                key.spec.cache().with(|cache| {
                     cache.borrow_mut().insert(key.path.clone(), texture.clone());
                 });
             },
@@ -1147,28 +1183,29 @@ pub(crate) mod decode {
         })
     }
 
-    fn full_size(path: &Path) -> TextureKey {
+    fn texture_key(path: &Path, spec: TextureSpec) -> TextureKey {
         TextureKey {
             path: path.to_path_buf(),
-            spec: TextureSpec::Full,
+            spec,
         }
     }
 
-    /// The full-size texture of `path`: [`Requested::Ready`] from the cache,
-    /// or decoded off the GTK thread and passed to `deliver` while `ticket`
-    /// stays current.
+    /// The texture of `path` decoded as `spec` asks: [`Requested::Ready`]
+    /// from the cache, or decoded off the GTK thread and passed to `deliver`
+    /// while `ticket` stays current.
     pub(crate) fn request_texture(
         path: &Path,
+        spec: TextureSpec,
         ticket: &DecodeTicket,
         deliver: impl FnOnce(&gdk::Texture) + 'static,
     ) -> Requested<gdk::Texture> {
-        scheduler().request(full_size(path), ticket, deliver)
+        scheduler().request(texture_key(path, spec), ticket, deliver)
     }
 
-    /// Whether decoding `path` is known to fail, so a row can skip the
-    /// placeholder.
-    pub(crate) fn texture_failed(path: &Path) -> bool {
-        scheduler().is_failed(&full_size(path))
+    /// Whether decoding `path` as `spec` is known to fail, so a row can skip
+    /// the placeholder.
+    pub(crate) fn texture_failed(path: &Path, spec: TextureSpec) -> bool {
+        scheduler().is_failed(&texture_key(path, spec))
     }
 
     pub(crate) fn reset_texture_decodes() {
@@ -1177,6 +1214,56 @@ pub(crate) mod decode {
                 scheduler.reset();
             }
         });
+    }
+
+    /// Runs `apply` with the full-size texture of `path`: now when cached,
+    /// else once a worker has decoded it. Not gated on mapping, so it suits
+    /// a single persistent widget; one that is reused for other content must
+    /// check in `apply` that the result is still wanted.
+    pub(crate) fn with_texture(path: &Path, apply: impl FnOnce(&gdk::Texture) + 'static) {
+        if let Some(texture) = TextureSpec::Full.cached(path) {
+            apply(&texture);
+            return;
+        }
+        let ticket = DecodeTicket::default();
+        let alive = ticket.clone();
+        // Missed the cache just now, so this is pending or known to fail.
+        let _ = request_texture(path, TextureSpec::Full, &ticket, move |texture| {
+            // The waiter owns its ticket, so it stays current until then.
+            let _alive = alive;
+            apply(texture);
+        });
+    }
+
+    /// Shows the full-size texture of `path` as `avatar`'s custom image: at
+    /// once when cached, else decoded off the GTK thread while the avatar is
+    /// mapped. The avatar keeps its fixed size and its initials until then.
+    pub(crate) fn set_avatar_image_when_mapped(avatar: &adw::Avatar, path: &Path) {
+        if let Some(texture) = TextureSpec::Full.cached(path) {
+            avatar.set_custom_image(Some(&texture));
+            return;
+        }
+        if texture_failed(path, TextureSpec::Full) {
+            return;
+        }
+        let ticket = DecodeTicket::default();
+        let on_map = ticket.clone();
+        let path = path.to_path_buf();
+        avatar.connect_map(move |avatar| {
+            if avatar.custom_image().is_some() {
+                return;
+            }
+            let weak = avatar.downgrade();
+            let requested = request_texture(&path, TextureSpec::Full, &on_map, move |texture| {
+                if let Some(avatar) = weak.upgrade() {
+                    avatar.set_custom_image(Some(texture));
+                }
+            });
+            if let Requested::Ready(texture) = requested {
+                avatar.set_custom_image(Some(&texture));
+            }
+        });
+        avatar.connect_unmap(move |_| ticket.invalidate());
     }
 
     mod imp {
@@ -1191,6 +1278,26 @@ pub(crate) mod decode {
             pub(super) texture: RefCell<Option<gdk::Texture>>,
             /// Size the image's header declares, shown until it decodes.
             pub(super) declared: Cell<(i32, i32)>,
+            /// Longest side the intrinsic size is fitted to; 0 keeps it.
+            pub(super) fit: Cell<i32>,
+        }
+
+        impl DeferredTexture {
+            pub(super) fn size(&self) -> (i32, i32) {
+                let (width, height) = self
+                    .texture
+                    .borrow()
+                    .as_ref()
+                    .map_or(self.declared.get(), |texture| {
+                        (texture.width(), texture.height())
+                    });
+                let fit = self.fit.get();
+                if fit > 0 && width > 0 && height > 0 {
+                    crate::timeline::reactions::fit_within(width, height, fit)
+                } else {
+                    (width, height)
+                }
+            }
         }
 
         #[glib::object_subclass]
@@ -1210,17 +1317,11 @@ pub(crate) mod decode {
             }
 
             fn intrinsic_width(&self) -> i32 {
-                self.texture
-                    .borrow()
-                    .as_ref()
-                    .map_or(self.declared.get().0, |texture| texture.width())
+                self.size().0
             }
 
             fn intrinsic_height(&self) -> i32 {
-                self.texture
-                    .borrow()
-                    .as_ref()
-                    .map_or(self.declared.get().1, |texture| texture.height())
+                self.size().1
             }
         }
     }
@@ -1228,15 +1329,24 @@ pub(crate) mod decode {
     glib::wrapper! {
         /// A static image that paints nothing at its declared size until its
         /// texture arrives, then paints in place: a picture showing it keeps
-        /// its layout and its row is never rebound.
+        /// its layout and its row is never rebound. With a fit, both sizes
+        /// are fitted to it and GTK scales the texture when it paints.
         pub struct DeferredTexture(ObjectSubclass<imp::DeferredTexture>)
             @implements gdk::Paintable;
     }
 
     impl DeferredTexture {
-        fn new(declared: (i32, i32)) -> Self {
+        fn new(declared: (i32, i32), fit: i32) -> Self {
             let paintable: Self = glib::Object::new();
             paintable.imp().declared.set(declared);
+            paintable.imp().fit.set(fit);
+            paintable
+        }
+
+        /// `texture`, laid out as if its longest side were `fit`.
+        pub(crate) fn fitted(texture: &gdk::Texture, fit: i32) -> Self {
+            let paintable = Self::new((texture.width(), texture.height()), fit);
+            paintable.imp().texture.replace(Some(texture.clone()));
             paintable
         }
 
@@ -1245,9 +1355,9 @@ pub(crate) mod decode {
         }
 
         fn set_texture(&self, texture: &gdk::Texture) {
-            let before = (self.intrinsic_width(), self.intrinsic_height());
+            let before = self.imp().size();
             self.imp().texture.replace(Some(texture.clone()));
-            if before != (texture.width(), texture.height()) {
+            if before != self.imp().size() {
                 // Header unknown or wrong: the one case that relayouts.
                 self.invalidate_size();
             }
@@ -1260,10 +1370,17 @@ pub(crate) mod decode {
     /// image header and requests the decode only while it is mapped. Unmapping
     /// makes the request stale, and mapping again requests it anew.
     pub(crate) fn deferred_texture_picture(path: &Path) -> gtk::Picture {
-        if let Some(texture) = TEXTURE_CACHE.with(|cache| cache.borrow_mut().get(path)) {
+        if let Some(texture) = TextureSpec::Full.cached(path) {
             return gtk::Picture::for_paintable(&texture);
         }
-        if texture_failed(path) {
+        deferred_picture(path, TextureSpec::Full, 0)
+    }
+
+    /// A picture of `path` decoded as `spec` asks, waiting in a
+    /// [`DeferredTexture`] fitted to `fit` (0 for none) until mapped and
+    /// decoded. Callers check the cache for `spec` first.
+    pub(crate) fn deferred_picture(path: &Path, spec: TextureSpec, fit: i32) -> gtk::Picture {
+        if texture_failed(path, spec) {
             // Decoding again would not help.
             return gtk::Picture::new();
         }
@@ -1272,18 +1389,23 @@ pub(crate) mod decode {
                 Some((i32::try_from(width).ok()?, i32::try_from(height).ok()?))
             })
             .unwrap_or((0, 0));
-        let paintable = DeferredTexture::new(declared);
+        let paintable = DeferredTexture::new(declared, fit);
         let picture = gtk::Picture::for_paintable(&paintable);
         let ticket = DecodeTicket::default();
         let weak = paintable.downgrade();
         let path = path.to_path_buf();
         let on_map = ticket.clone();
-        picture.connect_map(move |_| request_into(&weak, &path, &on_map));
+        picture.connect_map(move |_| request_into(&weak, &path, spec, &on_map));
         picture.connect_unmap(move |_| ticket.invalidate());
         picture
     }
 
-    fn request_into(weak: &glib::WeakRef<DeferredTexture>, path: &Path, ticket: &DecodeTicket) {
+    fn request_into(
+        weak: &glib::WeakRef<DeferredTexture>,
+        path: &Path,
+        spec: TextureSpec,
+        ticket: &DecodeTicket,
+    ) {
         let Some(paintable) = weak.upgrade() else {
             return;
         };
@@ -1291,7 +1413,7 @@ pub(crate) mod decode {
             return;
         }
         let target = weak.clone();
-        let requested = request_texture(path, ticket, move |texture| {
+        let requested = request_texture(path, spec, ticket, move |texture| {
             if let Some(paintable) = target.upgrade() {
                 paintable.set_texture(texture);
             }

@@ -73,11 +73,20 @@ pub(super) fn build_members(callbacks: &Callbacks) -> (gtk::Box, MembersWidgets)
         };
         if let Some(avatar) = row.first_child().and_downcast::<adw::Avatar>() {
             avatar.set_text(Some(&member.name));
-            let texture = member
-                .avatar_path
-                .as_deref()
-                .and_then(crate::timeline_message_widget::get_or_load_texture);
-            avatar.set_custom_image(texture.as_ref());
+            avatar.set_custom_image(gtk::gdk::Paintable::NONE);
+            if let Some(path) = member.avatar_path.as_deref() {
+                // Rows are recycled: apply only while this member is shown.
+                let weak = avatar.downgrade();
+                let name = member.name.clone();
+                crate::timeline::cache::decode::with_texture(path, move |texture| {
+                    let Some(avatar) = weak.upgrade() else {
+                        return;
+                    };
+                    if avatar.text().as_deref() == Some(name.as_str()) {
+                        avatar.set_custom_image(Some(texture));
+                    }
+                });
+            }
         }
         if let Some(text) = row.last_child().and_downcast::<gtk::Box>() {
             if let Some(name) = text.first_child().and_downcast::<gtk::Label>() {
