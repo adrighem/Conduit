@@ -351,7 +351,7 @@ pub(crate) mod tests {
     /// 1x1 GIF89a.
     const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
 
-    fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    pub(crate) fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("conduit-{}-{name}", std::process::id()));
         std::fs::write(&path, bytes).expect("write temp image");
         path

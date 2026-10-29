@@ -11,14 +11,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
-use gtk::{gdk, glib, graphene, Box, Orientation, Widget};
+use gtk::{gdk, graphene, Box, Orientation, Widget};
 
 use super::actions::ActionSlot;
 use super::quick_actions::{rebuild_quick_bar, QuickBarState};
-use super::tests::{run_gtk_test, test_context, TempTestDir};
+use super::tests::{pump, pump_until, run_gtk_test, test_context, TempTestDir};
 use super::text::{create_message_text_widget, render_text_content};
 use crate::message_markup::MessageRenderContext;
 
@@ -74,21 +73,13 @@ fn show_in_window(content: &impl IsA<Widget>) -> gtk::Window {
     let window = gtk::Window::new();
     window.set_child(Some(content));
     window.present();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let context = glib::MainContext::default();
-    while !(content.is_mapped() && content.width() > 0) {
-        assert!(Instant::now() < deadline, "widget was never laid out");
-        context.iteration(false);
-    }
+    let laid_out = || content.is_mapped() && content.width() > 0;
+    pump_until(5000, laid_out);
+    assert!(laid_out(), "widget was never laid out");
     // Let icon and texture loads settle before rendering. Static images
     // decode on worker threads, so wait for those to land.
-    for _ in 0..20 {
-        context.iteration(false);
-    }
-    while has_pending_decode(content.upcast_ref()) && Instant::now() < deadline {
-        context.iteration(false);
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    pump(50);
+    pump_until(5000, || !has_pending_decode(content.upcast_ref()));
     window
 }
 
