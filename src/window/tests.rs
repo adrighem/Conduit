@@ -3244,6 +3244,60 @@ fn test_cached_theme_json_roundtrip() {
 }
 
 #[test]
+fn completion_index_keys_change_on_every_user_group_and_channel_mutation() {
+    let workspace = WorkspaceSessionState::default();
+    let discovered_channels = StampedCell::<Arc<Vec<SlackConversation>>>::default();
+    let channel = |id: &str| SlackConversation {
+        id: id.to_string(),
+        name: Some(id.to_lowercase()),
+        ..SlackConversation::default()
+    };
+    let mention_key = || mention_index_key(&workspace);
+    let channel_key = || channel_index_key(&discovered_channels, &workspace);
+
+    let (mentions, channels) = (mention_key(), channel_key());
+    assert_eq!(workspace.users.borrow().len(), 0);
+    assert_eq!(mention_key(), mentions, "reading changes no key");
+    assert_eq!(channel_key(), channels);
+
+    let mut changed = mentions;
+    let mut assert_changed = |key: [u64; 3], what: &str| {
+        assert_ne!(key, changed, "{what} left the mention key unchanged");
+        changed = key;
+    };
+    workspace
+        .users
+        .borrow_mut()
+        .insert("U1".to_string(), SlackUser::default());
+    assert_changed(mention_key(), "a known user");
+    workspace
+        .user_directory
+        .discovered_users
+        .borrow_mut()
+        .push(SlackUser::default());
+    assert_changed(mention_key(), "a discovered user");
+    workspace.user_directory.apply_user_groups(Vec::new());
+    assert_changed(mention_key(), "user groups");
+    workspace.reset();
+    assert_changed(mention_key(), "a session reset");
+
+    let mut changed = channels;
+    let mut assert_changed = |key: [u64; 2], what: &str| {
+        assert_ne!(key, changed, "{what} left the channel key unchanged");
+        changed = key;
+    };
+    Arc::make_mut(&mut discovered_channels.borrow_mut()).push(channel("C1"));
+    assert_changed(channel_key(), "a discovered channel edited in place");
+    *discovered_channels.borrow_mut() = Arc::default();
+    assert_changed(channel_key(), "a replaced discovery snapshot");
+    workspace
+        .conversations
+        .borrow_mut()
+        .upsert_opened(channel("C2"));
+    assert_changed(channel_key(), "a catalog conversation");
+}
+
+#[test]
 fn perf_guard_window_loads_no_image_file_on_the_gtk_thread() {
     // GtkPicture's file loaders and gdk-pixbuf's `from_file` decode on the
     // calling thread. Workers decode instead (`timeline::cache::decode`).

@@ -20,6 +20,7 @@ use crate::models::{
     slack_timestamp_is_after, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation,
     SlackFile, SlackMessage, SlackUser, SlackUserGroup,
 };
+use crate::search::StampedCell;
 use crate::sidebar::{UserSearchAliases, UserStatuses};
 use crate::thread_catalog::ThreadCatalog;
 use crate::unread_ledger::UnreadLedger;
@@ -260,8 +261,8 @@ impl ChannelNameLookups {
 pub(crate) struct UserDirectoryState {
     pub(crate) discovery: DiscoveryGate,
     pub(crate) channel_lookups: RefCell<ChannelNameLookups>,
-    pub(crate) discovered_users: RefCell<Vec<SlackUser>>,
-    pub(crate) user_groups: RefCell<Vec<SlackUserGroup>>,
+    pub(crate) discovered_users: StampedCell<Vec<SlackUser>>,
+    pub(crate) user_groups: StampedCell<Vec<SlackUserGroup>>,
     pub(crate) user_names: RefCell<Arc<HashMap<String, String>>>,
     pub(crate) user_full_names: RefCell<Arc<HashMap<String, String>>>,
     pub(crate) user_avatar_urls: RefCell<Arc<HashMap<String, String>>>,
@@ -328,7 +329,7 @@ impl UserDirectoryState {
 pub(crate) struct WorkspaceSessionState {
     lifecycle: Cell<WorkspaceLifecycle>,
     pub(crate) conversations: RefCell<ConversationCatalog>,
-    pub(crate) users: RefCell<HashMap<String, SlackUser>>,
+    pub(crate) users: StampedCell<HashMap<String, SlackUser>>,
     pub(crate) user_directory: UserDirectoryState,
     pub(crate) view: RefCell<WorkspaceViewState>,
     pub(crate) threads: RefCell<ThreadCatalog>,
