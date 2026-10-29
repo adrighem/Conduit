@@ -8,8 +8,9 @@ use gtk::pango;
 
 use super::model::{FileRow, SavedRow, SearchRow, SecondaryAction, SecondaryRow, ThreadRow};
 use crate::message_markup::MessageRenderContext;
+use crate::timeline::cache::decode;
 use crate::timeline_message_widget::{
-    build_timeline_message_widget, get_or_load_texture, resolve_cached_asset_path, TimelineAction,
+    build_timeline_message_widget, resolve_cached_asset_path, TimelineAction,
 };
 
 pub(crate) type Dispatch = Rc<dyn Fn(SecondaryAction)>;
@@ -221,25 +222,50 @@ fn search_card(row: &SearchRow) -> gtk::Box {
     card
 }
 
+/// The thumbnail of a file row: its icon, replaced in place by the image once
+/// a worker has decoded it. Each bind builds its own widget, which owns the
+/// request, so a result for a row that was since unbound or rebound to
+/// another file is dropped with it.
 fn file_thumbnail(row: &FileRow, context: &MessageRenderContext) -> gtk::Widget {
-    let texture = row
-        .thumbnail_url
-        .as_deref()
-        .and_then(|url| resolve_cached_asset_path(url, context))
-        .and_then(|path| get_or_load_texture(&path));
-    if let Some(texture) = texture {
-        let picture = gtk::Picture::for_paintable(&texture);
-        picture.set_content_fit(gtk::ContentFit::Cover);
-        picture.set_size_request(FILE_THUMBNAIL_SIZE, FILE_THUMBNAIL_SIZE);
-        picture.set_overflow(gtk::Overflow::Hidden);
-        picture.add_css_class("secondary-thumbnail");
-        return picture.upcast();
-    }
     let icon = gtk::Image::from_icon_name(row.icon_name);
     icon.set_pixel_size(24);
     icon.set_size_request(FILE_THUMBNAIL_SIZE, FILE_THUMBNAIL_SIZE);
     icon.add_css_class("secondary-file-icon");
-    icon.upcast()
+    let path = row
+        .thumbnail_url
+        .as_deref()
+        .and_then(|url| resolve_cached_asset_path(url, context))
+        .filter(|path| !decode::texture_failed(path, decode::TextureSpec::Full));
+    let Some(path) = path else {
+        return icon.upcast();
+    };
+    let picture = match decode::TextureSpec::Full.cached(&path) {
+        Some(texture) => return thumbnail_picture(gtk::Picture::for_paintable(&texture)).upcast(),
+        None => {
+            decode::deferred_picture(&path, decode::TextureSpec::Full, FILE_THUMBNAIL_SIZE, None)
+        }
+    };
+    if let Some(paintable) = picture
+        .paintable()
+        .and_downcast::<decode::DeferredPaintable>()
+    {
+        let icon = icon.clone();
+        paintable.connect_invalidate_contents(move |paintable| {
+            icon.set_visible(paintable.content().is_none());
+        });
+    }
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&icon));
+    overlay.add_overlay(&thumbnail_picture(picture));
+    overlay.upcast()
+}
+
+fn thumbnail_picture(picture: gtk::Picture) -> gtk::Picture {
+    picture.set_content_fit(gtk::ContentFit::Cover);
+    picture.set_size_request(FILE_THUMBNAIL_SIZE, FILE_THUMBNAIL_SIZE);
+    picture.set_overflow(gtk::Overflow::Hidden);
+    picture.add_css_class("secondary-thumbnail");
+    picture
 }
 
 fn file_meta_text(row: &FileRow) -> String {

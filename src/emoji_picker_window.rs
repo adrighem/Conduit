@@ -19,6 +19,7 @@ use gtk::{gio, glib};
 use sha2::{Digest, Sha256};
 
 use crate::emoji::{EmojiCatalog, EmojiEntry, EmojiValue};
+use crate::timeline::cache::decode::{self, DecodeTicket, Decoded, Requested, TextureSpec};
 
 const CATEGORY_ICONS: &[(&str, &str)] = &[
     ("All", "🌟"),
@@ -476,6 +477,258 @@ pub(crate) fn request_custom_emoji_file(
     emoji_loader().queue(url.to_string(), true, Some(Box::new(on_ready)));
 }
 
+/// First frames of the animated custom emoji seen so far, by URL. A cell
+/// shows one at once, and its presence marks the emoji as animated.
+type Stills = Rc<RefCell<HashMap<String, gtk::gdk::Texture>>>;
+
+/// One recycled grid cell. Its image is decoded off the GTK thread, and only
+/// while the cell is mapped: unmapping, unbinding or rebinding it makes any
+/// decode it still waits on stale, so a late result never lands on a cell
+/// that has moved on to another emoji.
+struct EmojiSlot {
+    container: gtk::Box,
+    stack: gtk::Stack,
+    pic: gtk::Picture,
+    stills: Stills,
+    /// The cached file of the custom emoji the cell is bound to.
+    file: RefCell<Option<PathBuf>>,
+    /// Waits on the image the cell shows.
+    load: DecodeTicket,
+    /// Waits on the animation a hover plays.
+    hover: DecodeTicket,
+}
+
+impl EmojiSlot {
+    /// A cell of the grid: a stack of the unicode text, the image and a
+    /// placeholder, which plays an animated emoji while hovered.
+    fn build(stills: &Stills) -> Rc<Self> {
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        container.set_size_request(38, 38);
+        container.set_halign(gtk::Align::Center);
+        container.set_valign(gtk::Align::Center);
+
+        let stack = gtk::Stack::new();
+        stack.set_size_request(36, 36);
+        stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+
+        let lbl = gtk::Label::new(None);
+        lbl.add_css_class("title-3");
+        lbl.set_size_request(36, 36);
+        stack.add_named(&lbl, Some("text"));
+
+        let pic = gtk::Picture::new();
+        pic.set_size_request(32, 32);
+        pic.set_can_shrink(true);
+        pic.set_content_fit(gtk::ContentFit::Cover);
+        stack.add_named(&pic, Some("pic"));
+
+        let placeholder = gtk::Label::new(Some("💬"));
+        placeholder.add_css_class("dim-label");
+        placeholder.set_size_request(36, 36);
+        stack.add_named(&placeholder, Some("placeholder"));
+
+        container.append(&stack);
+
+        let slot = Rc::new(Self {
+            container: container.clone(),
+            stack,
+            pic,
+            stills: stills.clone(),
+            file: RefCell::new(None),
+            load: DecodeTicket::default(),
+            hover: DecodeTicket::default(),
+        });
+        let motion = gtk::EventControllerMotion::new();
+        let weak = Rc::downgrade(&slot);
+        motion.connect_enter(move |_, _, _| {
+            if let Some(slot) = weak.upgrade() {
+                slot.hover(true);
+            }
+        });
+        let weak = Rc::downgrade(&slot);
+        motion.connect_leave(move |_| {
+            if let Some(slot) = weak.upgrade() {
+                slot.hover(false);
+            }
+        });
+        container.add_controller(motion);
+        let weak = Rc::downgrade(&slot);
+        container.connect_map(move |_| {
+            if let Some(slot) = weak.upgrade() {
+                slot.request();
+            }
+        });
+        let weak = Rc::downgrade(&slot);
+        container.connect_unmap(move |_| {
+            if let Some(slot) = weak.upgrade() {
+                slot.suspend();
+            }
+        });
+        slot
+    }
+
+    /// The URL of the custom emoji the cell is bound to, empty for none.
+    fn url(&self) -> String {
+        self.stack.widget_name().to_string()
+    }
+
+    /// Stops waiting on decodes, e.g. once the cell is off screen.
+    fn suspend(&self) {
+        self.load.invalidate();
+        self.hover.invalidate();
+    }
+
+    /// Unbinds the cell from whatever emoji it showed.
+    fn reset(&self) {
+        self.suspend();
+        self.file.take();
+        self.container.remove_css_class("hovered");
+        self.container.remove_css_class("animating");
+        self.stack.set_widget_name("");
+        self.pic.set_paintable(None::<&gtk::gdk::Paintable>);
+    }
+
+    /// The cell's emoji is downloaded: show it, once the cell is mapped.
+    fn set_file(self: &Rc<Self>, path: PathBuf) {
+        self.file.replace(Some(path));
+        self.request();
+    }
+
+    /// Asks for the image of the bound emoji, unless the cell is not mapped
+    /// or already shows it.
+    fn request(self: &Rc<Self>) {
+        let url = self.url();
+        let Some(path) = self.file.borrow().clone() else {
+            return;
+        };
+        if !self.container.is_mapped() || url.is_empty() || self.pic.paintable().is_some() {
+            return;
+        }
+        let still = self.stills.borrow().get(&url).cloned();
+        if let Some(still) = still {
+            self.show(&still);
+            return;
+        }
+        if !crate::animated_image::may_animate(&path) {
+            self.request_still(&path);
+            return;
+        }
+        let slot = Rc::downgrade(self);
+        let (arrived_url, arrived_path) = (url.clone(), path.clone());
+        let requested = decode::request_animation(&path, &self.load, move |decoded| {
+            if let Some(slot) = slot.upgrade() {
+                slot.animation_loaded(&arrived_url, &arrived_path, decoded);
+            }
+        });
+        if let Requested::Ready(decoded) = requested {
+            self.animation_loaded(&url, &path, &decoded);
+        }
+    }
+
+    fn animation_loaded(self: &Rc<Self>, url: &str, path: &Path, decoded: &Decoded) {
+        if self.url() != url {
+            return;
+        }
+        match decoded {
+            Decoded::Animation(animation) => {
+                let still = gtk::gdk::Texture::for_pixbuf(&animation.iter(None).pixbuf());
+                self.stills
+                    .borrow_mut()
+                    .insert(url.to_string(), still.clone());
+                self.show(&still);
+                if self.container.has_css_class("hovered") {
+                    self.animate(animation);
+                }
+            }
+            // One frame after all.
+            Decoded::Still | Decoded::Texture(_) => self.request_still(path),
+        }
+    }
+
+    fn request_still(self: &Rc<Self>, path: &Path) {
+        let url = self.url();
+        let slot = Rc::downgrade(self);
+        let requested =
+            decode::request_texture(path, TextureSpec::Full, &self.load, move |texture| {
+                if let Some(slot) = slot.upgrade().filter(|slot| slot.url() == url) {
+                    slot.show(texture);
+                }
+            });
+        if let Requested::Ready(texture) = requested {
+            self.show(&texture);
+        }
+    }
+
+    fn show(&self, texture: &gtk::gdk::Texture) {
+        self.pic.set_paintable(Some(texture));
+        self.stack.set_visible_child_name("pic");
+    }
+
+    /// The pointer entered or left the cell. An animated emoji plays while
+    /// hovered, loaded again then rather than kept for every cell shown.
+    fn hover(self: &Rc<Self>, entered: bool) {
+        let url = self.url();
+        if !entered {
+            self.container.remove_css_class("hovered");
+            self.container.remove_css_class("animating");
+            self.hover.invalidate();
+            let still = self.stills.borrow().get(&url).cloned();
+            if let Some(still) = still {
+                self.pic.set_paintable(Some(&still));
+            }
+            return;
+        }
+        self.container.add_css_class("hovered");
+        let path = self.file.borrow().clone();
+        let animated = self.stills.borrow().contains_key(&url);
+        let (true, Some(path), false) = (animated, path, self.container.has_css_class("animating"))
+        else {
+            return;
+        };
+        let slot = Rc::downgrade(self);
+        // A known still has nothing to play: `Ready` needs no handling.
+        let _ = decode::request_animation(&path, &self.hover, move |decoded| {
+            if let (Some(slot), Decoded::Animation(animation)) = (slot.upgrade(), decoded) {
+                if slot.url() == url {
+                    slot.animate(animation);
+                }
+            }
+        });
+    }
+
+    fn animate(&self, animation: &gdk_pixbuf::PixbufAnimation) {
+        if self.container.has_css_class("animating") {
+            return;
+        }
+        self.container.add_css_class("animating");
+        let iter = animation.iter(None);
+        let last_update = Rc::new(Cell::new(std::time::Instant::now()));
+        let delay_ms = iter
+            .delay_time()
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(60)
+            .max(60);
+        let stack = self.stack.downgrade();
+        let container = self.container.downgrade();
+        let url = self.url();
+        self.pic.add_tick_callback(move |p, _frame_clock| {
+            let (Some(stack), Some(container)) = (stack.upgrade(), container.upgrade()) else {
+                return glib::ControlFlow::Break;
+            };
+            if !container.has_css_class("hovered") || !p.is_mapped() || stack.widget_name() != url {
+                container.remove_css_class("animating");
+                return glib::ControlFlow::Break;
+            }
+            if last_update.get().elapsed().as_millis() as u64 >= delay_ms {
+                last_update.set(std::time::Instant::now());
+                iter.advance(std::time::SystemTime::now());
+                p.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&iter.pixbuf())));
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+}
+
 impl EmojiPickerWindow {
     pub(crate) fn new(
         parent: &impl IsA<gtk::Widget>,
@@ -561,118 +814,20 @@ impl EmojiPickerWindow {
 
         let (download_tx, mut download_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, PathBuf)>();
-        let pending_widgets: std::rc::Rc<
-            std::cell::RefCell<HashMap<String, Vec<glib::WeakRef<gtk::Stack>>>>,
-        > = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
-
-        let animated_emojis: Rc<RefCell<HashMap<String, (PathBuf, gtk::gdk::Texture)>>> =
+        let pending_widgets: Rc<RefCell<HashMap<String, Vec<std::rc::Weak<EmojiSlot>>>>> =
             Rc::new(RefCell::new(HashMap::new()));
-
-        fn start_slot_animation(
-            container: &gtk::Box,
-            stack: &gtk::Stack,
-            pic: &gtk::Picture,
-            path: &Path,
-            expected_url: &str,
-        ) {
-            if container.has_css_class("animating")
-                || !crate::animated_image::within_decode_budget(path)
-            {
-                return;
-            }
-            let Ok(anim) = gdk_pixbuf::PixbufAnimation::from_file(path) else {
-                return;
-            };
-            if anim.is_static_image() {
-                return;
-            }
-            container.add_css_class("animating");
-
-            let iter = anim.iter(None);
-            let last_update = Rc::new(Cell::new(std::time::Instant::now()));
-            let delay_ms = iter
-                .delay_time()
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(60)
-                .max(60);
-
-            let stack_weak = stack.downgrade();
-            let container_weak = container.downgrade();
-            let url_owned = expected_url.to_string();
-
-            pic.add_tick_callback(move |p, _frame_clock| {
-                let Some(stack) = stack_weak.upgrade() else {
-                    return glib::ControlFlow::Break;
-                };
-                let Some(container) = container_weak.upgrade() else {
-                    return glib::ControlFlow::Break;
-                };
-                if !container.has_css_class("hovered")
-                    || !p.is_mapped()
-                    || stack.widget_name() != url_owned
-                {
-                    container.remove_css_class("animating");
-                    return glib::ControlFlow::Break;
-                }
-                if last_update.get().elapsed().as_millis() as u64 >= delay_ms {
-                    last_update.set(std::time::Instant::now());
-                    iter.advance(std::time::SystemTime::now());
-                    p.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&iter.pixbuf())));
-                }
-                glib::ControlFlow::Continue
-            });
-        }
-
-        fn apply_custom_emoji_image(
-            stack: &gtk::Stack,
-            path: &Path,
-            expected_url: &str,
-            animated_emojis: &Rc<RefCell<HashMap<String, (PathBuf, gtk::gdk::Texture)>>>,
-        ) {
-            let Some(pic) = stack.child_by_name("pic").and_downcast::<gtk::Picture>() else {
-                return;
-            };
-            if !crate::animated_image::within_decode_budget(path) {
-                return;
-            }
-            if let Ok(anim) = gdk_pixbuf::PixbufAnimation::from_file(path) {
-                if !anim.is_static_image() {
-                    let iter = anim.iter(None);
-                    let first_pixbuf = iter.pixbuf();
-                    let first_texture = gtk::gdk::Texture::for_pixbuf(&first_pixbuf);
-                    pic.set_paintable(Some(&first_texture));
-                    stack.set_visible_child_name("pic");
-
-                    animated_emojis.borrow_mut().insert(
-                        expected_url.to_string(),
-                        (path.to_path_buf(), first_texture),
-                    );
-
-                    if let Some(container) = stack.parent().and_downcast::<gtk::Box>() {
-                        if container.has_css_class("hovered") {
-                            start_slot_animation(&container, stack, &pic, path, expected_url);
-                        }
-                    }
-                    return;
-                }
-            }
-
-            pic.set_filename(Some(path));
-            stack.set_visible_child_name("pic");
-        }
+        let stills: Stills = Rc::new(RefCell::new(HashMap::new()));
+        let slots: Rc<RefCell<HashMap<gtk::Box, Rc<EmojiSlot>>>> =
+            Rc::new(RefCell::new(HashMap::new()));
 
         {
             let pending_widgets = pending_widgets.clone();
-            let animated_emojis = animated_emojis.clone();
             glib::spawn_future_local(async move {
                 while let Some((url, path)) = download_rx.recv().await {
-                    if let Some(stacks) = pending_widgets.borrow_mut().remove(&url) {
-                        for stack_weak in stacks {
-                            if let Some(stack) = stack_weak.upgrade() {
-                                if stack.widget_name() == url {
-                                    apply_custom_emoji_image(&stack, &path, &url, &animated_emojis);
-                                }
-                            }
+                    let waiting = pending_widgets.borrow_mut().remove(&url);
+                    for slot in waiting.into_iter().flatten() {
+                        if let Some(slot) = slot.upgrade().filter(|slot| slot.url() == url) {
+                            slot.set_file(path.clone());
                         }
                     }
                 }
@@ -681,96 +836,33 @@ impl EmojiPickerWindow {
 
         let factory = gtk::SignalListItemFactory::new();
         {
-            let animated_emojis = animated_emojis.clone();
+            let stills = stills.clone();
+            let slots = slots.clone();
             factory.connect_setup(move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+                let slot = EmojiSlot::build(&stills);
+                list_item.set_child(Some(&slot.container));
+                slots.borrow_mut().insert(slot.container.clone(), slot);
+            });
+        }
 
-                let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                container.set_size_request(38, 38);
-                container.set_halign(gtk::Align::Center);
-                container.set_valign(gtk::Align::Center);
-
-                let stack = gtk::Stack::new();
-                stack.set_size_request(36, 36);
-                stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-
-                let lbl = gtk::Label::new(None);
-                lbl.add_css_class("title-3");
-                lbl.set_size_request(36, 36);
-                stack.add_named(&lbl, Some("text"));
-
-                let pic = gtk::Picture::new();
-                pic.set_size_request(32, 32);
-                pic.set_can_shrink(true);
-                pic.set_content_fit(gtk::ContentFit::Cover);
-                stack.add_named(&pic, Some("pic"));
-
-                let placeholder = gtk::Label::new(Some("💬"));
-                placeholder.add_css_class("dim-label");
-                placeholder.set_size_request(36, 36);
-                stack.add_named(&placeholder, Some("placeholder"));
-
-                container.append(&stack);
-
-                let motion = gtk::EventControllerMotion::new();
+        {
+            let slots = slots.clone();
+            factory.connect_teardown(move |_, list_item| {
+                if let Some(container) = list_item
+                    .downcast_ref::<gtk::ListItem>()
+                    .and_then(|list_item| list_item.child())
+                    .and_downcast::<gtk::Box>()
                 {
-                    let stack_weak = stack.downgrade();
-                    let pic_weak = pic.downgrade();
-                    let container_weak = container.downgrade();
-                    let animated_emojis = animated_emojis.clone();
-                    motion.connect_enter(move |_, _, _| {
-                        let Some(container) = container_weak.upgrade() else {
-                            return;
-                        };
-                        let Some(stack) = stack_weak.upgrade() else {
-                            return;
-                        };
-                        let Some(pic) = pic_weak.upgrade() else {
-                            return;
-                        };
-                        container.add_css_class("hovered");
-                        let url = stack.widget_name().to_string();
-                        if url.is_empty() {
-                            return;
-                        }
-                        if let Some((path, _)) = animated_emojis.borrow().get(&url) {
-                            start_slot_animation(&container, &stack, &pic, path, &url);
-                        }
-                    });
+                    slots.borrow_mut().remove(&container);
                 }
-                {
-                    let stack_weak = stack.downgrade();
-                    let pic_weak = pic.downgrade();
-                    let container_weak = container.downgrade();
-                    let animated_emojis = animated_emojis.clone();
-                    motion.connect_leave(move |_| {
-                        let Some(container) = container_weak.upgrade() else {
-                            return;
-                        };
-                        let Some(stack) = stack_weak.upgrade() else {
-                            return;
-                        };
-                        let Some(pic) = pic_weak.upgrade() else {
-                            return;
-                        };
-                        container.remove_css_class("hovered");
-                        container.remove_css_class("animating");
-                        let url = stack.widget_name().to_string();
-                        if let Some((_, first_frame)) = animated_emojis.borrow().get(&url) {
-                            pic.set_paintable(Some(first_frame));
-                        }
-                    });
-                }
-                container.add_controller(motion);
-
-                list_item.set_child(Some(&container));
             });
         }
 
         {
             let pending_widgets = pending_widgets.clone();
             let download_tx = download_tx.clone();
-            let animated_emojis = animated_emojis.clone();
+            let slots = slots.clone();
             factory.connect_bind(move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
                 let Some(boxed) = list_item.item().and_downcast::<glib::BoxedAnyObject>() else {
@@ -782,18 +874,16 @@ impl EmojiPickerWindow {
                 let Some(container) = list_item.child().and_downcast::<gtk::Box>() else {
                     return;
                 };
-                container.remove_css_class("hovered");
-                container.remove_css_class("animating");
+                let Some(slot) = slots.borrow().get(&container).cloned() else {
+                    return;
+                };
+                slot.reset();
                 container.set_tooltip_text(Some(&format!(":{}:", entry.name)));
                 container.update_property(&[gtk::accessible::Property::Label(&entry.label)]);
 
-                let Some(stack) = container.first_child().and_downcast::<gtk::Stack>() else {
-                    return;
-                };
-
+                let stack = &slot.stack;
                 match &entry.value {
                     EmojiValue::Unicode(u) => {
-                        stack.set_widget_name("");
                         if let Some(lbl) = stack.child_by_name("text").and_downcast::<gtk::Label>()
                         {
                             lbl.set_text(u);
@@ -802,15 +892,15 @@ impl EmojiPickerWindow {
                     }
                     EmojiValue::CustomImage(url) => {
                         stack.set_widget_name(url);
+                        stack.set_visible_child_name("placeholder");
                         if let Some(cached_path) = resolve_custom_emoji_cached_file(url) {
-                            apply_custom_emoji_image(&stack, &cached_path, url, &animated_emojis);
+                            slot.set_file(cached_path);
                         } else {
-                            stack.set_visible_child_name("placeholder");
                             pending_widgets
                                 .borrow_mut()
                                 .entry(url.clone())
                                 .or_default()
-                                .push(stack.downgrade());
+                                .push(Rc::downgrade(&slot));
 
                             let tx = download_tx.clone();
                             let url_clone = url.clone();
@@ -825,15 +915,12 @@ impl EmojiPickerWindow {
 
         factory.connect_unbind(move |_, list_item| {
             let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-            if let Some(container) = list_item.child().and_downcast::<gtk::Box>() {
-                container.remove_css_class("hovered");
-                container.remove_css_class("animating");
-                if let Some(stack) = container.first_child().and_downcast::<gtk::Stack>() {
-                    stack.set_widget_name("");
-                    if let Some(pic) = stack.child_by_name("pic").and_downcast::<gtk::Picture>() {
-                        pic.set_paintable(Option::<&gtk::gdk::Paintable>::None);
-                    }
-                }
+            if let Some(slot) = list_item
+                .child()
+                .and_downcast::<gtk::Box>()
+                .and_then(|container| slots.borrow().get(&container).cloned())
+            {
+                slot.reset();
             }
         });
 
@@ -1086,5 +1173,244 @@ mod tests {
             "https://example.com/emoji-{}.png",
             MAX_FAILED_EMOJI_URLS + 9
         )));
+    }
+
+    /// Tests that create GTK widgets. They run only when
+    /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
+    mod graphical {
+        use super::*;
+        use crate::animated_image::tests::ANIMATED_GIF;
+        use crate::timeline::tests::{
+            descendants, pump, pump_until, run_gtk_test, save_test_image, ManualDecodes,
+            TempTestDir,
+        };
+
+        const QUERY: &str = "qqx";
+        const STILL_SIDES: [i32; 4] = [20, 24, 28, 32];
+
+        struct Picker {
+            _dir: TempTestDir,
+            parent: gtk::Window,
+            picker: EmojiPickerWindow,
+        }
+
+        impl Picker {
+            fn cells(&self) -> Vec<(String, gtk::Box, gtk::Stack)> {
+                descendants(self.picker.window.upcast_ref())
+                    .into_iter()
+                    .filter_map(|widget| widget.downcast::<gtk::Stack>().ok())
+                    .filter(|stack| stack.widget_name().starts_with("https://"))
+                    .filter_map(|stack| {
+                        let container = stack.parent().and_downcast::<gtk::Box>()?;
+                        Some((stack.widget_name().to_string(), container, stack))
+                    })
+                    .collect()
+            }
+
+            fn search(&self, query: &str) {
+                let entry = descendants(self.picker.window.upcast_ref())
+                    .into_iter()
+                    .find_map(|widget| widget.downcast::<gtk::SearchEntry>().ok())
+                    .expect("search entry");
+                entry.set_text(query);
+            }
+
+            /// Width of the still a cell shows, once it has one.
+            fn shown_width(stack: &gtk::Stack) -> Option<i32> {
+                let pic = stack.child_by_name("pic").and_downcast::<gtk::Picture>()?;
+                let texture = pic.paintable()?;
+                Some(texture.intrinsic_width())
+            }
+        }
+
+        impl Drop for Picker {
+            fn drop(&mut self) {
+                self.picker.window.destroy();
+                self.parent.destroy();
+            }
+        }
+
+        /// Four static emoji of different sizes, two animated ones and an
+        /// alias of the first of those, all cached on disk already.
+        fn open_picker() -> Picker {
+            let dir = TempTestDir::new("emoji-picker");
+            let mut custom = HashMap::new();
+            let mut register = |name: &str, extension: &str, write: &dyn Fn(&Path)| {
+                let path = dir.path().join(format!("{name}.{extension}"));
+                write(&path);
+                let url = format!("https://emoji.example.com/{name}.{extension}");
+                invalidate_or_set_custom_emoji_cached_file(&url, path);
+                custom.insert(name.to_string(), url);
+            };
+            for (index, side) in STILL_SIDES.iter().enumerate() {
+                register(&format!("{QUERY}-still-{index}"), "png", &|path| {
+                    save_test_image(path, "png", *side, *side);
+                });
+            }
+            for index in 0..2 {
+                register(&format!("{QUERY}-anim-{index}"), "gif", &|path| {
+                    std::fs::write(path, ANIMATED_GIF).expect("write gif");
+                });
+            }
+            custom.insert(format!("{QUERY}-alias"), format!("alias:{QUERY}-anim-0"));
+            let parent = gtk::Window::new();
+            let picker = EmojiPickerWindow::new(&parent, &custom, |_| {});
+            picker.present();
+            let picker = Picker {
+                _dir: dir,
+                parent,
+                picker,
+            };
+            picker.search(QUERY);
+            pump_until(3000, || picker.cells().len() == 7);
+            picker
+        }
+
+        #[test]
+        fn perf_guard_emoji_picker_decodes_off_the_gtk_thread() {
+            run_gtk_test(|| {
+                let _ = adw::init();
+                let decodes = ManualDecodes::install();
+                let before = crate::debug::IMAGE_DECODES.get();
+                let picker = open_picker();
+                pump_until(2000, || {
+                    picker
+                        .cells()
+                        .iter()
+                        .all(|(_, container, _)| container.is_mapped())
+                        && decodes.0.running().len() == decode::MAX_IN_FLIGHT
+                });
+                pump(20);
+                assert_eq!(
+                    crate::debug::IMAGE_DECODES.get() - before,
+                    0,
+                    "the picker must leave decodes to the workers"
+                );
+                let cells = picker.cells();
+                assert_eq!(cells.len(), 7, "four stills, two animations, one alias");
+                assert_eq!(decodes.0.running().len(), decode::MAX_IN_FLIGHT);
+                for (_, _, stack) in &cells {
+                    assert_eq!(stack.visible_child_name().as_deref(), Some("placeholder"));
+                }
+
+                let finished = decodes.finish_all();
+                pump(20);
+                let unique: HashSet<_> = finished.iter().collect();
+                assert_eq!(finished.len(), 6, "one decode per file: {finished:?}");
+                assert_eq!(unique.len(), finished.len(), "no file decoded twice");
+                for (url, container, stack) in &cells {
+                    assert_eq!(stack.visible_child_name().as_deref(), Some("pic"), "{url}");
+                    assert!(!container.has_css_class("animating"));
+                    let width = Picker::shown_width(stack).expect("image shown");
+                    if let Some(index) = url
+                        .split("still-")
+                        .nth(1)
+                        .and_then(|rest| rest.split('.').next())
+                        .and_then(|index| index.parse::<usize>().ok())
+                    {
+                        assert_eq!(width, STILL_SIDES[index], "{url} shows its own image");
+                    }
+                }
+
+                // Hovering an animated emoji loads it again, off the thread,
+                // and plays it; leaving restores the still frame.
+                let animated: Vec<_> = cells
+                    .iter()
+                    .filter(|(url, ..)| url.ends_with("anim-0.gif"))
+                    .collect();
+                assert_eq!(animated.len(), 2, "the alias shows the same file");
+                let hover = |container: &gtk::Box, signal: &str| {
+                    let motion = container
+                        .observe_controllers()
+                        .into_iter()
+                        .filter_map(|controller| {
+                            controller
+                                .ok()?
+                                .downcast::<gtk::EventControllerMotion>()
+                                .ok()
+                        })
+                        .next()
+                        .expect("motion controller");
+                    match signal {
+                        "enter" => motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]),
+                        _ => motion.emit_by_name::<()>("leave", &[]),
+                    }
+                };
+                let before = crate::debug::IMAGE_DECODES.get();
+                hover(&animated[0].1, "enter");
+                hover(&animated[1].1, "enter");
+                assert_eq!(
+                    decodes.0.running().len(),
+                    1,
+                    "both cells share one animation load"
+                );
+                assert_eq!(crate::debug::IMAGE_DECODES.get() - before, 0);
+                decodes.finish_all();
+                assert!(animated[0].1.has_css_class("animating"));
+                assert!(animated[1].1.has_css_class("animating"));
+                hover(&animated[0].1, "leave");
+                assert!(!animated[0].1.has_css_class("animating"));
+            });
+        }
+
+        #[test]
+        fn recycled_cell_ignores_the_decode_of_the_emoji_it_showed_before() {
+            run_gtk_test(|| {
+                let _ = adw::init();
+                let decodes = ManualDecodes::install();
+                let dir = TempTestDir::new("emoji-recycle");
+                let slot = EmojiSlot::build(&Stills::default());
+                let window = gtk::Window::new();
+                window.set_child(Some(&slot.container));
+                window.present();
+                pump_until(2000, || slot.container.is_mapped());
+                // Bound to one emoji, then to another before the first
+                // one's decode has landed, as a scrolled grid does.
+                for (index, side) in [20, 24].into_iter().enumerate() {
+                    let path = dir.path().join(format!("{index}.png"));
+                    save_test_image(&path, "png", side, side);
+                    slot.reset();
+                    slot.stack
+                        .set_widget_name(&format!("https://emoji.example.com/{index}.png"));
+                    slot.set_file(path);
+                }
+                let running = decodes.0.running();
+                assert_eq!(running.len(), 2, "{running:?}");
+                // The second one's own result lands first, the first one's
+                // late.
+                for key in [&running[1], &running[0]] {
+                    let index = decodes
+                        .0
+                        .running()
+                        .iter()
+                        .position(|running| running == key)
+                        .expect("still running");
+                    decodes.0.complete(index, decode::decode_now_for_tests(key));
+                }
+                assert_eq!(
+                    Picker::shown_width(&slot.stack),
+                    Some(24),
+                    "a late result of another emoji must not replace it"
+                );
+                window.destroy();
+            });
+        }
+
+        #[test]
+        fn unmapped_cells_request_no_decodes() {
+            run_gtk_test(|| {
+                let _ = adw::init();
+                let decodes = ManualDecodes::install();
+                let picker = open_picker();
+                pump_until(500, || !decodes.0.running().is_empty());
+                picker.picker.window.set_visible(false);
+                pump(50);
+                // Whatever was queued for cells that are no longer shown is
+                // skipped: finishing the running decodes starts nothing new.
+                let running = decodes.0.running().len();
+                let finished = decodes.finish_all();
+                assert_eq!(finished.len(), running, "no queued decode started");
+            });
+        }
     }
 }
