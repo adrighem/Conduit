@@ -1130,6 +1130,31 @@ fn pump_main_context_until(ms: u64, done: impl Fn() -> bool) {
     }
 }
 
+/// Presents `window` and pumps until its first layout. On Wayland the
+/// toplevel is only sized once the compositor configures it, and a
+/// GtkListView `scroll_to` issued before that is lost, so a timeline filled
+/// in the same turn as `present()` would open at its oldest row there.
+fn present_and_wait_for_layout(window: &gtk::Window) {
+    window.present();
+    pump_main_context_until(5000, || window.height() > 0);
+    assert!(window.height() > 0, "window was never laid out");
+}
+
+/// Pumps until the timeline sits at its newest message, failing loudly if
+/// it never gets there.
+fn wait_until_at_bottom(view: &NativeTimelineView) {
+    let vadj = view.scrolled_window.vadjustment();
+    let at_bottom = || vadj.value() > 0.0 && vadj.upper() - vadj.page_size() - vadj.value() < 1.0;
+    pump_main_context_until(5000, at_bottom);
+    assert!(
+        at_bottom(),
+        "opens at the newest message: value {} of upper {} page {}",
+        vadj.value(),
+        vadj.upper(),
+        vadj.page_size()
+    );
+}
+
 fn record_auto_marks(view: &NativeTimelineView) -> Rc<RefCell<Vec<String>>> {
     let marks: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let recorded = marks.clone();
@@ -1233,13 +1258,13 @@ fn in_place_updates_keep_scroll_and_focus_on_clicked_row() {
         let window = gtk::Window::new();
         window.set_default_size(400, 500);
         window.set_child(Some(view.widget()));
-        window.present();
+        present_and_wait_for_layout(&window);
         view.set_messages(&messages, &ctx, None);
-        pump(400);
+        wait_until_at_bottom(&view);
+        pump(300);
 
         let vadj = view.scrolled_window.vadjustment();
         let bottom = vadj.value();
-        assert!(bottom > 0.0, "opens at the newest message");
 
         // Click-like focus on a visible row near the bottom.
         let focused = view
@@ -2195,15 +2220,17 @@ fn scrolling_near_top_requests_older_page_and_prepend_keeps_position() {
         let window = gtk::Window::new();
         window.set_default_size(400, 500);
         window.set_child(Some(view.widget()));
-        window.present();
+        present_and_wait_for_layout(&window);
         view.set_read_mark_target("C1", None);
         view.set_messages(&page(100..200), &ctx, None);
-        pump(400);
+        wait_until_at_bottom(&view);
+        // Past the 150ms settle, whose paging check must find the bottom.
+        pump(300);
         assert!(requests.borrow().is_empty(), "opens at the newest message");
 
         let vadj = view.scrolled_window.vadjustment();
         vadj.set_value(vadj.lower() + vadj.page_size() / 4.0);
-        pump(100);
+        pump_main_context_until(2000, || !requests.borrow().is_empty());
         assert_eq!(*requests.borrow(), vec!["C1:None".to_string()]);
 
         // While the page is in flight, further scrolling does not re-request.
@@ -2219,7 +2246,9 @@ fn scrolling_near_top_requests_older_page_and_prepend_keeps_position() {
         prepend.timeline_scroll = crate::message_markup::TimelineScrollBehavior::PreservePrepend;
         view.set_messages(&page(0..200), &prepend, None);
         view.finish_loading_older("C1", None);
-        pump(400);
+        pump_main_context_until(2000, || vadj.upper() > upper_before);
+        // Past the settle, whose paging check must see the anchored offset.
+        pump(300);
 
         let grown = vadj.upper() - upper_before;
         assert!(grown > 0.0, "older rows were prepended");
@@ -2289,15 +2318,17 @@ fn failed_older_page_backs_off_instead_of_rerequesting() {
         let window = gtk::Window::new();
         window.set_default_size(400, 500);
         window.set_child(Some(view.widget()));
-        window.present();
+        present_and_wait_for_layout(&window);
         view.set_read_mark_target("C1", None);
         view.set_messages(&messages, &ctx, None);
-        pump(400);
+        wait_until_at_bottom(&view);
+        // Past the 150ms settle, whose paging check must find the bottom.
+        pump(300);
         assert_eq!(requests.get(), 0, "opens at the newest message");
 
         let vadj = view.scrolled_window.vadjustment();
         vadj.set_value(vadj.lower() + vadj.page_size() / 4.0);
-        pump(100);
+        pump_main_context_until(2000, || requests.get() > 0);
         assert_eq!(requests.get(), 1);
 
         // The page fails while the user still sits near the top: no retry
@@ -2315,7 +2346,7 @@ fn failed_older_page_backs_off_instead_of_rerequesting() {
         view.set_read_mark_target("C2", None);
         view.set_read_mark_target("C1", None);
         vadj.set_value(vadj.value() - 1.0);
-        pump(200);
+        pump_main_context_until(2000, || requests.get() > 1);
         assert_eq!(requests.get(), 2, "a fresh surface pages again");
         window.destroy();
     });
