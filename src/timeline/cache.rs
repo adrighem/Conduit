@@ -3,22 +3,47 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use gtk::prelude::TextureExt;
+
 use crate::message_markup::MessageRenderContext;
 
 pub(crate) const MAX_TEXTURE_CACHE_SIZE: usize = 256;
+/// Approximate memory (width x height x 4) each texture cache may hold. The
+/// entry cap alone lets 256 full-size photos reach gigabytes.
+pub(crate) const MAX_TEXTURE_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 pub(crate) type CacheEntry = gtk::gdk::Texture;
 
+fn texture_bytes(texture: &CacheEntry) -> usize {
+    let side = |side: i32| usize::try_from(side).unwrap_or(0);
+    side(texture.width())
+        .saturating_mul(side(texture.height()))
+        .saturating_mul(4)
+}
+
+/// Least-recently-used texture cache bounded by entry count and by bytes.
+/// A single texture over the byte budget is still kept, alone, so it is not
+/// decoded again on every row build.
 pub(crate) struct BoundedTextureCache {
     entries: HashMap<PathBuf, CacheEntry>,
     order: VecDeque<PathBuf>,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
 }
 
 impl BoundedTextureCache {
     pub(crate) fn new() -> Self {
+        Self::with_limits(MAX_TEXTURE_CACHE_SIZE, MAX_TEXTURE_CACHE_BYTES)
+    }
+
+    fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
+            bytes: 0,
+            max_entries,
+            max_bytes,
         }
     }
 
@@ -34,26 +59,31 @@ impl BoundedTextureCache {
     }
 
     pub(crate) fn insert(&mut self, path: PathBuf, value: CacheEntry) {
-        if self.entries.contains_key(&path) {
-            self.entries.insert(path.clone(), value);
+        if let Some(previous) = self.entries.remove(&path) {
+            self.bytes -= texture_bytes(&previous);
             if let Some(pos) = self.order.iter().position(|p| p == &path) {
                 self.order.remove(pos);
             }
-            self.order.push_back(path);
-        } else {
-            if self.entries.len() >= MAX_TEXTURE_CACHE_SIZE {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.entries.remove(&oldest);
+        }
+        let added = texture_bytes(&value);
+        while !self.order.is_empty()
+            && (self.entries.len() >= self.max_entries || self.bytes + added > self.max_bytes)
+        {
+            if let Some(oldest) = self.order.pop_front() {
+                if let Some(evicted) = self.entries.remove(&oldest) {
+                    self.bytes -= texture_bytes(&evicted);
                 }
             }
-            self.entries.insert(path.clone(), value);
-            self.order.push_back(path);
         }
+        self.bytes += added;
+        self.entries.insert(path.clone(), value);
+        self.order.push_back(path);
     }
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+        self.bytes = 0;
     }
 }
 
@@ -575,5 +605,85 @@ mod path_tests {
         std::os::unix::fs::symlink(&fx.secret, hashed_file(&fx, url, ".png")).unwrap();
         let found = resolve_cached_asset_path_in(&fx.cache, url, &test_context());
         assert_eq!(found, None);
+    }
+}
+
+#[cfg(test)]
+mod texture_cache_tests {
+    use super::*;
+
+    /// A texture of `side` x `side` pixels: `side * side * 4` budgeted bytes.
+    fn texture(side: i32) -> CacheEntry {
+        let pixbuf = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, side, side)
+            .expect("allocate pixbuf");
+        gtk::gdk::Texture::for_pixbuf(&pixbuf)
+    }
+
+    fn path(name: &str) -> PathBuf {
+        PathBuf::from(name)
+    }
+
+    fn has(cache: &mut BoundedTextureCache, name: &str) -> bool {
+        cache.get(&path(name)).is_some()
+    }
+
+    #[test]
+    fn evicts_least_recently_used_entries_to_stay_within_the_byte_budget() {
+        // Room for two 16x16 textures (1 KiB each), not three.
+        let mut cache = BoundedTextureCache::with_limits(100, 2 * 1024);
+        cache.insert(path("a"), texture(16));
+        cache.insert(path("b"), texture(16));
+        assert!(has(&mut cache, "a"), "touch a so b is the oldest");
+        cache.insert(path("c"), texture(16));
+        assert!(!has(&mut cache, "b"));
+        assert!(has(&mut cache, "a") && has(&mut cache, "c"));
+        assert_eq!(cache.bytes, 2 * 1024);
+    }
+
+    #[test]
+    fn one_large_texture_evicts_as_many_entries_as_it_needs() {
+        let mut cache = BoundedTextureCache::with_limits(100, 4 * 1024);
+        for name in ["a", "b", "c"] {
+            cache.insert(path(name), texture(16));
+        }
+        // 32x32 is 4 KiB: the whole budget.
+        cache.insert(path("big"), texture(32));
+        assert_eq!(cache.entries.len(), 1);
+        assert!(has(&mut cache, "big"));
+        assert_eq!(cache.bytes, 4 * 1024);
+    }
+
+    #[test]
+    fn a_texture_over_the_budget_is_kept_alone() {
+        let mut cache = BoundedTextureCache::with_limits(100, 1024);
+        cache.insert(path("a"), texture(16));
+        cache.insert(path("huge"), texture(64));
+        assert!(!has(&mut cache, "a"));
+        assert!(has(&mut cache, "huge"));
+        cache.insert(path("b"), texture(16));
+        assert!(!has(&mut cache, "huge"));
+        assert_eq!(cache.bytes, 1024);
+    }
+
+    #[test]
+    fn replacing_an_entry_swaps_its_bytes_and_clear_resets_them() {
+        let mut cache = BoundedTextureCache::with_limits(100, 8 * 1024);
+        cache.insert(path("a"), texture(16));
+        cache.insert(path("a"), texture(32));
+        assert_eq!(cache.bytes, 4 * 1024);
+        assert_eq!(cache.entries.len(), 1);
+        cache.clear();
+        assert_eq!(cache.bytes, 0);
+        assert!(!has(&mut cache, "a"));
+    }
+
+    #[test]
+    fn the_entry_cap_still_applies() {
+        let mut cache = BoundedTextureCache::with_limits(2, usize::MAX);
+        for name in ["a", "b", "c"] {
+            cache.insert(path(name), texture(4));
+        }
+        assert!(!has(&mut cache, "a"));
+        assert!(has(&mut cache, "b") && has(&mut cache, "c"));
     }
 }
