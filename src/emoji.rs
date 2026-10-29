@@ -359,7 +359,10 @@ impl EmojiPickerModel {
         })
     }
 
+    /// Entries matching `query`, names starting with it first (as Slack
+    /// completes `:sm` to `smile`, not `flag-sm`), then by relevance band.
     fn ranked_entries(&self, query: &str) -> Vec<&EmojiEntry> {
+        let prefix = query.trim().to_lowercase();
         let query = SearchQuery::parse(query);
         let mut matches = self
             .entries()
@@ -370,7 +373,8 @@ impl EmojiPickerModel {
                     SearchField::new(&entry.name, PRIMARY_FIELD_WEIGHT),
                     SearchField::new(&entry.label, SECONDARY_FIELD_WEIGHT),
                 ])?;
-                Some((score.band(), index, entry))
+                let name_prefix = entry.name.to_lowercase().starts_with(&prefix);
+                Some(((name_prefix, score.band()), index, entry))
             })
             .collect::<Vec<_>>();
         matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
@@ -600,6 +604,18 @@ mod tests {
             matches.first().map(|entry| entry.name.as_str()),
             Some("parrot")
         );
+    }
+
+    #[test]
+    fn catalog_search_completes_name_prefixes_before_word_matches() {
+        let matches =
+            EmojiPickerModel::new(EmojiCatalog::new(&HashMap::new()).entries()).search("sm");
+
+        assert_eq!(
+            matches.first().map(|entry| entry.name.as_str()),
+            Some("smiley")
+        );
+        assert!(matches.iter().any(|entry| entry.name == "flag-sm"));
     }
 
     #[test]
