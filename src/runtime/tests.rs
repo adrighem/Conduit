@@ -10044,6 +10044,168 @@ fn cached_conversation_user_ids_selects_known_direct_message_members() {
     );
 }
 
+/// Serves `users.list` and records every requested API method.
+struct MethodCountingSlackServer {
+    address: std::net::SocketAddr,
+    methods: Arc<Mutex<Vec<String>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl MethodCountingSlackServer {
+    /// Stops the server and returns the methods requested so far.
+    fn finish(self) -> Vec<String> {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.thread.join().unwrap();
+        let methods = self.methods.lock().unwrap().clone();
+        methods
+    }
+}
+
+fn spawn_method_counting_slack_server() -> MethodCountingSlackServer {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let address = server.server_addr().to_ip().unwrap();
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_methods = methods.clone();
+    let thread_stop = stop.clone();
+    let thread = std::thread::spawn(move || {
+        while !thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(20)) else {
+                continue;
+            };
+            let method = request
+                .url()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            thread_methods.lock().unwrap().push(method.clone());
+            let body = if method == "users.list" {
+                r#"{"ok":true,"members":[{"id":"U0","name":"ada"},{"id":"U1","name":"bob"}]}"#
+            } else {
+                r#"{"ok":false,"error":"unexpected_method"}"#
+            };
+            request
+                .respond(tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                ))
+                .unwrap();
+        }
+    });
+    MethodCountingSlackServer {
+        address,
+        methods,
+        stop,
+        thread,
+    }
+}
+
+#[test]
+fn perf_guard_startup_user_names_use_one_users_list_and_no_users_info() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "conduit-user-directory-fan-out-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+        let workspace = WorkspaceReducerAdapter::default();
+        let (sender, _receiver) = runtime_event_channel();
+        let events = RuntimeEventSender {
+            sender,
+            session: SessionId::default().next(),
+            request: None,
+            fallback: OperationContext::new(
+                RuntimeOperation::Conversations,
+                RuntimeTarget::Workspace,
+            ),
+            workspace_patch_send_gate: None,
+        };
+        let server = spawn_method_counting_slack_server();
+        let mut slack = SlackApi::new(StoredToken {
+            access_token: "test-token".to_string(),
+            ..Default::default()
+        });
+        slack.api_base_url = format!("http://{}/api", server.address);
+
+        // A workspace with hundreds of cached direct message users.
+        let conversations = (0..300)
+            .map(|index| SlackConversation {
+                id: format!("D{index}"),
+                user: Some(format!("U{index}")),
+                is_im: Some(true),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let cached_names = (0..300)
+            .map(|index| (format!("U{index}"), format!("User {index}")))
+            .collect::<HashMap<_, _>>();
+        let store_option = Some(store.clone());
+
+        // Cold start, a reconnect refresh and a discovery all in one session.
+        for _ in 0..2 {
+            refresh_cached_conversation_user_names(
+                &events,
+                &slack,
+                &store_option,
+                &workspace,
+                &conversations,
+                &cached_names,
+            )
+            .await;
+        }
+        list_user_directory(
+            &events,
+            &slack,
+            &store_option,
+            &workspace,
+            USER_DIRECTORY_REUSE,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(server.finish(), vec!["users.list".to_string()]);
+
+        // A later session finds the persisted directory fresh and stays silent.
+        let fresh_workspace = WorkspaceReducerAdapter::default();
+        let server = spawn_method_counting_slack_server();
+        slack.api_base_url = format!("http://{}/api", server.address);
+        refresh_cached_conversation_user_names(
+            &events,
+            &slack,
+            &store_option,
+            &fresh_workspace,
+            &conversations,
+            &cached_names,
+        )
+        .await;
+        assert!(server.finish().is_empty());
+
+        let _ = std::fs::remove_dir_all(directory);
+    });
+}
+
+#[test]
+fn user_directory_freshness_honours_the_ttl_and_clock_rollback() {
+    let now = 10 * USER_DIRECTORY_TTL_MS;
+    assert!(!user_directory_is_fresh(None, now));
+    assert!(user_directory_is_fresh(Some(now - 1), now));
+    assert!(!user_directory_is_fresh(
+        Some(now - USER_DIRECTORY_TTL_MS),
+        now
+    ));
+    assert!(!user_directory_is_fresh(Some(now + 1), now));
+}
+
 fn channel(id: &str, latest: Option<&str>) -> SlackConversation {
     let mut conversation = SlackConversation {
         id: id.to_string(),

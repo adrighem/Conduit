@@ -67,6 +67,14 @@ const CHANNEL_HISTORY_PREFETCH_LIMIT: usize = 12;
 /// Prefetches in flight at once. Slack rate-limits per method, and every
 /// completed prefetch takes the store admission lock, so keep this small.
 const CHANNEL_HISTORY_PREFETCH_CONCURRENCY: usize = 3;
+/// A persisted user directory refreshed more recently than this is reused on
+/// startup and reconnect instead of paging `users.list` again.
+const USER_DIRECTORY_TTL_MS: i64 = 6 * 60 * 60 * 1000;
+/// A directory listed this recently is handed to discovery and the startup
+/// refresh as is, so racing callers share one `users.list`.
+const USER_DIRECTORY_REUSE: Duration = Duration::from_secs(10 * 60);
+const USER_DIRECTORY_OPERATION: &str = "user_directory";
+const USER_DIRECTORY_TARGET: &str = "workspace";
 const CONVERSATION_MEMBER_PAGE_LIMIT: usize = 25;
 const NAVIGATION_TASK_CONCURRENCY: usize = 2;
 const INTERACTIVE_TASK_CONCURRENCY: usize = 8;
@@ -1252,10 +1260,18 @@ struct WorkspaceReducerAdapter {
     coordinator: Arc<Mutex<WorkspaceCoordinator>>,
     attention_metrics: Arc<AttentionMetrics>,
     store_batch_admission: Arc<tokio::sync::Mutex<()>>,
+    user_directory_listing: Arc<tokio::sync::Mutex<Option<UserDirectoryListing>>>,
     pending_writes: Arc<Mutex<std::collections::VecDeque<PendingWorkspaceWrite>>>,
     read_flusher: Option<ReadFlusherHandle>,
     #[cfg(test)]
     history_completion_send_gate: Arc<Mutex<Option<Arc<TestWorkspacePatchSendGate>>>>,
+}
+
+/// The last `users.list` result, kept so concurrent callers share one listing.
+#[derive(Debug)]
+struct UserDirectoryListing {
+    users: Vec<SlackUser>,
+    listed_at: std::time::Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -4663,38 +4679,14 @@ async fn run_job_payload(
         }
         SyncJobPayload::MembershipSync { channel_id } => {
             if channel_id == "user_directory" {
-                let api = &connection.slack;
-                let users_base_revision = connection.workspace.revision();
-                let users = api.users().await?;
-                connection
-                    .workspace
-                    .apply_persisted_and_publish(
-                        connection.workspace_store.as_ref(),
-                        events,
-                        MutationOrigin::WebApi,
-                        WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
-                            users_base_revision,
-                            users,
-                        )),
-                    )
-                    .await?;
-                if let Some(store) = connection.workspace_store.as_ref() {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as i64;
-                    store
-                        .store_sync_freshness(
-                            "user_directory",
-                            "workspace",
-                            SyncFreshness {
-                                refreshed_at_ms: Some(now_ms),
-                                retry_count: 0,
-                                retry_after_ms: None,
-                            },
-                        )
-                        .await?;
-                }
+                list_user_directory(
+                    events,
+                    &connection.slack,
+                    &connection.workspace_store,
+                    &connection.workspace,
+                    USER_DIRECTORY_REUSE,
+                )
+                .await?;
             }
         }
     }
@@ -5156,20 +5148,14 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         }
         RuntimeCommand::DiscoverConversations => {
             let api = require_slack(context.slack)?;
-            let users_base_revision = context.workspace.revision();
-            let users = api.users().await?;
-            context
-                .workspace
-                .apply_persisted_and_publish(
-                    context.workspace_store.as_ref(),
-                    context.events,
-                    MutationOrigin::WebApi,
-                    WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(
-                        users_base_revision,
-                        users.clone(),
-                    )),
-                )
-                .await?;
+            let users = list_user_directory(
+                context.events,
+                api,
+                context.workspace_store,
+                context.workspace,
+                USER_DIRECTORY_REUSE,
+            )
+            .await?;
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationPeopleDiscovered(users));
@@ -8005,6 +7991,9 @@ async fn publish_prefetched_history_snapshot(
         .await
 }
 
+/// Slack's `users.list` already carries every cached DM user, so one listing
+/// replaces a `users.info` per user. Skipped while the persisted directory is
+/// fresh; users missing from the cache are loaded on demand by `LoadUser`.
 async fn refresh_cached_conversation_user_names(
     events: &RuntimeEventSender,
     api: &SlackApi,
@@ -8013,43 +8002,99 @@ async fn refresh_cached_conversation_user_names(
     conversations: &[SlackConversation],
     cached_user_names: &HashMap<String, String>,
 ) {
-    let user_ids = cached_conversation_user_ids(conversations, cached_user_names);
-    if user_ids.is_empty() {
+    if cached_conversation_user_ids(conversations, cached_user_names).is_empty() {
         return;
     }
-
-    let base_revision = workspace.revision();
-    let mut refreshed_users = Vec::new();
-    for user_id in user_ids {
-        match api.user(&user_id).await {
-            Ok(user) => {
-                refreshed_users.push(user);
+    if let Some(store) = workspace_store.as_ref() {
+        match store
+            .load_sync_freshness(USER_DIRECTORY_OPERATION, USER_DIRECTORY_TARGET)
+            .await
+        {
+            Ok(freshness) => {
+                let refreshed_at_ms = freshness.and_then(|freshness| freshness.refreshed_at_ms);
+                if user_directory_is_fresh(refreshed_at_ms, unix_now_ms()) {
+                    return;
+                }
             }
             Err(error) => crate::debug::log(
-                "runtime",
-                &format!("UserNameRefreshFailed user_id={user_id} error={error:#}"),
+                "store",
+                &format!("UserDirectoryFreshnessLoadFailed error={error:#}"),
             ),
         }
     }
-
-    if refreshed_users.is_empty() {
-        return;
+    if let Err(error) = list_user_directory(
+        events,
+        api,
+        workspace_store,
+        workspace,
+        USER_DIRECTORY_REUSE,
+    )
+    .await
+    {
+        crate::debug::log(
+            "runtime",
+            &format!("UserDirectoryRefreshFailed error={error:#}"),
+        );
     }
+}
 
-    if let Err(error) = workspace
+fn user_directory_is_fresh(refreshed_at_ms: Option<i64>, now_ms: i64) -> bool {
+    refreshed_at_ms
+        .is_some_and(|refreshed| (0..USER_DIRECTORY_TTL_MS).contains(&(now_ms - refreshed)))
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// Lists the workspace users, persists them and records the refresh time.
+/// Concurrent callers queue on the listing lock and reuse a listing younger
+/// than `reuse` rather than paging `users.list` again.
+async fn list_user_directory(
+    events: &RuntimeEventSender,
+    api: &SlackApi,
+    workspace_store: &Option<WorkspaceStore>,
+    workspace: &WorkspaceReducerAdapter,
+    reuse: Duration,
+) -> Result<Vec<SlackUser>> {
+    let mut listing = workspace.user_directory_listing.lock().await;
+    if let Some(listing) = listing
+        .as_ref()
+        .filter(|listing| listing.listed_at.elapsed() < reuse)
+    {
+        return Ok(listing.users.clone());
+    }
+    let base_revision = workspace.revision();
+    let users = api.users().await?;
+    workspace
         .apply_persisted_and_publish(
             workspace_store.as_ref(),
             events,
             MutationOrigin::WebApi,
-            WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(base_revision, refreshed_users)),
+            WorkspaceMutation::UsersSnapshot(SnapshotEnvelope::new(base_revision, users.clone())),
         )
-        .await
-    {
-        crate::debug::log(
-            "store",
-            &format!("ConversationUserProjectionStoreFailed error={error:#}"),
-        );
+        .await?;
+    if let Some(store) = workspace_store.as_ref() {
+        store
+            .store_sync_freshness(
+                USER_DIRECTORY_OPERATION,
+                USER_DIRECTORY_TARGET,
+                SyncFreshness {
+                    refreshed_at_ms: Some(unix_now_ms()),
+                    retry_count: 0,
+                    retry_after_ms: None,
+                },
+            )
+            .await?;
     }
+    *listing = Some(UserDirectoryListing {
+        users: users.clone(),
+        listed_at: std::time::Instant::now(),
+    });
+    Ok(users)
 }
 
 fn handle_conversations_load_error(events: &RuntimeEventSender, error: anyhow::Error) {
