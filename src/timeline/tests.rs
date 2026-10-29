@@ -3022,6 +3022,52 @@ mod graphical {
     }
 
     #[test]
+    fn code_block_keeps_its_height_when_the_highlighted_view_swaps_in() {
+        run_gtk_test(|| {
+            let long = "let total = items.iter().map(|item| item.price * item.quantity)";
+            for lines in [1, 2, 9, 12, 30, 120] {
+                let code = (0..lines)
+                    .map(|i| format!("{long}.sum::<u64>() + {i};"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let block = build_code_block_widget(&code, Some("rust"));
+                let width = 420;
+                let window = gtk::Window::new();
+                window.set_default_size(width, 1400);
+                window.set_child(Some(&block));
+                // The placeholder, as the first layout sees it.
+                let before = block.measure(Orientation::Vertical, width).1;
+                window.present();
+                pump_until(2000, || {
+                    descendants(&block)
+                        .iter()
+                        .any(|widget| widget.is::<sourceview5::View>())
+                });
+                assert!(
+                    descendants(&block)
+                        .iter()
+                        .any(|widget| widget.is::<sourceview5::View>()),
+                    "the view swaps in"
+                );
+                // A TextView reports its height once it is allocated and its
+                // lines are validated.
+                let view = descendants(&block)
+                    .into_iter()
+                    .find_map(|widget| widget.downcast::<sourceview5::View>().ok())
+                    .expect("highlighted view");
+                pump_until(2000, || view.height() > 0);
+                pump(100);
+                let after = block.measure(Orientation::Vertical, width).1;
+                assert!(
+                    (before - after).abs() <= 1,
+                    "{lines} lines: placeholder {before}px, view {after}px"
+                );
+                window.destroy();
+            }
+        });
+    }
+
+    #[test]
     fn perf_guard_code_blocks_build_source_views_only_once_shown() {
         run_gtk_test(|| {
             let code = "fn main() {\n    println!(\"hi\");\n}";
