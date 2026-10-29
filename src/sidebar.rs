@@ -1170,15 +1170,49 @@ pub fn conversation_picker_sections_with_statuses(
 }
 
 fn sort_picker_items(
-    items: &mut [ConversationPickerItem],
+    items: &mut Vec<ConversationPickerItem>,
     query: Option<&SearchQuery>,
     participant_coverage: Option<&HashMap<String, ParticipantCoverage>>,
 ) {
-    items.sort_by(|left, right| {
-        compare_relevance(&left.row, &right.row, query)
-            .then_with(|| compare_ranking(&left.row, &right.row, participant_coverage))
-            .then_with(|| compare_title(&left.row, &right.row))
-    });
+    sort_by_relevance_then_title(
+        items,
+        |item| &item.row,
+        query,
+        |left, right| compare_ranking(left, right, participant_coverage),
+    );
+}
+
+/// Sorts by match band, then `rank`, then title. The band and the title key
+/// are computed once per row, not once per comparison: scoring and
+/// lowercasing thousands of discovered rows inside the comparator made every
+/// picker rebuild take hundreds of milliseconds.
+fn sort_by_relevance_then_title<T>(
+    items: &mut Vec<T>,
+    row: impl Fn(&T) -> &SidebarRowModel,
+    query: Option<&SearchQuery>,
+    rank: impl Fn(&SidebarRowModel, &SidebarRowModel) -> std::cmp::Ordering,
+) {
+    let query = query.filter(|query| !query.is_empty());
+    let mut keyed = std::mem::take(items)
+        .into_iter()
+        .map(|item| {
+            let item_row = row(&item);
+            let band = query
+                .and_then(|query| item_row.match_score(query))
+                .map_or(0, MatchScore::band);
+            (band, title_sort_key(&item_row.title), item)
+        })
+        .collect::<Vec<_>>();
+    keyed.sort_by(
+        |(left_band, left_title, left), (right_band, right_title, right)| {
+            let (left, right) = (row(left), row(right));
+            right_band
+                .cmp(left_band)
+                .then_with(|| rank(left, right))
+                .then_with(|| (left_title, &left.id).cmp(&(right_title, &right.id)))
+        },
+    );
+    items.extend(keyed.into_iter().map(|(_, _, item)| item));
 }
 
 fn build_sidebar_sections_from_rows(
@@ -1400,12 +1434,8 @@ fn section(kind: SidebarSectionKind, rows: Vec<SidebarRowModel>) -> Option<Sideb
     })
 }
 
-fn sort_section_rows(rows: &mut [SidebarRowModel], query: Option<&SearchQuery>) {
-    rows.sort_by(|left, right| {
-        compare_relevance(left, right, query)
-            .then_with(|| compare_attention(left, right))
-            .then_with(|| compare_title(left, right))
-    });
+fn sort_section_rows(rows: &mut Vec<SidebarRowModel>, query: Option<&SearchQuery>) {
+    sort_by_relevance_then_title(rows, |row| row, query, compare_attention);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1476,15 +1506,16 @@ fn user_matches_query(
 }
 
 fn sort_search_rows(
-    rows: &mut [SidebarRowModel],
+    rows: &mut Vec<SidebarRowModel>,
     query: &SearchQuery,
     participant_coverage: &HashMap<String, ParticipantCoverage>,
 ) {
-    rows.sort_by(|left, right| {
-        compare_relevance(left, right, Some(query))
-            .then_with(|| compare_ranking(left, right, Some(participant_coverage)))
-            .then_with(|| compare_title(left, right))
-    });
+    sort_by_relevance_then_title(
+        rows,
+        |row| row,
+        Some(query),
+        |left, right| compare_ranking(left, right, Some(participant_coverage)),
+    );
 }
 
 /// Ranking after match quality, shared by the conversation switcher, the
@@ -1543,10 +1574,6 @@ fn compare_draft(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::O
     right.has_draft.cmp(&left.has_draft)
 }
 
-fn compare_title(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::Ordering {
-    (title_sort_key(&left.title), &left.id).cmp(&(title_sort_key(&right.title), &right.id))
-}
-
 fn compare_recency(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp::Ordering {
     match (&left.latest_ts, &right.latest_ts) {
         (Some(left_ts), Some(right_ts)) => {
@@ -1564,21 +1591,17 @@ fn compare_recency(left: &SidebarRowModel, right: &SidebarRowModel) -> std::cmp:
     }
 }
 
-fn compare_relevance(
-    left: &SidebarRowModel,
-    right: &SidebarRowModel,
-    query: Option<&SearchQuery>,
-) -> std::cmp::Ordering {
-    let Some(query) = query.filter(|query| !query.is_empty()) else {
-        return std::cmp::Ordering::Equal;
-    };
-    let left_band = left.match_score(query).map_or(0, MatchScore::band);
-    let right_band = right.match_score(query).map_or(0, MatchScore::band);
-    right_band.cmp(&left_band)
+fn title_sort_key(title: &str) -> String {
+    #[cfg(test)]
+    TITLE_SORT_KEYS.with(|count| count.set(count.get() + 1));
+    title.trim_start_matches('#').trim_start().to_lowercase()
 }
 
-fn title_sort_key(title: &str) -> String {
-    title.trim_start_matches('#').trim_start().to_lowercase()
+#[cfg(test)]
+thread_local! {
+    /// Counts sort-key computations so perf guards can assert they stay
+    /// linear in the number of rows.
+    static TITLE_SORT_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -3980,5 +4003,36 @@ mod tests {
                 inserted: 1,
             }]
         );
+    }
+
+    #[test]
+    fn perf_guard_picker_sort_keys_are_computed_once_per_row() {
+        let channels = (0..2_000)
+            .map(|index| channel(&format!("C{index:05}"), &format!("Team-{}", 2_000 - index)))
+            .collect::<Vec<_>>();
+        let users = (0..2_000)
+            .map(|index| SlackUser {
+                id: Some(format!("U{index:05}")),
+                real_name: Some(format!("Person {}", 2_000 - index)),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let rows = channels.len() + users.len();
+
+        for query in ["", "e"] {
+            TITLE_SORT_KEYS.with(|count| count.set(0));
+            let results =
+                conversation_picker_sections(&[], &channels, &users, &HashMap::new(), None, query)
+                    .search_results
+                    .expect("picker should produce flat results");
+            let keys = TITLE_SORT_KEYS.with(std::cell::Cell::get);
+
+            assert_eq!(results.len(), rows, "query {query:?}");
+            // One key per row in its section sort and one in the merged sort.
+            assert!(
+                keys <= 2 * rows,
+                "query {query:?} computed {keys} sort keys for {rows} rows"
+            );
+        }
     }
 }

@@ -484,7 +484,7 @@ fn sidebar_list_store_splice_preserves_selection_by_model_identity() {
 }
 
 #[test]
-fn picker_population_flattens_sections_and_preserves_bounded_order() {
+fn picker_population_flattens_sections_in_order() {
     let sections = ConversationPickerSections {
         conversations: (0..30)
             .map(|index| picker_item(&format!("C{index}"), &format!("Channel {index}")))
@@ -495,7 +495,7 @@ fn picker_population_flattens_sections_and_preserves_bounded_order() {
     };
     let entries = conversation_picker_population_entries(&sections);
     assert!(matches!(
-        entries.front(),
+        entries.first(),
         Some(ConversationPickerListEntry::Header(title)) if title == "Conversations"
     ));
     assert!(entries.iter().any(
@@ -504,19 +504,11 @@ fn picker_population_flattens_sections_and_preserves_bounded_order() {
     assert!(entries.iter().any(
         |entry| matches!(entry, ConversationPickerListEntry::Header(title) if title == "People")
     ));
-
-    let expected = entries.iter().cloned().collect::<Vec<_>>();
-    let mut population = ConversationPickerPopulation::new(7, entries);
-    let mut actual = Vec::new();
-    while let Some(batch) = population.next_batch(7) {
-        assert!(batch.len() <= PICKER_POPULATION_BATCH_SIZE);
-        actual.extend(batch);
-    }
-    assert_eq!(actual, expected);
+    assert_eq!(entries.len(), 3 + 30 + 1 + 1);
 }
 
 #[test]
-fn picker_population_rejects_stale_generation_without_appending() {
+fn picker_population_lists_search_results_without_headers() {
     let sections = ConversationPickerSections {
         search_results: Some(vec![picker_item("C1", "General")]),
         ..Default::default()
@@ -525,10 +517,6 @@ fn picker_population_rejects_stale_generation_without_appending() {
     assert!(entries
         .iter()
         .all(|entry| matches!(entry, ConversationPickerListEntry::Item(_))));
-
-    let mut population = ConversationPickerPopulation::new(4, entries);
-    assert_eq!(population.next_batch(5), None);
-    assert!(population.is_empty());
 }
 
 #[test]
@@ -1209,20 +1197,6 @@ fn earliest_unread_ts_is_none_for_empty_messages() {
 }
 
 #[test]
-fn sidebar_row_action_lookup_ignores_unregistered_rows() {
-    let action = SidebarRowAction {
-        channel_id: "C123".to_string(),
-        title: "#general".to_string(),
-        action: ConversationPickerAction::OpenConversation,
-    };
-    let mut actions = HashMap::new();
-    actions.insert(4, action.clone());
-
-    assert_eq!(sidebar_row_action_for_index(&actions, 3), None);
-    assert_eq!(sidebar_row_action_for_index(&actions, 4), Some(action));
-}
-
-#[test]
 fn sidebar_section_state_toggles_independently() {
     let mut collapsed = HashSet::from([SidebarSectionKind::Channels]);
 
@@ -1427,7 +1401,7 @@ fn user_projection_invalidations_target_only_affected_surfaces() {
         &["U123".to_string()],
         Some("U999"),
         Some("D123"),
-        false,
+        None,
     );
     assert!(dm_flags.contains(UiInvalidations::SIDEBAR));
     assert!(dm_flags.contains(UiInvalidations::TITLE));
@@ -1438,7 +1412,7 @@ fn user_projection_invalidations_target_only_affected_surfaces() {
         &["U456".to_string()],
         None,
         Some("C123"),
-        false,
+        None,
     );
     assert!(group_flags.contains(UiInvalidations::SIDEBAR));
     assert!(!group_flags.contains(UiInvalidations::TITLE));
@@ -1448,13 +1422,36 @@ fn user_projection_invalidations_target_only_affected_surfaces() {
         &["U999".to_string()],
         Some("U999"),
         Some("C123"),
-        false,
+        None,
     );
     assert_eq!(current_user_flags, UiInvalidations::TITLE);
 
-    let picker_flags =
-        user_projection_invalidations(&conversations, &["U000".to_string()], None, None, true);
+    let picker_flags = user_projection_invalidations(
+        &conversations,
+        &["U000".to_string()],
+        None,
+        None,
+        Some(true),
+    );
     assert_eq!(picker_flags, UiInvalidations::PICKER);
+
+    let known_only_picker_flags = user_projection_invalidations(
+        &conversations,
+        &["U000".to_string()],
+        None,
+        None,
+        Some(false),
+    );
+    assert!(known_only_picker_flags.is_empty());
+
+    let known_only_dm_flags = user_projection_invalidations(
+        &conversations,
+        &["U123".to_string()],
+        None,
+        None,
+        Some(false),
+    );
+    assert!(known_only_dm_flags.contains(UiInvalidations::PICKER));
 }
 
 #[test]
