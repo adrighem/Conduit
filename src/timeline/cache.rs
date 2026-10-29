@@ -695,8 +695,6 @@ mod texture_cache_tests {
 /// and decodes the same bytes, so a cache prune or atomic rename between
 /// check and decode cannot hand the loader another file. Results come back
 /// to the GTK thread, which alone fills [`TEXTURE_CACHE`] and paints.
-// Callers arrive with the next commit.
-#[allow(dead_code)]
 pub(crate) mod decode {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
@@ -706,6 +704,8 @@ pub(crate) mod decode {
     use std::rc::{Rc, Weak};
     use std::time::{Duration, Instant};
 
+    use gtk::prelude::*;
+    use gtk::subclass::prelude::*;
     use gtk::{gdk, gio, glib};
 
     use super::TEXTURE_CACHE;
@@ -1177,6 +1177,128 @@ pub(crate) mod decode {
                 scheduler.reset();
             }
         });
+    }
+
+    mod imp {
+        use std::cell::{Cell, RefCell};
+
+        use gtk::prelude::*;
+        use gtk::subclass::prelude::*;
+        use gtk::{gdk, glib};
+
+        #[derive(Default)]
+        pub struct DeferredTexture {
+            pub(super) texture: RefCell<Option<gdk::Texture>>,
+            /// Size the image's header declares, shown until it decodes.
+            pub(super) declared: Cell<(i32, i32)>,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for DeferredTexture {
+            const NAME: &'static str = "ConduitDeferredTexture";
+            type Type = super::DeferredTexture;
+            type Interfaces = (gdk::Paintable,);
+        }
+
+        impl ObjectImpl for DeferredTexture {}
+
+        impl PaintableImpl for DeferredTexture {
+            fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
+                if let Some(texture) = self.texture.borrow().as_ref() {
+                    texture.snapshot(snapshot, width, height);
+                }
+            }
+
+            fn intrinsic_width(&self) -> i32 {
+                self.texture
+                    .borrow()
+                    .as_ref()
+                    .map_or(self.declared.get().0, |texture| texture.width())
+            }
+
+            fn intrinsic_height(&self) -> i32 {
+                self.texture
+                    .borrow()
+                    .as_ref()
+                    .map_or(self.declared.get().1, |texture| texture.height())
+            }
+        }
+    }
+
+    glib::wrapper! {
+        /// A static image that paints nothing at its declared size until its
+        /// texture arrives, then paints in place: a picture showing it keeps
+        /// its layout and its row is never rebound.
+        pub struct DeferredTexture(ObjectSubclass<imp::DeferredTexture>)
+            @implements gdk::Paintable;
+    }
+
+    impl DeferredTexture {
+        fn new(declared: (i32, i32)) -> Self {
+            let paintable: Self = glib::Object::new();
+            paintable.imp().declared.set(declared);
+            paintable
+        }
+
+        pub(crate) fn texture(&self) -> Option<gdk::Texture> {
+            self.imp().texture.borrow().clone()
+        }
+
+        fn set_texture(&self, texture: &gdk::Texture) {
+            let before = (self.intrinsic_width(), self.intrinsic_height());
+            self.imp().texture.replace(Some(texture.clone()));
+            if before != (texture.width(), texture.height()) {
+                // Header unknown or wrong: the one case that relayouts.
+                self.invalidate_size();
+            }
+            self.invalidate_contents();
+        }
+    }
+
+    /// A picture of the static image at `path`. A cached texture shows at
+    /// once; otherwise the picture holds a [`DeferredTexture`] sized from the
+    /// image header and requests the decode only while it is mapped. Unmapping
+    /// makes the request stale, and mapping again requests it anew.
+    pub(crate) fn deferred_texture_picture(path: &Path) -> gtk::Picture {
+        if let Some(texture) = TEXTURE_CACHE.with(|cache| cache.borrow_mut().get(path)) {
+            return gtk::Picture::for_paintable(&texture);
+        }
+        if texture_failed(path) {
+            // Decoding again would not help.
+            return gtk::Picture::new();
+        }
+        let declared = crate::image_header::declared_dimensions(path)
+            .and_then(|(width, height)| {
+                Some((i32::try_from(width).ok()?, i32::try_from(height).ok()?))
+            })
+            .unwrap_or((0, 0));
+        let paintable = DeferredTexture::new(declared);
+        let picture = gtk::Picture::for_paintable(&paintable);
+        let ticket = DecodeTicket::default();
+        let weak = paintable.downgrade();
+        let path = path.to_path_buf();
+        let on_map = ticket.clone();
+        picture.connect_map(move |_| request_into(&weak, &path, &on_map));
+        picture.connect_unmap(move |_| ticket.invalidate());
+        picture
+    }
+
+    fn request_into(weak: &glib::WeakRef<DeferredTexture>, path: &Path, ticket: &DecodeTicket) {
+        let Some(paintable) = weak.upgrade() else {
+            return;
+        };
+        if paintable.texture().is_some() {
+            return;
+        }
+        let target = weak.clone();
+        let requested = request_texture(path, ticket, move |texture| {
+            if let Some(paintable) = target.upgrade() {
+                paintable.set_texture(texture);
+            }
+        });
+        if let Requested::Ready(texture) = requested {
+            paintable.set_texture(&texture);
+        }
     }
 
     /// Replaces this thread's scheduler with a fresh one on `executor`.

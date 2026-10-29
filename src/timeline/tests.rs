@@ -12,6 +12,7 @@ use crate::message_markup::MessageRenderContext;
 use crate::models::{
     SlackAttachment, SlackAttachmentField, SlackFile, SlackMessage, SlackReaction,
 };
+use crate::timeline::cache::decode;
 
 #[test]
 fn fit_within_keeps_aspect_ratio() {
@@ -1430,6 +1431,199 @@ fn perf_guard_re_render_rebinds_only_rows_whose_inputs_changed() {
         view.set_messages(&messages, &renamed, None);
         pump_main_context(50);
         assert_eq!(rebound_rows(&view, &before).len(), before.len());
+        window.destroy();
+    });
+}
+
+type TextureExecutor = decode::ManualExecutor<decode::TextureKey, gtk::gdk::Texture>;
+
+/// Runs static texture decodes on a manual executor until dropped.
+struct ManualDecodes(Rc<TextureExecutor>);
+
+impl ManualDecodes {
+    fn install() -> Self {
+        clear_timeline_view_caches();
+        let executor = TextureExecutor::new();
+        decode::install_texture_executor_for_tests(executor.clone());
+        Self(executor)
+    }
+
+    /// Decodes everything running, and whatever that lets start, as the
+    /// workers would. Returns the keys in completion order.
+    fn finish_all(&self) -> Vec<decode::TextureKey> {
+        let mut finished = Vec::new();
+        while let Some(key) = self.0.running().first().cloned() {
+            assert!(finished.len() < 1000, "decodes keep coming");
+            self.0.complete(0, decode::decode_texture_file(&key.path));
+            finished.push(key);
+        }
+        finished
+    }
+}
+
+impl Drop for ManualDecodes {
+    fn drop(&mut self) {
+        decode::reset_texture_decoder_for_tests();
+    }
+}
+
+/// A directory inside the image asset cache, where row binds accept files.
+struct AssetCacheTestDir(PathBuf);
+
+impl AssetCacheTestDir {
+    fn new(prefix: &str) -> Self {
+        let dir = crate::config::image_asset_cache_dir()
+            .join(format!("conduit-test-{prefix}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("asset cache test dir");
+        Self(dir)
+    }
+}
+
+impl Drop for AssetCacheTestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Pictures under `root` that wait on, or show, an off-thread decode.
+fn deferred_pictures(root: &Widget) -> Vec<(Picture, decode::DeferredTexture)> {
+    descendants(root)
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<Picture>().ok())
+        .filter_map(|picture| {
+            let deferred = picture
+                .paintable()
+                .and_downcast::<decode::DeferredTexture>()?;
+            Some((picture, deferred))
+        })
+        .collect()
+}
+
+#[test]
+fn perf_guard_binding_timeline_rows_decodes_no_static_images_on_the_gtk_thread() {
+    run_gtk_test(|| {
+        let decodes = ManualDecodes::install();
+        let assets = AssetCacheTestDir::new("decode-guard");
+        let emoji_dir = TempTestDir::new("decode-guard-emoji");
+        let emoji_path = emoji_dir.path().join("guard.png");
+        save_test_image(&emoji_path, "png", 64, 64);
+        let emoji_url = "https://example.com/decode-guard-emoji.png".to_string();
+        crate::emoji_picker_window::invalidate_or_set_custom_emoji_cached_file(
+            &emoji_url,
+            emoji_path.clone(),
+        );
+        let mut ctx = test_context();
+        ctx.custom_emojis = Arc::new(HashMap::from([("guard".to_string(), emoji_url)]));
+        let messages = (0..60)
+            .rev()
+            .map(|i| {
+                let mut message = SlackMessage {
+                    ts: format!("1700000{i:03}.000100"),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("message {i} :guard: here")),
+                    ..Default::default()
+                };
+                if i % 2 == 0 {
+                    let url = format!("https://files.slack.com/files-pri/T1-F{i}/photo.png");
+                    let path = assets.0.join(format!("photo-{i}.png"));
+                    save_test_image(&path, "png", 40 + i, 30);
+                    ctx.image_assets.insert(url.clone(), path);
+                    message.files = Some(vec![SlackFile {
+                        id: Some(format!("F{i}")),
+                        mimetype: Some("image/png".to_string()),
+                        url_private: Some(url),
+                        ..Default::default()
+                    }]);
+                }
+                message
+            })
+            .collect::<Vec<_>>();
+        let view = NativeTimelineView::new();
+        let window = gtk::Window::new();
+        window.set_default_size(400, 500);
+        window.set_child(Some(view.widget()));
+        window.present();
+
+        let before = crate::debug::IMAGE_DECODES.get();
+        view.set_messages(&messages, &ctx, None);
+        pump_main_context(300);
+        assert_eq!(
+            crate::debug::IMAGE_DECODES.get() - before,
+            0,
+            "binding rows must leave static decodes to the workers"
+        );
+        let running = decodes.0.running();
+        assert!(
+            (1..=decode::MAX_IN_FLIGHT).contains(&running.len()),
+            "mapped pictures request decodes, a few at a time: {running:?}"
+        );
+
+        // Completion paints in place: no row is rebound.
+        let rows = bound_row_widgets(&view);
+        let finished = decodes.finish_all();
+        pump_main_context(50);
+        assert_eq!(rebound_rows(&view, &rows), Vec::<String>::new());
+        let emoji_decodes = finished.iter().filter(|key| key.path == emoji_path).count();
+        assert_eq!(emoji_decodes, 1, "one decode serves every inline emoji");
+        let pictures: Vec<_> = rows
+            .iter()
+            .flat_map(|(_, row)| deferred_pictures(row))
+            .filter(|(picture, _)| picture.is_mapped())
+            .collect();
+        assert!(!pictures.is_empty(), "rows show deferred pictures");
+        for (_, deferred) in &pictures {
+            assert!(
+                deferred.texture().is_some(),
+                "no visible image stays pending"
+            );
+        }
+        window.destroy();
+    });
+}
+
+#[test]
+fn deferred_picture_decodes_only_while_mapped() {
+    run_gtk_test(|| {
+        let decodes = ManualDecodes::install();
+        let temp_dir = TempTestDir::new("deferred-mapped");
+        let path = temp_dir.path().join("photo.png");
+        save_test_image(&path, "png", 120, 80);
+
+        let picture = decode::deferred_texture_picture(&path);
+        let deferred = picture
+            .paintable()
+            .and_downcast::<decode::DeferredTexture>()
+            .expect("deferred paintable");
+        // Sized from the header before any decode, so nothing relayouts.
+        assert_eq!(
+            (deferred.intrinsic_width(), deferred.intrinsic_height()),
+            (120, 80)
+        );
+        assert!(
+            decodes.0.running().is_empty(),
+            "unmapped: nothing requested"
+        );
+
+        let window = gtk::Window::new();
+        window.set_child(Some(&picture));
+        window.present();
+        pump_main_context_until(500, || !decodes.0.running().is_empty());
+        assert_eq!(decodes.0.running().len(), 1);
+
+        // Unmapped before the decode lands: cached, not applied.
+        window.set_visible(false);
+        decodes.finish_all();
+        assert!(deferred.texture().is_none());
+
+        // Mapped again: served from the cache at once, no second decode.
+        window.present();
+        pump_main_context_until(500, || deferred.texture().is_some());
+        assert!(deferred.texture().is_some());
+        assert!(decodes.0.running().is_empty());
+        assert_eq!(
+            (deferred.intrinsic_width(), deferred.intrinsic_height()),
+            (120, 80)
+        );
         window.destroy();
     });
 }

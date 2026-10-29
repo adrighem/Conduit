@@ -50,12 +50,11 @@ fn declared_size(image: &MessageImage) -> Option<(u32, u32)> {
     Some((image.width?, image.height?))
 }
 
+/// Size the file's own header declares. Other formats fall back to Slack's
+/// declared size, then [`PLACEHOLDER_SIZE`]: gdk-pixbuf's probe would block
+/// the GTK thread on a glycin subprocess.
 fn file_size(path: &Path) -> Option<(u32, u32)> {
-    if let Some(size) = crate::image_header::declared_dimensions(path) {
-        return Some(size);
-    }
-    let (_, width, height) = crate::animated_image::file_info(path)?;
-    Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+    crate::image_header::declared_dimensions(path)
 }
 
 /// The image URL (the cache key, not the network URL) when the window will
