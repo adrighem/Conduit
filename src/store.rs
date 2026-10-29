@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
-    slack_timestamp_is_after, SlackConversation, SlackMessage, SlackUser, SlackUserStatus,
+    slack_timestamp_is_after, SlackConversation, SlackMessage, SlackUser, SlackUserGroup,
+    SlackUserStatus,
 };
 use crate::slack::SidebarTheme;
 use crate::slack_message_wire::normalize_cached_messages;
@@ -40,6 +41,10 @@ const LEGACY_CONVERSATION_READ_KEYS: [&str; 5] = [
 const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
 /// Channels from the last completed discovery sweep.
 const DISCOVERED_CHANNEL_KIND: &str = "discovered_channel";
+/// Full `users.list` records (with the bot and deleted flags the pickers
+/// need), written with the `user_directory` refresh time.
+const DISCOVERED_USER_KIND: &str = "discovered_user";
+const DISCOVERED_USER_GROUP_KIND: &str = "discovered_user_group";
 /// Channels resolved on demand (`conversations.info`), such as archived ones
 /// the sweep skips; sweeps never replace or drop these.
 const RESOLVED_CHANNEL_KIND: &str = "resolved_channel";
@@ -1422,6 +1427,50 @@ impl WorkspaceStore {
             .map(|channel| (channel.id.clone(), channel))
             .collect();
         self.store_kind_map(RESOLVED_CHANNEL_KIND, values, false)
+            .await
+    }
+
+    pub(crate) async fn load_discovered_users(&self) -> Result<Vec<SlackUser>> {
+        Ok(self
+            .load_kind_map::<SlackUser>(DISCOVERED_USER_KIND)
+            .await?
+            .into_values()
+            .collect())
+    }
+
+    /// Replaces the stored `users.list` records.
+    pub(crate) async fn replace_discovered_users(&self, users: &[SlackUser]) -> Result<()> {
+        let values = users
+            .iter()
+            .filter_map(|user| {
+                Some((
+                    user.id.clone().filter(|id| !id.trim().is_empty())?,
+                    user.clone(),
+                ))
+            })
+            .collect();
+        self.store_kind_map(DISCOVERED_USER_KIND, values, true)
+            .await
+    }
+
+    pub(crate) async fn load_discovered_user_groups(&self) -> Result<Vec<SlackUserGroup>> {
+        Ok(self
+            .load_kind_map::<SlackUserGroup>(DISCOVERED_USER_GROUP_KIND)
+            .await?
+            .into_values()
+            .collect())
+    }
+
+    /// Replaces the stored user groups.
+    pub(crate) async fn replace_discovered_user_groups(
+        &self,
+        groups: &[SlackUserGroup],
+    ) -> Result<()> {
+        let values = groups
+            .iter()
+            .map(|group| (group.id.clone(), group.clone()))
+            .collect();
+        self.store_kind_map(DISCOVERED_USER_GROUP_KIND, values, true)
             .await
     }
 
