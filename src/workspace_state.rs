@@ -13,6 +13,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
@@ -85,9 +86,50 @@ impl WorkspaceLifecycle {
     }
 }
 
+/// How long discovered channels, people and user groups stay valid before the
+/// next picker or completion use lists them again. `conversations.list` pages
+/// through every channel, so it must not run on each open.
+pub(crate) const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
+/// An unanswered discovery request is repeated after this long.
+const DISCOVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Decides when a discovery request is worth sending: once per `DISCOVERY_TTL`
+/// after a completed listing, and never while one is in flight.
+#[derive(Debug, Default)]
+pub(crate) struct DiscoveryGate {
+    completed_at: Cell<Option<Instant>>,
+    requested_at: Cell<Option<Instant>>,
+}
+
+impl DiscoveryGate {
+    /// Returns whether to send a request now, recording it as in flight.
+    pub(crate) fn should_request(&self, now: Instant) -> bool {
+        let within = |at: Option<Instant>, window: Duration| {
+            at.is_some_and(|at| now.saturating_duration_since(at) < window)
+        };
+        if within(self.completed_at.get(), DISCOVERY_TTL)
+            || within(self.requested_at.get(), DISCOVERY_RETRY_AFTER)
+        {
+            return false;
+        }
+        self.requested_at.set(Some(now));
+        true
+    }
+
+    pub(crate) fn complete(&self, now: Instant) {
+        self.completed_at.set(Some(now));
+    }
+
+    pub(crate) fn reset(&self) {
+        self.completed_at.set(None);
+        self.requested_at.set(None);
+    }
+}
+
 /// Consolidated user and user-group directory projections derived from the workspace session.
 #[derive(Debug, Default)]
 pub(crate) struct UserDirectoryState {
+    pub(crate) discovery: DiscoveryGate,
     pub(crate) discovered_users: RefCell<Vec<SlackUser>>,
     pub(crate) user_groups: RefCell<Vec<SlackUserGroup>>,
     pub(crate) user_names: RefCell<Arc<HashMap<String, String>>>,
@@ -103,6 +145,7 @@ pub(crate) struct UserDirectoryState {
 
 impl UserDirectoryState {
     pub(crate) fn reset(&self) {
+        self.discovery.reset();
         self.discovered_users.borrow_mut().clear();
         self.user_groups.borrow_mut().clear();
         self.reset_projections();
@@ -3551,5 +3594,36 @@ mod tests {
             .borrow()
             .is_empty());
         assert!(session.user_directory.pending_user_ids.borrow().is_empty());
+    }
+
+    #[test]
+    fn perf_guard_discovery_requests_once_per_ttl_and_never_concurrently() {
+        let gate = DiscoveryGate::default();
+        let start = Instant::now();
+
+        // First use requests; reconnects and repeated opens while it is in
+        // flight do not.
+        assert!(gate.should_request(start));
+        assert!(!gate.should_request(start + Duration::from_secs(1)));
+        assert!(!gate.should_request(start + DISCOVERY_RETRY_AFTER - Duration::from_secs(1)));
+
+        // A lost request is retried, a completed listing is trusted for the TTL.
+        assert!(gate.should_request(start + DISCOVERY_RETRY_AFTER));
+        let done = start + Duration::from_secs(40);
+        gate.complete(done);
+        for opens in 0..100 {
+            assert!(!gate.should_request(done + Duration::from_secs(opens * 30)));
+        }
+        assert!(gate.should_request(done + DISCOVERY_TTL));
+    }
+
+    #[test]
+    fn discovery_gate_reset_allows_a_new_session_to_request() {
+        let gate = DiscoveryGate::default();
+        let now = Instant::now();
+        gate.complete(now);
+        assert!(!gate.should_request(now));
+        gate.reset();
+        assert!(gate.should_request(now));
     }
 }

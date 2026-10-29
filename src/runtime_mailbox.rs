@@ -49,7 +49,6 @@ pub enum RuntimeCommand {
     Disconnect,
     RefreshConversations,
     UpdateAttentionPreferences(AttentionPreferences),
-    DiscoverChannels,
     DiscoverConversations,
     JoinConversation {
         channel_id: String,
@@ -313,7 +312,6 @@ pub enum RuntimeAdmissionKind {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ConversationDiscoveryScope {
     Full,
-    Channels,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
