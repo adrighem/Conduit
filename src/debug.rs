@@ -209,20 +209,99 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-/// Runs an image decode and logs it when it took at least 4 ms, since the
-/// callers run on the GTK thread. Costs nothing but a flag check when debug
-/// logging is off.
-pub(crate) fn trace_image_decode<T>(kind: &str, decode: impl FnOnce() -> T) -> T {
+/// Loader an image decode goes through, which decides where the work runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageLoader {
+    /// `gdk::Texture::from_filename`: GTK decodes PNG and JPEG in-process and
+    /// hands anything else to gdk-pixbuf.
+    Texture,
+    /// gdk-pixbuf, whose glycin loaders run in a sandboxed subprocess.
+    Pixbuf,
+}
+
+/// `format=` label for a decode log line.
+fn image_format_label(format: Option<crate::image_header::ImageFormat>) -> &'static str {
+    use crate::image_header::ImageFormat;
+    match format {
+        Some(ImageFormat::Png) => "png",
+        Some(ImageFormat::Jpeg) => "jpeg",
+        Some(ImageFormat::Gif) => "gif",
+        Some(ImageFormat::Webp) => "webp",
+        None => "other",
+    }
+}
+
+/// Whether `loader` decodes `format` in GTK itself (`gtk`) or through
+/// gdk-pixbuf and glycin (`pixbuf`).
+fn image_decode_backend(
+    loader: ImageLoader,
+    format: Option<crate::image_header::ImageFormat>,
+) -> &'static str {
+    use crate::image_header::ImageFormat;
+    match (loader, format) {
+        (ImageLoader::Texture, Some(ImageFormat::Png | ImageFormat::Jpeg)) => "gtk",
+        _ => "pixbuf",
+    }
+}
+
+thread_local! {
+    /// Decodes since the last idle: count, GTK backend ms, pixbuf backend
+    /// ms, and whether the idle report is scheduled.
+    static DECODE_BURST: std::cell::Cell<(u32, f64, f64, bool)> =
+        const { std::cell::Cell::new((0, 0.0, 0.0, false)) };
+}
+
+/// Folds one decode into [`DECODE_BURST`] and, on the GTK thread, schedules
+/// one `image_decode_burst count=<n> gtk_ms=<x> pixbuf_ms=<y>` line per idle.
+fn record_decode_burst(backend: &str, elapsed_ms: f64) {
+    if !gtk::glib::MainContext::default().is_owner() {
+        return;
+    }
+    let (count, gtk_ms, pixbuf_ms, scheduled) = DECODE_BURST.get();
+    let (gtk_ms, pixbuf_ms) = if backend == "gtk" {
+        (gtk_ms + elapsed_ms, pixbuf_ms)
+    } else {
+        (gtk_ms, pixbuf_ms + elapsed_ms)
+    };
+    DECODE_BURST.set((count + 1, gtk_ms, pixbuf_ms, true));
+    if !scheduled {
+        gtk::glib::idle_add_local_once(|| {
+            let (count, gtk_ms, pixbuf_ms, _) = DECODE_BURST.replace((0, 0.0, 0.0, false));
+            log(
+                "performance",
+                &format!(
+                    "image_decode_burst count={count} gtk_ms={gtk_ms:.2} pixbuf_ms={pixbuf_ms:.2}"
+                ),
+            );
+        });
+    }
+}
+
+/// Runs an image decode of `path` through `loader` and logs it when it took
+/// at least 4 ms, since the callers run on the GTK thread. Costs nothing but
+/// a flag check when debug logging is off.
+pub(crate) fn trace_image_decode<T>(
+    kind: &str,
+    path: &std::path::Path,
+    loader: ImageLoader,
+    decode: impl FnOnce() -> T,
+) -> T {
     if !enabled() {
         return decode();
     }
     let started = std::time::Instant::now();
     let result = decode();
     let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let format = crate::image_header::declared_header(path).map(|(format, _, _)| format);
+    let backend = image_decode_backend(loader, format);
+    record_decode_burst(backend, elapsed_ms);
     if elapsed_ms >= 4.0 {
+        let format = image_format_label(format);
         log(
             "performance",
-            &format!("image_decode kind={kind} elapsed_ms={elapsed_ms:.2}"),
+            &format!(
+                "image_decode kind={kind} format={format} backend={backend} elapsed_ms={elapsed_ms:.2}"
+            ),
         );
     }
     result
@@ -323,6 +402,27 @@ fn truncate(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_decodes_name_the_backend_that_runs_them() {
+        use crate::image_header::ImageFormat;
+        for format in [ImageFormat::Png, ImageFormat::Jpeg] {
+            assert_eq!(
+                image_decode_backend(ImageLoader::Texture, Some(format)),
+                "gtk"
+            );
+            assert_eq!(
+                image_decode_backend(ImageLoader::Pixbuf, Some(format)),
+                "pixbuf"
+            );
+        }
+        // GTK hands formats it cannot decode itself to gdk-pixbuf.
+        for format in [Some(ImageFormat::Gif), Some(ImageFormat::Webp), None] {
+            assert_eq!(image_decode_backend(ImageLoader::Texture, format), "pixbuf");
+        }
+        assert_eq!(image_format_label(Some(ImageFormat::Jpeg)), "jpeg");
+        assert_eq!(image_format_label(None), "other");
+    }
 
     #[test]
     fn tracing_filter_is_quiet_by_default_and_debuggable_on_request() {
