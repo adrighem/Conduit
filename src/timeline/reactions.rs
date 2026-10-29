@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
+use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, Box, Button, Image, Label, Orientation, Picture, Widget};
 
 use super::actions::ToggleReactionCallback;
@@ -42,29 +43,129 @@ pub fn scale_reaction_pixbuf(pixbuf: &gdk_pixbuf::Pixbuf) -> gdk_pixbuf::Pixbuf 
         .unwrap_or_else(|| pixbuf.clone())
 }
 
+/// Longest side up to which a PNG or JPEG reaction emoji is decoded by GTK in
+/// process and scaled at render. Slack custom emoji are at most 128 px; larger
+/// files take the pixbuf path, which caches only its 32 px result.
+const IN_PROCESS_EMOJI_MAX_SIDE: u32 = 128;
+
+mod imp {
+    use std::cell::OnceCell;
+
+    use gtk::gdk;
+    use gtk::glib;
+    use gtk::prelude::*;
+    use gtk::subclass::prelude::*;
+
+    use super::{fit_within, REACTION_EMOJI_SIZE};
+
+    /// A texture that reports the `REACTION_EMOJI_SIZE` box it fits in as its
+    /// intrinsic size, so layout matches a pre-scaled emoji while GTK does
+    /// the scaling when it snapshots.
+    #[derive(Default)]
+    pub struct FittedTexture {
+        pub(super) texture: OnceCell<gdk::Texture>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for FittedTexture {
+        const NAME: &'static str = "ConduitFittedTexture";
+        type Type = super::FittedTexture;
+        type Interfaces = (gdk::Paintable,);
+    }
+
+    impl ObjectImpl for FittedTexture {}
+
+    impl FittedTexture {
+        fn fitted_size(&self) -> (i32, i32) {
+            self.texture.get().map_or((0, 0), |texture| {
+                fit_within(texture.width(), texture.height(), REACTION_EMOJI_SIZE)
+            })
+        }
+    }
+
+    impl PaintableImpl for FittedTexture {
+        fn flags(&self) -> gdk::PaintableFlags {
+            gdk::PaintableFlags::SIZE | gdk::PaintableFlags::CONTENTS
+        }
+
+        fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
+            if let Some(texture) = self.texture.get() {
+                texture.snapshot(snapshot, width, height);
+            }
+        }
+
+        fn intrinsic_width(&self) -> i32 {
+            self.fitted_size().0
+        }
+
+        fn intrinsic_height(&self) -> i32 {
+            self.fitted_size().1
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct FittedTexture(ObjectSubclass<imp::FittedTexture>)
+        @implements gtk::gdk::Paintable;
+}
+
+/// `texture` as a paintable whose intrinsic size is its `REACTION_EMOJI_SIZE`
+/// fit. Textures that already have that size are used as they are.
+fn fit_reaction_texture(texture: gtk::gdk::Texture) -> gtk::gdk::Paintable {
+    let size = fit_within(texture.width(), texture.height(), REACTION_EMOJI_SIZE);
+    if size == (texture.width(), texture.height()) {
+        return texture.upcast();
+    }
+    let fitted: FittedTexture = glib::Object::new();
+    let _ = fitted.imp().texture.set(texture);
+    fitted.upcast()
+}
+
+/// Decodes the emoji at `path`. Small PNG and JPEG go through GTK's own
+/// decoders, at the file's size; everything else through gdk-pixbuf (glycin),
+/// scaled to `REACTION_EMOJI_SIZE` at once.
+fn decode_reaction_texture(path: &Path) -> Option<gtk::gdk::Texture> {
+    use crate::image_header::ImageFormat;
+    let in_process = matches!(
+        crate::image_header::declared_header(path),
+        Some((ImageFormat::Png | ImageFormat::Jpeg, width, height))
+            if width.max(height) <= IN_PROCESS_EMOJI_MAX_SIDE
+    );
+    if in_process {
+        return crate::debug::trace_image_decode(
+            "texture",
+            path,
+            crate::debug::ImageLoader::Texture,
+            || gtk::gdk::Texture::from_filename(path),
+        )
+        .ok();
+    }
+    let scaled = crate::debug::trace_image_decode(
+        "pixbuf",
+        path,
+        crate::debug::ImageLoader::Pixbuf,
+        || {
+            let pixbuf = gdk_pixbuf::Pixbuf::from_file(path).ok()?;
+            Some(scale_reaction_pixbuf(&pixbuf))
+        },
+    )?;
+    Some(gtk::gdk::Texture::for_pixbuf(&scaled))
+}
+
 pub fn load_custom_emoji_picture(path: &Path) -> Widget {
     let paintable =
         crate::animated_image::animated_paintable(path, REACTION_EMOJI_SIZE).or_else(|| {
             REACTION_TEXTURE_CACHE.with(|cache| {
                 let mut map = cache.borrow_mut();
                 if let Some(texture) = map.get(path) {
-                    return Some(texture.upcast());
+                    return Some(fit_reaction_texture(texture));
                 }
                 if !crate::animated_image::within_decode_budget(path) {
                     return None;
                 }
-                let scaled = crate::debug::trace_image_decode(
-                    "pixbuf",
-                    path,
-                    crate::debug::ImageLoader::Pixbuf,
-                    || {
-                        let pixbuf = gdk_pixbuf::Pixbuf::from_file(path).ok()?;
-                        Some(scale_reaction_pixbuf(&pixbuf))
-                    },
-                )?;
-                let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
+                let texture = decode_reaction_texture(path)?;
                 map.insert(path.to_path_buf(), texture.clone());
-                Some(texture.upcast())
+                Some(fit_reaction_texture(texture))
             })
         });
     let pic = match paintable {

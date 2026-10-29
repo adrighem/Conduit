@@ -2071,6 +2071,69 @@ fn test_reaction_and_quick_bar_images_sized_to_32px() {
     });
 }
 
+fn save_test_image(path: &Path, format: &str, width: i32, height: i32) {
+    gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, width, height)
+        .expect("pixbuf")
+        .savev(path, format, &[])
+        .expect("save");
+}
+
+fn cached_reaction_size(path: &Path) -> (i32, i32) {
+    let texture = REACTION_TEXTURE_CACHE
+        .with(|cache| cache.borrow_mut().get(path))
+        .expect("emoji cached");
+    (texture.width(), texture.height())
+}
+
+#[test]
+fn test_small_png_and_jpeg_reaction_emoji_decode_in_process_at_32px_layout() {
+    run_gtk_test(|| {
+        let temp_dir = TempTestDir::new("reaction-in-process");
+        for (name, format) in [("wide.png", "png"), ("wide.jpg", "jpeg")] {
+            let path = temp_dir.path().join(name);
+            save_test_image(&path, format, 96, 48);
+            let widget = load_custom_emoji_picture(&path);
+            let pic = widget.downcast::<Picture>().expect("expected Picture");
+            let paintable = pic.paintable().expect("expected paintable");
+            // GTK scales at render; layout still sees the 32 px fit.
+            assert_eq!(cached_reaction_size(&path), (96, 48), "{name}");
+            assert_eq!(paintable.intrinsic_width(), 32, "{name}");
+            assert_eq!(paintable.intrinsic_height(), 16, "{name}");
+            assert_eq!(pic.width_request(), 32);
+            assert_eq!(pic.height_request(), 32);
+        }
+    });
+}
+
+#[test]
+fn test_large_png_reaction_emoji_keeps_the_pixbuf_scaled_path() {
+    run_gtk_test(|| {
+        let temp_dir = TempTestDir::new("reaction-pixbuf");
+        let path = temp_dir.path().join("big.png");
+        save_test_image(&path, "png", 256, 128);
+        let widget = load_custom_emoji_picture(&path);
+        let pic = widget.downcast::<Picture>().expect("expected Picture");
+        let paintable = pic.paintable().expect("expected paintable");
+        assert_eq!(cached_reaction_size(&path), (32, 16));
+        assert_eq!(paintable.intrinsic_width(), 32);
+        assert_eq!(paintable.intrinsic_height(), 16);
+    });
+}
+
+#[test]
+fn perf_guard_reaction_emoji_decodes_once_per_file() {
+    run_gtk_test(|| {
+        let temp_dir = TempTestDir::new("reaction-once");
+        let path = temp_dir.path().join("once.png");
+        save_test_image(&path, "png", 64, 64);
+        let before = crate::debug::IMAGE_DECODES.get();
+        for _ in 0..40 {
+            load_custom_emoji_picture(&path);
+        }
+        assert_eq!(crate::debug::IMAGE_DECODES.get() - before, 1);
+    });
+}
+
 #[test]
 fn test_build_code_block_widget_single_line_no_lang() {
     run_gtk_test(|| {
