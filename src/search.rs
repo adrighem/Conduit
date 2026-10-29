@@ -384,29 +384,113 @@ impl<T: Clone, K: Ord> CompletionIndex<T, K> {
     }
 }
 
-/// A lazily built completion index that stays until its data changes.
+/// Source of [`StampedCell`] stamps. Process-wide, so a stamp never repeats
+/// even when a cell or its contents are replaced wholesale.
+static NEXT_DATA_STAMP: AtomicU64 = AtomicU64::new(1);
+
+fn next_data_stamp() -> u64 {
+    NEXT_DATA_STAMP.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A `RefCell` that records mutable access. Every `borrow_mut` that is
+/// dereferenced mutably gives the cell a new [`StampedCell::stamp`] when the
+/// borrow ends, so a cache keyed on the stamp cannot miss a change however
+/// the data is mutated. Equal stamps imply equal contents; unequal stamps
+/// may still hold equal contents, which only costs a rebuild.
+#[derive(Debug)]
+pub struct StampedCell<T> {
+    value: std::cell::RefCell<T>,
+    stamp: std::cell::Cell<u64>,
+}
+
+impl<T> StampedCell<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            value: std::cell::RefCell::new(value),
+            stamp: std::cell::Cell::new(next_data_stamp()),
+        }
+    }
+
+    pub fn borrow(&self) -> std::cell::Ref<'_, T> {
+        self.value.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> StampedRefMut<'_, T> {
+        StampedRefMut {
+            guard: self.value.borrow_mut(),
+            stamp: &self.stamp,
+            changed: false,
+        }
+    }
+
+    pub fn stamp(&self) -> u64 {
+        self.stamp.get()
+    }
+}
+
+impl<T: Default> Default for StampedCell<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+/// Mutable access to a [`StampedCell`]; restamps the cell when it was
+/// dereferenced mutably.
+pub struct StampedRefMut<'a, T> {
+    guard: std::cell::RefMut<'a, T>,
+    stamp: &'a std::cell::Cell<u64>,
+    changed: bool,
+}
+
+impl<T> std::ops::Deref for StampedRefMut<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> std::ops::DerefMut for StampedRefMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.changed = true;
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for StampedRefMut<'_, T> {
+    fn drop(&mut self) {
+        if self.changed {
+            self.stamp.set(next_data_stamp());
+        }
+    }
+}
+
+/// A lazily built completion index, keyed on the stamps of the data it was
+/// built from. A lookup with a different key rebuilds it, so the cache
+/// serves current data without anyone invalidating it.
 #[derive(Debug)]
 pub struct CompletionCache<I> {
-    index: Option<std::rc::Rc<I>>,
+    entry: Option<(Vec<u64>, std::rc::Rc<I>)>,
 }
 
 impl<I> Default for CompletionCache<I> {
     fn default() -> Self {
-        Self { index: None }
+        Self { entry: None }
     }
 }
 
 impl<I> CompletionCache<I> {
-    /// The cached index, built by `build` only when there is none.
-    pub fn get_or_build(&mut self, build: impl FnOnce() -> I) -> std::rc::Rc<I> {
-        self.index
-            .get_or_insert_with(|| std::rc::Rc::new(build()))
-            .clone()
-    }
-
-    /// Drops the index; the next lookup rebuilds it from the new data.
-    pub fn invalidate(&mut self) {
-        self.index = None;
+    /// The cached index when it was built for `key`, else the result of
+    /// `build`, which is then cached.
+    pub fn get_or_build(&mut self, key: &[u64], build: impl FnOnce() -> I) -> std::rc::Rc<I> {
+        if let Some((cached_key, index)) = &self.entry {
+            if cached_key == key {
+                return index.clone();
+            }
+        }
+        let index = std::rc::Rc::new(build());
+        self.entry = Some((key.to_vec(), index.clone()));
+        index
     }
 }
 
@@ -558,23 +642,77 @@ mod tests {
     }
 
     #[test]
-    fn perf_guard_completion_index_is_built_once_until_invalidated() {
-        let mut builds = 0;
-        let mut cache = CompletionCache::<Vec<u8>>::default();
+    fn perf_guard_completion_index_is_built_once_until_its_data_changes() {
+        let data = StampedCell::new(vec!["ada"]);
+        let builds = std::cell::Cell::new(0);
+        let mut cache = CompletionCache::<usize>::default();
+        let lookup = |cache: &mut CompletionCache<usize>| {
+            *cache.get_or_build(&[data.stamp()], || {
+                builds.set(builds.get() + 1);
+                data.borrow().len()
+            })
+        };
         for _ in 0..100 {
-            cache.get_or_build(|| {
-                builds += 1;
-                Vec::new()
-            });
+            assert_eq!(lookup(&mut cache), 1);
         }
-        assert_eq!(builds, 1, "keystrokes must reuse the cached index");
+        assert_eq!(builds.get(), 1, "keystrokes must reuse the cached index");
 
-        cache.invalidate();
-        cache.get_or_build(|| {
-            builds += 1;
-            Vec::new()
-        });
-        assert_eq!(builds, 2, "changed data rebuilds the index");
+        data.borrow_mut().push("alan");
+        assert_eq!(lookup(&mut cache), 2, "changed data is never served stale");
+        assert_eq!(builds.get(), 2);
+    }
+
+    #[test]
+    fn completion_cache_sees_swapped_snapshots_without_any_invalidation() {
+        let names = StampedCell::new(vec!["ada".to_string()]);
+        let build = || {
+            CompletionIndex::new(
+                names
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .map(|(position, name)| {
+                        CompletionEntry::new(
+                            name.clone(),
+                            [SearchField::new(name, PRIMARY_FIELD_WEIGHT)],
+                            name.to_lowercase(),
+                            None,
+                            position,
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let rank = |_: &CompletionEntry<String, usize>, score: MatchScore| Reverse(score);
+        let mut cache = CompletionCache::default();
+        let find = |cache: &mut CompletionCache<_>| {
+            let index = cache.get_or_build(&[names.stamp()], build);
+            index.search("al", &mut None, 10, rank)
+        };
+        assert!(find(&mut cache).is_empty());
+
+        *names.borrow_mut() = vec!["ada".to_string(), "alan".to_string()];
+        assert_eq!(find(&mut cache), ["alan"], "a swapped snapshot is seen");
+
+        names.borrow_mut().push("alice".to_string());
+        assert_eq!(find(&mut cache), ["alan", "alice"], "an in-place edit too");
+    }
+
+    #[test]
+    fn stamped_cell_changes_stamp_only_when_mutably_dereferenced() {
+        let cell = StampedCell::new(vec![1]);
+        let first = cell.stamp();
+        assert_eq!(cell.borrow().len(), 1);
+        drop(cell.borrow_mut());
+        assert_eq!(cell.borrow_mut().len(), 1);
+        assert_eq!(cell.stamp(), first, "reads never restamp");
+
+        cell.borrow_mut().push(2);
+        let second = cell.stamp();
+        assert_ne!(second, first);
+        *cell.borrow_mut() = vec![1, 2];
+        assert_ne!(cell.stamp(), second, "equal content still restamps");
+        assert_ne!(StampedCell::<u8>::default().stamp(), cell.stamp());
     }
 
     #[test]

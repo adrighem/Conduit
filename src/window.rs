@@ -81,7 +81,7 @@ use crate::runtime::{
     RuntimeEventKind, RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity,
     RuntimeOperation, RuntimeTarget, SessionId, UploadAttachment,
 };
-use crate::search::{CompletionCache, CompletionMatches};
+use crate::search::{CompletionCache, CompletionMatches, StampedCell};
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
     self, ConversationKind, ConversationPickerAction, KeyedSidebarItem, SidebarItemModel,
@@ -388,7 +388,7 @@ mod imp {
         pub pending_opened_conversation_ids: RefCell<HashSet<String>>,
         /// Shared so the render context's title cache can detect changes
         /// by pointer; replace or `Arc::make_mut` it, never mutate in place.
-        pub discovered_channels: RefCell<Arc<Vec<SlackConversation>>>,
+        pub discovered_channels: StampedCell<Arc<Vec<SlackConversation>>>,
         pub(super) conversation_titles: RefCell<ConversationTitlesCache>,
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
         pub(super) conversation_picker_refresh: Cell<PickerRefreshGate>,
@@ -433,7 +433,7 @@ mod imp {
         pub(super) pending_image_assets: RefCell<BoundedImageAssetKeys>,
         pub(super) failed_image_assets: RefCell<BoundedImageAssetKeys>,
         pub(super) recovering_image_assets: RefCell<BoundedImageAssetKeys>,
-        pub custom_emojis: RefCell<Arc<HashMap<String, String>>>,
+        pub custom_emojis: StampedCell<Arc<HashMap<String, String>>>,
         pub realtime_status: Cell<RealtimeStatus>,
         pub(super) message_composer_completion: RefCell<Option<ComposerCompletion>>,
         pub(super) thread_composer_completion: RefCell<Option<ComposerCompletion>>,
@@ -1158,22 +1158,36 @@ struct ComposerCompletion {
     matches: Option<CompletionMatches>,
 }
 
-/// The completion data a change can affect.
-#[derive(Debug, Clone, Copy)]
-enum CompletionData {
-    People,
-    Channels,
-    Emoji,
-    All,
-}
-
 /// Candidate indexes for `@`, `#` and `:` completion, built on first use and
-/// dropped when their data changes (`invalidate_completion_data`).
+/// rebuilt when the stamps of their source data differ (see
+/// [`mention_index_key`]), so no change path has to invalidate them.
 #[derive(Debug, Default)]
 struct CompletionIndexes {
     mentions: CompletionCache<MentionCompletionIndex>,
     channels: CompletionCache<ChannelCompletionIndex>,
     emoji: CompletionCache<EmojiCompletionIndex>,
+}
+
+/// Stamps of everything `@` candidates are built from: the known users, the
+/// discovered users and the user groups.
+fn mention_index_key(workspace: &WorkspaceSessionState) -> [u64; 3] {
+    [
+        workspace.users.stamp(),
+        workspace.user_directory.discovered_users.stamp(),
+        workspace.user_directory.user_groups.stamp(),
+    ]
+}
+
+/// Stamps of everything `#` candidates are built from: the discovered
+/// channels and the conversation catalog.
+fn channel_index_key(
+    discovered_channels: &StampedCell<Arc<Vec<SlackConversation>>>,
+    workspace: &WorkspaceSessionState,
+) -> [u64; 2] {
+    [
+        discovered_channels.stamp(),
+        workspace.conversations.borrow().content_stamp(),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -7111,19 +7125,23 @@ impl ConduitWindow {
     }
 
     fn cached_mention_index(&self) -> Rc<MentionCompletionIndex> {
+        let key = mention_index_key(&self.imp().workspace);
         self.imp()
             .completion_indexes
             .borrow_mut()
             .mentions
-            .get_or_build(|| mention_completion_index(&self.composer_mention_candidates()))
+            .get_or_build(&key, || {
+                mention_completion_index(&self.composer_mention_candidates())
+            })
     }
 
     fn cached_channel_index(&self) -> Rc<ChannelCompletionIndex> {
         let imp = self.imp();
+        let key = channel_index_key(&imp.discovered_channels, &imp.workspace);
         imp.completion_indexes
             .borrow_mut()
             .channels
-            .get_or_build(|| {
+            .get_or_build(&key, || {
                 channel_completion_index(&channel_candidates(
                     imp.discovered_channels
                         .borrow()
@@ -7135,28 +7153,13 @@ impl ConduitWindow {
 
     fn cached_emoji_index(&self) -> Rc<EmojiCompletionIndex> {
         let imp = self.imp();
-        imp.completion_indexes.borrow_mut().emoji.get_or_build(|| {
-            let custom_emojis = imp.custom_emojis.borrow();
-            emoji_completion_index(EmojiCatalog::new(&custom_emojis).entries())
-        })
-    }
-
-    /// Drops the cached completion indexes whose data changed, then
-    /// refreshes any active suggestions.
-    fn invalidate_completion_data(&self, data: CompletionData) {
-        {
-            let mut indexes = self.imp().completion_indexes.borrow_mut();
-            if matches!(data, CompletionData::People | CompletionData::All) {
-                indexes.mentions.invalidate();
-            }
-            if matches!(data, CompletionData::Channels | CompletionData::All) {
-                indexes.channels.invalidate();
-            }
-            if matches!(data, CompletionData::Emoji | CompletionData::All) {
-                indexes.emoji.invalidate();
-            }
-        }
-        self.invalidate_composer_completions();
+        imp.completion_indexes
+            .borrow_mut()
+            .emoji
+            .get_or_build(&[imp.custom_emojis.stamp()], || {
+                let custom_emojis = imp.custom_emojis.borrow();
+                emoji_completion_index(EmojiCatalog::new(&custom_emojis).entries())
+            })
     }
 
     /// Whether the caret sits in an `@`, `#` or `:` token, so new data can
@@ -7562,7 +7565,7 @@ impl ConduitWindow {
                     .discovery
                     .complete(std::time::Instant::now());
                 *self.imp().discovered_channels.borrow_mut() = Arc::new(channels);
-                self.invalidate_completion_data(CompletionData::Channels);
+                self.invalidate_composer_completions();
                 self.invalidate_conversation_picker();
                 self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
             }
@@ -7574,7 +7577,7 @@ impl ConduitWindow {
                         upsert_discovered_channel(discovered, channel);
                     }
                 }
-                self.invalidate_completion_data(CompletionData::Channels);
+                self.invalidate_composer_completions();
                 self.invalidate_conversation_picker();
                 self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
             }
@@ -7602,7 +7605,7 @@ impl ConduitWindow {
                         Arc::make_mut(&mut self.imp().discovered_channels.borrow_mut()),
                         *conversation,
                     );
-                    self.invalidate_completion_data(CompletionData::Channels);
+                    self.invalidate_composer_completions();
                     self.invalidate_conversation_picker();
                     self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
                 }
@@ -7616,14 +7619,14 @@ impl ConduitWindow {
                     .borrow_mut() = users;
                 self.invalidate_conversation_picker();
                 self.invalidate_people_picker();
-                self.invalidate_completion_data(CompletionData::People);
+                self.invalidate_composer_completions();
             }
             RuntimeEventKind::UserGroupsDiscovered(groups) => {
                 self.imp()
                     .workspace
                     .user_directory
                     .apply_user_groups(groups);
-                self.invalidate_completion_data(CompletionData::People);
+                self.invalidate_composer_completions();
             }
             RuntimeEventKind::ConversationOpenCompleted { channel_id } => {
                 let title = self.conversation_title(&channel_id);
@@ -9574,7 +9577,6 @@ impl ConduitWindow {
         imp.failed_image_assets.borrow_mut().clear();
         imp.recovering_image_assets.borrow_mut().clear();
         *imp.custom_emojis.borrow_mut() = Arc::default();
-        self.invalidate_completion_data(CompletionData::All);
         self.set_composer_canonical_text(ComposerTarget::Message, "");
         self.set_composer_canonical_text(ComposerTarget::Thread, "");
         for target in COMPOSER_TARGETS {
@@ -9785,7 +9787,7 @@ impl ConduitWindow {
                 .set_custom_emojis(&self.imp().custom_emojis.borrow());
             write_status_dialog_test_state(self, state);
         }
-        self.invalidate_completion_data(CompletionData::Emoji);
+        self.invalidate_composer_completions();
     }
 
     fn handle_runtime_error(&self, context: &OperationContext, failure: &RuntimeFailure) {
@@ -10137,7 +10139,7 @@ impl ConduitWindow {
             self.apply_workspace_timeline_projection(revision, application.timeline_changes());
         }
         if application.conversation_changed() {
-            self.invalidate_completion_data(CompletionData::Channels);
+            self.invalidate_composer_completions();
             if !application.removals().is_empty() {
                 remove_patch_departures_from_discovery(
                     Arc::make_mut(&mut self.imp().discovered_channels.borrow_mut()),
@@ -10291,7 +10293,7 @@ impl ConduitWindow {
         for target in COMPOSER_TARGETS {
             self.refresh_composer_mention_names(target);
         }
-        self.invalidate_completion_data(CompletionData::People);
+        self.invalidate_composer_completions();
         let mut affected_user_ids = affected_user_ids.into_iter().collect::<Vec<_>>();
         affected_user_ids.sort();
         self.patch_users_on_timelines(&affected_user_ids);
@@ -10444,7 +10446,7 @@ impl ConduitWindow {
     }
 
     fn sync_conversations_from_catalog(&self) {
-        self.invalidate_completion_data(CompletionData::Channels);
+        self.invalidate_composer_completions();
         *self.imp().sidebar_error.borrow_mut() = None;
         self.request_conversation_user_names();
         // Restore, notification and URI intents below select from workspace
@@ -10456,7 +10458,7 @@ impl ConduitWindow {
     }
 
     fn sync_changed_conversations(&self, changed_channel_ids: &[String], structure_changed: bool) {
-        self.invalidate_completion_data(CompletionData::Channels);
+        self.invalidate_composer_completions();
         *self.imp().sidebar_error.borrow_mut() = None;
         self.request_changed_conversation_user_names(changed_channel_ids);
         if structure_changed || !self.render_changed_conversations(changed_channel_ids) {
