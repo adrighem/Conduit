@@ -45,6 +45,9 @@ const THREAD_CONTEXT_MAX_PAGES: usize = 20;
 const DEFAULT_DEBUG_CONVERSATION_PROPERTY_LIMIT: usize = 20;
 const DEBUG_CONVERSATION_PROPERTIES_ENV: &str = "CONDUIT_DEBUG_CONVERSATION_PROPERTIES";
 const CONVERSATIONS_LIST_METHOD: &str = "conversations.list";
+/// `conversations.list` is a Tier 2 method (about 20 requests a minute), so
+/// full discovery waits this long between pages instead of hitting 429s.
+pub(crate) const DISCOVERY_PAGE_INTERVAL: Duration = Duration::from_secs(3);
 const USERS_CONVERSATIONS_METHOD: &str = "users.conversations";
 const USERS_LIST_METHOD: &str = "users.list";
 const SLACK_API_BASE_URL: &str = "https://slack.com/api";
@@ -940,12 +943,24 @@ impl SlackApi {
     }
 
     /// Lists every accessible public or private channel, including channels the
-    /// current user has not joined yet.
+    /// current user has not joined yet. Pages are paced to stay under Slack's
+    /// rate limit; the pause holds only a Background runtime permit.
     pub async fn discover_conversations(&self) -> Result<Vec<SlackConversation>> {
+        self.discover_conversations_paced(DISCOVERY_PAGE_INTERVAL)
+            .await
+    }
+
+    pub(crate) async fn discover_conversations_paced(
+        &self,
+        page_interval: Duration,
+    ) -> Result<Vec<SlackConversation>> {
         let mut cursor: Option<String> = None;
         let mut conversations = Vec::new();
 
         loop {
+            if cursor.is_some() {
+                tokio::time::sleep(page_interval).await;
+            }
             let params = paginated_list_params(cursor.as_deref(), true);
             let response: ConversationListResponse =
                 self.post_form(CONVERSATIONS_LIST_METHOD, &params).await?;

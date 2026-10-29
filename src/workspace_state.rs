@@ -92,13 +92,26 @@ impl WorkspaceLifecycle {
 pub(crate) const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
 /// An unanswered discovery request is repeated after this long.
 const DISCOVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Discovery starts on its own this long after login, once startup traffic
+/// has settled, so mention names and pickers fill in without user action.
+pub(crate) const DISCOVERY_STARTUP_DELAY: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StartupDiscovery {
+    #[default]
+    Unscheduled,
+    Scheduled,
+    Started,
+}
 
 /// Decides when a discovery request is worth sending: once per `DISCOVERY_TTL`
-/// after a completed listing, and never while one is in flight.
+/// after a completed listing, and never while one is in flight. The delayed
+/// startup request and the picker triggers share it, so they cannot both run.
 #[derive(Debug, Default)]
 pub(crate) struct DiscoveryGate {
     completed_at: Cell<Option<Instant>>,
     requested_at: Cell<Option<Instant>>,
+    startup: Cell<StartupDiscovery>,
 }
 
 impl DiscoveryGate {
@@ -120,9 +133,25 @@ impl DiscoveryGate {
         self.completed_at.set(Some(now));
     }
 
+    /// Claims the once-per-session startup timer; reconnects get `false`.
+    pub(crate) fn schedule_startup(&self) -> bool {
+        (self.startup.get() == StartupDiscovery::Unscheduled)
+            .then(|| self.startup.set(StartupDiscovery::Scheduled))
+            .is_some()
+    }
+
+    /// Called when the startup timer fires; `false` if the session was reset
+    /// in the meantime.
+    pub(crate) fn start_scheduled(&self) -> bool {
+        (self.startup.get() == StartupDiscovery::Scheduled)
+            .then(|| self.startup.set(StartupDiscovery::Started))
+            .is_some()
+    }
+
     pub(crate) fn reset(&self) {
         self.completed_at.set(None);
         self.requested_at.set(None);
+        self.startup.set(StartupDiscovery::Unscheduled);
     }
 }
 
@@ -3615,6 +3644,48 @@ mod tests {
             assert!(!gate.should_request(done + Duration::from_secs(opens * 30)));
         }
         assert!(gate.should_request(done + DISCOVERY_TTL));
+    }
+
+    #[test]
+    fn perf_guard_startup_discovery_is_scheduled_once_and_shares_the_gate() {
+        let gate = DiscoveryGate::default();
+        let start = Instant::now();
+
+        // Reconnects re-run the Authenticated handler but share one timer.
+        assert!(gate.schedule_startup());
+        assert!(!gate.schedule_startup());
+        assert!(!gate.schedule_startup());
+
+        // A picker opened before the timer starts the run right away, and the
+        // timer then finds the completed listing fresh.
+        assert!(gate.should_request(start));
+        gate.complete(start + Duration::from_secs(20));
+        assert!(gate.start_scheduled());
+        assert!(!gate.should_request(start + DISCOVERY_STARTUP_DELAY));
+        assert!(!gate.start_scheduled());
+        assert!(!gate.schedule_startup());
+    }
+
+    #[test]
+    fn perf_guard_picker_during_background_discovery_does_not_start_a_second_run() {
+        let gate = DiscoveryGate::default();
+        let start = Instant::now();
+        assert!(gate.schedule_startup());
+        assert!(gate.start_scheduled());
+        assert!(gate.should_request(start + DISCOVERY_STARTUP_DELAY));
+        // Paced paging takes minutes; opens inside the retry window are no-ops.
+        assert!(!gate.should_request(
+            start + DISCOVERY_STARTUP_DELAY + DISCOVERY_RETRY_AFTER - Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn startup_discovery_timer_is_cancelled_by_a_session_reset() {
+        let gate = DiscoveryGate::default();
+        assert!(gate.schedule_startup());
+        gate.reset();
+        assert!(!gate.start_scheduled());
+        assert!(gate.schedule_startup());
     }
 
     #[test]

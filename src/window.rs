@@ -97,7 +97,7 @@ use crate::workspace_state::{
     ConversationOpenRenderAction, ConversationPatchRemoval, ConversationSelectionDecision,
     MainMessageView, ThreadApplyOutcome, ThreadOpenOutcome, TimelineProjectionApplication,
     TimelineProjectionOperation, WorkspaceLifecycle, WorkspaceLifecycleEvent,
-    WorkspaceScrollBehavior, WorkspaceSessionState,
+    WorkspaceScrollBehavior, WorkspaceSessionState, DISCOVERY_STARTUP_DELAY,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -7349,6 +7349,7 @@ impl ConduitWindow {
             RuntimeEventKind::Authenticated(auth) => {
                 if !self.imp().connect_requested.get() {
                     self.show_workspace(auth);
+                    self.schedule_startup_discovery();
                     // Feeds the Threads rail pill before the view is opened.
                     self.load_followed_threads(None);
                 }
@@ -10978,13 +10979,44 @@ impl ConduitWindow {
     }
 
     /// Lists channels, people and user groups for the pickers and composer
-    /// completion. Paging every channel is costly, so it runs on first use
-    /// and then at most once per `DISCOVERY_TTL`, never at startup.
+    /// completion. Paging every channel is costly, so it runs when one of them
+    /// first needs it or after `DISCOVERY_STARTUP_DELAY`, then at most once
+    /// per `DISCOVERY_TTL`.
     fn request_discovery(&self) {
         let discovery = &self.imp().workspace.user_directory.discovery;
         if discovery.should_request(std::time::Instant::now()) {
             self.send_command(RuntimeCommand::DiscoverConversations);
         }
+    }
+
+    /// Starts discovery in the background once startup traffic has settled,
+    /// so channel mention names and the pickers are filled without user
+    /// action. Reconnects share the single timer and the discovery gate.
+    fn schedule_startup_discovery(&self) {
+        if !self
+            .imp()
+            .workspace
+            .user_directory
+            .discovery
+            .schedule_startup()
+        {
+            return;
+        }
+        let weak_window = self.downgrade();
+        glib::timeout_add_local_once(DISCOVERY_STARTUP_DELAY, move || {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            if window
+                .imp()
+                .workspace
+                .user_directory
+                .discovery
+                .start_scheduled()
+            {
+                window.request_discovery();
+            }
+        });
     }
 
     fn show_change_status_dialog(&self) {
