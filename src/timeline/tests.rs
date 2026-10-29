@@ -450,6 +450,23 @@ pub(crate) fn pump_until(ms: u64, done: impl Fn() -> bool) {
     }
 }
 
+/// [`pump_until`] that fails at once when `done` never holds, naming what
+/// was waited for and the state `observed` at the end, so a loaded run
+/// cannot fall through to assertions about a state it never reached.
+pub(crate) fn wait_for(
+    ms: u64,
+    what: &str,
+    observed: impl Fn() -> String,
+    done: impl Fn() -> bool,
+) {
+    pump_until(ms, &done);
+    assert!(
+        done(),
+        "timed out after {ms} ms waiting for {what}: {}",
+        observed()
+    );
+}
+
 /// Presents `window` and pumps until its first layout. On Wayland the
 /// toplevel is only sized once the compositor configures it, and a
 /// GtkListView `scroll_to` issued before that is lost, so a timeline filled

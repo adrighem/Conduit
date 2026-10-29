@@ -463,7 +463,7 @@ mod tests {
 
         use crate::timeline::cache::decode;
         use crate::timeline_message_widget::tests::{
-            descendants, pump, pump_until, save_test_image, AssetCacheTestDir, ManualDecodes,
+            descendants, save_test_image, wait_for, AssetCacheTestDir, ManualDecodes,
         };
 
         /// More rows than GtkListView realizes at once, a few hundred.
@@ -503,8 +503,16 @@ mod tests {
                 .collect()
         }
 
-        /// Each bound row's title with the width of the thumbnail it shows.
-        fn shown_thumbnails(view: &SecondaryView) -> Vec<(String, Option<i32>)> {
+        /// A bound Files row: its title, whether its thumbnail is on screen,
+        /// and the width of the image the thumbnail shows, once it has one.
+        #[derive(Debug, Clone)]
+        struct Thumbnail {
+            title: String,
+            mapped: bool,
+            width: Option<i32>,
+        }
+
+        fn shown_thumbnails(view: &SecondaryView) -> Vec<Thumbnail> {
             descendants(view.list_view.upcast_ref())
                 .into_iter()
                 .filter_map(|widget| widget.downcast::<adw::Clamp>().ok())
@@ -516,42 +524,123 @@ mod tests {
                         .find(|label| label.has_css_class("heading"))?
                         .text()
                         .to_string();
-                    let width = inside
+                    let (mapped, width) = inside
                         .iter()
                         .filter_map(|widget| widget.downcast_ref::<gtk::Picture>())
                         .find_map(|picture| {
                             let deferred = picture
                                 .paintable()
                                 .and_downcast::<decode::DeferredPaintable>()?;
-                            Some(deferred.content()?.intrinsic_width())
-                        });
-                    Some((title, width))
+                            let width = deferred.content().map(|c| c.intrinsic_width());
+                            Some((picture.is_mapped(), width))
+                        })
+                        .unwrap_or((false, None));
+                    Some(Thumbnail {
+                        title,
+                        mapped,
+                        width,
+                    })
                 })
                 .collect()
         }
 
-        fn show_files(rows: Vec<SecondaryRow>, context: &MessageRenderContext) -> SecondaryView {
+        /// Thumbnails on screen that have not painted yet.
+        fn pending_thumbnails(view: &SecondaryView) -> Vec<String> {
+            shown_thumbnails(view)
+                .into_iter()
+                .filter(|row| row.mapped && row.width.is_none())
+                .map(|row| row.title)
+                .collect()
+        }
+
+        /// A short description of the list, for failure messages.
+        fn describe_list(view: &SecondaryView, decodes: &ManualDecodes) -> String {
+            let shown = shown_thumbnails(view);
+            let adjustment = view.scrolled_window.vadjustment();
+            format!(
+                "scrolled {}/{}, {} rows bound ({:?} .. {:?}), pending {:?}, running {:?}",
+                adjustment.value(),
+                adjustment.upper(),
+                shown.len(),
+                shown.first().map(|row| &row.title),
+                shown.last().map(|row| &row.title),
+                pending_thumbnails(view),
+                decodes.0.running().len(),
+            )
+        }
+
+        /// Destroys the window a test showed, also when it fails: a window
+        /// left open would keep requesting decodes in the tests after it.
+        struct ShownWindow(gtk::Window);
+
+        impl Drop for ShownWindow {
+            fn drop(&mut self) {
+                self.0.destroy();
+            }
+        }
+
+        fn show_files(
+            rows: Vec<SecondaryRow>,
+            context: &MessageRenderContext,
+        ) -> (SecondaryView, ShownWindow) {
             let view = SecondaryView::new();
             let window = gtk::Window::new();
             window.set_default_size(640, 400);
             window.set_child(Some(view.widget()));
             window.present();
-            pump_until(5000, || window.height() > 0);
+            wait_for(
+                5000,
+                "the window to lay out",
+                || format!("height {}", window.height()),
+                || window.height() > 0,
+            );
             view.show_rows(SecondaryKind::Files, rows, context);
-            pump_until(5000, || view.list_view.height() > 0);
-            pump(50);
-            view
+            // `show_rows` resets the scroll offset from an idle. Wait for
+            // that one, or it would undo a scroll made right after.
+            let reset = Rc::new(Cell::new(false));
+            let flag = reset.clone();
+            glib::idle_add_local_once(move || flag.set(true));
+            wait_for(
+                5000,
+                "the list to lay out",
+                || format!("height {}, reset {}", view.list_view.height(), reset.get()),
+                || reset.get() && view.list_view.height() > 0,
+            );
+            (view, ShownWindow(window))
+        }
+
+        /// Finishes decodes until every thumbnail on screen has painted, and
+        /// returns how many it finished.
+        fn settle_thumbnails(view: &SecondaryView, decodes: &ManualDecodes) -> usize {
+            let finished = Cell::new(0);
+            wait_for(
+                5000,
+                "every thumbnail on screen to paint",
+                || describe_list(view, decodes),
+                || {
+                    finished.set(finished.get() + decodes.finish_all().len());
+                    decodes.0.running().is_empty() && pending_thumbnails(view).is_empty()
+                },
+            );
+            finished.get()
         }
 
         /// Rows that were bound, but never mapped, wait for a request that
         /// scrolling brings; the ones that painted must show their own image.
         /// Returns how many painted.
-        fn assert_each_painted_row_shows_its_own_thumbnail(view: &SecondaryView) -> usize {
+        fn assert_each_painted_row_shows_its_own_thumbnail(
+            view: &SecondaryView,
+            decodes: &ManualDecodes,
+        ) -> usize {
             let painted: Vec<_> = shown_thumbnails(view)
                 .into_iter()
-                .filter_map(|(title, width)| Some((title, width?)))
+                .filter_map(|row| Some((row.title, row.width?)))
                 .collect();
-            assert!(!painted.is_empty(), "no row painted its thumbnail");
+            assert!(
+                !painted.is_empty(),
+                "no row painted its thumbnail: {}",
+                describe_list(view, decodes)
+            );
             for (title, width) in &painted {
                 let index: i32 = title["file-".len()..].parse().expect("index");
                 assert_eq!(*width, thumbnail_side(index), "{title}");
@@ -568,31 +657,40 @@ mod tests {
                 let mut context = test_context();
                 let rows = thumbnail_rows(&assets, &mut context);
                 let before = crate::debug::IMAGE_DECODES.get();
-                let view = show_files(rows, &context);
-                pump_until(2000, || decodes.0.running().len() == decode::MAX_IN_FLIGHT);
-                pump(20);
+                let (view, _window) = show_files(rows, &context);
+                wait_for(
+                    5000,
+                    "the visible rows to ask for decodes",
+                    || describe_list(&view, &decodes),
+                    || decodes.0.running().len() == decode::MAX_IN_FLIGHT,
+                );
                 assert_eq!(
                     crate::debug::IMAGE_DECODES.get() - before,
                     0,
                     "Files rows must leave decodes to the workers"
                 );
-                let bound = shown_thumbnails(&view).len();
-                assert!(bound < THUMBNAIL_ROWS as usize, "every row was bound");
-                assert!(shown_thumbnails(&view)
-                    .iter()
-                    .all(|(_, width)| width.is_none()));
-                let running = decodes.0.running();
-                assert_eq!(running.len(), decode::MAX_IN_FLIGHT, "{running:?}");
+                let bound = shown_thumbnails(&view);
+                assert!(bound.len() < THUMBNAIL_ROWS as usize, "every row was bound");
+                assert!(
+                    bound.iter().all(|row| row.width.is_none()),
+                    "painted before any decode finished: {bound:?}"
+                );
 
                 // Only the rows on screen were asked for, and each paints
                 // its own image in place once it lands.
-                let finished = decodes.finish_all();
-                pump(20);
-                let painted = assert_each_painted_row_shows_its_own_thumbnail(&view);
-                assert_eq!(painted, finished.len(), "{finished:?}");
+                let finished = settle_thumbnails(&view, &decodes);
+                let painted = assert_each_painted_row_shows_its_own_thumbnail(&view, &decodes);
+                // Rows that were on screen only while the list settled may
+                // have decoded for nothing, but none painted without one.
                 assert!(
-                    painted < bound,
-                    "rows that are not mapped asked for decodes"
+                    painted <= finished,
+                    "{painted} painted, {finished} finished: {}",
+                    describe_list(&view, &decodes)
+                );
+                assert!(
+                    painted < bound.len(),
+                    "rows that are not mapped asked for decodes: {}",
+                    describe_list(&view, &decodes)
                 );
             });
         }
@@ -605,29 +703,44 @@ mod tests {
                 let assets = AssetCacheTestDir::new("files-recycle");
                 let mut context = test_context();
                 let rows = thumbnail_rows(&assets, &mut context);
-                let view = show_files(rows, &context);
-                pump_until(2000, || decodes.0.running().len() == decode::MAX_IN_FLIGHT);
-                assert_eq!(decodes.0.running().len(), decode::MAX_IN_FLIGHT);
+                let (view, _window) = show_files(rows, &context);
+                wait_for(
+                    5000,
+                    "the visible rows to ask for decodes",
+                    || describe_list(&view, &decodes),
+                    || decodes.0.running().len() == decode::MAX_IN_FLIGHT,
+                );
                 // Scrolled away before any decode landed, so the rows they
                 // were for are off screen when the workers finish.
                 let adjustment = view.scrolled_window.vadjustment();
                 adjustment.set_value(adjustment.upper());
-                pump_until(2000, || {
-                    shown_thumbnails(&view)
-                        .iter()
-                        .any(|(title, _)| title == "file-599")
-                });
-                pump(50);
-                decodes.finish_all();
-                pump(20);
+                let last = format!("file-{}", THUMBNAIL_ROWS - 1);
+                wait_for(
+                    5000,
+                    "the last rows to be bound",
+                    || describe_list(&view, &decodes),
+                    || {
+                        shown_thumbnails(&view)
+                            .iter()
+                            .any(|row| row.mapped && row.title == last)
+                    },
+                );
+                settle_thumbnails(&view, &decodes);
+                // GtkListView keeps the first and last rows realized and
+                // mapped. The ones between them that were on the first
+                // screen are off screen now, whatever their decodes did.
                 let shown = shown_thumbnails(&view);
-                for (title, width) in &shown {
+                for row in shown
+                    .iter()
+                    .filter(|row| (1..=4).any(|index| row.title == format!("file-{index}")))
+                {
                     assert!(
-                        width.is_none() || *title != "file-0",
-                        "a row that scrolled away painted: {title}"
+                        row.width.is_none() && !row.mapped,
+                        "a row that scrolled away is still on screen or painted: {row:?}, {}",
+                        describe_list(&view, &decodes)
                     );
                 }
-                assert_each_painted_row_shows_its_own_thumbnail(&view);
+                assert_each_painted_row_shows_its_own_thumbnail(&view, &decodes);
             });
         }
 
@@ -641,11 +754,21 @@ mod tests {
                 std::fs::write(&path, b"not an image").expect("write");
                 let mut context = test_context();
                 let url = "https://files.slack.com/broken.png".to_string();
-                context.image_assets.insert(url.clone(), path);
-                let view = show_files(vec![file_row("broken", url)], &context);
-                pump_until(500, || !decodes.0.running().is_empty());
+                context.image_assets.insert(url.clone(), path.clone());
+                let (view, _window) = show_files(vec![file_row("broken", url)], &context);
+                wait_for(
+                    5000,
+                    "the row to ask for its decode",
+                    || describe_list(&view, &decodes),
+                    || !decodes.0.running().is_empty(),
+                );
                 decodes.finish_all();
-                pump(20);
+                wait_for(
+                    5000,
+                    "the decode to be known as failed",
+                    || describe_list(&view, &decodes),
+                    || decode::texture_failed(&path, decode::TextureSpec::Full),
+                );
                 let icon = descendants(view.list_view.upcast_ref())
                     .into_iter()
                     .find(|widget| widget.has_css_class("secondary-file-icon"))
