@@ -277,6 +277,13 @@ fn record_decode_burst(backend: &str, elapsed_ms: f64) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Image decodes traced on this thread, whether or not logging is on, so
+    /// perf guards can assert how many decodes a code path makes.
+    pub(crate) static IMAGE_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Runs an image decode of `path` through `loader` and logs it when it took
 /// at least 4 ms, since the callers run on the GTK thread. Costs nothing but
 /// a flag check when debug logging is off.
@@ -286,6 +293,8 @@ pub(crate) fn trace_image_decode<T>(
     loader: ImageLoader,
     decode: impl FnOnce() -> T,
 ) -> T {
+    #[cfg(test)]
+    IMAGE_DECODES.set(IMAGE_DECODES.get() + 1);
     if !enabled() {
         return decode();
     }
