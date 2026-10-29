@@ -139,13 +139,17 @@ fn webp(reader: &mut impl Read) -> Option<(u32, u32)> {
 /// formats and for files too short or malformed to say; callers should then
 /// assume the file may be animated.
 pub(crate) fn declared_frame_count(path: &Path) -> Option<u32> {
-    let mut reader = BufReader::new(File::open(path).ok()?);
-    let (format, _, _) = header(&mut reader)?;
+    frame_count(&mut BufReader::new(File::open(path).ok()?))
+}
+
+/// [`declared_frame_count`] for an image already in memory.
+pub(crate) fn frame_count(reader: &mut (impl Read + Seek)) -> Option<u32> {
+    let (format, _, _) = header(reader)?;
     reader.rewind().ok()?;
     match format {
-        ImageFormat::Gif => gif_frame_count(&mut reader),
+        ImageFormat::Gif => gif_frame_count(reader),
         ImageFormat::Webp => {
-            webp_frame_count(&mut reader).map(|frames| u32::try_from(frames).unwrap_or(u32::MAX))
+            webp_frame_count(reader).map(|frames| u32::try_from(frames).unwrap_or(u32::MAX))
         }
         ImageFormat::Png | ImageFormat::Jpeg => Some(1),
     }

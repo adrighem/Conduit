@@ -162,37 +162,25 @@ impl AnimatedImage {
     }
 }
 
-/// The shared paintable playing the animation at `path`, sized for a widget of
-/// at most `display_size` logical pixels per side. `None` when the file is not
-/// animated or cannot be decoded; callers then show it as a static image.
-pub(crate) fn animated_paintable(path: &Path, display_size: i32) -> Option<gdk::Paintable> {
+/// The live shared player of `path` for `display_size`, if any widget still
+/// shows one.
+pub(crate) fn existing_player(path: &Path, display_size: i32) -> Option<gdk::Paintable> {
     let key = (path.to_path_buf(), display_size);
-    let existing = PLAYERS.with(|players| players.borrow().get(&key).and_then(|w| w.upgrade()));
-    if let Some(player) = existing {
-        return Some(player.upcast());
-    }
-    if STATIC_FILES.with(|files| files.borrow().contains(path))
-        || !may_be_animated(path)
-        || !within_decode_budget(path)
-    {
-        return None;
-    }
-    // Headers that declare one frame need no animation decode: the static
-    // path decodes the file once instead of twice.
-    if crate::image_header::declared_frame_count(path) == Some(1) {
-        remember_static(path);
-        return None;
-    }
-    let animation = crate::debug::trace_image_decode(
-        "animation",
-        path,
-        crate::debug::ImageLoader::Pixbuf,
-        || gdk_pixbuf::PixbufAnimation::from_file(path),
-    )
-    .ok()?;
-    if animation.is_static_image() {
-        remember_static(path);
-        return None;
+    PLAYERS
+        .with(|players| players.borrow().get(&key).and_then(glib::WeakRef::upgrade))
+        .map(Cast::upcast)
+}
+
+/// The shared paintable playing `animation`, loaded from `path`, sized for a
+/// widget of at most `display_size` logical pixels per side. Reuses the live
+/// player for that size, so N copies cost one decoder and one timer.
+pub(crate) fn player(
+    path: &Path,
+    display_size: i32,
+    animation: &gdk_pixbuf::PixbufAnimation,
+) -> gdk::Paintable {
+    if let Some(player) = existing_player(path, display_size) {
+        return player;
     }
     let player = AnimatedImage::new(
         animation.iter(Some(SystemTime::now())),
@@ -201,12 +189,37 @@ pub(crate) fn animated_paintable(path: &Path, display_size: i32) -> Option<gdk::
     PLAYERS.with(|players| {
         let mut players = players.borrow_mut();
         players.retain(|_, weak| weak.upgrade().is_some());
-        players.insert(key, player.downgrade());
+        players.insert((path.to_path_buf(), display_size), player.downgrade());
     });
-    Some(player.upcast())
+    player.upcast()
 }
 
-fn remember_static(path: &Path) {
+/// Whether `path` should load as an animation, judged from its headers on
+/// the GTK thread without decoding: a GIF or WebP not known to be static.
+/// Headers that declare one frame are remembered as static, so the still
+/// path decodes the file once instead of twice.
+pub(crate) fn may_animate(path: &Path) -> bool {
+    if is_known_static(path) || !may_be_animated(path) {
+        return false;
+    }
+    if crate::image_header::declared_frame_count(path) == Some(1) {
+        remember_static(path);
+        return false;
+    }
+    true
+}
+
+/// Size of the frames a player for `display_size` shows of a `width` x
+/// `height` animation, so a placeholder can reserve it before the load.
+pub(crate) fn frame_size(width: i32, height: i32, display_size: i32) -> (i32, i32) {
+    fit_down(width, height, display_size.saturating_mul(OVERSAMPLE))
+}
+
+pub(crate) fn is_known_static(path: &Path) -> bool {
+    STATIC_FILES.with(|files| files.borrow().contains(path))
+}
+
+pub(crate) fn remember_static(path: &Path) {
     STATIC_FILES.with(|files| {
         let mut files = files.borrow_mut();
         if files.len() >= MAX_STATIC_FILES {
@@ -231,19 +244,24 @@ fn any_window_active() -> bool {
 
 /// Scales `pixbuf` down so its longest side is at most `max_side`.
 fn scale_to_fit(pixbuf: &gdk_pixbuf::Pixbuf, max_side: i32) -> gdk_pixbuf::Pixbuf {
-    let (width, height) = (pixbuf.width(), pixbuf.height());
-    let longest = width.max(height);
-    if max_side <= 0 || longest <= max_side {
+    let size = (pixbuf.width(), pixbuf.height());
+    let (width, height) = fit_down(size.0, size.1, max_side);
+    if (width, height) == size {
         return pixbuf.clone();
     }
-    let scale = |side: i32| ((side as i64 * max_side as i64) / longest as i64).max(1) as i32;
     pixbuf
-        .scale_simple(
-            scale(width),
-            scale(height),
-            gdk_pixbuf::InterpType::Bilinear,
-        )
+        .scale_simple(width, height, gdk_pixbuf::InterpType::Bilinear)
         .unwrap_or_else(|| pixbuf.clone())
+}
+
+/// `width` x `height` shrunk so its longest side is at most `max_side`.
+fn fit_down(width: i32, height: i32, max_side: i32) -> (i32, i32) {
+    let longest = width.max(height);
+    if max_side <= 0 || longest <= max_side {
+        return (width, height);
+    }
+    let scale = |side: i32| ((side as i64 * max_side as i64) / longest as i64).max(1) as i32;
+    (scale(width), scale(height))
 }
 
 /// Whether `path` is in a format that can hold several frames. Reads only the
@@ -423,7 +441,8 @@ pub(crate) mod tests {
     }
 
     /// 1x1 GIF89a with two 100 ms frames.
-    const ANIMATED_GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\
+    pub(crate) const ANIMATED_GIF: &[u8] =
+        b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\
         !\xf9\x04\x00\x0a\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00\
         !\xf9\x04\x00\x0a\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02L\x01\x00;";
 
@@ -431,8 +450,8 @@ pub(crate) mod tests {
     fn perf_guard_static_gif_is_decoded_at_most_once() {
         let path = write_temp("guard-once.gif", GIF);
         let before = crate::debug::IMAGE_DECODES.get();
-        // The row-build sequence: animation probe, then the static texture.
-        assert!(animated_paintable(&path, 18).is_none());
+        // The row-build sequence: header check, then the static texture.
+        assert!(!may_animate(&path));
         let texture = crate::timeline::cache::get_or_load_texture(&path);
         let decodes = crate::debug::IMAGE_DECODES.get() - before;
         std::fs::remove_file(path).ok();
@@ -443,7 +462,7 @@ pub(crate) mod tests {
     #[test]
     fn single_frame_gif_has_no_player() {
         let path = write_temp("still.gif", GIF);
-        assert!(animated_paintable(&path, 18).is_none());
+        assert!(!may_animate(&path));
         assert!(STATIC_FILES.with(|files| files.borrow().contains(&path)));
         std::fs::remove_file(path).ok();
     }
@@ -466,7 +485,11 @@ pub(crate) mod tests {
         );
         assert!(file_info(&path).is_none());
         assert!(!within_decode_budget(&path));
-        assert!(animated_paintable(&path, 18).is_none());
+        // Its animation load stops in the worker, on the bytes it read.
+        assert!(matches!(
+            crate::timeline::cache::decode::read_animation(&path),
+            Err(crate::timeline::cache::decode::DecodeError::Permanent(_))
+        ));
         assert!(!STATIC_FILES.with(|files| files.borrow().contains(&path)));
         assert!(crate::timeline::cache::get_or_load_texture(&path).is_none());
         std::fs::remove_file(path).ok();
@@ -526,10 +549,14 @@ pub(crate) mod tests {
             // the GTK test thread holds while other tests pump it.
             crate::timeline_message_widget::tests::run_gtk_test(|| {
                 let path = write_temp("shared.gif", ANIMATED_GIF);
-                let first = animated_paintable(&path, 18).expect("animated paintable");
-                let second = animated_paintable(&path, 18).expect("animated paintable");
-                let other_size = animated_paintable(&path, 32).expect("animated paintable");
+                assert!(may_animate(&path));
+                let animation =
+                    gdk_pixbuf::PixbufAnimation::from_file(&path).expect("animation loads");
+                let first = player(&path, 18, &animation);
+                let second = player(&path, 18, &animation);
+                let other_size = player(&path, 32, &animation);
                 assert_eq!(first, second);
+                assert_eq!(existing_player(&path, 18), Some(first.clone()));
                 assert_ne!(first, other_size);
                 assert_eq!(first.intrinsic_width(), 1);
                 std::fs::remove_file(path).ok();

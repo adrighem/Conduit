@@ -5,7 +5,7 @@ use gtk::{glib, Box, Button, Image, Label, Orientation, Picture, Widget};
 
 use super::actions::ToggleReactionCallback;
 use super::cache::decode::{
-    classify_glib_error, deferred_picture, DecodeError, DeferredTexture, TextureSpec,
+    classify_glib_error, deferred_picture, DecodeError, DeferredPaintable, TextureSpec,
 };
 use super::cache::resolve_cached_asset_path;
 use super::row::register_timeline_css;
@@ -62,7 +62,7 @@ fn fit_reaction_texture(texture: gtk::gdk::Texture, size: i32) -> gtk::gdk::Pain
     if fit_within(texture.width(), texture.height(), size) == (texture.width(), texture.height()) {
         return texture.upcast();
     }
-    DeferredTexture::fitted(&texture, size).upcast()
+    DeferredPaintable::fitted(texture.upcast_ref(), size).upcast()
 }
 
 /// Decodes reaction emoji `bytes`, read from `path`, once for every emoji
@@ -121,13 +121,15 @@ pub(crate) fn memory_texture(pixbuf: &gdk_pixbuf::Pixbuf) -> gtk::gdk::Texture {
 
 /// Custom emoji image whose longest side is `size` pixels.
 pub fn load_custom_emoji_picture(path: &Path, size: i32) -> Widget {
-    let pic = match crate::animated_image::animated_paintable(path, size) {
-        Some(paintable) => Picture::for_paintable(&paintable),
-        None => match TextureSpec::Reaction.cached(path) {
-            Some(texture) => Picture::for_paintable(&fit_reaction_texture(texture, size)),
-            // Decoded off the GTK thread once mapped, in the `size` slot.
-            None => deferred_picture(path, TextureSpec::Reaction, size),
-        },
+    let pic = if let Some(player) = crate::animated_image::existing_player(path, size) {
+        Picture::for_paintable(&DeferredPaintable::fitted(&player, size))
+    } else if let Some(texture) = TextureSpec::Reaction.cached(path) {
+        Picture::for_paintable(&fit_reaction_texture(texture, size))
+    } else {
+        // Loaded off the GTK thread once mapped, in the `size` slot: as an
+        // animation played for that size when the header allows one, else
+        // as a still shared by every size.
+        deferred_picture(path, TextureSpec::Reaction, size, Some(size))
     };
     pic.set_size_request(size, size);
     // Centered so a roomier parent (a quick bar button) cannot stretch it.

@@ -515,7 +515,7 @@ fn rebound_rows(view: &NativeTimelineView, before: &[(String, Widget)]) -> Vec<S
         .collect()
 }
 
-type TextureExecutor = decode::ManualExecutor<decode::TextureKey, gtk::gdk::Texture>;
+type TextureExecutor = decode::ManualExecutor<decode::TextureKey, decode::Decoded>;
 
 /// Runs static texture decodes on a manual executor until dropped.
 struct ManualDecodes(Rc<TextureExecutor>);
@@ -534,7 +534,7 @@ impl ManualDecodes {
         let mut finished = Vec::new();
         while let Some(key) = self.0.running().first().cloned() {
             assert!(finished.len() < 1000, "decodes keep coming");
-            self.0.complete(0, decode::decode_key(&key));
+            self.0.complete(0, decode::decode_now_for_tests(&key));
             finished.push(key);
         }
         finished
@@ -566,14 +566,14 @@ impl Drop for AssetCacheTestDir {
 }
 
 /// Pictures under `root` that wait on, or show, an off-thread decode.
-fn deferred_pictures(root: &Widget) -> Vec<(Picture, decode::DeferredTexture)> {
+fn deferred_pictures(root: &Widget) -> Vec<(Picture, decode::DeferredPaintable)> {
     descendants(root)
         .into_iter()
         .filter_map(|widget| widget.downcast::<Picture>().ok())
         .filter_map(|picture| {
             let deferred = picture
                 .paintable()
-                .and_downcast::<decode::DeferredTexture>()?;
+                .and_downcast::<decode::DeferredPaintable>()?;
             Some((picture, deferred))
         })
         .collect()
@@ -1945,7 +1945,7 @@ mod graphical {
             assert!(!pictures.is_empty(), "rows show deferred pictures");
             for (_, deferred) in &pictures {
                 assert!(
-                    deferred.texture().is_some(),
+                    deferred.content().is_some(),
                     "no visible image stays pending"
                 );
             }
@@ -1964,7 +1964,7 @@ mod graphical {
             let picture = decode::deferred_texture_picture(&path);
             let deferred = picture
                 .paintable()
-                .and_downcast::<decode::DeferredTexture>()
+                .and_downcast::<decode::DeferredPaintable>()
                 .expect("deferred paintable");
             // Sized from the header before any decode, so nothing relayouts.
             assert_eq!(
@@ -1985,12 +1985,12 @@ mod graphical {
             // Unmapped before the decode lands: cached, not applied.
             window.set_visible(false);
             decodes.finish_all();
-            assert!(deferred.texture().is_none());
+            assert!(deferred.content().is_none());
 
             // Mapped again: served from the cache at once, no second decode.
             window.present();
-            pump_until(500, || deferred.texture().is_some());
-            assert!(deferred.texture().is_some());
+            pump_until(500, || deferred.content().is_some());
+            assert!(deferred.content().is_some());
             assert!(decodes.0.running().is_empty());
             assert_eq!(
                 (deferred.intrinsic_width(), deferred.intrinsic_height()),
@@ -2660,6 +2660,127 @@ mod graphical {
     }
 
     #[test]
+    fn perf_guard_animations_load_off_the_gtk_thread() {
+        run_gtk_test(|| {
+            let decodes = ManualDecodes::install();
+            let temp_dir = TempTestDir::new("animation-guard");
+            let gif = crate::animated_image::tests::ANIMATED_GIF;
+            let animated: Vec<PathBuf> = (0..4)
+                .map(|i| {
+                    let path = temp_dir.path().join(format!("anim-{i}.gif"));
+                    std::fs::write(&path, gif).expect("write gif");
+                    path
+                })
+                .collect();
+            let column = Box::new(Orientation::Vertical, 0);
+            let window = gtk::Window::new();
+            window.set_child(Some(&column));
+            window.present();
+
+            let decodes_before = crate::debug::IMAGE_DECODES.get();
+            let probes = crate::animated_image::tests::glycin_probes_during(|| {
+                // The same GIF twice at one size, and as a reaction.
+                for _ in 0..2 {
+                    column.append(&load_animated_or_static_picture(
+                        &animated[0],
+                        40,
+                        40,
+                        gtk::ContentFit::Contain,
+                    ));
+                }
+                column.append(&load_custom_emoji_picture(
+                    &animated[0],
+                    REACTION_EMOJI_SIZE,
+                ));
+                column.append(&load_custom_emoji_picture(
+                    &animated[0],
+                    QUICK_BAR_EMOJI_SIZE,
+                ));
+                for path in &animated[1..] {
+                    column.append(&load_animated_or_static_picture(
+                        path,
+                        40,
+                        40,
+                        gtk::ContentFit::Contain,
+                    ));
+                }
+                pump_until(500, || decodes.0.running().len() == decode::MAX_IN_FLIGHT);
+                pump(20);
+            });
+            assert_eq!(
+                crate::debug::IMAGE_DECODES.get() - decodes_before,
+                0,
+                "animations must load off the GTK thread"
+            );
+            assert_eq!(probes, 0, "no glycin header probe on the GTK thread");
+            let running = decodes.0.running();
+            assert_eq!(running.len(), decode::MAX_IN_FLIGHT, "{running:?}");
+            assert!(running
+                .iter()
+                .all(|key| key.spec == decode::TextureSpec::Animation));
+
+            // Placeholders hold the header's size until the players arrive.
+            let pictures = deferred_pictures(column.upcast_ref());
+            assert_eq!(pictures.len(), 7);
+            for (_, deferred) in &pictures {
+                assert!(deferred.content().is_none());
+                assert!(deferred.intrinsic_width() > 0);
+            }
+
+            let finished = decodes.finish_all();
+            pump(20);
+            let first = finished
+                .iter()
+                .filter(|key| key.path == animated[0])
+                .count();
+            assert_eq!(first, 1, "one load serves every size of a file");
+            let players: Vec<gtk::gdk::Paintable> = pictures
+                .iter()
+                .map(|(_, deferred)| deferred.content().expect("animation arrived"))
+                .collect();
+            for player in &players {
+                assert!(!player.is::<gtk::gdk::Texture>(), "plays as an animation");
+            }
+            assert_eq!(players[0], players[1], "one player per display size");
+            assert_ne!(players[0], players[2], "the reaction plays at its size");
+            assert_ne!(players[2], players[3], "the quick bar plays at its size");
+            for (index, size) in [(2, REACTION_EMOJI_SIZE), (3, QUICK_BAR_EMOJI_SIZE)] {
+                let deferred = &pictures[index].1;
+                assert_eq!(
+                    (deferred.intrinsic_width(), deferred.intrinsic_height()),
+                    (size, size),
+                    "each emoji keeps its {size} px slot"
+                );
+            }
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn animations_load_through_gdk_pixbufs_task_thread() {
+        run_gtk_test(|| {
+            clear_timeline_view_caches();
+            decode::reset_texture_decoder_for_tests();
+            let temp_dir = TempTestDir::new("animation-real");
+            let path = temp_dir.path().join("anim.gif");
+            std::fs::write(&path, crate::animated_image::tests::ANIMATED_GIF).expect("gif");
+            let picture = load_animated_or_static_picture(&path, 40, 40, gtk::ContentFit::Contain);
+            let picture = picture.downcast::<Picture>().expect("picture");
+            let deferred = picture
+                .paintable()
+                .and_downcast::<decode::DeferredPaintable>()
+                .expect("deferred until loaded");
+            let window = gtk::Window::new();
+            window.set_child(Some(&picture));
+            window.present();
+            pump_until(5000, || deferred.content().is_some());
+            let player = deferred.content().expect("animation loaded");
+            assert!(!player.is::<gtk::gdk::Texture>());
+            window.destroy();
+        });
+    }
+
+    #[test]
     fn perf_guard_reactions_and_avatars_decode_off_the_gtk_thread() {
         run_gtk_test(|| {
             let decodes = ManualDecodes::install();
@@ -2752,7 +2873,7 @@ mod graphical {
             let pictures = deferred_pictures(column.upcast_ref());
             assert_eq!(pictures.len(), 6, "every reaction waited in place");
             for (picture, deferred) in &pictures {
-                assert!(deferred.texture().is_some(), "no reaction stays pending");
+                assert!(deferred.content().is_some(), "no reaction stays pending");
                 assert_eq!(
                     (deferred.intrinsic_width(), deferred.intrinsic_height()),
                     (32, 16)

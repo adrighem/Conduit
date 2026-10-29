@@ -13,7 +13,9 @@ use crate::models::{SlackFile, SlackMessage};
 use super::actions::{
     ActionHandler, HoverEvent, OpenMediaCallback, TimelineAction, ToggleReactionCallback,
 };
-use super::cache::decode::{deferred_texture_picture, set_avatar_image_when_mapped};
+use super::cache::decode::{
+    deferred_picture, deferred_texture_picture, set_avatar_image_when_mapped, TextureSpec,
+};
 use super::cache::{is_media_collapsed, resolve_cached_asset_path, set_media_collapsed};
 use super::reactions::build_reactions_widget;
 use super::text::{create_message_text_widget, render_text_content};
@@ -174,8 +176,8 @@ pub fn wrap_collapsible_media(media: Widget, ts: &str, slot: &str, title: Option
 }
 
 /// Loads `path` as an animated `Picture` when it's a multi-frame image (GIF/
-/// animated WebP), otherwise as a static texture decoded off the GTK thread
-/// once the picture is mapped (see [`deferred_texture_picture`]).
+/// animated WebP), otherwise as a static texture. Either loads off the GTK
+/// thread once the picture is mapped (see [`deferred_picture`]).
 /// Generalizes the animation driver already used for custom emoji reactions
 /// (see `load_custom_emoji_picture`) to arbitrary message/attachment images.
 pub fn load_animated_or_static_picture(
@@ -185,9 +187,15 @@ pub fn load_animated_or_static_picture(
     content_fit: gtk::ContentFit,
 ) -> Widget {
     let longest_side = width.max(height);
-    let pic = match crate::animated_image::animated_paintable(path, longest_side) {
-        Some(paintable) => Picture::for_paintable(&paintable),
-        None => deferred_texture_picture(path),
+    let pic = if let Some(player) = crate::animated_image::existing_player(path, longest_side) {
+        Picture::for_paintable(&player)
+    } else if let Some(texture) = TextureSpec::Full.cached(path) {
+        Picture::for_paintable(&texture)
+    } else {
+        // Loaded off the GTK thread once mapped, behind a placeholder of
+        // the size the header declares: as an animation when the header
+        // allows one, else as a still.
+        deferred_picture(path, TextureSpec::Full, 0, Some(longest_side))
     };
     pic.set_size_request(width, height);
     pic.set_can_shrink(true);
