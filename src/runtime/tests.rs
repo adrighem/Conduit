@@ -10025,7 +10025,8 @@ fn cached_conversation_user_ids_selects_known_direct_message_members() {
     );
 }
 
-/// Serves `users.list` and records every requested API method.
+/// Serves `users.list` and a four-page `conversations.list`, and records
+/// every requested API method.
 struct MethodCountingSlackServer {
     address: std::net::SocketAddr,
     methods: Arc<Mutex<Vec<String>>>,
@@ -10062,10 +10063,21 @@ fn spawn_method_counting_slack_server() -> MethodCountingSlackServer {
                 .unwrap_or_default()
                 .to_string();
             thread_methods.lock().unwrap().push(method.clone());
-            let body = if method == "users.list" {
-                r#"{"ok":true,"members":[{"id":"U0","name":"ada"},{"id":"U1","name":"bob"}]}"#
-            } else {
-                r#"{"ok":false,"error":"unexpected_method"}"#
+            let list_calls = thread_methods
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|method| *method == "conversations.list")
+                .count();
+            let body = match method.as_str() {
+                "users.list" => {
+                    r#"{"ok":true,"members":[{"id":"U0","name":"ada"},{"id":"U1","name":"bob"}]}"#
+                }
+                "conversations.list" if list_calls <= 3 => {
+                    r#"{"ok":true,"channels":[],"response_metadata":{"next_cursor":"more"}}"#
+                }
+                "conversations.list" => r#"{"ok":true,"channels":[]}"#,
+                _ => r#"{"ok":false,"error":"unexpected_method"}"#,
             };
             request
                 .respond(tiny_http::Response::from_string(body).with_header(
@@ -10172,6 +10184,35 @@ fn perf_guard_startup_user_names_use_one_users_list_and_no_users_info() {
         assert!(server.finish().is_empty());
 
         let _ = std::fs::remove_dir_all(directory);
+    });
+}
+
+#[test]
+fn perf_guard_channel_discovery_paces_pages_below_the_tier_2_rate() {
+    // Tier 2 allows about 20 requests a minute.
+    assert!(crate::slack::DISCOVERY_PAGE_INTERVAL >= Duration::from_secs(3));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let server = spawn_method_counting_slack_server();
+        let mut slack = SlackApi::new(StoredToken {
+            access_token: "test-token".to_string(),
+            ..Default::default()
+        });
+        slack.api_base_url = format!("http://{}/api", server.address);
+
+        let interval = Duration::from_millis(100);
+        let started = Instant::now();
+        slack.discover_conversations_paced(interval).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(server.finish(), vec!["conversations.list".to_string(); 4]);
+        // Three pauses separate four pages; the first page is not delayed.
+        assert!(elapsed >= interval * 3);
     });
 }
 
