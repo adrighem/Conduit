@@ -1189,11 +1189,25 @@ impl NativeTimelineView {
         let settling = self.settling.clone();
         let current_settle = self.settle_generation.clone();
         let check_load_older = self.check_load_older.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(settle_delay), move || {
-            if current_settle.get() == settle_generation {
-                settling.set(false);
-                check_load_older();
+        let vadj = self.scrolled_window.vadjustment();
+        let pin_pending = pin_to_bottom && focus_index.is_none();
+        let settle_started = Instant::now();
+        glib::timeout_add_local(std::time::Duration::from_millis(settle_delay), move || {
+            if current_settle.get() != settle_generation {
+                return glib::ControlFlow::Break;
             }
+            // The pin lands on the next layout. When that frame is slower
+            // than the settle delay the view still sits at the oldest row,
+            // and ending the settle there would page in older history.
+            if pin_pending
+                && !is_near_bottom(&vadj)
+                && settle_started.elapsed() < PIN_SETTLE_DEADLINE
+            {
+                return glib::ControlFlow::Continue;
+            }
+            settling.set(false);
+            check_load_older();
+            glib::ControlFlow::Break
         });
     }
 
@@ -1245,6 +1259,10 @@ impl NativeTimelineView {
 /// Distance from the newest message within which the view still counts as
 /// following the conversation.
 const STICK_TO_BOTTOM_SLACK: f64 = 48.0;
+
+/// How long a render pinned to the newest message keeps paging suspended
+/// while waiting for the pin to land.
+const PIN_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn is_near_bottom(vadj: &gtk::Adjustment) -> bool {
     vadj.page_size() <= 0.0
