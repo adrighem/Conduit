@@ -72,21 +72,19 @@ pub(super) fn build_members(callbacks: &Callbacks) -> (gtk::Box, MembersWidgets)
             return;
         };
         if let Some(avatar) = row.first_child().and_downcast::<adw::Avatar>() {
-            avatar.set_text(Some(&member.name));
-            avatar.set_custom_image(gtk::gdk::Paintable::NONE);
-            if let Some(path) = member.avatar_path.as_deref() {
-                // Rows are recycled: apply only while this member is shown.
-                let weak = avatar.downgrade();
-                let name = member.name.clone();
-                crate::timeline::cache::decode::with_texture(path, move |texture| {
-                    let Some(avatar) = weak.upgrade() else {
-                        return;
-                    };
-                    if avatar.text().as_deref() == Some(name.as_str()) {
-                        avatar.set_custom_image(Some(texture));
-                    }
-                });
-            }
+            let weak_item = item.downgrade();
+            let still_rows = bind_rows.clone();
+            set_member_avatar(&avatar, member, move |user_id, path| {
+                // The item this row is bound to now, and its avatar now.
+                let bound = weak_item
+                    .upgrade()
+                    .and_then(|item| item.item().and_downcast::<gtk::StringObject>());
+                bound.is_some_and(|id| id.string() == user_id)
+                    && still_rows
+                        .borrow()
+                        .get(user_id)
+                        .is_some_and(|member| member.avatar_path.as_deref() == Some(path))
+            });
         }
         if let Some(text) = row.last_child().and_downcast::<gtk::Box>() {
             if let Some(name) = text.first_child().and_downcast::<gtk::Label>() {
@@ -263,5 +261,92 @@ impl Inner {
             "empty"
         };
         self.members.pages.set_visible_child_name(page);
+    }
+}
+
+/// Shows `member` on a recycled row's `avatar`: initials now, its picture
+/// once decoded off the GTK thread. `shows(user_id, path)` says whether the
+/// row still shows that member with that avatar when the decode lands, so a
+/// late result never paints another member's row.
+fn set_member_avatar(
+    avatar: &adw::Avatar,
+    member: &MemberRow,
+    shows: impl Fn(&str, &std::path::Path) -> bool + 'static,
+) {
+    avatar.set_text(Some(&member.name));
+    avatar.set_custom_image(gtk::gdk::Paintable::NONE);
+    let Some(path) = member.avatar_path.clone() else {
+        return;
+    };
+    let weak = avatar.downgrade();
+    let user_id = member.user_id.clone();
+    let expected = path.clone();
+    crate::timeline::cache::decode::with_texture(&path, move |texture| {
+        if let Some(avatar) = weak.upgrade().filter(|_| shows(&user_id, &expected)) {
+            avatar.set_custom_image(Some(texture));
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tests that create GTK widgets. They run only when
+    /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
+    mod graphical {
+        use super::*;
+        use crate::timeline::cache::decode;
+
+        fn member(dir: &std::path::Path, user_id: &str, side: i32) -> MemberRow {
+            let path = dir.join(format!("{user_id}.png"));
+            gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, side, side)
+                .expect("pixbuf")
+                .savev(&path, "png", &[])
+                .expect("save");
+            MemberRow {
+                user_id: user_id.to_string(),
+                name: "Alex".to_string(),
+                status: String::new(),
+                avatar_path: Some(path),
+            }
+        }
+
+        #[test]
+        fn recycled_rows_keep_each_namesakes_own_avatar() {
+            crate::timeline::tests::run_gtk_test(|| {
+                crate::timeline::clear_timeline_view_caches();
+                let executor = decode::ManualExecutor::<decode::TextureKey, decode::Decoded>::new();
+                decode::install_texture_executor_for_tests(executor.clone());
+                let dir = crate::timeline::tests::TempTestDir::new("member-namesakes");
+                let first = member(dir.path(), "U1", 8);
+                let second = member(dir.path(), "U2", 16);
+                // One row bound to U1, then recycled for U2 before U1's
+                // decode lands, as a scrolled list does.
+                let bound = Rc::new(RefCell::new(String::new()));
+                let avatar = adw::Avatar::new(36, None, true);
+                for row in [&first, &second] {
+                    bound.borrow_mut().clone_from(&row.user_id);
+                    let bound = bound.clone();
+                    set_member_avatar(&avatar, row, move |user_id, _| *bound.borrow() == user_id);
+                }
+                // U2's decode lands first, then U1's late one.
+                for user_id in ["U2", "U1"] {
+                    let running = executor.running();
+                    let index = running
+                        .iter()
+                        .position(|key| key.path.ends_with(format!("{user_id}.png")))
+                        .expect("decode running");
+                    let result = decode::decode_now_for_tests(&running[index]);
+                    executor.complete(index, result);
+                }
+                let shown = avatar
+                    .custom_image()
+                    .and_downcast::<gtk::gdk::Texture>()
+                    .expect("U2's avatar shows");
+                decode::reset_texture_decoder_for_tests();
+                assert_eq!(shown.width(), 16, "U1's late result must not replace it");
+            });
+        }
     }
 }
