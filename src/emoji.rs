@@ -1,10 +1,16 @@
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 #[cfg(test)]
 use serde::{Deserialize, Serialize};
 
-use crate::search::{SearchField, SearchQuery, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT};
+#[cfg(test)]
+use crate::search::SearchQuery;
+use crate::search::{
+    CompletionEntry, CompletionIndex, CompletionMatches, MatchScore, SearchField,
+    PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
+};
 
 mod slack_names;
 
@@ -209,8 +215,10 @@ fn canonical_emoji_name(name: &str) -> String {
     canonical
 }
 
-/// Widget-independent emoji picker data. The native composer and status
-/// pickers and the WebView reaction picker are rendered from this model.
+/// Widget-independent emoji picker data and the uncached reference ranking:
+/// composer completion ranks through [`EmojiCompletionIndex`] and must order
+/// results exactly as [`EmojiPickerModel::search`] does.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct EmojiPickerModel {
     entries: Vec<EmojiEntry>,
@@ -300,6 +308,7 @@ impl EmojiPickerGenerationGate {
     }
 }
 
+#[cfg(test)]
 impl EmojiPickerModel {
     pub fn new(entries: Vec<EmojiEntry>) -> Self {
         Self { entries }
@@ -374,12 +383,59 @@ impl EmojiPickerModel {
                     SearchField::new(&entry.label, SECONDARY_FIELD_WEIGHT),
                 ])?;
                 let name_prefix = entry.name.to_lowercase().starts_with(&prefix);
-                Some(((name_prefix, score.band()), index, entry))
+                Some((emoji_rank(name_prefix, score), index, entry))
             })
             .collect::<Vec<_>>();
-        matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        matches.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         matches.into_iter().map(|(_, _, entry)| entry).collect()
     }
+}
+
+/// Sort key for a match, best first: names starting with the query, then
+/// the relevance band.
+fn emoji_rank(name_prefix: bool, score: MatchScore) -> Reverse<(bool, u8)> {
+    Reverse((name_prefix, score.band()))
+}
+
+/// Emoji prepared for `:` completion; see [`CompletionIndex`]. Equal ranks
+/// keep catalog order.
+pub type EmojiCompletionIndex = CompletionIndex<EmojiEntry, usize>;
+
+/// Prepares `entries` once so each keystroke only scores matches.
+pub fn emoji_completion_index(entries: Vec<EmojiEntry>) -> EmojiCompletionIndex {
+    CompletionIndex::new(
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(position, entry)| {
+                CompletionEntry::new(
+                    entry.clone(),
+                    [
+                        SearchField::new(&entry.name, PRIMARY_FIELD_WEIGHT),
+                        SearchField::new(&entry.label, SECONDARY_FIELD_WEIGHT),
+                    ],
+                    entry.name.to_lowercase(),
+                    None,
+                    position,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The best `limit` emoji for `query`, ranked like
+/// [`EmojiPickerModel::search`]. `matches` carries the previous keystroke's
+/// matches, so a query that extends it filters those instead of the index.
+pub fn search_emoji_index(
+    index: &EmojiCompletionIndex,
+    query: &str,
+    matches: &mut Option<CompletionMatches>,
+    limit: usize,
+) -> Vec<EmojiEntry> {
+    let prefix = query.trim().to_lowercase();
+    index.search(query, matches, limit, |entry, score| {
+        emoji_rank(entry.name_key.starts_with(&prefix), score)
+    })
 }
 
 pub fn emoji_picker_accessible_label(entry: &EmojiEntry) -> String {
@@ -425,6 +481,7 @@ fn category_label(group: emojis::Group) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::take_candidates_scored;
 
     #[test]
     fn catalog_resolves_unicode_custom_and_alias_emoji() {
@@ -865,5 +922,84 @@ mod tests {
             decoded["entries"][0]["value"],
             "https://emoji.example/image.png?label=\"quoted\""
         );
+    }
+
+    #[test]
+    fn incremental_emoji_completion_ranks_like_the_picker_model() {
+        let custom = HashMap::from([
+            (
+                "party-parrot".to_string(),
+                "https://emoji.example/parrot.png".to_string(),
+            ),
+            ("smirk-x".to_string(), "alias:smirk".to_string()),
+        ]);
+        let entries = EmojiCatalog::new(&custom).entries();
+        let reference = EmojiPickerModel::new(entries.clone());
+        let index = emoji_completion_index(entries);
+
+        let typing: [&[&str]; 6] = [
+            &["sm", "smi", "smil", "smile", "smil", "sm", "s", "sm"],
+            &["fl", "fla", "flag", "flag-", "flag-s", "flag-sm"],
+            &["+1", "+", "thumbs", "thumbs u", "thumbsup"],
+            &["par", "parr", "party", "party p", "pa", "PAR", "Par "],
+            &["hear", "heart", "heart e", "heart eyes", "héart"],
+            &["zz", "z", "smirk", "smirk-", "smirk-x"],
+        ];
+        for sequence in typing {
+            let mut matches = None;
+            for query in sequence {
+                for limit in [10, usize::MAX] {
+                    assert_eq!(
+                        search_emoji_index(&index, query, &mut matches, limit),
+                        reference
+                            .search(query)
+                            .into_iter()
+                            .take(limit)
+                            .collect::<Vec<_>>(),
+                        "query {query:?} limit {limit} in {sequence:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emoji_completion_index_completes_name_prefixes_before_word_matches() {
+        let index = emoji_completion_index(EmojiCatalog::new(&HashMap::new()).entries());
+        let mut matches = None;
+
+        for query in ["sm", "smi"] {
+            let found = search_emoji_index(&index, query, &mut matches, 10);
+            assert!(found
+                .first()
+                .is_some_and(|entry| entry.name.starts_with(query)));
+        }
+        let found = search_emoji_index(&index, "sm", &mut matches, usize::MAX);
+        assert_eq!(
+            found.first().map(|entry| entry.name.as_str()),
+            Some("smiley")
+        );
+        assert!(found.iter().any(|entry| entry.name == "flag-sm"));
+    }
+
+    #[test]
+    fn perf_guard_extending_an_emoji_query_scores_only_the_previous_matches() {
+        let entries = EmojiCatalog::new(&HashMap::new()).entries();
+        let reference = EmojiPickerModel::new(entries.clone());
+        let index = emoji_completion_index(entries);
+        let mut matches = None;
+        take_candidates_scored();
+
+        let mut expected = index.len();
+        for query in ["sm", "smi", "smil", "smile"] {
+            search_emoji_index(&index, query, &mut matches, 10);
+            assert_eq!(
+                take_candidates_scored(),
+                expected,
+                "{query:?} must score the previous matches, not the catalog"
+            );
+            expected = reference.search(query).len();
+        }
+        assert!(expected < index.len() / 10, "the fixture must narrow");
     }
 }

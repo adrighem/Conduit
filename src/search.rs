@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 /// Weight used for the main, human-readable field of a search result.
@@ -78,6 +80,19 @@ impl SearchQuery {
             .any(|term| best_match_in_field(term, &value).is_some())
     }
 
+    /// Whether every match of `self` is also a match of `previous`: the terms
+    /// before `previous`'s last one are unchanged and its last term only
+    /// grew, or terms were added. A longer substring or an extra term can only
+    /// narrow the matches, so filtering the previous matches finds them all.
+    pub fn extends(&self, previous: &SearchQuery) -> bool {
+        let Some(last) = previous.terms.len().checked_sub(1) else {
+            return true;
+        };
+        self.terms.len() > last
+            && self.terms[..last] == previous.terms[..last]
+            && self.terms[last].starts_with(previous.terms[last].as_str())
+    }
+
     /// Scores a match from 0 to 100, or returns `None` unless every query term
     /// occurs in at least one field.
     ///
@@ -103,8 +118,27 @@ impl SearchQuery {
 
         let fields = fields
             .into_iter()
-            .map(|field| (normalize_for_search(field.value), field.weight.min(100)))
+            .map(|field| (normalize_for_search(field.value), field.weight))
             .collect::<Vec<_>>();
+        self.score_normalized(
+            fields
+                .iter()
+                .map(|(value, weight)| (value.as_str(), *weight)),
+        )
+    }
+
+    /// Scores like [`SearchQuery::score`] for fields already passed through
+    /// [`normalize_for_search`], so a cached index normalizes each field once
+    /// instead of once per keystroke.
+    pub fn score_normalized<'a>(
+        &self,
+        fields: impl IntoIterator<Item = (&'a str, u8)>,
+    ) -> Option<MatchScore> {
+        if self.is_empty() {
+            return Some(MatchScore(100));
+        }
+
+        let fields = fields.into_iter().collect::<Vec<_>>();
         let mut term_scores = Vec::with_capacity(self.terms.len());
 
         for term in &self.terms {
@@ -112,7 +146,7 @@ impl SearchQuery {
                 .iter()
                 .filter_map(|(value, field_weight)| {
                     best_match_in_field(term, value)
-                        .map(|score| weighted_percentage(score, *field_weight))
+                        .map(|score| weighted_percentage(score, (*field_weight).min(100)))
                 })
                 .max()?;
             term_scores.push(best);
@@ -128,7 +162,7 @@ impl SearchQuery {
     }
 }
 
-fn normalize_for_search(value: &str) -> String {
+pub fn normalize_for_search(value: &str) -> String {
     value
         .nfkd()
         .filter(|character| !is_combining_mark(*character))
@@ -170,6 +204,212 @@ fn weighted_percentage(score: u8, weight: u8) -> u8 {
     ((u16::from(score) * u16::from(weight)) / 100) as u8
 }
 
+static NEXT_COMPLETION_INDEX_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+thread_local! {
+    static CANDIDATES_SCORED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Candidates scored on this thread since the last call, for guards that
+/// bound the work of a completion keystroke.
+#[cfg(test)]
+pub fn take_candidates_scored() -> usize {
+    CANDIDATES_SCORED.with(|scored| scored.replace(0))
+}
+
+/// One completion candidate prepared once: its search fields are normalized
+/// when the index is built, not on every keystroke.
+#[derive(Debug, Clone)]
+pub struct CompletionEntry<T, K> {
+    pub item: T,
+    /// Lowercased primary name, for ranking rules that compare it.
+    pub name_key: String,
+    fields: Vec<(String, u8)>,
+    /// Entries sharing an id collapse to the best ranked one.
+    unique_id: Option<String>,
+    /// Order among equally scored matches, precomputed once.
+    tie: K,
+}
+
+impl<T, K> CompletionEntry<T, K> {
+    pub fn new<'a>(
+        item: T,
+        fields: impl IntoIterator<Item = SearchField<'a>>,
+        name_key: String,
+        unique_id: Option<String>,
+        tie: K,
+    ) -> Self {
+        Self {
+            item,
+            name_key,
+            fields: fields
+                .into_iter()
+                .map(|field| (normalize_for_search(field.value), field.weight))
+                .collect(),
+            unique_id,
+            tie,
+        }
+    }
+}
+
+/// The matches of one query, kept so the next keystroke can filter them
+/// instead of scoring the whole index again.
+#[derive(Debug, Clone)]
+pub struct CompletionMatches {
+    index_id: u64,
+    raw_query: String,
+    query: SearchQuery,
+    /// Every match (before collapsing shared ids), best first.
+    ranked: Vec<u32>,
+}
+
+/// Completion candidates prepared for repeated searching. Build it once per
+/// change of the underlying data, then [`CompletionIndex::search`] on every
+/// keystroke.
+#[derive(Debug)]
+pub struct CompletionIndex<T, K> {
+    id: u64,
+    entries: Vec<CompletionEntry<T, K>>,
+}
+
+impl<T: Clone, K: Ord> CompletionIndex<T, K> {
+    pub fn new(entries: Vec<CompletionEntry<T, K>>) -> Self {
+        Self {
+            id: NEXT_COMPLETION_INDEX_ID.fetch_add(1, Ordering::Relaxed),
+            entries,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The best `limit` matches for `query`, ordered by `rank` (best first,
+    /// the smaller key) and then by each entry's precomputed tie key.
+    ///
+    /// `matches` is the previous search of this index. When `query` extends
+    /// it, only those matches are scored; otherwise the whole index is.
+    /// `matches` is replaced by this search's matches.
+    pub fn search<P: Ord>(
+        &self,
+        query: &str,
+        matches: &mut Option<CompletionMatches>,
+        limit: usize,
+        rank: impl Fn(&CompletionEntry<T, K>, MatchScore) -> P,
+    ) -> Vec<T> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let previous = matches
+            .take()
+            .filter(|previous| previous.index_id == self.id);
+        let previous = match previous {
+            Some(previous) if previous.raw_query == query => {
+                let found = self.top(&previous.ranked, limit);
+                *matches = Some(previous);
+                return found;
+            }
+            other => other,
+        };
+
+        let parsed = SearchQuery::parse(query);
+        let mut scored = match previous
+            .as_ref()
+            .filter(|previous| parsed.extends(&previous.query))
+        {
+            Some(previous) => self.score(&parsed, previous.ranked.iter().copied(), &rank),
+            None => self.score(&parsed, 0..self.entries.len() as u32, &rank),
+        };
+        scored.sort_by(|(left_rank, left), (right_rank, right)| {
+            left_rank
+                .cmp(right_rank)
+                .then_with(|| {
+                    self.entries[*left as usize]
+                        .tie
+                        .cmp(&self.entries[*right as usize].tie)
+                })
+                .then_with(|| left.cmp(right))
+        });
+        let ranked = scored
+            .into_iter()
+            .map(|(_, index)| index)
+            .collect::<Vec<_>>();
+        let found = self.top(&ranked, limit);
+        *matches = Some(CompletionMatches {
+            index_id: self.id,
+            raw_query: query.to_string(),
+            query: parsed,
+            ranked,
+        });
+        found
+    }
+
+    fn score<P>(
+        &self,
+        query: &SearchQuery,
+        candidates: impl Iterator<Item = u32>,
+        rank: &impl Fn(&CompletionEntry<T, K>, MatchScore) -> P,
+    ) -> Vec<(P, u32)> {
+        candidates
+            .filter_map(|index| {
+                let entry = &self.entries[index as usize];
+                #[cfg(test)]
+                CANDIDATES_SCORED.with(|scored| scored.set(scored.get() + 1));
+                let score = query.score_normalized(
+                    entry
+                        .fields
+                        .iter()
+                        .map(|(value, weight)| (value.as_str(), *weight)),
+                )?;
+                Some((rank(entry, score), index))
+            })
+            .collect()
+    }
+
+    fn top(&self, ranked: &[u32], limit: usize) -> Vec<T> {
+        let mut seen = std::collections::HashSet::new();
+        ranked
+            .iter()
+            .filter_map(|&index| {
+                let entry = &self.entries[index as usize];
+                match entry.unique_id.as_deref() {
+                    Some(id) if !seen.insert(id) => None,
+                    _ => Some(entry.item.clone()),
+                }
+            })
+            .take(limit)
+            .collect()
+    }
+}
+
+/// A lazily built completion index that stays until its data changes.
+#[derive(Debug)]
+pub struct CompletionCache<I> {
+    index: Option<std::rc::Rc<I>>,
+}
+
+impl<I> Default for CompletionCache<I> {
+    fn default() -> Self {
+        Self { index: None }
+    }
+}
+
+impl<I> CompletionCache<I> {
+    /// The cached index, built by `build` only when there is none.
+    pub fn get_or_build(&mut self, build: impl FnOnce() -> I) -> std::rc::Rc<I> {
+        self.index
+            .get_or_insert_with(|| std::rc::Rc::new(build()))
+            .clone()
+    }
+
+    /// Drops the index; the next lookup rebuilds it from the new data.
+    pub fn invalidate(&mut self) {
+        self.index = None;
+    }
+}
+
 #[cfg(test)]
 fn matches_all_terms<'a>(query: &str, values: impl IntoIterator<Item = &'a str>) -> bool {
     let query = SearchQuery::parse(query);
@@ -184,6 +424,8 @@ fn matches_all_terms<'a>(query: &str, values: impl IntoIterator<Item = &'a str>)
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Reverse;
+
     use super::*;
 
     fn score(query: &str, value: &str) -> MatchScore {
@@ -293,5 +535,77 @@ mod tests {
     #[test]
     fn empty_query_matches_with_a_neutral_perfect_score() {
         assert_eq!(score("  ", "anything").percentage(), 100);
+    }
+
+    #[test]
+    fn query_extension_only_narrows_matches() {
+        let query = |text| SearchQuery::parse(text);
+
+        assert!(query("ali").extends(&query("al")));
+        assert!(query("al").extends(&query("al")));
+        assert!(query("al").extends(&query("")));
+        assert!(query("ali ro").extends(&query("ali")));
+        assert!(query("fat rob").extends(&query("fat ro")));
+        assert!(query("c-r").extends(&query("c-")));
+        assert!(query("c-").extends(&query("c")));
+        assert!(!query("a").extends(&query("al")), "backspace widens");
+        assert!(!query("ro ali").extends(&query("ali")), "terms are ordered");
+        assert!(
+            !query("a li").extends(&query("al")),
+            "a split is not growth"
+        );
+        assert!(!query("").extends(&query("al")));
+    }
+
+    #[test]
+    fn perf_guard_completion_index_is_built_once_until_invalidated() {
+        let mut builds = 0;
+        let mut cache = CompletionCache::<Vec<u8>>::default();
+        for _ in 0..100 {
+            cache.get_or_build(|| {
+                builds += 1;
+                Vec::new()
+            });
+        }
+        assert_eq!(builds, 1, "keystrokes must reuse the cached index");
+
+        cache.invalidate();
+        cache.get_or_build(|| {
+            builds += 1;
+            Vec::new()
+        });
+        assert_eq!(builds, 2, "changed data rebuilds the index");
+    }
+
+    #[test]
+    fn completion_matches_of_a_replaced_index_are_never_reused() {
+        let build = |names: &[&str]| {
+            CompletionIndex::new(
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(position, name)| {
+                        CompletionEntry::new(
+                            name.to_string(),
+                            [SearchField::new(name, PRIMARY_FIELD_WEIGHT)],
+                            name.to_lowercase(),
+                            None,
+                            position,
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let rank = |_: &CompletionEntry<String, usize>, score: MatchScore| Reverse(score);
+        let before = build(&["ada", "alan"]);
+        let mut matches = None;
+        assert_eq!(before.search("a", &mut matches, 10, rank), ["ada", "alan"]);
+
+        let after = build(&["ada", "alan", "alice"]);
+        assert_eq!(
+            after.search("al", &mut matches, 10, rank),
+            ["alan", "alice"],
+            "a stale match set would miss the new entry"
+        );
     }
 }
