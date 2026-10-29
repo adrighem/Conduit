@@ -112,6 +112,8 @@ impl UiInvalidations {
     pub const THREAD: Self = Self(1 << 2);
     pub const TITLE: Self = Self(1 << 3);
     pub const PICKER: Self = Self(1 << 4);
+    pub const PEOPLE_PICKER: Self = Self(1 << 5);
+    pub const COMPLETION: Self = Self(1 << 6);
 
     pub fn contains(self, invalidation: Self) -> bool {
         self.0 & invalidation.0 != 0
@@ -386,6 +388,7 @@ mod imp {
         pub(super) conversation_titles: RefCell<ConversationTitlesCache>,
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
         pub(super) conversation_picker_refresh: Cell<PickerRefreshGate>,
+        pub(super) people_picker_refresh: Cell<PickerRefreshGate>,
         pub(super) people_picker_view: RefCell<Option<PeoplePickerView>>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
         pub(super) pending_last_conversation: RefCell<Option<LastConversation>>,
@@ -6997,6 +7000,26 @@ impl ConduitWindow {
         )
     }
 
+    /// Whether the caret sits in an `@`, `#` or `:` token, so new data can
+    /// change the suggestions. Without one there is nothing to refresh.
+    fn composer_completion_is_active(&self, target: ComposerTarget) -> bool {
+        self.composer_completion(target)
+            .borrow()
+            .as_ref()
+            .is_some_and(|completion| completion.token.is_some())
+    }
+
+    /// Coalesces suggestion refreshes after data changes into the next frame
+    /// flush, and skips them while no completion is active.
+    fn invalidate_composer_completions(&self) {
+        if COMPOSER_TARGETS
+            .into_iter()
+            .any(|target| self.composer_completion_is_active(target))
+        {
+            self.queue_ui_invalidations(UiInvalidations::COMPLETION);
+        }
+    }
+
     fn refresh_composer_completion(&self, target: ComposerTarget) {
         let text_view = self.composer_text_view(target);
         let buffer = text_view.buffer();
@@ -7410,19 +7433,15 @@ impl ConduitWindow {
                     .discovered_users
                     .borrow_mut() = users;
                 self.invalidate_conversation_picker();
-                self.refresh_open_people_picker(true);
-                for target in COMPOSER_TARGETS {
-                    self.refresh_composer_completion(target);
-                }
+                self.invalidate_people_picker();
+                self.invalidate_composer_completions();
             }
             RuntimeEventKind::UserGroupsDiscovered(groups) => {
                 self.imp()
                     .workspace
                     .user_directory
                     .apply_user_groups(groups);
-                for target in COMPOSER_TARGETS {
-                    self.refresh_composer_completion(target);
-                }
+                self.invalidate_composer_completions();
             }
             RuntimeEventKind::ConversationOpenCompleted { channel_id } => {
                 let title = self.conversation_title(&channel_id);
@@ -7979,6 +7998,16 @@ impl ConduitWindow {
         }
         if invalidations.contains(UiInvalidations::PICKER) {
             self.refresh_open_conversation_picker();
+        }
+        if invalidations.contains(UiInvalidations::PEOPLE_PICKER) {
+            self.refresh_open_people_picker();
+        }
+        if invalidations.contains(UiInvalidations::COMPLETION) {
+            for target in COMPOSER_TARGETS {
+                if self.composer_completion_is_active(target) {
+                    self.refresh_composer_completion(target);
+                }
+            }
         }
         if invalidations.contains(UiInvalidations::TITLE) {
             self.refresh_workspace_title_status();
@@ -9562,9 +9591,7 @@ impl ConduitWindow {
                 .set_custom_emojis(&self.imp().custom_emojis.borrow());
             write_status_dialog_test_state(self, state);
         }
-        for target in COMPOSER_TARGETS {
-            self.refresh_composer_completion(target);
-        }
+        self.invalidate_composer_completions();
     }
 
     fn handle_runtime_error(&self, context: &OperationContext, failure: &RuntimeFailure) {
@@ -10068,8 +10095,8 @@ impl ConduitWindow {
 
         for target in COMPOSER_TARGETS {
             self.refresh_composer_mention_names(target);
-            self.refresh_composer_completion(target);
         }
+        self.invalidate_composer_completions();
         let mut affected_user_ids = affected_user_ids.into_iter().collect::<Vec<_>>();
         affected_user_ids.sort();
         self.patch_users_on_timelines(&affected_user_ids);
@@ -11372,6 +11399,30 @@ impl ConduitWindow {
             confirm: confirm.clone(),
             rows: rows.clone(),
             excluded_user_ids: excluded_user_ids.iter().cloned().collect(),
+            discovery_complete: Rc::new(Cell::new(has_discovered_people)),
+            shown: Rc::default(),
+        });
+        self.imp()
+            .people_picker_refresh
+            .set(PickerRefreshGate::default());
+
+        let weak_window = self.downgrade();
+        list.connect_map(move |list| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let is_active = window
+                .imp()
+                .people_picker_view
+                .borrow()
+                .as_ref()
+                .is_some_and(|view| view.list == *list);
+            let mut gate = window.imp().people_picker_refresh.get();
+            let rebuild = is_active && gate.shown();
+            window.imp().people_picker_refresh.set(gate);
+            if rebuild {
+                window.refresh_open_people_picker();
+            }
         });
 
         let rows_for_search = rows.clone();
@@ -11417,14 +11468,30 @@ impl ConduitWindow {
 
         dialog.present();
         search.grab_focus();
-        self.refresh_open_people_picker(has_discovered_people);
+        self.refresh_open_people_picker();
         self.request_discovery();
     }
 
-    fn refresh_open_people_picker(&self, discovery_complete: bool) {
+    /// Marks people discovery complete and coalesces the open people
+    /// picker's rebuild into the next frame flush.
+    fn invalidate_people_picker(&self) {
+        if let Some(view) = self.imp().people_picker_view.borrow().as_ref() {
+            view.discovery_complete.set(true);
+            self.queue_ui_invalidations(UiInvalidations::PEOPLE_PICKER);
+        }
+    }
+
+    fn refresh_open_people_picker(&self) {
         let Some(view) = self.imp().people_picker_view.borrow().clone() else {
             return;
         };
+        let mut gate = self.imp().people_picker_refresh.get();
+        let rebuild = gate.request(view.list.is_mapped());
+        self.imp().people_picker_refresh.set(gate);
+        if !rebuild {
+            return;
+        }
+        let discovery_complete = view.discovery_complete.get();
         let selected_user_ids = view
             .rows
             .borrow()
@@ -11433,24 +11500,20 @@ impl ConduitWindow {
             .map(|person| person.user_id.clone())
             .collect::<HashSet<_>>();
         let current_user_id = self.imp().current_user_id.borrow().clone();
-        let mut people = self
-            .imp()
-            .workspace
-            .user_directory
-            .discovered_users
-            .borrow()
-            .iter()
-            .filter(|user| !user.deleted.unwrap_or(false) && !user.is_bot.unwrap_or(false))
-            .filter_map(|user| {
-                let id = user.id.as_ref()?.trim();
-                let name = user.direct_message_name()?;
-                (!id.is_empty()
-                    && Some(id) != current_user_id.as_deref()
-                    && !view.excluded_user_ids.contains(id))
-                .then(|| (id.to_string(), name))
-            })
-            .collect::<Vec<_>>();
-        people.sort_by_key(|(_, name)| name.to_lowercase());
+        let people = people_picker_entries(
+            &self
+                .imp()
+                .workspace
+                .user_directory
+                .discovered_users
+                .borrow(),
+            current_user_id.as_deref(),
+            &view.excluded_user_ids,
+        );
+        if !people.is_empty() && *view.shown.borrow() == people {
+            return;
+        }
+        view.shown.borrow_mut().clone_from(&people);
 
         self.clear_list(&view.list);
         view.rows.borrow_mut().clear();
@@ -11590,28 +11653,28 @@ impl ConduitWindow {
         container.append(&search);
 
         let weak_window = self.downgrade();
-        let (list, store) = conversation_picker_list(move |entry| {
+        let model = ConversationPickerModel::new(move |entry| {
             weak_window.upgrade().map_or_else(
                 || gtk::Label::new(None).upcast(),
                 |window| window.conversation_picker_entry_widget(entry),
             )
         });
+        let list = model.list.clone();
 
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_vexpand(true);
         scroller.set_child(Some(&list));
         container.append(&scroller);
 
-        set_conversation_picker_entries(
-            &store,
+        model.show(
+            "",
             vec![ConversationPickerListEntry::Placeholder(gettext(
                 "Loading conversations…",
             ))],
         );
 
         *self.imp().conversation_picker_view.borrow_mut() = Some(ConversationPickerView {
-            list: list.clone(),
-            store: store.clone(),
+            model: model.clone(),
             search: search.clone(),
             include_discovery,
         });
@@ -11629,7 +11692,7 @@ impl ConduitWindow {
                 .conversation_picker_view
                 .borrow()
                 .as_ref()
-                .is_some_and(|view| view.list == *list);
+                .is_some_and(|view| view.model.list == *list);
             let mut gate = window.imp().conversation_picker_refresh.get();
             let rebuild = is_active && gate.shown();
             window.imp().conversation_picker_refresh.set(gate);
@@ -11653,7 +11716,7 @@ impl ConduitWindow {
                     let mut active = window.imp().conversation_picker_view.borrow_mut();
                     if active
                         .as_ref()
-                        .is_some_and(|view| view.list == list_for_close)
+                        .is_some_and(|view| view.model.list == list_for_close)
                     {
                         active.take();
                         true
@@ -11676,7 +11739,7 @@ impl ConduitWindow {
         let weak_window = self.downgrade();
         let dialog_for_activate = dialog.clone();
         list.connect_activate(move |_, position| {
-            let action = conversation_picker_action_at(&store, position);
+            let action = model.action_at(position);
             if let (Some(window), Some(action)) = (weak_window.upgrade(), action) {
                 if on_activate(&window, action) {
                     dialog_for_activate.close();
@@ -11695,7 +11758,7 @@ impl ConduitWindow {
                     .conversation_picker_view
                     .borrow()
                     .as_ref()
-                    .is_some_and(|view| view.list == list_for_initial_population);
+                    .is_some_and(|view| view.model.list == list_for_initial_population);
                 if picker_is_active {
                     window.refresh_open_conversation_picker();
                 }
@@ -11716,7 +11779,7 @@ impl ConduitWindow {
             return;
         };
         let mut gate = self.imp().conversation_picker_refresh.get();
-        let rebuild = gate.request(view.list.is_mapped());
+        let rebuild = gate.request(view.model.list.is_mapped());
         self.imp().conversation_picker_refresh.set(gate);
         if !rebuild {
             return;
@@ -11747,8 +11810,8 @@ impl ConduitWindow {
                 query.as_str(),
             )
         };
-        set_conversation_picker_entries(
-            &view.store,
+        view.model.show(
+            query.as_str(),
             conversation_picker_population_entries(&sections),
         );
     }
