@@ -2271,3 +2271,40 @@ fn conversation_text_params_use_field_name() {
     );
     assert!(conversation_text_params("", "topic", "x").is_err());
 }
+
+#[test]
+fn discovery_paging_pauses_between_pages_and_caps_the_run() {
+    let mut paging =
+        DiscoveryPaging::with_limits(Duration::from_secs(4), Duration::from_secs(32), 3);
+    assert_eq!(paging.begin_page(None), Ok(Duration::ZERO));
+    assert_eq!(paging.begin_page(Some("a")), Ok(Duration::from_secs(4)));
+    assert_eq!(paging.begin_page(Some("b")), Ok(Duration::from_secs(4)));
+    assert_eq!(paging.begin_page(Some("c")), Err(DiscoveryStop::PageCap));
+    assert_eq!(paging.pages(), 3);
+}
+
+#[test]
+fn discovery_paging_stops_on_a_repeated_cursor() {
+    let mut paging = DiscoveryPaging::new();
+    assert!(paging.begin_page(Some("a")).is_ok());
+    assert!(paging.begin_page(Some("b")).is_ok());
+    assert_eq!(
+        paging.begin_page(Some("a")),
+        Err(DiscoveryStop::RepeatedCursor)
+    );
+}
+
+#[test]
+fn discovery_paging_doubles_after_rate_limits_up_to_the_maximum() {
+    let mut paging = DiscoveryPaging::new();
+    assert!(paging.begin_page(None).is_ok());
+    for _ in 0..10 {
+        paging.note_rate_limited();
+    }
+    assert_eq!(
+        paging.begin_page(Some("a")),
+        Ok(DISCOVERY_MAX_PAGE_INTERVAL)
+    );
+    // Tier 2 allows about 20 requests a minute.
+    assert!(DISCOVERY_PAGE_INTERVAL >= Duration::from_secs(3));
+}

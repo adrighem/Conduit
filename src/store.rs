@@ -38,6 +38,17 @@ const LEGACY_CONVERSATION_READ_KEYS: [&str; 5] = [
     "has_unreads",
 ];
 const MAX_CACHED_CHANNEL_MESSAGES: usize = 200;
+/// Channels from the last completed discovery sweep.
+const DISCOVERED_CHANNEL_KIND: &str = "discovered_channel";
+/// Channels resolved on demand (`conversations.info`), such as archived ones
+/// the sweep skips; sweeps never replace or drop these.
+const RESOLVED_CHANNEL_KIND: &str = "resolved_channel";
+/// Channels from a sweep still in progress; replaces the set on completion.
+const DISCOVERY_PARTIAL_KIND: &str = "discovered_channel_partial";
+const DISCOVERY_PROGRESS_KIND: &str = "channel_discovery_progress";
+const DISCOVERY_PROGRESS_KEY: &str = "channels";
+/// `sync_metadata` operation whose refresh time is the last completed sweep.
+const CHANNEL_DISCOVERY_OPERATION: &str = "channel_discovery";
 const ATTENTION_DELIVERY_KIND: &str = "attention_delivery";
 const ATTENTION_DELIVERY_LEDGER_KEY: &str = "__ledger__";
 const MAX_ATTENTION_DELIVERIES: usize = 512;
@@ -663,6 +674,20 @@ pub(crate) enum AttentionObservationStatus {
 pub(crate) struct AttentionDeliveryOutcome {
     pub(crate) observation: AttentionObservationStatus,
     pub(crate) notification_claimed: bool,
+}
+
+/// Where an interrupted discovery sweep resumes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ChannelDiscoveryProgress {
+    pub(crate) cursor: String,
+    pub(crate) pages: u32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChannelDiscoveryState {
+    /// When the last full sweep completed.
+    pub(crate) completed_at_ms: Option<i64>,
+    pub(crate) progress: Option<ChannelDiscoveryProgress>,
 }
 
 #[allow(dead_code)]
@@ -1358,6 +1383,165 @@ impl WorkspaceStore {
     #[allow(dead_code)]
     pub async fn store_custom_emojis(&self, emojis: &HashMap<String, String>) -> Result<()> {
         self.store_kind_map("custom_emoji", emojis.clone(), true)
+            .await
+    }
+
+    /// Channels from the last completed discovery sweep, overlaid with the
+    /// pages of a sweep still in progress and any on-demand lookups. Never
+    /// drops a channel, so a partial sweep only ever adds.
+    pub(crate) async fn load_discovered_channels(&self) -> Result<Vec<SlackConversation>> {
+        let workspace_key = self.workspace_key.clone();
+        self.query_or_reset(Vec::new(), move |connection| {
+            let mut channels = load_sqlite_kind_map::<SlackConversation>(
+                connection,
+                &workspace_key,
+                RESOLVED_CHANNEL_KIND,
+            )?;
+            for kind in [DISCOVERED_CHANNEL_KIND, DISCOVERY_PARTIAL_KIND] {
+                channels.extend(load_sqlite_kind_map::<SlackConversation>(
+                    connection,
+                    &workspace_key,
+                    kind,
+                )?);
+            }
+            let mut channels = channels.into_values().collect::<Vec<_>>();
+            channels.sort_by_key(|channel| channel.display_name().to_lowercase());
+            Ok(channels)
+        })
+        .await
+    }
+
+    /// Adds channels resolved on demand (`conversations.info`) to the
+    /// discovered set; sweeps neither replace nor clear them.
+    pub(crate) async fn upsert_discovered_channels(
+        &self,
+        channels: Vec<SlackConversation>,
+    ) -> Result<()> {
+        let values = channels
+            .into_iter()
+            .map(|channel| (channel.id.clone(), channel))
+            .collect();
+        self.store_kind_map(RESOLVED_CHANNEL_KIND, values, false)
+            .await
+    }
+
+    pub(crate) async fn load_channel_discovery_state(&self) -> Result<ChannelDiscoveryState> {
+        let workspace_key = self.workspace_key.clone();
+        self.query_or_reset(ChannelDiscoveryState::default(), move |connection| {
+            let progress = load_sqlite_item::<ChannelDiscoveryProgress>(
+                connection,
+                &workspace_key,
+                DISCOVERY_PROGRESS_KIND,
+                DISCOVERY_PROGRESS_KEY,
+            )?;
+            let completed_at_ms = connection
+                .query_row(
+                    "SELECT refreshed_at_ms FROM sync_metadata
+                     WHERE workspace_key = ?1 AND operation = ?2 AND target = ?3",
+                    params![workspace_key, CHANNEL_DISCOVERY_OPERATION, "workspace"],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten();
+            Ok(ChannelDiscoveryState {
+                completed_at_ms,
+                progress,
+            })
+        })
+        .await
+    }
+
+    /// Persists one batch of a running sweep plus its resume point, or clears
+    /// the resume point when `progress` is `None`. The batch is merged into
+    /// the partial set, so earlier results survive an interruption.
+    pub(crate) async fn save_discovery_progress(
+        &self,
+        batch: Vec<SlackConversation>,
+        progress: Option<ChannelDiscoveryProgress>,
+    ) -> Result<()> {
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut changed =
+                    ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                for channel in &batch {
+                    changed |= upsert_sqlite_item(
+                        &transaction,
+                        &workspace_key,
+                        DISCOVERY_PARTIAL_KIND,
+                        &channel.id,
+                        channel,
+                    )?;
+                }
+                changed |= match &progress {
+                    Some(progress) => upsert_sqlite_item(
+                        &transaction,
+                        &workspace_key,
+                        DISCOVERY_PROGRESS_KIND,
+                        DISCOVERY_PROGRESS_KEY,
+                        progress,
+                    )?,
+                    None => {
+                        delete_sqlite_kind(&transaction, &workspace_key, DISCOVERY_PROGRESS_KIND)?
+                    }
+                };
+                finish_sqlite_transaction(transaction, changed)?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Finishes a sweep: the accumulated pages replace the stored channel set
+    /// (dropping channels that were archived or removed), the resume point is
+    /// cleared and the completion time recorded, all in one transaction.
+    pub(crate) async fn complete_discovery_sweep(
+        &self,
+        batch: Vec<SlackConversation>,
+        completed_at_ms: i64,
+    ) -> Result<()> {
+        let workspace_key = self.workspace_key.clone();
+        let workspace_id = self.workspace_id.clone();
+        self.hub()
+            .await?
+            .write(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                ensure_sqlite_workspace(&transaction, &workspace_key, &workspace_id, false)?;
+                for channel in &batch {
+                    upsert_sqlite_item(
+                        &transaction,
+                        &workspace_key,
+                        DISCOVERY_PARTIAL_KIND,
+                        &channel.id,
+                        channel,
+                    )?;
+                }
+                let swept = load_sqlite_kind_map::<SlackConversation>(
+                    &transaction,
+                    &workspace_key,
+                    DISCOVERY_PARTIAL_KIND,
+                )?;
+                sync_sqlite_kind(&transaction, &workspace_key, DISCOVERED_CHANNEL_KIND, swept)?;
+                delete_sqlite_kind(&transaction, &workspace_key, DISCOVERY_PARTIAL_KIND)?;
+                delete_sqlite_kind(&transaction, &workspace_key, DISCOVERY_PROGRESS_KIND)?;
+                transaction.execute(
+                    "INSERT INTO sync_metadata(
+                         workspace_key, operation, target,
+                         refreshed_at_ms, retry_count, retry_after_ms
+                     ) VALUES (?1, ?2, 'workspace', ?3, 0, NULL)
+                     ON CONFLICT(workspace_key, operation, target) DO UPDATE SET
+                         refreshed_at_ms = excluded.refreshed_at_ms,
+                         retry_count = 0,
+                         retry_after_ms = NULL",
+                    params![workspace_key, CHANNEL_DISCOVERY_OPERATION, completed_at_ms],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
             .await
     }
 
@@ -3310,6 +3494,17 @@ fn reset_sqlite_workspace(connection: &mut Connection, workspace_key: &str) -> R
     )?;
     transaction.commit()?;
     Ok(())
+}
+
+fn delete_sqlite_kind(
+    transaction: &Transaction<'_>,
+    workspace_key: &str,
+    kind: &str,
+) -> Result<bool> {
+    Ok(transaction.execute(
+        "DELETE FROM workspace_items WHERE workspace_key = ?1 AND kind = ?2",
+        params![workspace_key, kind],
+    )? > 0)
 }
 
 fn delete_sqlite_workspace_item(

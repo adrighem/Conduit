@@ -11,7 +11,7 @@
 //! the returned outcomes to their views and translate request decisions into runtime commands.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -89,7 +89,7 @@ impl WorkspaceLifecycle {
 /// How long discovered channels, people and user groups stay valid before the
 /// next picker or completion use lists them again. `conversations.list` pages
 /// through every channel, so it must not run on each open.
-pub(crate) const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
+pub(crate) const DISCOVERY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// An unanswered discovery request is repeated after this long.
 const DISCOVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Discovery starts on its own this long after login, once startup traffic
@@ -155,10 +155,62 @@ impl DiscoveryGate {
     }
 }
 
+/// Mention-name lookups (`conversations.info`) in flight at once.
+pub(crate) const CHANNEL_LOOKUP_CONCURRENCY: usize = 3;
+
+/// Resolves `<#C...>` mention names that neither the member channels nor the
+/// discovered ones know: each id is asked once, at most
+/// `CHANNEL_LOOKUP_CONCURRENCY` at a time, and ids that could not be resolved
+/// are not asked again this session.
+#[derive(Debug, Default)]
+pub(crate) struct ChannelNameLookups {
+    in_flight: HashSet<String>,
+    queued: VecDeque<String>,
+    unresolved: HashSet<String>,
+}
+
+impl ChannelNameLookups {
+    /// Queues unknown ids and returns those that may be sent now.
+    pub(crate) fn request(&mut self, ids: impl IntoIterator<Item = String>) -> Vec<String> {
+        for id in ids {
+            if !self.in_flight.contains(&id)
+                && !self.unresolved.contains(&id)
+                && !self.queued.contains(&id)
+            {
+                self.queued.push_back(id);
+            }
+        }
+        std::iter::from_fn(|| self.next_to_send()).collect()
+    }
+
+    /// Records a lookup result and returns the next id to send, if any.
+    pub(crate) fn finish(&mut self, id: &str, resolved: bool) -> Option<String> {
+        self.in_flight.remove(id);
+        if !resolved {
+            self.unresolved.insert(id.to_string());
+        }
+        self.next_to_send()
+    }
+
+    fn next_to_send(&mut self) -> Option<String> {
+        if self.in_flight.len() >= CHANNEL_LOOKUP_CONCURRENCY {
+            return None;
+        }
+        let id = self.queued.pop_front()?;
+        self.in_flight.insert(id.clone());
+        Some(id)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Consolidated user and user-group directory projections derived from the workspace session.
 #[derive(Debug, Default)]
 pub(crate) struct UserDirectoryState {
     pub(crate) discovery: DiscoveryGate,
+    pub(crate) channel_lookups: RefCell<ChannelNameLookups>,
     pub(crate) discovered_users: RefCell<Vec<SlackUser>>,
     pub(crate) user_groups: RefCell<Vec<SlackUserGroup>>,
     pub(crate) user_names: RefCell<Arc<HashMap<String, String>>>,
@@ -175,6 +227,7 @@ pub(crate) struct UserDirectoryState {
 impl UserDirectoryState {
     pub(crate) fn reset(&self) {
         self.discovery.reset();
+        self.channel_lookups.borrow_mut().reset();
         self.discovered_users.borrow_mut().clear();
         self.user_groups.borrow_mut().clear();
         self.reset_projections();
@@ -3677,6 +3730,40 @@ mod tests {
         assert!(!gate.should_request(
             start + DISCOVERY_STARTUP_DELAY + DISCOVERY_RETRY_AFTER - Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn perf_guard_channel_name_lookups_are_deduplicated_and_capped() {
+        let mut lookups = ChannelNameLookups::default();
+        let ids = (0..10).map(|index| format!("C{index}")).collect::<Vec<_>>();
+
+        let sent = lookups.request(ids.iter().cloned().chain(ids.iter().cloned()));
+        assert_eq!(sent, ["C0", "C1", "C2"]);
+
+        // Asking again for in-flight or queued ids sends nothing.
+        assert!(lookups.request(ids.iter().cloned()).is_empty());
+
+        // Each answer frees one slot, so the cap holds while the queue drains.
+        let mut total = sent.len();
+        let mut next = lookups.finish("C0", true);
+        while let Some(id) = next {
+            total += 1;
+            assert!(lookups.in_flight.len() <= CHANNEL_LOOKUP_CONCURRENCY);
+            next = lookups.finish(&id, true);
+        }
+        assert_eq!(lookups.in_flight.len(), 2);
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn unresolved_channel_names_are_not_asked_again_this_session() {
+        let mut lookups = ChannelNameLookups::default();
+        assert_eq!(lookups.request(["C1".to_string()]), ["C1"]);
+        assert_eq!(lookups.finish("C1", false), None);
+        assert!(lookups.request(["C1".to_string()]).is_empty());
+
+        lookups.reset();
+        assert_eq!(lookups.request(["C1".to_string()]), ["C1"]);
     }
 
     #[test]

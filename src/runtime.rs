@@ -40,12 +40,13 @@ use crate::models::{
 use crate::realtime::RealtimeStatus;
 use crate::services::conversation_history::ConversationHistoryService;
 use crate::slack::{
-    DownloadedPreviewAsset, PreviewAssetMime, SlackApi, SlackError, SlackErrorCategory,
+    DiscoveryPaging, DiscoveryStop, DownloadedPreviewAsset, PreviewAssetMime, SlackApi, SlackError,
+    SlackErrorCategory,
 };
 use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketModeMessageKind};
 use crate::store::{
-    AttentionObservationStatus, StoreError, StoreErrorCategory, SyncFreshness, WorkspaceBootstrap,
-    WorkspaceStore,
+    AttentionObservationStatus, ChannelDiscoveryProgress, ChannelDiscoveryState, StoreError,
+    StoreErrorCategory, SyncFreshness, WorkspaceBootstrap, WorkspaceStore,
 };
 use crate::sync_scheduler::{
     AdmissionOutcome, CancellationId, CompletionOutcome, FreshnessPolicy, JobOutcome, RefreshClass,
@@ -59,7 +60,7 @@ use crate::workspace_pipeline::{
     WorkspaceCoordinator, WorkspaceEffect, WorkspaceMutation, WorkspacePatch, WorkspaceReduction,
     WorkspaceRevision,
 };
-use crate::workspace_state::WorkspaceLifecycleEvent;
+use crate::workspace_state::{WorkspaceLifecycleEvent, DISCOVERY_TTL};
 
 /// Total conversations prefetched at startup: huddles, then DMs with
 /// unreads, then the best-ranked remainder.
@@ -73,6 +74,9 @@ const USER_DIRECTORY_TTL_MS: i64 = 6 * 60 * 60 * 1000;
 /// A directory listed this recently is handed to discovery and the startup
 /// refresh as is, so racing callers share one `users.list`.
 const USER_DIRECTORY_REUSE: Duration = Duration::from_secs(10 * 60);
+/// A discovery sweep persists its resume point and results every this many
+/// pages, so quitting mid-sweep loses at most a few pages of work.
+const DISCOVERY_PROGRESS_EVERY_PAGES: usize = 10;
 const USER_DIRECTORY_OPERATION: &str = "user_directory";
 const USER_DIRECTORY_TARGET: &str = "workspace";
 const CONVERSATION_MEMBER_PAGE_LIMIT: usize = 25;
@@ -340,6 +344,16 @@ impl RuntimeCommand {
                 RuntimeTaskLane::Background,
                 RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::ConversationDiscovery(
                     ConversationDiscoveryScope::Full,
+                )),
+            ),
+            Self::LoadChannelInfo { channel_id } => RuntimeCommandDescriptor::request(
+                OperationContext::new(
+                    RuntimeOperation::ConversationDiscovery,
+                    RuntimeTarget::Channel(channel_id.clone()),
+                ),
+                RuntimeTaskLane::Background,
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::ChannelInfo(
+                    OpaqueAdmissionTarget::digest(&[channel_id]),
                 )),
             ),
             Self::JoinConversation { channel_id } => RuntimeCommandDescriptor::request(
@@ -806,6 +820,14 @@ pub enum RuntimeEventKind {
     ConversationsSynchronized,
     ConversationsLoadFailed(RuntimeFailure),
     ConversationChannelsDiscovered(Vec<SlackConversation>),
+    /// Channels from earlier discovery sweeps, read from the store at startup.
+    DiscoveredChannelsHydrated(Vec<SlackConversation>),
+    /// Result of an on-demand `conversations.info`; `None` when the channel
+    /// cannot be resolved (not found or no access).
+    ChannelInfoLoaded {
+        channel_id: String,
+        conversation: Option<Box<SlackConversation>>,
+    },
     ConversationPeopleDiscovered(Vec<SlackUser>),
     UserGroupsDiscovered(Vec<SlackUserGroup>),
     ConversationOpenCompleted {
@@ -971,10 +993,15 @@ impl RuntimeEventKind {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
             }
             Self::ConversationChannelsDiscovered(_)
+            | Self::DiscoveredChannelsHydrated(_)
             | Self::ConversationPeopleDiscovered(_)
             | Self::UserGroupsDiscovered(_) => OperationContext::new(
                 RuntimeOperation::ConversationDiscovery,
                 RuntimeTarget::Workspace,
+            ),
+            Self::ChannelInfoLoaded { channel_id, .. } => OperationContext::new(
+                RuntimeOperation::ConversationDiscovery,
+                RuntimeTarget::Channel(channel_id.clone()),
             ),
             Self::ConversationOpenCompleted { channel_id }
             | Self::ConversationUpdateCompleted { channel_id } => OperationContext::new(
@@ -4764,6 +4791,16 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
     if let Some(theme) = sidebar_theme {
         events.send_event(RuntimeEventKind::WorkspaceThemeLoaded(theme));
     }
+    match store.load_discovered_channels().await {
+        Ok(channels) if !channels.is_empty() => {
+            events.send_event(RuntimeEventKind::DiscoveredChannelsHydrated(channels));
+        }
+        Ok(_) => {}
+        Err(error) => crate::debug::log(
+            "store",
+            &format!("DiscoveredChannelsLoadFailed error={error:#}"),
+        ),
+    }
     let users = users_from_cached_projections(
         &user_names,
         &user_full_names,
@@ -5162,10 +5199,43 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     crate::debug::log("runtime", &format!("UserGroupsFetchFailed error={error:#}"))
                 }
             }
-            let channels = api.discover_conversations().await?;
+            let channels = discover_channels(api, context.workspace_store).await?;
             context
                 .events
                 .send_event(RuntimeEventKind::ConversationChannelsDiscovered(channels));
+        }
+        RuntimeCommand::LoadChannelInfo { channel_id } => {
+            let api = require_slack(context.slack)?;
+            // Best effort: a channel the user cannot see is a normal answer.
+            let conversation = match api.conversation_info(&channel_id).await {
+                Ok(conversation) => Some(conversation),
+                Err(error) => {
+                    crate::debug::log(
+                        "runtime",
+                        &format!("ChannelInfoLoadFailed channel_id={channel_id} error={error:#}"),
+                    );
+                    None
+                }
+            };
+            if let (Some(conversation), Some(store)) =
+                (&conversation, context.workspace_store.as_ref())
+            {
+                if let Err(error) = store
+                    .upsert_discovered_channels(vec![conversation.clone()])
+                    .await
+                {
+                    crate::debug::log(
+                        "store",
+                        &format!("DiscoveredChannelStoreFailed error={error:#}"),
+                    );
+                }
+            }
+            context
+                .events
+                .send_event(RuntimeEventKind::ChannelInfoLoaded {
+                    channel_id,
+                    conversation: conversation.map(Box::new),
+                });
         }
         RuntimeCommand::JoinConversation { channel_id } => {
             let api = require_slack(context.slack)?;
@@ -8025,8 +8095,18 @@ async fn refresh_cached_conversation_user_names(
 }
 
 fn user_directory_is_fresh(refreshed_at_ms: Option<i64>, now_ms: i64) -> bool {
-    refreshed_at_ms
-        .is_some_and(|refreshed| (0..USER_DIRECTORY_TTL_MS).contains(&(now_ms - refreshed)))
+    refreshed_at_ms.is_some_and(|refreshed| is_within_ttl(refreshed, now_ms, USER_DIRECTORY_TTL_MS))
+}
+
+/// Whether `refreshed_ms` is under `ttl_ms` old; a clock that went backwards
+/// counts as stale.
+fn is_within_ttl(refreshed_ms: i64, now_ms: i64, ttl_ms: i64) -> bool {
+    (0..ttl_ms).contains(&(now_ms - refreshed_ms))
+}
+
+fn discovery_sweep_is_fresh(completed_at_ms: Option<i64>, now_ms: i64) -> bool {
+    completed_at_ms
+        .is_some_and(|completed| is_within_ttl(completed, now_ms, DISCOVERY_TTL.as_millis() as i64))
 }
 
 fn unix_now_ms() -> i64 {
@@ -8081,6 +8161,148 @@ async fn list_user_directory(
         listed_at: std::time::Instant::now(),
     });
     Ok(users)
+}
+
+/// Channels for the pickers and mention names. A sweep that completed within
+/// `DISCOVERY_TTL` is served from the store with no network call; otherwise a
+/// paced sweep runs, resuming from the persisted cursor of an interrupted one.
+async fn discover_channels(
+    api: &SlackApi,
+    store: &Option<WorkspaceStore>,
+) -> Result<Vec<SlackConversation>> {
+    discover_channels_with(api, store, DiscoveryPaging::new()).await
+}
+
+async fn discover_channels_with(
+    api: &SlackApi,
+    store: &Option<WorkspaceStore>,
+    mut paging: DiscoveryPaging,
+) -> Result<Vec<SlackConversation>> {
+    let state = match store {
+        Some(store) => store.load_channel_discovery_state().await?,
+        None => ChannelDiscoveryState::default(),
+    };
+    if let Some(store) = store {
+        if state.progress.is_none()
+            && discovery_sweep_is_fresh(state.completed_at_ms, unix_now_ms())
+        {
+            return Ok(store.load_discovered_channels().await?);
+        }
+    }
+
+    let mut cursor = state
+        .progress
+        .as_ref()
+        .map(|progress| progress.cursor.clone());
+    let mut total_pages = state.progress.as_ref().map_or(0, |progress| progress.pages);
+    let mut batch = Vec::new();
+    loop {
+        let pause = match paging.begin_page(cursor.as_deref()) {
+            Ok(pause) => pause,
+            Err(stop) => {
+                crate::debug::log(
+                    "runtime",
+                    &format!("ChannelDiscoveryStopped reason={stop:?} pages={total_pages}"),
+                );
+                // A repeating cursor is a broken resume point: start over next
+                // time. Hitting the page cap keeps it so the sweep continues.
+                let progress = match (stop, &cursor) {
+                    (DiscoveryStop::PageCap, Some(cursor)) => Some(ChannelDiscoveryProgress {
+                        cursor: cursor.clone(),
+                        pages: total_pages,
+                    }),
+                    _ => None,
+                };
+                return finish_discovery_run(store, batch, progress).await;
+            }
+        };
+        if !pause.is_zero() {
+            tokio::time::sleep(pause).await;
+        }
+        let rate_limit_hits = api.rate_limit_hits();
+        let page = match api.discovery_page(cursor.as_deref()).await {
+            Ok(page) => page,
+            Err(error) => {
+                // Keep what was fetched; a stale cursor cannot be resumed.
+                let invalid_cursor = matches!(
+                    &error,
+                    SlackError::Api { code, .. } if code == "invalid_cursor"
+                );
+                let progress = match (&cursor, invalid_cursor) {
+                    (Some(cursor), false) => Some(ChannelDiscoveryProgress {
+                        cursor: cursor.clone(),
+                        pages: total_pages,
+                    }),
+                    _ => None,
+                };
+                if let Err(store_error) = finish_discovery_run(store, batch, progress).await {
+                    crate::debug::log(
+                        "store",
+                        &format!("ChannelDiscoveryProgressStoreFailed error={store_error:#}"),
+                    );
+                }
+                return Err(error.into());
+            }
+        };
+        if api.rate_limit_hits() > rate_limit_hits {
+            paging.note_rate_limited();
+        }
+        total_pages += 1;
+        batch.extend(page.channels);
+        cursor = page.next_cursor;
+        match &cursor {
+            None => {
+                return complete_discovery_run(store, batch).await;
+            }
+            Some(next)
+                if paging
+                    .pages()
+                    .is_multiple_of(DISCOVERY_PROGRESS_EVERY_PAGES) =>
+            {
+                if let Some(store) = store {
+                    let progress = ChannelDiscoveryProgress {
+                        cursor: next.clone(),
+                        pages: total_pages,
+                    };
+                    store
+                        .save_discovery_progress(std::mem::take(&mut batch), Some(progress))
+                        .await?;
+                }
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// Persists an unfinished run (results so far and the resume point) and
+/// returns everything discovered so far.
+async fn finish_discovery_run(
+    store: &Option<WorkspaceStore>,
+    batch: Vec<SlackConversation>,
+    progress: Option<ChannelDiscoveryProgress>,
+) -> Result<Vec<SlackConversation>> {
+    let Some(store) = store else {
+        return Ok(sorted_channels(batch));
+    };
+    store.save_discovery_progress(batch, progress).await?;
+    Ok(store.load_discovered_channels().await?)
+}
+
+/// Replaces the stored channels with the finished sweep.
+async fn complete_discovery_run(
+    store: &Option<WorkspaceStore>,
+    batch: Vec<SlackConversation>,
+) -> Result<Vec<SlackConversation>> {
+    let Some(store) = store else {
+        return Ok(sorted_channels(batch));
+    };
+    store.complete_discovery_sweep(batch, unix_now_ms()).await?;
+    Ok(store.load_discovered_channels().await?)
+}
+
+fn sorted_channels(mut channels: Vec<SlackConversation>) -> Vec<SlackConversation> {
+    channels.sort_by_key(|channel| channel.display_name().to_lowercase());
+    channels
 }
 
 fn handle_conversations_load_error(events: &RuntimeEventSender, error: anyhow::Error) {

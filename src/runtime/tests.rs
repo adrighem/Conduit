@@ -7764,6 +7764,9 @@ fn expected_runtime_admission(command: &RuntimeCommand) -> RuntimeAdmissionPolic
                 target: OpaqueAdmissionTarget::digest(&[user_id]),
             })
         }
+        RuntimeCommand::LoadChannelInfo { channel_id } => RuntimeAdmissionPolicy::coalescible(
+            RuntimeAdmissionKey::ChannelInfo(OpaqueAdmissionTarget::digest(&[channel_id])),
+        ),
         RuntimeCommand::LoadImageAsset { key, .. } => RuntimeAdmissionPolicy::coalescible(
             RuntimeAdmissionKey::ImageAsset(OpaqueAdmissionTarget::digest(&[key])),
         ),
@@ -7840,6 +7843,7 @@ fn expected_legacy_scheduling(
         RuntimeCommand::RefreshConversations
         | RuntimeCommand::DiscoverConversations
         | RuntimeCommand::LoadUser { .. }
+        | RuntimeCommand::LoadChannelInfo { .. }
         | RuntimeCommand::LoadUserProfile { .. } => (true, None, RuntimeTaskLane::Background),
         RuntimeCommand::LoadImageAsset { .. }
         | RuntimeCommand::LoadMedia { .. }
@@ -7946,6 +7950,9 @@ fn runtime_command_fixtures() -> Vec<RuntimeCommand> {
         RuntimeCommand::LoadUserProfile {
             user_id: "U1".to_string(),
         },
+        RuntimeCommand::LoadChannelInfo {
+            channel_id: "C1".to_string(),
+        },
         RuntimeCommand::LoadImageAsset {
             key: "image-key-canary".to_string(),
             url: "https://files.slack.com/image?token=image-url-canary".to_string(),
@@ -8049,7 +8056,7 @@ fn runtime_command_fixtures() -> Vec<RuntimeCommand> {
 #[test]
 fn runtime_command_admission_metadata_is_exhaustive_and_behavior_neutral() {
     let commands = runtime_command_fixtures();
-    assert_eq!(commands.len(), 45);
+    assert_eq!(commands.len(), 46);
 
     for command in commands {
         let descriptor = command.descriptor();
@@ -10025,8 +10032,7 @@ fn cached_conversation_user_ids_selects_known_direct_message_members() {
     );
 }
 
-/// Serves `users.list` and a four-page `conversations.list`, and records
-/// every requested API method.
+/// Serves `users.list` and records every requested API method.
 struct MethodCountingSlackServer {
     address: std::net::SocketAddr,
     methods: Arc<Mutex<Vec<String>>>,
@@ -10063,21 +10069,10 @@ fn spawn_method_counting_slack_server() -> MethodCountingSlackServer {
                 .unwrap_or_default()
                 .to_string();
             thread_methods.lock().unwrap().push(method.clone());
-            let list_calls = thread_methods
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|method| *method == "conversations.list")
-                .count();
-            let body = match method.as_str() {
-                "users.list" => {
-                    r#"{"ok":true,"members":[{"id":"U0","name":"ada"},{"id":"U1","name":"bob"}]}"#
-                }
-                "conversations.list" if list_calls <= 3 => {
-                    r#"{"ok":true,"channels":[],"response_metadata":{"next_cursor":"more"}}"#
-                }
-                "conversations.list" => r#"{"ok":true,"channels":[]}"#,
-                _ => r#"{"ok":false,"error":"unexpected_method"}"#,
+            let body = if method == "users.list" {
+                r#"{"ok":true,"members":[{"id":"U0","name":"ada"},{"id":"U1","name":"bob"}]}"#
+            } else {
+                r#"{"ok":false,"error":"unexpected_method"}"#
             };
             request
                 .respond(tiny_http::Response::from_string(body).with_header(
@@ -10187,32 +10182,378 @@ fn perf_guard_startup_user_names_use_one_users_list_and_no_users_info() {
     });
 }
 
-#[test]
-fn perf_guard_channel_discovery_paces_pages_below_the_tier_2_rate() {
-    // Tier 2 allows about 20 requests a minute.
-    assert!(crate::slack::DISCOVERY_PAGE_INTERVAL >= Duration::from_secs(3));
+/// One `conversations.list` request seen by a [`PagedChannelServer`].
+struct ChannelListRequest {
+    cursor: String,
+    at: Instant,
+}
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let server = spawn_method_counting_slack_server();
+/// Serves `conversations.list` from a script of `(cursor, channel id, next
+/// cursor)` pages and can answer one chosen call with HTTP 429.
+struct PagedChannelServer {
+    address: std::net::SocketAddr,
+    requests: Arc<Mutex<Vec<ChannelListRequest>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl PagedChannelServer {
+    fn start(
+        pages: &'static [(&'static str, &'static str, Option<&'static str>)],
+        rate_limit_call: Option<usize>,
+    ) -> Self {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_requests = requests.clone();
+        let thread_stop = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(20)) else {
+                    continue;
+                };
+                let mut body = String::new();
+                std::io::Read::read_to_string(request.as_reader(), &mut body).unwrap();
+                let cursor = body
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("cursor="))
+                    .unwrap_or_default()
+                    .to_string();
+                let call = {
+                    let mut requests = thread_requests.lock().unwrap();
+                    requests.push(ChannelListRequest {
+                        cursor: cursor.clone(),
+                        at: Instant::now(),
+                    });
+                    requests.len()
+                };
+                let json = tiny_http::Header::from_bytes("Content-Type", "application/json");
+                if rate_limit_call == Some(call) {
+                    request
+                        .respond(
+                            tiny_http::Response::from_string("{}")
+                                .with_status_code(429)
+                                .with_header(
+                                    tiny_http::Header::from_bytes("Retry-After", "1").unwrap(),
+                                ),
+                        )
+                        .unwrap();
+                    continue;
+                }
+                let page = pages.iter().find(|(key, _, _)| *key == cursor);
+                let response = match page {
+                    Some((_, id, next)) => {
+                        let metadata = next.map_or(String::new(), |next| {
+                            format!(r#","response_metadata":{{"next_cursor":"{next}"}}"#)
+                        });
+                        format!(
+                            r#"{{"ok":true,"channels":[{{"id":"{id}","name":"{}","is_channel":true}}]{metadata}}}"#,
+                            id.to_lowercase()
+                        )
+                    }
+                    None => r#"{"ok":false,"error":"invalid_cursor"}"#.to_string(),
+                };
+                request
+                    .respond(tiny_http::Response::from_string(response).with_header(json.unwrap()))
+                    .unwrap();
+            }
+        });
+        Self {
+            address,
+            requests,
+            stop,
+            thread,
+        }
+    }
+
+    fn api(&self) -> SlackApi {
         let mut slack = SlackApi::new(StoredToken {
             access_token: "test-token".to_string(),
             ..Default::default()
         });
-        slack.api_base_url = format!("http://{}/api", server.address);
+        slack.api_base_url = format!("http://{}/api", self.address);
+        slack
+    }
 
-        let interval = Duration::from_millis(100);
-        let started = Instant::now();
-        slack.discover_conversations_paced(interval).await.unwrap();
-        let elapsed = started.elapsed();
+    /// Stops the server and returns the requests it saw.
+    fn finish(self) -> Vec<ChannelListRequest> {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.thread.join().unwrap();
+        std::mem::take(&mut *self.requests.lock().unwrap())
+    }
+}
 
-        assert_eq!(server.finish(), vec!["conversations.list".to_string(); 4]);
-        // Three pauses separate four pages; the first page is not delayed.
-        assert!(elapsed >= interval * 3);
+fn discovery_test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+fn discovery_test_store(name: &str) -> (WorkspaceStore, PathBuf) {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "conduit-{name}-test-{}-{nonce}",
+        std::process::id()
+    ));
+    (
+        WorkspaceStore::new(directory.clone(), "T123:U123"),
+        directory,
+    )
+}
+
+fn discovered_channel(id: &str) -> SlackConversation {
+    SlackConversation {
+        id: id.to_string(),
+        name: Some(id.to_lowercase()),
+        is_channel: Some(true),
+        ..Default::default()
+    }
+}
+
+fn channel_ids(channels: &[SlackConversation]) -> Vec<&str> {
+    let mut ids = channels
+        .iter()
+        .map(|channel| channel.id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+fn fast_paging(max_pages: usize) -> DiscoveryPaging {
+    DiscoveryPaging::with_limits(
+        Duration::from_millis(5),
+        Duration::from_millis(20),
+        max_pages,
+    )
+}
+
+static THREE_PAGES: [(&str, &str, Option<&str>); 3] = [
+    ("", "C1", Some("p1")),
+    ("p1", "C2", Some("p2")),
+    ("p2", "C3", None),
+];
+
+#[test]
+fn perf_guard_stored_discovery_inside_the_ttl_makes_no_conversations_list_calls() {
+    discovery_test_runtime().block_on(async {
+        let (store, directory) = discovery_test_store("discovery-fresh");
+        store
+            .complete_discovery_sweep(
+                vec![discovered_channel("C1"), discovered_channel("C2")],
+                unix_now_ms(),
+            )
+            .await
+            .unwrap();
+        let server = PagedChannelServer::start(&THREE_PAGES, None);
+
+        let channels = discover_channels_with(&server.api(), &Some(store), fast_paging(300))
+            .await
+            .unwrap();
+
+        assert_eq!(channel_ids(&channels), ["C1", "C2"]);
+        assert!(server.finish().is_empty());
+        let _ = std::fs::remove_dir_all(directory);
+    });
+}
+
+#[test]
+fn an_expired_sweep_runs_again_and_replaces_the_stored_channels_only_on_completion() {
+    discovery_test_runtime().block_on(async {
+        let (store, directory) = discovery_test_store("discovery-replace");
+        let day_ms = DISCOVERY_TTL.as_millis() as i64;
+        store
+            .complete_discovery_sweep(vec![discovered_channel("OLD")], unix_now_ms() - 2 * day_ms)
+            .await
+            .unwrap();
+        let store = Some(store);
+        let server = PagedChannelServer::start(&THREE_PAGES, None);
+        let api = server.api();
+
+        // A run cut short by the page cap adds channels but drops none.
+        let partial = discover_channels_with(&api, &store, fast_paging(2))
+            .await
+            .unwrap();
+        assert_eq!(channel_ids(&partial), ["C1", "C2", "OLD"]);
+        let state = store.as_ref().unwrap().load_channel_discovery_state().await;
+        let progress = state.unwrap().progress.expect("resume point is kept");
+        assert_eq!(progress.cursor, "p2");
+
+        // The resumed run finishes and the finished sweep replaces the set.
+        let full = discover_channels_with(&api, &store, fast_paging(300))
+            .await
+            .unwrap();
+        assert_eq!(channel_ids(&full), ["C1", "C2", "C3"]);
+        let state = store
+            .as_ref()
+            .unwrap()
+            .load_channel_discovery_state()
+            .await
+            .unwrap();
+        assert!(state.progress.is_none());
+        assert!(discovery_sweep_is_fresh(
+            state.completed_at_ms,
+            unix_now_ms()
+        ));
+
+        // The resumed run started from the stored cursor, not from scratch.
+        let cursors = server
+            .finish()
+            .into_iter()
+            .map(|request| request.cursor)
+            .collect::<Vec<_>>();
+        assert_eq!(cursors, ["", "p1", "p2"]);
+        let _ = std::fs::remove_dir_all(directory);
+    });
+}
+
+#[test]
+fn a_resumed_sweep_continues_from_the_stored_cursor() {
+    discovery_test_runtime().block_on(async {
+        let (store, directory) = discovery_test_store("discovery-resume");
+        store
+            .save_discovery_progress(
+                vec![discovered_channel("C1")],
+                Some(ChannelDiscoveryProgress {
+                    cursor: "p1".to_string(),
+                    pages: 1,
+                }),
+            )
+            .await
+            .unwrap();
+        let server = PagedChannelServer::start(&THREE_PAGES, None);
+
+        let channels = discover_channels_with(&server.api(), &Some(store), fast_paging(300))
+            .await
+            .unwrap();
+
+        assert_eq!(channel_ids(&channels), ["C1", "C2", "C3"]);
+        let cursors = server
+            .finish()
+            .into_iter()
+            .map(|request| request.cursor)
+            .collect::<Vec<_>>();
+        assert_eq!(cursors, ["p1", "p2"]);
+        let _ = std::fs::remove_dir_all(directory);
+    });
+}
+
+static LOOPING_PAGES: [(&str, &str, Option<&str>); 2] =
+    [("", "C1", Some("loop")), ("loop", "C2", Some("loop"))];
+
+#[test]
+fn a_repeating_cursor_stops_the_sweep_without_completing_it() {
+    discovery_test_runtime().block_on(async {
+        let (store, directory) = discovery_test_store("discovery-loop");
+        let optional_store = Some(store.clone());
+        let server = PagedChannelServer::start(&LOOPING_PAGES, None);
+
+        let channels = discover_channels_with(&server.api(), &optional_store, fast_paging(300))
+            .await
+            .unwrap();
+
+        assert_eq!(channel_ids(&channels), ["C1", "C2"]);
+        assert_eq!(server.finish().len(), 2);
+        let state = store.load_channel_discovery_state().await.unwrap();
+        assert!(state.progress.is_none());
+        assert!(state.completed_at_ms.is_none());
+        let _ = std::fs::remove_dir_all(directory);
+    });
+}
+
+#[test]
+fn perf_guard_discovery_stops_at_the_page_cap_and_keeps_the_resume_point() {
+    discovery_test_runtime().block_on(async {
+        let (store, directory) = discovery_test_store("discovery-cap");
+        let optional_store = Some(store.clone());
+        let server = PagedChannelServer::start(&THREE_PAGES, None);
+
+        discover_channels_with(&server.api(), &optional_store, fast_paging(1))
+            .await
+            .unwrap();
+
+        assert_eq!(server.finish().len(), 1);
+        let state = store.load_channel_discovery_state().await.unwrap();
+        assert_eq!(
+            state.progress.map(|progress| progress.cursor),
+            Some("p1".to_string())
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    });
+}
+
+#[test]
+fn perf_guard_discovery_waits_out_a_429_and_then_slows_down() {
+    discovery_test_runtime().block_on(async {
+        let server = PagedChannelServer::start(&THREE_PAGES, Some(2));
+        let interval = Duration::from_millis(50);
+        let paging = DiscoveryPaging::with_limits(interval, Duration::from_millis(400), 300);
+
+        discover_channels_with(&server.api(), &None, paging)
+            .await
+            .unwrap();
+
+        // Calls: "", "p1" (429), "p1" again after Retry-After, "p2".
+        let requests = server.finish();
+        assert_eq!(requests.len(), 4);
+        let gap = |from: usize, to: usize| requests[to].at.duration_since(requests[from].at);
+        assert!(gap(0, 1) >= interval);
+        assert!(gap(1, 2) >= Duration::from_secs(1));
+        // After the 429 the pause before the next page doubles.
+        assert!(gap(2, 3) >= interval * 2);
+    });
+}
+
+#[test]
+fn channel_discovery_store_round_trips_and_keeps_resolved_channels() {
+    discovery_test_runtime().block_on(async {
+        let (store, directory) = discovery_test_store("discovery-store");
+
+        // A database from before discovery was persisted has nothing stored.
+        store
+            .store_custom_emojis(&HashMap::from([("a".to_string(), "b".to_string())]))
+            .await
+            .unwrap();
+        assert!(store.load_discovered_channels().await.unwrap().is_empty());
+        assert_eq!(
+            store.load_channel_discovery_state().await.unwrap(),
+            ChannelDiscoveryState::default()
+        );
+
+        store
+            .upsert_discovered_channels(vec![discovered_channel("ARCHIVED")])
+            .await
+            .unwrap();
+        store
+            .save_discovery_progress(
+                vec![discovered_channel("C1")],
+                Some(ChannelDiscoveryProgress {
+                    cursor: "p1".to_string(),
+                    pages: 10,
+                }),
+            )
+            .await
+            .unwrap();
+        let state = store.load_channel_discovery_state().await.unwrap();
+        assert_eq!(state.progress.as_ref().map(|p| p.pages), Some(10));
+        assert_eq!(state.completed_at_ms, None);
+
+        store
+            .complete_discovery_sweep(vec![discovered_channel("C2")], 1_234)
+            .await
+            .unwrap();
+        let state = store.load_channel_discovery_state().await.unwrap();
+        assert_eq!(state.progress, None);
+        assert_eq!(state.completed_at_ms, Some(1_234));
+        // The sweep kept its earlier partial pages and the resolved lookups.
+        let channels = store.load_discovered_channels().await.unwrap();
+        assert_eq!(channel_ids(&channels), ["ARCHIVED", "C1", "C2"]);
+        let _ = std::fs::remove_dir_all(directory);
     });
 }
 
