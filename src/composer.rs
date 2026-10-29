@@ -1287,11 +1287,11 @@ pub fn mention_candidates(users: &[SlackUser]) -> Vec<MentionCandidate> {
     }
 
     let mut candidates = candidates_by_id.into_values().collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        left.display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase())
-            .then_with(|| left.user_id.cmp(&right.user_id))
+    candidates.sort_by_cached_key(|candidate| {
+        (
+            candidate.display_name.to_lowercase(),
+            candidate.user_id.clone(),
+        )
     });
     candidates
 }
@@ -1337,20 +1337,13 @@ pub fn search_mention_candidates(
             Some((candidate.clone(), score))
         })
         .collect::<Vec<_>>();
-    matches.sort_by(|(left, left_score), (right, right_score)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| {
-                MentionTarget::classify(&left.user_id)
-                    .suggestion_rank()
-                    .cmp(&MentionTarget::classify(&right.user_id).suggestion_rank())
-            })
-            .then_with(|| {
-                left.display_name
-                    .to_lowercase()
-                    .cmp(&right.display_name.to_lowercase())
-            })
-            .then_with(|| left.user_id.cmp(&right.user_id))
+    matches.sort_by_cached_key(|(candidate, score)| {
+        (
+            std::cmp::Reverse(*score),
+            MentionTarget::classify(&candidate.user_id).suggestion_rank(),
+            candidate.display_name.to_lowercase(),
+            candidate.user_id.clone(),
+        )
     });
 
     let mut seen_user_ids = HashSet::new();
@@ -1384,11 +1377,8 @@ pub fn channel_candidates<'a>(
     }
 
     let mut candidates = candidates_by_id.into_values().collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        left.title
-            .to_lowercase()
-            .cmp(&right.title.to_lowercase())
-            .then_with(|| left.channel_id.cmp(&right.channel_id))
+    candidates.sort_by_cached_key(|candidate| {
+        (candidate.title.to_lowercase(), candidate.channel_id.clone())
     });
     candidates
 }
@@ -1413,11 +1403,12 @@ pub fn search_channel_candidates(
             Some((candidate.clone(), score))
         })
         .collect::<Vec<_>>();
-    matches.sort_by(|(left, left_score), (right, right_score)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
-            .then_with(|| left.channel_id.cmp(&right.channel_id))
+    matches.sort_by_cached_key(|(candidate, score)| {
+        (
+            std::cmp::Reverse(*score),
+            candidate.title.to_lowercase(),
+            candidate.channel_id.clone(),
+        )
     });
 
     let mut seen_channel_ids = HashSet::new();

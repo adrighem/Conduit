@@ -1,11 +1,12 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use adw::prelude::*;
 use gettextrs::gettext;
-use gtk::prelude::*;
 use gtk::{gio, glib};
 
+use crate::models::SlackUser;
 use crate::sidebar::{
     self, ConversationPickerAction, ConversationPickerItem, ConversationPickerSections,
 };
@@ -29,8 +30,7 @@ impl SidebarRowAction {
 
 #[derive(Debug, Clone)]
 pub struct ConversationPickerView {
-    pub list: gtk::ListView,
-    pub store: gio::ListStore,
+    pub model: ConversationPickerModel,
     pub search: gtk::SearchEntry,
     pub include_discovery: bool,
 }
@@ -72,6 +72,31 @@ pub struct PeoplePickerView {
     pub confirm: gtk::Button,
     pub rows: Rc<RefCell<Vec<PeoplePickerRow>>>,
     pub excluded_user_ids: HashSet<String>,
+    pub discovery_complete: Rc<std::cell::Cell<bool>>,
+    /// The `(user id, name)` rows currently listed, so an unchanged
+    /// directory refresh skips the rebuild.
+    pub shown: Rc<RefCell<Vec<(String, String)>>>,
+}
+
+/// The `(user id, name)` rows the people picker lists, sorted by name. Each
+/// name is lowercased once for the sort, not once per comparison.
+pub fn people_picker_entries(
+    users: &[SlackUser],
+    current_user_id: Option<&str>,
+    excluded_user_ids: &HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut people = users
+        .iter()
+        .filter(|user| !user.deleted.unwrap_or(false) && !user.is_bot.unwrap_or(false))
+        .filter_map(|user| {
+            let id = user.id.as_ref()?.trim();
+            let name = user.direct_message_name()?;
+            (!id.is_empty() && Some(id) != current_user_id && !excluded_user_ids.contains(id))
+                .then(|| (id.to_string(), name))
+        })
+        .collect::<Vec<_>>();
+    people.sort_by_cached_key(|(id, name)| (name.to_lowercase(), id.clone()));
+    people
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,68 +106,336 @@ pub enum ConversationPickerListEntry {
     Placeholder(String),
 }
 
-/// Builds the conversation picker list. Rows are virtualized: `widget`
-/// runs only for the entries scrolled into view, so a rebuild over thousands
-/// of discovered channels and people swaps model objects instead of creating
-/// and destroying one widget per entry.
-pub fn conversation_picker_list(
-    widget: impl Fn(&ConversationPickerListEntry) -> gtk::Widget + 'static,
-) -> (gtk::ListView, gio::ListStore) {
-    let store = gio::ListStore::new::<glib::BoxedAnyObject>();
-    let factory = gtk::SignalListItemFactory::new();
-    factory.connect_bind(move |_, object| {
-        let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
-            return;
-        };
-        let Some(boxed) = list_item.item().and_downcast::<glib::BoxedAnyObject>() else {
-            return;
-        };
-        let entry = boxed.borrow::<ConversationPickerListEntry>();
-        let is_item = matches!(*entry, ConversationPickerListEntry::Item(_));
-        list_item.set_selectable(is_item);
-        list_item.set_activatable(is_item);
-        list_item.set_child(Some(&widget(&entry)));
-    });
-    factory.connect_unbind(|_, object| {
-        if let Some(list_item) = object.downcast_ref::<gtk::ListItem>() {
-            list_item.set_child(None::<&gtk::Widget>);
+impl ConversationPickerListEntry {
+    /// Identity of the entry across rebuilds; rows keep it when their
+    /// content (unread state, status, avatar) changes.
+    fn key(&self) -> PickerEntryKey<'_> {
+        match self {
+            Self::Header(title) => PickerEntryKey::Header(title),
+            Self::Item(item) => PickerEntryKey::Item(&item.row.id),
+            Self::Placeholder(text) => PickerEntryKey::Placeholder(text),
         }
-    });
-    let selection = gtk::SingleSelection::new(Some(store.clone()));
-    selection.set_autoselect(false);
-    selection.set_can_unselect(true);
-    let list = gtk::ListView::new(Some(selection), Some(factory));
-    list.set_single_click_activate(true);
-    list.add_css_class("navigation-sidebar");
-    (list, store)
+    }
 }
 
-/// Replaces every picker entry in one model change.
-pub fn set_conversation_picker_entries(
-    store: &gio::ListStore,
-    entries: Vec<ConversationPickerListEntry>,
-) {
-    let objects = entries
-        .into_iter()
-        .map(glib::BoxedAnyObject::new)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PickerEntryKey<'a> {
+    Header(&'a str),
+    Item(&'a str),
+    Placeholder(&'a str),
+}
+
+/// Keyed edits that turn the previous picker entries into the next ones.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PickerEdits {
+    /// Structural store edits, applied in order: remove `removed` entries at
+    /// `position`, then insert `next[inserted]` there.
+    pub splices: Vec<PickerSplice>,
+    /// Positions in `next` whose row kept its key and place but changed
+    /// content; they are updated in place after the splices.
+    pub updates: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerSplice {
+    pub position: usize,
+    pub removed: usize,
+    pub inserted: std::ops::Range<usize>,
+}
+
+impl PickerSplice {
+    fn end(&self) -> usize {
+        self.position + self.inserted.len()
+    }
+}
+
+fn push_removal(splices: &mut Vec<PickerSplice>, position: usize) {
+    match splices.last_mut() {
+        Some(last) if last.end() == position => last.removed += 1,
+        _ => splices.push(PickerSplice {
+            position,
+            removed: 1,
+            inserted: 0..0,
+        }),
+    }
+}
+
+fn push_insertion(splices: &mut Vec<PickerSplice>, position: usize, index: usize) {
+    match splices.last_mut() {
+        Some(last) if last.end() == position && last.inserted.end == index => {
+            last.inserted.end += 1;
+        }
+        _ => splices.push(PickerSplice {
+            position,
+            removed: 0,
+            inserted: index..index + 1,
+        }),
+    }
+}
+
+/// Keyed edits that turn `previous` into `next`, touching only entries that
+/// were added, removed, moved or changed. Rows that keep their key stay in
+/// the store, so the list keeps its scroll anchor and selection. Returns
+/// `None` when keys are not unique.
+pub fn picker_edits(
+    previous: &[ConversationPickerListEntry],
+    next: &[ConversationPickerListEntry],
+) -> Option<PickerEdits> {
+    let previous_keys = previous
+        .iter()
+        .map(ConversationPickerListEntry::key)
         .collect::<Vec<_>>();
-    store.splice(0, store.n_items(), &objects);
+    let next_keys = next
+        .iter()
+        .map(ConversationPickerListEntry::key)
+        .collect::<Vec<_>>();
+    let next_set = next_keys.iter().copied().collect::<HashSet<_>>();
+    let mut remaining = previous_keys.iter().copied().collect::<HashSet<_>>();
+    if next_set.len() != next_keys.len() || remaining.len() != previous_keys.len() {
+        return None;
+    }
+
+    let mut emitted = HashSet::with_capacity(next_keys.len());
+    let mut edits = PickerEdits::default();
+    let (mut old, mut new, mut position) = (0, 0, 0);
+    while old < previous.len() || new < next.len() {
+        if let Some(key) = previous_keys.get(old) {
+            if !next_set.contains(key) || emitted.contains(key) {
+                remaining.remove(key);
+                push_removal(&mut edits.splices, position);
+                old += 1;
+                continue;
+            }
+        }
+        if let Some(key) = next_keys.get(new) {
+            if !remaining.contains(key) {
+                emitted.insert(*key);
+                push_insertion(&mut edits.splices, position, new);
+                position += 1;
+                new += 1;
+                continue;
+            }
+        }
+        // Both entries survive: keep a match, or drop a moved entry here and
+        // insert it again where `next` places it.
+        let (previous_key, next_key) = (previous_keys[old], next_keys[new]);
+        remaining.remove(&previous_key);
+        old += 1;
+        if previous_key != next_key {
+            push_removal(&mut edits.splices, position);
+            continue;
+        }
+        if previous[old - 1] != next[new] {
+            edits.updates.push(new);
+        }
+        emitted.insert(next_key);
+        position += 1;
+        new += 1;
+    }
+    Some(edits)
 }
 
-/// The action for the activatable picker entry at `position`, if any.
-pub fn conversation_picker_action_at(
-    store: &gio::ListStore,
-    position: u32,
-) -> Option<SidebarRowAction> {
-    let boxed = store
-        .item(position)
-        .and_downcast::<glib::BoxedAnyObject>()?;
-    let entry = boxed.borrow::<ConversationPickerListEntry>();
-    match &*entry {
-        ConversationPickerListEntry::Item(item) => Some(SidebarRowAction::from_picker_item(item)),
-        ConversationPickerListEntry::Header(_) | ConversationPickerListEntry::Placeholder(_) => {
-            None
+type PickerRowWidget = Rc<dyn Fn(&ConversationPickerListEntry) -> gtk::Widget>;
+
+/// The conversation picker list. Rows are virtualized: the row widget is
+/// built only for entries scrolled into view, so a rebuild over thousands of
+/// discovered channels and people edits model objects instead of creating
+/// and destroying one widget per entry.
+#[derive(Clone)]
+pub struct ConversationPickerModel {
+    pub list: gtk::ListView,
+    store: gio::ListStore,
+    selection: gtk::SingleSelection,
+    entries: Rc<RefCell<Vec<ConversationPickerListEntry>>>,
+    query: Rc<RefCell<Option<String>>>,
+    widget: PickerRowWidget,
+    /// Containers of the currently bound item rows, by conversation or user
+    /// id, so a content update rebuilds just that row's widget.
+    bound: Rc<RefCell<HashMap<String, adw::Bin>>>,
+}
+
+impl std::fmt::Debug for ConversationPickerModel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConversationPickerModel")
+            .field("list", &self.list)
+            .field("entries", &self.entries.borrow().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConversationPickerModel {
+    pub fn new(widget: impl Fn(&ConversationPickerListEntry) -> gtk::Widget + 'static) -> Self {
+        let widget: PickerRowWidget = Rc::new(widget);
+        let bound = Rc::new(RefCell::new(HashMap::<String, adw::Bin>::new()));
+        let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(|_, object| {
+            if let Some(list_item) = object.downcast_ref::<gtk::ListItem>() {
+                list_item.set_child(Some(&adw::Bin::new()));
+            }
+        });
+        {
+            let widget = widget.clone();
+            let bound = bound.clone();
+            factory.connect_bind(move |_, object| {
+                let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
+                    return;
+                };
+                let Some(boxed) = list_item.item().and_downcast::<glib::BoxedAnyObject>() else {
+                    return;
+                };
+                let Some(bin) = list_item.child().and_downcast::<adw::Bin>() else {
+                    return;
+                };
+                let entry = boxed.borrow::<ConversationPickerListEntry>();
+                let item_id = match &*entry {
+                    ConversationPickerListEntry::Item(item) => Some(item.row.id.clone()),
+                    ConversationPickerListEntry::Header(_)
+                    | ConversationPickerListEntry::Placeholder(_) => None,
+                };
+                list_item.set_selectable(item_id.is_some());
+                list_item.set_activatable(item_id.is_some());
+                bin.set_child(Some(&widget(&entry)));
+                if let Some(item_id) = item_id {
+                    bound.borrow_mut().insert(item_id, bin);
+                }
+            });
         }
+        {
+            let bound = bound.clone();
+            factory.connect_unbind(move |_, object| {
+                let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
+                    return;
+                };
+                let Some(bin) = list_item.child().and_downcast::<adw::Bin>() else {
+                    return;
+                };
+                bin.set_child(None::<&gtk::Widget>);
+                bound.borrow_mut().retain(|_, bound_bin| *bound_bin != bin);
+            });
+        }
+        let selection = gtk::SingleSelection::new(Some(store.clone()));
+        selection.set_autoselect(false);
+        selection.set_can_unselect(true);
+        let list = gtk::ListView::new(Some(selection.clone()), Some(factory));
+        list.set_single_click_activate(true);
+        list.add_css_class("navigation-sidebar");
+        Self {
+            list,
+            store,
+            selection,
+            entries: Rc::default(),
+            query: Rc::default(),
+            widget,
+            bound,
+        }
+    }
+
+    /// Shows `next` for `query`. A new query replaces the list and returns
+    /// to the top; a data refresh for the same query edits only the changed
+    /// entries and keeps the scroll position and the selected row.
+    pub fn show(&self, query: &str, next: Vec<ConversationPickerListEntry>) {
+        let same_query = self.query.borrow().as_deref() == Some(query);
+        *self.query.borrow_mut() = Some(query.to_string());
+        let edits = same_query
+            .then(|| picker_edits(&self.entries.borrow(), &next))
+            .flatten();
+        match edits {
+            Some(edits) => self.apply(&edits, next),
+            None => self.replace(next),
+        }
+    }
+
+    fn replace(&self, next: Vec<ConversationPickerListEntry>) {
+        let objects = next
+            .iter()
+            .cloned()
+            .map(glib::BoxedAnyObject::new)
+            .collect::<Vec<_>>();
+        self.store.splice(0, self.store.n_items(), &objects);
+        *self.entries.borrow_mut() = next;
+        self.selection.set_selected(gtk::INVALID_LIST_POSITION);
+        if self.store.n_items() > 0 {
+            self.list.scroll_to(0, gtk::ListScrollFlags::NONE, None);
+        }
+    }
+
+    fn apply(&self, edits: &PickerEdits, next: Vec<ConversationPickerListEntry>) {
+        let selected_id = self.selected_id();
+        for splice in &edits.splices {
+            let objects = next[splice.inserted.clone()]
+                .iter()
+                .cloned()
+                .map(glib::BoxedAnyObject::new)
+                .collect::<Vec<_>>();
+            self.store
+                .splice(splice.position as u32, splice.removed as u32, &objects);
+        }
+        // Content changes edit the stored entry and rebuild only a bound
+        // row's widget: a store replacement would drop the row the list is
+        // anchored on and shift the scroll position.
+        for &position in &edits.updates {
+            let entry = &next[position];
+            if let Some(boxed) = self
+                .store
+                .item(position as u32)
+                .and_downcast::<glib::BoxedAnyObject>()
+            {
+                *boxed.borrow_mut::<ConversationPickerListEntry>() = entry.clone();
+            }
+            if let ConversationPickerListEntry::Item(item) = entry {
+                if let Some(bin) = self.bound.borrow().get(&item.row.id) {
+                    bin.set_child(Some(&(self.widget)(entry)));
+                }
+            }
+        }
+        *self.entries.borrow_mut() = next;
+        let selected = selected_id
+            .and_then(|id| self.position_of(&id))
+            .unwrap_or(gtk::INVALID_LIST_POSITION);
+        if self.selection.selected() != selected {
+            self.selection.set_selected(selected);
+        }
+    }
+
+    fn selected_id(&self) -> Option<String> {
+        let position = usize::try_from(self.selection.selected()).ok()?;
+        match self.entries.borrow().get(position)? {
+            ConversationPickerListEntry::Item(item) => Some(item.row.id.clone()),
+            ConversationPickerListEntry::Header(_)
+            | ConversationPickerListEntry::Placeholder(_) => None,
+        }
+    }
+
+    /// Position of the item row for conversation or user `id`.
+    pub fn position_of(&self, id: &str) -> Option<u32> {
+        self.entries
+            .borrow()
+            .iter()
+            .position(|entry| entry.key() == PickerEntryKey::Item(id))
+            .and_then(|position| u32::try_from(position).ok())
+    }
+
+    /// The action for the activatable picker entry at `position`, if any.
+    pub fn action_at(&self, position: u32) -> Option<SidebarRowAction> {
+        match self.entries.borrow().get(usize::try_from(position).ok()?)? {
+            ConversationPickerListEntry::Item(item) => {
+                Some(SidebarRowAction::from_picker_item(item))
+            }
+            ConversationPickerListEntry::Header(_)
+            | ConversationPickerListEntry::Placeholder(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn selection(&self) -> &gtk::SingleSelection {
+        &self.selection
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> u32 {
+        self.store.n_items()
     }
 }
 
@@ -201,6 +494,53 @@ pub fn conversation_picker_population_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::SlackConversation;
+    use crate::sidebar::SidebarRowModel;
+
+    fn channel_entry(id: &str, name: &str) -> ConversationPickerListEntry {
+        let channel = SlackConversation {
+            id: id.to_string(),
+            name: Some(name.to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        ConversationPickerListEntry::Item(ConversationPickerItem {
+            row: SidebarRowModel::from_conversation(&channel, &HashMap::new(), None, None),
+            action: ConversationPickerAction::JoinChannel,
+        })
+    }
+
+    fn channel_entries(
+        prefix: &str,
+        ids: impl IntoIterator<Item = usize>,
+    ) -> Vec<ConversationPickerListEntry> {
+        std::iter::once(ConversationPickerListEntry::Header("Channels".to_string()))
+            .chain(
+                ids.into_iter().map(|index| {
+                    channel_entry(&format!("C{index:05}"), &format!("{prefix}-{index}"))
+                }),
+            )
+            .collect()
+    }
+
+    fn apply_edits(
+        previous: &[ConversationPickerListEntry],
+        next: &[ConversationPickerListEntry],
+        edits: &PickerEdits,
+    ) -> Vec<ConversationPickerListEntry> {
+        let mut entries = previous.to_vec();
+        for splice in &edits.splices {
+            entries.splice(
+                splice.position..splice.position + splice.removed,
+                next[splice.inserted.clone()].iter().cloned(),
+            );
+        }
+        for &position in &edits.updates {
+            assert_eq!(entries[position].key(), next[position].key());
+            entries[position] = next[position].clone();
+        }
+        entries
+    }
 
     #[test]
     fn perf_guard_hidden_picker_does_no_rebuild_work_until_shown() {
@@ -224,36 +564,113 @@ mod tests {
         assert!(!gate.shown());
     }
 
+    #[test]
+    fn perf_guard_picker_refresh_edits_only_changed_entries() {
+        let previous = channel_entries("team", 0..2_000);
+        let mut next = channel_entries("team", (0..2_000).filter(|index| index % 500 != 7));
+        next.insert(300, channel_entry("C90000", "new-a"));
+        next.insert(1_200, channel_entry("C90001", "new-b"));
+        let renamed = next
+            .iter()
+            .position(|entry| entry.key() == PickerEntryKey::Item("C00998"))
+            .expect("row survives");
+        next[renamed] = channel_entry("C00998", "renamed");
+
+        let edits = picker_edits(&previous, &next).expect("keys are unique");
+        assert_eq!(apply_edits(&previous, &next, &edits), next);
+        let touched = edits
+            .splices
+            .iter()
+            .map(|splice| splice.removed + splice.inserted.len())
+            .sum::<usize>();
+        assert_eq!(touched, 6, "four removals and two insertions: {edits:?}");
+        assert_eq!(edits.updates, vec![renamed]);
+    }
+
+    #[test]
+    fn people_picker_entries_sort_by_name_and_skip_unlistable_users() {
+        let user = |id: &str, name: &str| SlackUser {
+            id: Some(id.to_string()),
+            real_name: Some(name.to_string()),
+            ..Default::default()
+        };
+        let users = vec![
+            user("U3", "carol"),
+            user("U1", "Bob"),
+            user("U_SELF", "Me"),
+            user("U_OUT", "Already there"),
+            SlackUser {
+                is_bot: Some(true),
+                ..user("U_BOT", "Robot")
+            },
+            SlackUser {
+                deleted: Some(true),
+                ..user("U_GONE", "Gone")
+            },
+            user("U2", "alice"),
+        ];
+        let excluded = HashSet::from(["U_OUT".to_string()]);
+
+        let ids = people_picker_entries(&users, Some("U_SELF"), &excluded)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["U2", "U1", "U3"]);
+    }
+
+    #[test]
+    fn picker_edits_handle_moves_and_full_turnover() {
+        let previous = channel_entries("team", 0..6);
+        let mut next = previous.clone();
+        next.swap(1, 5);
+        let edits = picker_edits(&previous, &next).expect("keys are unique");
+        assert_eq!(apply_edits(&previous, &next, &edits), next);
+
+        let next = channel_entries("other", 10..14);
+        let edits = picker_edits(&previous, &next).expect("keys are unique");
+        assert_eq!(apply_edits(&previous, &next, &edits), next);
+
+        assert_eq!(
+            picker_edits(&previous, &[]).map(|edits| apply_edits(&previous, &[], &edits)),
+            Some(Vec::new())
+        );
+        let duplicate = vec![channel_entry("C1", "a"), channel_entry("C1", "b")];
+        assert_eq!(picker_edits(&previous, &duplicate), None);
+    }
+
     /// Tests that create GTK widgets. They run only when
     /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
     mod graphical {
         use std::cell::Cell;
-        use std::collections::HashMap;
 
         use super::*;
-        use crate::models::SlackConversation;
-        use crate::sidebar::SidebarRowModel;
-        use crate::timeline::tests::{pump_until, run_gtk_test};
+        use crate::timeline::tests::{pump, pump_until, run_gtk_test};
 
-        fn channel_entry(id: &str, name: &str) -> ConversationPickerListEntry {
-            let channel = SlackConversation {
-                id: id.to_string(),
-                name: Some(name.to_string()),
-                is_channel: Some(true),
-                ..Default::default()
-            };
-            ConversationPickerListEntry::Item(ConversationPickerItem {
-                row: SidebarRowModel::from_conversation(&channel, &HashMap::new(), None, None),
-                action: ConversationPickerAction::JoinChannel,
+        fn label_model(
+            binds: Rc<Cell<usize>>,
+            bound_titles: Rc<RefCell<Vec<String>>>,
+        ) -> ConversationPickerModel {
+            ConversationPickerModel::new(move |entry| {
+                binds.set(binds.get() + 1);
+                let text = match entry {
+                    ConversationPickerListEntry::Item(item) => item.row.title.clone(),
+                    ConversationPickerListEntry::Header(text)
+                    | ConversationPickerListEntry::Placeholder(text) => text.clone(),
+                };
+                bound_titles.borrow_mut().push(text.clone());
+                gtk::Label::new(Some(&text)).upcast()
             })
         }
 
-        fn channel_entries(prefix: &str, count: usize) -> Vec<ConversationPickerListEntry> {
-            std::iter::once(ConversationPickerListEntry::Header("Channels".to_string()))
-                .chain((0..count).map(|index| {
-                    channel_entry(&format!("C{index:05}"), &format!("{prefix}-{index}"))
-                }))
-                .collect()
+        fn picker_window(model: &ConversationPickerModel) -> (gtk::Window, gtk::ScrolledWindow) {
+            let scroller = gtk::ScrolledWindow::new();
+            scroller.set_child(Some(&model.list));
+            let window = gtk::Window::builder()
+                .default_width(400)
+                .default_height(300)
+                .child(&scroller)
+                .build();
+            (window, scroller)
         }
 
         #[test]
@@ -261,29 +678,10 @@ mod tests {
             run_gtk_test(|| {
                 let binds = Rc::new(Cell::new(0_usize));
                 let bound_titles = Rc::new(RefCell::new(Vec::<String>::new()));
-                let (list, store) = {
-                    let binds = binds.clone();
-                    let bound_titles = bound_titles.clone();
-                    conversation_picker_list(move |entry| {
-                        binds.set(binds.get() + 1);
-                        let text = match entry {
-                            ConversationPickerListEntry::Item(item) => item.row.title.clone(),
-                            ConversationPickerListEntry::Header(text)
-                            | ConversationPickerListEntry::Placeholder(text) => text.clone(),
-                        };
-                        bound_titles.borrow_mut().push(text.clone());
-                        gtk::Label::new(Some(&text)).upcast()
-                    })
-                };
-                let scroller = gtk::ScrolledWindow::new();
-                scroller.set_child(Some(&list));
-                let window = gtk::Window::builder()
-                    .default_width(400)
-                    .default_height(300)
-                    .child(&scroller)
-                    .build();
+                let model = label_model(binds.clone(), bound_titles.clone());
+                let (window, _) = picker_window(&model);
 
-                set_conversation_picker_entries(&store, channel_entries("old", 5_000));
+                model.show("", channel_entries("old", 0..5_000));
                 window.present();
                 pump_until(5000, || binds.get() > 0);
                 assert!(binds.get() > 0, "the open picker never bound a row");
@@ -297,19 +695,17 @@ mod tests {
 
                 binds.set(0);
                 bound_titles.borrow_mut().clear();
-                set_conversation_picker_entries(&store, channel_entries("fresh", 5_000));
-                pump_until(5000, || {
+                model.show("", channel_entries("fresh", 0..5_000));
+                let fresh_bound = || {
                     bound_titles
                         .borrow()
                         .iter()
                         .any(|title| title.contains("fresh-0"))
-                });
+                };
+                pump_until(5000, fresh_bound);
 
                 assert!(
-                    bound_titles
-                        .borrow()
-                        .iter()
-                        .any(|title| title.contains("fresh-0")),
+                    fresh_bound(),
                     "the open picker did not show the rebuilt entries: {:?}",
                     bound_titles.borrow()
                 );
@@ -318,12 +714,73 @@ mod tests {
                     "a rebuild bound {} rows for 5000 entries",
                     binds.get()
                 );
-                assert_eq!(store.n_items(), 5_001);
-                assert_eq!(conversation_picker_action_at(&store, 0), None);
+                assert_eq!(model.len(), 5_001);
+                assert_eq!(model.action_at(0), None);
                 assert_eq!(
-                    conversation_picker_action_at(&store, 1).map(|action| action.channel_id),
+                    model.action_at(1).map(|action| action.channel_id),
                     Some("C00000".to_string())
                 );
+                window.close();
+            });
+        }
+
+        #[test]
+        fn open_picker_data_refresh_keeps_scroll_anchor_and_selection() {
+            run_gtk_test(|| {
+                let bound_titles = Rc::new(RefCell::new(Vec::<String>::new()));
+                let model = label_model(Rc::default(), bound_titles.clone());
+                let (window, scroller) = picker_window(&model);
+                model.show("", channel_entries("team", 0..2_000));
+                window.present();
+                pump_until(5000, || window.height() > 0);
+
+                let selected_id = "C01000";
+                let selected = model.position_of(selected_id).expect("row exists");
+                model
+                    .list
+                    .scroll_to(selected, gtk::ListScrollFlags::SELECT, None);
+                let adjustment = scroller.vadjustment();
+                pump_until(5000, || adjustment.value() > 0.0);
+                pump(50);
+                let value_before = adjustment.value();
+                assert!(value_before > 0.0, "the picker never scrolled");
+                assert_eq!(model.selection().selected(), selected);
+
+                // Rows come and go above and below the viewport (net zero
+                // above it), and the selected row itself changes content.
+                let mut next = channel_entries(
+                    "team",
+                    (0..2_000).filter(|index| ![10, 20, 1_900].contains(index)),
+                );
+                next.insert(5, channel_entry("C90000", "new-a"));
+                next.insert(15, channel_entry("C90001", "new-b"));
+                next.insert(1_950, channel_entry("C90002", "new-c"));
+                let renamed = next
+                    .iter()
+                    .position(|entry| entry.key() == PickerEntryKey::Item(selected_id))
+                    .expect("selected row survives");
+                next[renamed] = channel_entry(selected_id, "renamed");
+                model.show("", next);
+                pump(100);
+
+                let position = model.position_of(selected_id).expect("row survives");
+                assert_eq!(model.selection().selected(), position, "selection lost");
+                assert!(
+                    bound_titles
+                        .borrow()
+                        .iter()
+                        .any(|title| title.contains("renamed")),
+                    "the visible renamed row was not rebuilt"
+                );
+                assert!(
+                    (adjustment.value() - value_before).abs() < 1.0,
+                    "scroll moved from {value_before} to {}",
+                    adjustment.value()
+                );
+
+                model.show("team-1", channel_entries("team", 100..200));
+                pump(100);
+                assert_eq!(adjustment.value(), 0.0, "a new query starts at the top");
                 window.close();
             });
         }
