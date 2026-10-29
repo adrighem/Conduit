@@ -1080,9 +1080,40 @@ mod graphical {
                 true,
             );
             let button = find_menu_button(widget.upcast_ref()).expect("author menu button");
-            // The menu itself is built on first open; see
-            // perf_guard_author_menus_build_their_popover_on_first_open.
+            // The menu is built on first open (see
+            // perf_guard_author_menus_build_their_popover_on_first_open).
             assert!(button.is_sensitive(), "the button can open its menu");
+            let window = gtk::Window::new();
+            window.set_child(Some(&widget));
+            window.present();
+            button.popup();
+            pump_until(2000, || button.popover().is_some_and(|p| p.is_visible()));
+            let model = button.menu_model().expect("opening builds the menu");
+            let items: Vec<(String, String)> = (0..model.n_items())
+                .map(|i| {
+                    let attr = |name: &str| {
+                        model
+                            .item_attribute_value(i, name, None)
+                            .and_then(|value| value.get::<String>())
+                            .unwrap_or_default()
+                    };
+                    (attr("label"), attr("action"))
+                })
+                .collect();
+            assert_eq!(
+                items,
+                [
+                    ("Message…".to_string(), "author.message".to_string()),
+                    ("Profile".to_string(), "author.profile".to_string()),
+                ]
+            );
+            assert!(button
+                .popover()
+                .and_downcast::<gtk::PopoverMenu>()
+                .is_some_and(|popover| popover.menu_model().as_ref() == Some(&model)));
+            button.popdown();
+            window.set_child(None::<&Widget>);
+            window.destroy();
             let mut focusable = 0;
             let mut stack = vec![widget.clone().upcast::<Widget>()];
             while let Some(current) = stack.pop() {
