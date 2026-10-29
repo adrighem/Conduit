@@ -177,9 +177,12 @@ pub(crate) fn animated_paintable(path: &Path, display_size: i32) -> Option<gdk::
     {
         return None;
     }
-    let animation = crate::debug::trace_image_decode("animation", || {
-        gdk_pixbuf::PixbufAnimation::from_file(path)
-    })
+    let animation = crate::debug::trace_image_decode(
+        "animation",
+        path,
+        crate::debug::ImageLoader::Pixbuf,
+        || gdk_pixbuf::PixbufAnimation::from_file(path),
+    )
     .ok()?;
     if animation.is_static_image() {
         STATIC_FILES.with(|files| {
@@ -305,7 +308,9 @@ pub(crate) fn file_info(path: &Path) -> Option<(gdk_pixbuf::PixbufFormat, i32, i
     if oversized {
         return None;
     }
-    crate::debug::trace_image_decode("file_info", || gdk_pixbuf::Pixbuf::file_info(path))
+    crate::debug::trace_image_decode("file_info", path, crate::debug::ImageLoader::Pixbuf, || {
+        gdk_pixbuf::Pixbuf::file_info(path)
+    })
 }
 
 /// Number of frames in a RIFF WebP: its `ANMF` chunks, or 1 for a still.

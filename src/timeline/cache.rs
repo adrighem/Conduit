@@ -90,9 +90,12 @@ pub(crate) fn get_or_load_texture(path: &Path) -> Option<gtk::gdk::Texture> {
         if !crate::animated_image::within_decode_budget(path) {
             return None;
         }
-        if let Ok(tex) =
-            crate::debug::trace_image_decode("texture", || gtk::gdk::Texture::from_filename(path))
-        {
+        if let Ok(tex) = crate::debug::trace_image_decode(
+            "texture",
+            path,
+            crate::debug::ImageLoader::Texture,
+            || gtk::gdk::Texture::from_filename(path),
+        ) {
             map.insert(path.to_path_buf(), tex.clone());
             return Some(tex);
         }
