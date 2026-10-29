@@ -29,6 +29,14 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
+Plain `cargo test` skips the graphical tests (they would open GTK windows). `meson test` runs
+them once under Xvfb as the "Graphical tests" target, or run them directly:
+
+```sh
+xvfb-run -a env CONDUIT_GRAPHICAL_TESTS=1 GDK_BACKEND=x11 GSK_RENDERER=cairo \
+  GSETTINGS_BACKEND=memory GTK_A11Y=none cargo test graphical::
+```
+
 The repository pins its reviewed Rust, rustfmt, and Clippy versions in
 `rust-toolchain.toml`. A rustup-managed installation selects that toolchain automatically. Update
 the pin deliberately and keep CI and release packaging synchronized; do not develop against a

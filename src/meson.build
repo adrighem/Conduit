@@ -98,6 +98,8 @@ if cargo_features_arg != ''
   cargo_test_args += ['--features', cargo_features_arg]
 endif
 
+# Runs without a display, so graphical tests skip themselves here; the
+# 'Graphical tests' target in tests/meson.build runs them under Xvfb.
 test('Cargo tests',
   cargo_bin,
   args: cargo_test_args,
