@@ -215,7 +215,7 @@ fn media_collapse_key_is_stable_and_namespaced_per_slot() {
     );
 }
 
-fn descendants(root: &Widget) -> Vec<Widget> {
+pub(crate) fn descendants(root: &Widget) -> Vec<Widget> {
     let mut found = Vec::new();
     let mut child = root.first_child();
     while let Some(widget) = child {
@@ -515,13 +515,13 @@ fn rebound_rows(view: &NativeTimelineView, before: &[(String, Widget)]) -> Vec<S
         .collect()
 }
 
-type TextureExecutor = decode::ManualExecutor<decode::TextureKey, decode::Decoded>;
+pub(crate) type TextureExecutor = decode::ManualExecutor<decode::TextureKey, decode::Decoded>;
 
 /// Runs static texture decodes on a manual executor until dropped.
-struct ManualDecodes(Rc<TextureExecutor>);
+pub(crate) struct ManualDecodes(pub(crate) Rc<TextureExecutor>);
 
 impl ManualDecodes {
-    fn install() -> Self {
+    pub(crate) fn install() -> Self {
         clear_timeline_view_caches();
         let executor = TextureExecutor::new();
         decode::install_texture_executor_for_tests(executor.clone());
@@ -530,7 +530,7 @@ impl ManualDecodes {
 
     /// Decodes everything running, and whatever that lets start, as the
     /// workers would. Returns the keys in completion order.
-    fn finish_all(&self) -> Vec<decode::TextureKey> {
+    pub(crate) fn finish_all(&self) -> Vec<decode::TextureKey> {
         let mut finished = Vec::new();
         while let Some(key) = self.0.running().first().cloned() {
             assert!(finished.len() < 1000, "decodes keep coming");
@@ -548,10 +548,10 @@ impl Drop for ManualDecodes {
 }
 
 /// A directory inside the image asset cache, where row binds accept files.
-struct AssetCacheTestDir(PathBuf);
+pub(crate) struct AssetCacheTestDir(pub(crate) PathBuf);
 
 impl AssetCacheTestDir {
-    fn new(prefix: &str) -> Self {
+    pub(crate) fn new(prefix: &str) -> Self {
         let dir = crate::config::image_asset_cache_dir()
             .join(format!("conduit-test-{prefix}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("asset cache test dir");
@@ -702,7 +702,7 @@ fn test_can_group_messages() {
     assert!(!can_group_messages(&prev, &curr_broadcast));
 }
 
-fn save_test_image(path: &Path, format: &str, width: i32, height: i32) {
+pub(crate) fn save_test_image(path: &Path, format: &str, width: i32, height: i32) {
     gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, width, height)
         .expect("pixbuf")
         .savev(path, format, &[])

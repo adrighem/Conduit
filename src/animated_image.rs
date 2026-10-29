@@ -452,10 +452,10 @@ pub(crate) mod tests {
         let before = crate::debug::IMAGE_DECODES.get();
         // The row-build sequence: header check, then the static texture.
         assert!(!may_animate(&path));
-        let texture = crate::timeline::cache::get_or_load_texture(&path);
+        let texture = crate::timeline::cache::decode::decode_texture_file(&path);
         let decodes = crate::debug::IMAGE_DECODES.get() - before;
         std::fs::remove_file(path).ok();
-        assert!(texture.is_some(), "the static path must still load it");
+        assert!(texture.is_ok(), "the static path must still load it");
         assert_eq!(decodes, 1, "a one-frame GIF must not be decoded twice");
     }
 
@@ -491,7 +491,7 @@ pub(crate) mod tests {
             Err(crate::timeline::cache::decode::DecodeError::Permanent(_))
         ));
         assert!(!STATIC_FILES.with(|files| files.borrow().contains(&path)));
-        assert!(crate::timeline::cache::get_or_load_texture(&path).is_none());
+        assert!(crate::timeline::cache::decode::decode_texture_file(&path).is_err());
         std::fs::remove_file(path).ok();
     }
 

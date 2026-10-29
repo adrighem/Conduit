@@ -461,6 +461,199 @@ mod tests {
     mod graphical {
         use super::*;
 
+        use crate::timeline::cache::decode;
+        use crate::timeline_message_widget::tests::{
+            descendants, pump, pump_until, save_test_image, AssetCacheTestDir, ManualDecodes,
+        };
+
+        /// More rows than GtkListView realizes at once, a few hundred.
+        const THUMBNAIL_ROWS: i32 = 600;
+
+        fn thumbnail_side(index: i32) -> i32 {
+            16 + index % 50
+        }
+
+        fn file_row(title: &str, url: String) -> SecondaryRow {
+            SecondaryRow::File(FileRow {
+                title: title.to_string(),
+                icon_name: "image-x-generic-symbolic",
+                detail: "PNG".to_string(),
+                owner: None,
+                channel_title: None,
+                created_ts: None,
+                thumbnail_url: Some(url),
+                open: FileOpenTarget::Unavailable,
+            })
+        }
+
+        /// Files rows whose thumbnails are PNGs of a distinct size each, so
+        /// a row showing another row's image is visible.
+        fn thumbnail_rows(
+            assets: &AssetCacheTestDir,
+            context: &mut MessageRenderContext,
+        ) -> Vec<SecondaryRow> {
+            (0..THUMBNAIL_ROWS)
+                .map(|index| {
+                    let path = assets.0.join(format!("thumb-{index}.png"));
+                    save_test_image(&path, "png", thumbnail_side(index), thumbnail_side(index));
+                    let url = format!("https://files.slack.com/thumb-{index}.png");
+                    context.image_assets.insert(url.clone(), path);
+                    file_row(&format!("file-{index}"), url)
+                })
+                .collect()
+        }
+
+        /// Each bound row's title with the width of the thumbnail it shows.
+        fn shown_thumbnails(view: &SecondaryView) -> Vec<(String, Option<i32>)> {
+            descendants(view.list_view.upcast_ref())
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<adw::Clamp>().ok())
+                .filter_map(|clamp| {
+                    let inside = descendants(clamp.upcast_ref());
+                    let title = inside
+                        .iter()
+                        .filter_map(|widget| widget.downcast_ref::<gtk::Label>())
+                        .find(|label| label.has_css_class("heading"))?
+                        .text()
+                        .to_string();
+                    let width = inside
+                        .iter()
+                        .filter_map(|widget| widget.downcast_ref::<gtk::Picture>())
+                        .find_map(|picture| {
+                            let deferred = picture
+                                .paintable()
+                                .and_downcast::<decode::DeferredPaintable>()?;
+                            Some(deferred.content()?.intrinsic_width())
+                        });
+                    Some((title, width))
+                })
+                .collect()
+        }
+
+        fn show_files(rows: Vec<SecondaryRow>, context: &MessageRenderContext) -> SecondaryView {
+            let view = SecondaryView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(640, 400);
+            window.set_child(Some(view.widget()));
+            window.present();
+            pump_until(5000, || window.height() > 0);
+            view.show_rows(SecondaryKind::Files, rows, context);
+            pump_until(5000, || view.list_view.height() > 0);
+            pump(50);
+            view
+        }
+
+        /// Rows that were bound, but never mapped, wait for a request that
+        /// scrolling brings; the ones that painted must show their own image.
+        /// Returns how many painted.
+        fn assert_each_painted_row_shows_its_own_thumbnail(view: &SecondaryView) -> usize {
+            let painted: Vec<_> = shown_thumbnails(view)
+                .into_iter()
+                .filter_map(|(title, width)| Some((title, width?)))
+                .collect();
+            assert!(!painted.is_empty(), "no row painted its thumbnail");
+            for (title, width) in &painted {
+                let index: i32 = title["file-".len()..].parse().expect("index");
+                assert_eq!(*width, thumbnail_side(index), "{title}");
+            }
+            painted.len()
+        }
+
+        #[test]
+        fn perf_guard_files_thumbnails_decode_off_the_gtk_thread() {
+            run_gtk_test(|| {
+                let _ = adw::init();
+                let decodes = ManualDecodes::install();
+                let assets = AssetCacheTestDir::new("files-guard");
+                let mut context = test_context();
+                let rows = thumbnail_rows(&assets, &mut context);
+                let before = crate::debug::IMAGE_DECODES.get();
+                let view = show_files(rows, &context);
+                pump_until(2000, || decodes.0.running().len() == decode::MAX_IN_FLIGHT);
+                pump(20);
+                assert_eq!(
+                    crate::debug::IMAGE_DECODES.get() - before,
+                    0,
+                    "Files rows must leave decodes to the workers"
+                );
+                let bound = shown_thumbnails(&view).len();
+                assert!(bound < THUMBNAIL_ROWS as usize, "every row was bound");
+                assert!(shown_thumbnails(&view)
+                    .iter()
+                    .all(|(_, width)| width.is_none()));
+                let running = decodes.0.running();
+                assert_eq!(running.len(), decode::MAX_IN_FLIGHT, "{running:?}");
+
+                // Only the rows on screen were asked for, and each paints
+                // its own image in place once it lands.
+                let finished = decodes.finish_all();
+                pump(20);
+                let painted = assert_each_painted_row_shows_its_own_thumbnail(&view);
+                assert_eq!(painted, finished.len(), "{finished:?}");
+                assert!(
+                    painted < bound,
+                    "rows that are not mapped asked for decodes"
+                );
+            });
+        }
+
+        #[test]
+        fn recycled_file_rows_show_only_their_own_thumbnail() {
+            run_gtk_test(|| {
+                let _ = adw::init();
+                let decodes = ManualDecodes::install();
+                let assets = AssetCacheTestDir::new("files-recycle");
+                let mut context = test_context();
+                let rows = thumbnail_rows(&assets, &mut context);
+                let view = show_files(rows, &context);
+                pump_until(2000, || decodes.0.running().len() == decode::MAX_IN_FLIGHT);
+                assert_eq!(decodes.0.running().len(), decode::MAX_IN_FLIGHT);
+                // Scrolled away before any decode landed, so the rows they
+                // were for are off screen when the workers finish.
+                let adjustment = view.scrolled_window.vadjustment();
+                adjustment.set_value(adjustment.upper());
+                pump_until(2000, || {
+                    shown_thumbnails(&view)
+                        .iter()
+                        .any(|(title, _)| title == "file-599")
+                });
+                pump(50);
+                decodes.finish_all();
+                pump(20);
+                let shown = shown_thumbnails(&view);
+                for (title, width) in &shown {
+                    assert!(
+                        width.is_none() || *title != "file-0",
+                        "a row that scrolled away painted: {title}"
+                    );
+                }
+                assert_each_painted_row_shows_its_own_thumbnail(&view);
+            });
+        }
+
+        #[test]
+        fn file_rows_keep_the_icon_when_a_thumbnail_cannot_be_decoded() {
+            run_gtk_test(|| {
+                let _ = adw::init();
+                let decodes = ManualDecodes::install();
+                let assets = AssetCacheTestDir::new("files-broken");
+                let path = assets.0.join("broken.png");
+                std::fs::write(&path, b"not an image").expect("write");
+                let mut context = test_context();
+                let url = "https://files.slack.com/broken.png".to_string();
+                context.image_assets.insert(url.clone(), path);
+                let view = show_files(vec![file_row("broken", url)], &context);
+                pump_until(500, || !decodes.0.running().is_empty());
+                decodes.finish_all();
+                pump(20);
+                let icon = descendants(view.list_view.upcast_ref())
+                    .into_iter()
+                    .find(|widget| widget.has_css_class("secondary-file-icon"))
+                    .expect("icon");
+                assert!(icon.is_visible(), "the file icon stays when decoding fails");
+            });
+        }
+
         #[test]
         fn secondary_view_switches_between_status_and_list_gtk() {
             run_gtk_test(|| {

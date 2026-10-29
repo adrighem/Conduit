@@ -3242,3 +3242,65 @@ fn test_cached_theme_json_roundtrip() {
         serde_json::from_str(&serialized).expect("deserialize theme");
     assert_eq!(theme, deserialized);
 }
+
+#[test]
+fn perf_guard_window_loads_no_image_file_on_the_gtk_thread() {
+    // GtkPicture's file loaders and gdk-pixbuf's `from_file` decode on the
+    // calling thread. Workers decode instead (`timeline::cache::decode`).
+    let source = include_str!("../window.rs");
+    for forbidden in [
+        "Picture::for_file",
+        "Picture::for_filename",
+        ".set_filename(",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden} decodes in place");
+    }
+}
+
+/// Tests that create GTK widgets. They run only when
+/// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
+mod graphical {
+    use super::*;
+    use crate::timeline::cache::decode;
+    use crate::timeline::tests::{
+        pump, pump_until, run_gtk_test, save_test_image, ManualDecodes, TempTestDir,
+    };
+
+    #[test]
+    fn perf_guard_composer_image_preview_decodes_off_the_gtk_thread() {
+        run_gtk_test(|| {
+            let _ = adw::init();
+            let decodes = ManualDecodes::install();
+            let dir = TempTestDir::new("composer-preview");
+            let path = dir.path().join("attachment.png");
+            save_test_image(&path, "png", 90, 60);
+            let before = crate::debug::IMAGE_DECODES.get();
+            let preview = composer_image_preview(&path);
+            let window = gtk::Window::new();
+            window.set_child(Some(&preview));
+            window.present();
+            pump_until(500, || !decodes.0.running().is_empty());
+            pump(20);
+            assert_eq!(
+                crate::debug::IMAGE_DECODES.get() - before,
+                0,
+                "the preview must leave its decode to a worker"
+            );
+            assert_eq!(decodes.0.running().len(), 1);
+            let shown = preview
+                .paintable()
+                .and_downcast::<decode::DeferredPaintable>()
+                .expect("deferred until decoded");
+            assert!(shown.content().is_none());
+            assert_eq!(
+                (preview.width_request(), preview.height_request()),
+                (72, 54)
+            );
+            decodes.finish_all();
+            pump(20);
+            let texture = shown.content().expect("decoded image paints in place");
+            assert_eq!(texture.intrinsic_width(), 90);
+            window.destroy();
+        });
+    }
+}

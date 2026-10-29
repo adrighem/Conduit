@@ -896,6 +896,16 @@ fn composer_attachment_preview(
     }
 }
 
+/// The preview of an image attachment. A worker decodes it once the picture
+/// is mapped, behind a placeholder of the size the header declares.
+fn composer_image_preview(path: &Path) -> gtk::Picture {
+    let picture = crate::timeline::cache::decode::deferred_texture_picture(path);
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk::ContentFit::Cover);
+    picture.set_size_request(72, 54);
+    picture
+}
+
 const COMPOSER_BOLD_TAG: &str = "composer-bold";
 const COMPOSER_ITALIC_TAG: &str = "composer-italic";
 const COMPOSER_UNDERLINE_TAG: &str = "composer-underline";
@@ -5827,11 +5837,7 @@ impl ConduitWindow {
             );
             let preview: gtk::Widget = match preview_kind {
                 ComposerAttachmentPreviewKind::Image => {
-                    let picture = gtk::Picture::for_file(&gio::File::for_path(&attachment.path));
-                    picture.set_can_shrink(true);
-                    picture.set_content_fit(gtk::ContentFit::Cover);
-                    picture.set_size_request(72, 54);
-                    picture.upcast()
+                    composer_image_preview(&attachment.path).upcast()
                 }
                 ComposerAttachmentPreviewKind::Video => {
                     let image = gtk::Image::from_icon_name("video-x-generic-symbolic");

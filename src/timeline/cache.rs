@@ -112,28 +112,6 @@ pub fn clear_timeline_view_caches() {
     crate::timeline_document_widget::clear_document_accent_cache();
 }
 
-pub(crate) fn get_or_load_texture(path: &Path) -> Option<gtk::gdk::Texture> {
-    TEXTURE_CACHE.with(|cache| {
-        let mut map = cache.borrow_mut();
-        if let Some(tex) = map.get(path) {
-            return Some(tex);
-        }
-        if !crate::animated_image::within_decode_budget(path) {
-            return None;
-        }
-        if let Ok(tex) = crate::debug::trace_image_decode(
-            "texture",
-            path,
-            crate::debug::ImageLoader::Texture,
-            || gtk::gdk::Texture::from_filename(path),
-        ) {
-            map.insert(path.to_path_buf(), tex.clone());
-            return Some(tex);
-        }
-        None
-    })
-}
-
 pub(crate) fn media_collapse_key(ts: &str, slot: &str) -> String {
     format!("{ts}:{slot}")
 }
@@ -815,7 +793,7 @@ pub(crate) mod decode {
     /// A waiter's liveness and generation. The requester keeps the ticket;
     /// dropping it kills its waiters and [`DecodeTicket::invalidate`] makes
     /// them stale. Results for either are still cached, never applied.
-    #[derive(Clone, Default)]
+    #[derive(Debug, Clone, Default)]
     pub(crate) struct DecodeTicket(Rc<Cell<u64>>);
 
     impl DecodeTicket {
@@ -1279,6 +1257,19 @@ pub(crate) mod decode {
             Requested::Pending => Requested::Pending,
             Requested::Ready(_) | Requested::Failed => Requested::Failed,
         }
+    }
+
+    /// Loads the GIF or WebP at `path` as an animation, off the GTK thread:
+    /// [`Requested::Ready`] with [`Decoded::Still`] when it is known to hold
+    /// one frame, else `deliver` gets [`Decoded::Animation`] (or `Still`)
+    /// while `ticket` stays current. Animations are not cached here, so each
+    /// request on a miss loads the file again; concurrent ones share the load.
+    pub(crate) fn request_animation(
+        path: &Path,
+        ticket: &DecodeTicket,
+        deliver: impl FnOnce(&Decoded) + 'static,
+    ) -> Requested<Decoded> {
+        scheduler().request(texture_key(path, TextureSpec::Animation), ticket, deliver)
     }
 
     /// Whether decoding `path` as `spec` is known to fail, so a row can skip
