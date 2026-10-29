@@ -18,7 +18,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gtk::prelude::*;
@@ -28,7 +29,8 @@ use serde_json::{json, Map, Value};
 use crate::models::{SlackConversation, SlackMessage, SlackUser};
 use crate::rich_message::{MessageNode, RichInline, RichInlineStyle, RichTextNode};
 use crate::search::{
-    SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
+    CompletionEntry, CompletionIndex, CompletionMatches, SearchField, ID_FIELD_WEIGHT,
+    PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
 };
 
 pub fn text_view_text(text_view: &gtk::TextView) -> String {
@@ -1296,66 +1298,80 @@ pub fn mention_candidates(users: &[SlackUser]) -> Vec<MentionCandidate> {
     candidates
 }
 
+/// Suggestions listed in the composer completion popover.
+pub const COMPOSER_COMPLETION_LIMIT: usize = 10;
+
+/// How many leading entries of `previous` and `next` are equal, so a
+/// suggestion list keeps those rows and rebuilds only the rest.
+pub fn common_prefix_len<T: PartialEq>(previous: &[T], next: &[T]) -> usize {
+    previous
+        .iter()
+        .zip(next)
+        .take_while(|(previous, next)| previous == next)
+        .count()
+}
+
+/// Mention candidates prepared for completion; see [`CompletionIndex`].
+pub type MentionCompletionIndex = CompletionIndex<MentionCandidate, (u8, String, String)>;
+
+/// Prepares `candidates` once so each keystroke only scores matches. Among
+/// equal scores people come before groups and broadcasts, then by lowercased
+/// display name and ID.
+pub fn mention_completion_index(candidates: &[MentionCandidate]) -> MentionCompletionIndex {
+    CompletionIndex::new(
+        candidates
+            .iter()
+            .map(|candidate| {
+                let name_key = candidate.display_name.to_lowercase();
+                let rank = MentionTarget::classify(&candidate.user_id).suggestion_rank();
+                CompletionEntry::new(
+                    candidate.clone(),
+                    [
+                        SearchField::new(&candidate.display_name, PRIMARY_FIELD_WEIGHT),
+                        SearchField::new(&candidate.user_id, ID_FIELD_WEIGHT),
+                    ]
+                    .into_iter()
+                    .chain(
+                        candidate
+                            .full_name
+                            .iter()
+                            .chain(&candidate.username)
+                            .chain(&candidate.search_aliases)
+                            .map(|name| SearchField::new(name, SECONDARY_FIELD_WEIGHT)),
+                    ),
+                    name_key.clone(),
+                    Some(candidate.user_id.clone()),
+                    (rank, name_key, candidate.user_id.clone()),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The best `limit` mention matches for `query`. `matches` carries the
+/// previous keystroke's matches, so a query that extends it filters those
+/// instead of the whole index.
+pub fn search_mention_index(
+    index: &MentionCompletionIndex,
+    query: &str,
+    matches: &mut Option<CompletionMatches>,
+    limit: usize,
+) -> Vec<MentionCandidate> {
+    index.search(query, matches, limit, |_, score| Reverse(score))
+}
+
+#[cfg(test)]
 pub fn search_mention_candidates(
     candidates: &[MentionCandidate],
     query: &str,
     limit: usize,
 ) -> Vec<MentionCandidate> {
-    if limit == 0 {
-        return Vec::new();
-    }
-
-    let query = SearchQuery::parse(query);
-    let mut matches = candidates
-        .iter()
-        .filter_map(|candidate| {
-            let score = query.score(
-                [
-                    SearchField::new(&candidate.display_name, PRIMARY_FIELD_WEIGHT),
-                    SearchField::new(&candidate.user_id, ID_FIELD_WEIGHT),
-                ]
-                .into_iter()
-                .chain(
-                    candidate
-                        .full_name
-                        .iter()
-                        .map(|name| SearchField::new(name, SECONDARY_FIELD_WEIGHT)),
-                )
-                .chain(
-                    candidate
-                        .username
-                        .iter()
-                        .map(|name| SearchField::new(name, SECONDARY_FIELD_WEIGHT)),
-                )
-                .chain(
-                    candidate
-                        .search_aliases
-                        .iter()
-                        .map(|alias| SearchField::new(alias, SECONDARY_FIELD_WEIGHT)),
-                ),
-            )?;
-            Some((candidate.clone(), score))
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by_cached_key(|(candidate, score)| {
-        (
-            std::cmp::Reverse(*score),
-            MentionTarget::classify(&candidate.user_id).suggestion_rank(),
-            candidate.display_name.to_lowercase(),
-            candidate.user_id.clone(),
-        )
-    });
-
-    let mut seen_user_ids = HashSet::new();
-    matches
-        .into_iter()
-        .filter_map(|(candidate, _)| {
-            seen_user_ids
-                .insert(candidate.user_id.clone())
-                .then_some(candidate)
-        })
-        .take(limit)
-        .collect()
+    search_mention_index(
+        &mention_completion_index(candidates),
+        query,
+        &mut None,
+        limit,
+    )
 }
 
 pub fn channel_candidates<'a>(
@@ -1383,44 +1399,53 @@ pub fn channel_candidates<'a>(
     candidates
 }
 
+/// Channel candidates prepared for completion; see [`CompletionIndex`].
+pub type ChannelCompletionIndex = CompletionIndex<ChannelCandidate, (String, String)>;
+
+/// Prepares `candidates` once; equal scores order by lowercased title and ID.
+pub fn channel_completion_index(candidates: &[ChannelCandidate]) -> ChannelCompletionIndex {
+    CompletionIndex::new(
+        candidates
+            .iter()
+            .map(|candidate| {
+                let name_key = candidate.title.to_lowercase();
+                CompletionEntry::new(
+                    candidate.clone(),
+                    [
+                        SearchField::new(&candidate.title, PRIMARY_FIELD_WEIGHT),
+                        SearchField::new(&candidate.channel_id, ID_FIELD_WEIGHT),
+                    ],
+                    name_key.clone(),
+                    Some(candidate.channel_id.clone()),
+                    (name_key, candidate.channel_id.clone()),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The best `limit` channel matches for `query`; see [`search_mention_index`].
+pub fn search_channel_index(
+    index: &ChannelCompletionIndex,
+    query: &str,
+    matches: &mut Option<CompletionMatches>,
+    limit: usize,
+) -> Vec<ChannelCandidate> {
+    index.search(query, matches, limit, |_, score| Reverse(score))
+}
+
+#[cfg(test)]
 pub fn search_channel_candidates(
     candidates: &[ChannelCandidate],
     query: &str,
     limit: usize,
 ) -> Vec<ChannelCandidate> {
-    if limit == 0 {
-        return Vec::new();
-    }
-
-    let query = SearchQuery::parse(query);
-    let mut matches = candidates
-        .iter()
-        .filter_map(|candidate| {
-            let score = query.score([
-                SearchField::new(&candidate.title, PRIMARY_FIELD_WEIGHT),
-                SearchField::new(&candidate.channel_id, ID_FIELD_WEIGHT),
-            ])?;
-            Some((candidate.clone(), score))
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by_cached_key(|(candidate, score)| {
-        (
-            std::cmp::Reverse(*score),
-            candidate.title.to_lowercase(),
-            candidate.channel_id.clone(),
-        )
-    });
-
-    let mut seen_channel_ids = HashSet::new();
-    matches
-        .into_iter()
-        .filter_map(|(candidate, _)| {
-            seen_channel_ids
-                .insert(candidate.channel_id.clone())
-                .then_some(candidate)
-        })
-        .take(limit)
-        .collect()
+    search_channel_index(
+        &channel_completion_index(candidates),
+        query,
+        &mut None,
+        limit,
+    )
 }
 
 pub fn replace_channel_token(
@@ -1930,10 +1955,11 @@ pub fn text_view_enter_action(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
-    use crate::models::SlackUserProfile;
+    use crate::models::{SlackUserGroup, SlackUserProfile};
     use crate::rich_message::MessageDocument;
+    use crate::search::{take_candidates_scored, SearchQuery};
 
     use super::*;
 
@@ -2638,6 +2664,311 @@ mod tests {
             search_mention_candidates(&candidates, "zil", 10)[0].user_id,
             "U3"
         );
+    }
+
+    /// The full-scan search that completion used before it kept an index,
+    /// kept as the reference ranking the index must reproduce.
+    fn legacy_search_mention_candidates(
+        candidates: &[MentionCandidate],
+        query: &str,
+        limit: usize,
+    ) -> Vec<MentionCandidate> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let query = SearchQuery::parse(query);
+        let mut matches = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let score = query.score(
+                    [
+                        SearchField::new(&candidate.display_name, PRIMARY_FIELD_WEIGHT),
+                        SearchField::new(&candidate.user_id, ID_FIELD_WEIGHT),
+                    ]
+                    .into_iter()
+                    .chain(
+                        candidate
+                            .full_name
+                            .iter()
+                            .map(|name| SearchField::new(name, SECONDARY_FIELD_WEIGHT)),
+                    )
+                    .chain(
+                        candidate
+                            .username
+                            .iter()
+                            .map(|name| SearchField::new(name, SECONDARY_FIELD_WEIGHT)),
+                    )
+                    .chain(
+                        candidate
+                            .search_aliases
+                            .iter()
+                            .map(|alias| SearchField::new(alias, SECONDARY_FIELD_WEIGHT)),
+                    ),
+                )?;
+                Some((candidate.clone(), score))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_cached_key(|(candidate, score)| {
+            (
+                Reverse(*score),
+                MentionTarget::classify(&candidate.user_id).suggestion_rank(),
+                candidate.display_name.to_lowercase(),
+                candidate.user_id.clone(),
+            )
+        });
+
+        let mut seen_user_ids = HashSet::new();
+        matches
+            .into_iter()
+            .filter_map(|(candidate, _)| {
+                seen_user_ids
+                    .insert(candidate.user_id.clone())
+                    .then_some(candidate)
+            })
+            .take(limit)
+            .collect()
+    }
+
+    fn legacy_search_channel_candidates(
+        candidates: &[ChannelCandidate],
+        query: &str,
+        limit: usize,
+    ) -> Vec<ChannelCandidate> {
+        let query = SearchQuery::parse(query);
+        let mut matches = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let score = query.score([
+                    SearchField::new(&candidate.title, PRIMARY_FIELD_WEIGHT),
+                    SearchField::new(&candidate.channel_id, ID_FIELD_WEIGHT),
+                ])?;
+                Some((candidate.clone(), score))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_cached_key(|(candidate, score)| {
+            (
+                Reverse(*score),
+                candidate.title.to_lowercase(),
+                candidate.channel_id.clone(),
+            )
+        });
+
+        let mut seen_channel_ids = HashSet::new();
+        matches
+            .into_iter()
+            .filter_map(|(candidate, _)| {
+                seen_channel_ids
+                    .insert(candidate.channel_id.clone())
+                    .then_some(candidate)
+            })
+            .take(limit)
+            .collect()
+    }
+
+    /// People, a user group and the broadcast keywords, with many repeated
+    /// display names so ties are common.
+    fn mention_directory(count: usize) -> Vec<MentionCandidate> {
+        const FIRST: [&str; 8] = [
+            "Ada",
+            "Alan",
+            "Alice",
+            "Bob",
+            "Carol",
+            "Žilvinas",
+            "Zoë",
+            "Grace",
+        ];
+        const LAST: [&str; 6] = ["Lovelace", "Adams", "Brown", "Hopper", "Smith", "Alvarez"];
+        let users = (0..count)
+            .map(|index| {
+                let (first, last) = (FIRST[index % 8], LAST[index / 8 % 6]);
+                user(
+                    Some(&format!("U{index:05}")),
+                    Some(first),
+                    Some(&format!("{first} {last}")),
+                    Some(&format!("{}.{}", first.to_lowercase(), last.to_lowercase())),
+                )
+            })
+            .collect::<Vec<_>>();
+        let groups = [SlackUserGroup {
+            id: "S1".to_string(),
+            handle: Some("support".to_string()),
+            name: Some("Support team".to_string()),
+            users: Vec::new(),
+        }];
+        all_mention_candidates(users.iter(), &groups)
+    }
+
+    fn channel_directory(count: usize) -> Vec<ChannelCandidate> {
+        const WORDS: [&str; 7] = [
+            "support",
+            "broker",
+            "orange",
+            "random",
+            "alpha",
+            "supportive",
+            "ops",
+        ];
+        (0..count)
+            .map(|index| ChannelCandidate {
+                channel_id: format!("C{index:05}"),
+                title: format!(
+                    "{}-{}-{}",
+                    WORDS[index % 7],
+                    WORDS[index / 7 % 7],
+                    index % 13
+                ),
+                is_private: index % 5 == 0,
+            })
+            .collect()
+    }
+
+    /// Typing runs, including backspaces, an emptied query and word breaks.
+    const COMPLETION_TYPING: [&[&str]; 9] = [
+        &[
+            "a", "al", "ali", "alic", "alice", "alice ", "alice a", "alice ad",
+        ],
+        &["ada", "ad", "a", "", "z", "zi", "zil", "žil"],
+        &["here", "he", "h", "che", "chan", "channel"],
+        &["sup", "supp", "support", "support t", "suppor"],
+        &["u00", "u001", "u0012", "u00123"],
+        &[
+            "lovelace",
+            "love",
+            "ada lov",
+            "ada.lo",
+            "ada.lovelace",
+            "ada.love",
+        ],
+        &["é", "e", "zoe", "zoë", "zo"],
+        &["c-", "c", "c-1", "broker-o", "broker-orange", "brok"],
+        &["ops", "ops-", "ops-s", "s", "so", "sop"],
+    ];
+
+    #[test]
+    fn incremental_mention_search_matches_the_full_scan_ranking() {
+        let candidates = mention_directory(300);
+        let index = mention_completion_index(&candidates);
+
+        for typing in COMPLETION_TYPING {
+            let mut matches = None;
+            for query in typing {
+                for limit in [10, usize::MAX, 1] {
+                    assert_eq!(
+                        search_mention_index(&index, query, &mut matches, limit),
+                        legacy_search_mention_candidates(&candidates, query, limit),
+                        "query {query:?} limit {limit} in {typing:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_channel_search_matches_the_full_scan_ranking() {
+        let candidates = channel_directory(300);
+        let index = channel_completion_index(&candidates);
+
+        for typing in COMPLETION_TYPING {
+            let mut matches = None;
+            for query in typing {
+                for limit in [10, usize::MAX, 1] {
+                    assert_eq!(
+                        search_channel_index(&index, query, &mut matches, limit),
+                        legacy_search_channel_candidates(&candidates, query, limit),
+                        "query {query:?} limit {limit} in {typing:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completion_search_keeps_the_best_of_candidates_sharing_an_id() {
+        let candidate = |display_name: &str| MentionCandidate {
+            user_id: "U1".to_string(),
+            display_name: display_name.to_string(),
+            full_name: None,
+            username: None,
+            search_aliases: Vec::new(),
+        };
+        let candidates = vec![candidate("Alicia"), candidate("Ali")];
+        let index = mention_completion_index(&candidates);
+        let mut matches = None;
+
+        for query in ["a", "al", "ali", "alic"] {
+            assert_eq!(
+                search_mention_index(&index, query, &mut matches, 10),
+                legacy_search_mention_candidates(&candidates, query, 10),
+                "query {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn perf_guard_extending_a_mention_query_scores_only_the_previous_matches() {
+        let candidates = mention_directory(2_000);
+        let index = mention_completion_index(&candidates);
+        let matching =
+            |query: &str| legacy_search_mention_candidates(&candidates, query, usize::MAX).len();
+        let mut matches = None;
+        take_candidates_scored();
+
+        let mut expected = index.len();
+        let mut total = 0;
+        for query in ["a", "al", "ali", "alic", "alice"] {
+            search_mention_index(&index, query, &mut matches, COMPOSER_COMPLETION_LIMIT);
+            let scored = take_candidates_scored();
+            assert_eq!(
+                scored, expected,
+                "{query:?} must score the previous matches, not the whole index"
+            );
+            total += scored;
+            expected = matching(query);
+        }
+        assert!(
+            total < 5 * index.len(),
+            "five keystrokes scored {total} candidates for an index of {}",
+            index.len()
+        );
+
+        search_mention_index(&index, "alice", &mut matches, COMPOSER_COMPLETION_LIMIT);
+        assert_eq!(take_candidates_scored(), 0, "a cursor move scores nothing");
+
+        search_mention_index(&index, "ali", &mut matches, COMPOSER_COMPLETION_LIMIT);
+        assert_eq!(
+            take_candidates_scored(),
+            index.len(),
+            "a backspace widens the matches and rescans the index"
+        );
+    }
+
+    #[test]
+    fn perf_guard_extending_a_channel_query_scores_only_the_previous_matches() {
+        let candidates = channel_directory(3_000);
+        let index = channel_completion_index(&candidates);
+        let mut matches = None;
+        take_candidates_scored();
+
+        let mut expected = index.len();
+        for query in ["s", "su", "sup", "supp", "support-b"] {
+            search_channel_index(&index, query, &mut matches, COMPOSER_COMPLETION_LIMIT);
+            assert_eq!(take_candidates_scored(), expected, "query {query:?}");
+            expected = legacy_search_channel_candidates(&candidates, query, usize::MAX).len();
+        }
+        assert!(expected < index.len() / 4, "the fixture must narrow");
+    }
+
+    #[test]
+    fn perf_guard_unchanged_suggestions_keep_their_rows() {
+        let previous = ["ada", "alan", "alice"];
+        assert_eq!(common_prefix_len(&previous, &previous), 3);
+        assert_eq!(common_prefix_len(&previous, &["ada", "alan"]), 2);
+        assert_eq!(common_prefix_len(&previous, &["ada", "alice", "alan"]), 1);
+        assert_eq!(common_prefix_len(&previous, &["bob"]), 0);
+        assert_eq!(common_prefix_len(&previous, &[] as &[&str]), 0);
+        assert_eq!(common_prefix_len(&[] as &[&str], &previous), 0);
     }
 
     #[test]

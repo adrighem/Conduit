@@ -34,24 +34,26 @@ use crate::attention::AttentionDecision;
 use crate::attention_settings;
 use crate::auth;
 use crate::composer::{
-    all_mention_candidates, channel_candidates, channel_token_at_caret, completion_key_action,
-    composer_draft_from_message, decode_rich_composer_draft, emoji_token_at_caret,
-    encode_rich_composer_draft, expand_composer_semantic_selection, hydrate_composer_mentions,
+    all_mention_candidates, channel_candidates, channel_completion_index, channel_token_at_caret,
+    common_prefix_len, completion_key_action, composer_draft_from_message,
+    decode_rich_composer_draft, emoji_token_at_caret, encode_rich_composer_draft,
+    expand_composer_semantic_selection, hydrate_composer_mentions, mention_completion_index,
     mention_token_at_caret, message_edit_key_action, replace_channel_token, replace_emoji_token,
-    replace_mention_token, search_channel_candidates, search_mention_candidates,
+    replace_mention_token, search_channel_index, search_mention_index,
     serialize_composer_semantics, text_view_enter_action, text_view_text, validate_slash_command,
-    ChannelCandidate, ChannelToken, CompletionKeyAction, ComposerAttachmentDraft,
-    ComposerBlockKind, ComposerBlockSpan, ComposerEntityKind, ComposerEntitySpan,
-    ComposerStyleSpan, ComposerTextStyle, EmojiToken, MentionCandidate, MentionSpan, MentionTarget,
-    MentionToken, MessageEditKeyAction, RichComposerDraft, SlashCommandValidation,
-    TextViewEnterAction,
+    ChannelCandidate, ChannelCompletionIndex, ChannelToken, CompletionKeyAction,
+    ComposerAttachmentDraft, ComposerBlockKind, ComposerBlockSpan, ComposerEntityKind,
+    ComposerEntitySpan, ComposerStyleSpan, ComposerTextStyle, EmojiToken, MentionCandidate,
+    MentionCompletionIndex, MentionSpan, MentionTarget, MentionToken, MessageEditKeyAction,
+    RichComposerDraft, SlashCommandValidation, TextViewEnterAction, COMPOSER_COMPLETION_LIMIT,
 };
 use crate::config;
 use crate::conversation_catalog::ConversationTitlesCache;
 use crate::drafts::{DraftKey, DraftSettings, Drafts};
 use crate::emoji::{
-    emoji_picker_accessible_label, move_emoji_picker_selection, EmojiCatalog, EmojiEntry,
-    EmojiPickerModel, EmojiPickerMove, EmojiValue,
+    emoji_completion_index, emoji_picker_accessible_label, move_emoji_picker_selection,
+    search_emoji_index, EmojiCatalog, EmojiCompletionIndex, EmojiEntry, EmojiPickerMove,
+    EmojiValue,
 };
 use crate::huddles::fallback::external_huddle_url;
 use crate::huddles::presentation::{present_huddle, HuddlePrimaryAction};
@@ -79,6 +81,7 @@ use crate::runtime::{
     RuntimeEventKind, RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity,
     RuntimeOperation, RuntimeTarget, SessionId, UploadAttachment,
 };
+use crate::search::{CompletionCache, CompletionMatches};
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
     self, ConversationKind, ConversationPickerAction, KeyedSidebarItem, SidebarItemModel,
@@ -391,6 +394,7 @@ mod imp {
         pub(super) conversation_picker_refresh: Cell<PickerRefreshGate>,
         pub(super) people_picker_refresh: Cell<PickerRefreshGate>,
         pub(super) people_picker_view: RefCell<Option<PeoplePickerView>>,
+        pub(super) completion_indexes: RefCell<CompletionIndexes>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
         pub(super) pending_last_conversation: RefCell<Option<LastConversation>>,
         pub(super) read_hold: RefCell<ReadHold>,
@@ -1136,7 +1140,7 @@ enum ComposerCompletionToken {
     Channel(ChannelToken),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum ComposerCompletionEntry {
     Emoji(EmojiEntry),
     Mention(MentionCandidate),
@@ -1149,6 +1153,27 @@ struct ComposerCompletion {
     list: gtk::ListBox,
     entries: Vec<ComposerCompletionEntry>,
     token: Option<ComposerCompletionToken>,
+    /// The matches of the last search, so a query that extends them filters
+    /// those instead of the whole index.
+    matches: Option<CompletionMatches>,
+}
+
+/// The completion data a change can affect.
+#[derive(Debug, Clone, Copy)]
+enum CompletionData {
+    People,
+    Channels,
+    Emoji,
+    All,
+}
+
+/// Candidate indexes for `@`, `#` and `:` completion, built on first use and
+/// dropped when their data changes (`invalidate_completion_data`).
+#[derive(Debug, Default)]
+struct CompletionIndexes {
+    mentions: CompletionCache<MentionCompletionIndex>,
+    channels: CompletionCache<ChannelCompletionIndex>,
+    emoji: CompletionCache<EmojiCompletionIndex>,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -7020,6 +7045,7 @@ impl ConduitWindow {
             list: list.clone(),
             entries: Vec::new(),
             token: None,
+            matches: None,
         };
         *self.composer_completion(target).borrow_mut() = Some(completion);
 
@@ -7084,6 +7110,55 @@ impl ConduitWindow {
         )
     }
 
+    fn cached_mention_index(&self) -> Rc<MentionCompletionIndex> {
+        self.imp()
+            .completion_indexes
+            .borrow_mut()
+            .mentions
+            .get_or_build(|| mention_completion_index(&self.composer_mention_candidates()))
+    }
+
+    fn cached_channel_index(&self) -> Rc<ChannelCompletionIndex> {
+        let imp = self.imp();
+        imp.completion_indexes
+            .borrow_mut()
+            .channels
+            .get_or_build(|| {
+                channel_completion_index(&channel_candidates(
+                    imp.discovered_channels
+                        .borrow()
+                        .iter()
+                        .chain(imp.workspace.conversations.borrow().iter()),
+                ))
+            })
+    }
+
+    fn cached_emoji_index(&self) -> Rc<EmojiCompletionIndex> {
+        let imp = self.imp();
+        imp.completion_indexes.borrow_mut().emoji.get_or_build(|| {
+            let custom_emojis = imp.custom_emojis.borrow();
+            emoji_completion_index(EmojiCatalog::new(&custom_emojis).entries())
+        })
+    }
+
+    /// Drops the cached completion indexes whose data changed, then
+    /// refreshes any active suggestions.
+    fn invalidate_completion_data(&self, data: CompletionData) {
+        {
+            let mut indexes = self.imp().completion_indexes.borrow_mut();
+            if matches!(data, CompletionData::People | CompletionData::All) {
+                indexes.mentions.invalidate();
+            }
+            if matches!(data, CompletionData::Channels | CompletionData::All) {
+                indexes.channels.invalidate();
+            }
+            if matches!(data, CompletionData::Emoji | CompletionData::All) {
+                indexes.emoji.invalidate();
+            }
+        }
+        self.invalidate_composer_completions();
+    }
+
     /// Whether the caret sits in an `@`, `#` or `:` token, so new data can
     /// change the suggestions. Without one there is nothing to refresh.
     fn composer_completion_is_active(&self, target: ComposerTarget) -> bool {
@@ -7118,38 +7193,52 @@ impl ConduitWindow {
         if mention_token.is_some() || channel_token.is_some() {
             self.request_discovery();
         }
+        let mut matches = self
+            .composer_completion(target)
+            .borrow_mut()
+            .as_mut()
+            .and_then(|completion| completion.matches.take());
         let (token, entries) = if let Some(token) = mention_token {
-            let candidates = self.composer_mention_candidates();
-            let entries = search_mention_candidates(&candidates, &token.query, 10)
-                .into_iter()
-                .map(ComposerCompletionEntry::Mention)
-                .collect();
+            let index = self.cached_mention_index();
+            let entries = search_mention_index(
+                &index,
+                &token.query,
+                &mut matches,
+                COMPOSER_COMPLETION_LIMIT,
+            )
+            .into_iter()
+            .map(ComposerCompletionEntry::Mention)
+            .collect();
             (Some(ComposerCompletionToken::Mention(token)), entries)
         } else if let Some(token) = channel_token {
-            let imp = self.imp();
-            let candidates = channel_candidates(
-                imp.discovered_channels
-                    .borrow()
-                    .iter()
-                    .chain(imp.workspace.conversations.borrow().iter()),
-            );
-            let entries = search_channel_candidates(&candidates, &token.query, 10)
-                .into_iter()
-                .map(ComposerCompletionEntry::Channel)
-                .collect();
+            let index = self.cached_channel_index();
+            let entries = search_channel_index(
+                &index,
+                &token.query,
+                &mut matches,
+                COMPOSER_COMPLETION_LIMIT,
+            )
+            .into_iter()
+            .map(ComposerCompletionEntry::Channel)
+            .collect();
             (Some(ComposerCompletionToken::Channel(token)), entries)
         } else {
             let token = emoji_token_at_caret(&text, caret);
             let entries = token.as_ref().map_or_else(Vec::new, |token| {
-                let custom_emojis = self.imp().custom_emojis.borrow();
-                let catalog = EmojiCatalog::new(&custom_emojis);
-                EmojiPickerModel::new(catalog.entries())
-                    .search(&token.query)
-                    .into_iter()
-                    .take(10)
-                    .map(ComposerCompletionEntry::Emoji)
-                    .collect::<Vec<_>>()
+                let index = self.cached_emoji_index();
+                search_emoji_index(
+                    &index,
+                    &token.query,
+                    &mut matches,
+                    COMPOSER_COMPLETION_LIMIT,
+                )
+                .into_iter()
+                .map(ComposerCompletionEntry::Emoji)
+                .collect::<Vec<_>>()
             });
+            if token.is_none() {
+                matches = None;
+            }
             (token.map(ComposerCompletionToken::Emoji), entries)
         };
         let completion_list_label = match token {
@@ -7163,10 +7252,15 @@ impl ConduitWindow {
             return;
         };
         completion.token = token;
-        completion.entries = entries;
+        completion.matches = matches;
+        let previous = std::mem::replace(&mut completion.entries, entries);
 
-        while let Some(child) = completion.list.first_child() {
-            completion.list.remove(&child);
+        // Rows whose entry is unchanged keep their widgets; only the rest is
+        // rebuilt, so a keystroke that leaves the top suggestions alone
+        // creates no widgets.
+        let kept = common_prefix_len(&previous, &completion.entries);
+        while let Some(row) = completion.list.row_at_index(kept as i32) {
+            completion.list.remove(&row);
         }
         if completion.entries.is_empty() {
             text_view.update_property(&[gtk::accessible::Property::Description("")]);
@@ -7177,7 +7271,7 @@ impl ConduitWindow {
         completion
             .list
             .update_property(&[gtk::accessible::Property::Label(completion_list_label)]);
-        for entry in &completion.entries {
+        for entry in &completion.entries[kept..] {
             completion.list.append(&composer_completion_row(entry));
         }
         completion
@@ -7198,6 +7292,7 @@ impl ConduitWindow {
         let mut completion_ref = self.composer_completion(target).borrow_mut();
         if let Some(completion) = completion_ref.as_mut() {
             completion.token = None;
+            completion.matches = None;
             completion.entries.clear();
             completion.popover.popdown();
         }
@@ -7467,6 +7562,7 @@ impl ConduitWindow {
                     .discovery
                     .complete(std::time::Instant::now());
                 *self.imp().discovered_channels.borrow_mut() = Arc::new(channels);
+                self.invalidate_completion_data(CompletionData::Channels);
                 self.invalidate_conversation_picker();
                 self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
             }
@@ -7478,6 +7574,7 @@ impl ConduitWindow {
                         upsert_discovered_channel(discovered, channel);
                     }
                 }
+                self.invalidate_completion_data(CompletionData::Channels);
                 self.invalidate_conversation_picker();
                 self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
             }
@@ -7505,6 +7602,7 @@ impl ConduitWindow {
                         Arc::make_mut(&mut self.imp().discovered_channels.borrow_mut()),
                         *conversation,
                     );
+                    self.invalidate_completion_data(CompletionData::Channels);
                     self.invalidate_conversation_picker();
                     self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
                 }
@@ -7518,14 +7616,14 @@ impl ConduitWindow {
                     .borrow_mut() = users;
                 self.invalidate_conversation_picker();
                 self.invalidate_people_picker();
-                self.invalidate_composer_completions();
+                self.invalidate_completion_data(CompletionData::People);
             }
             RuntimeEventKind::UserGroupsDiscovered(groups) => {
                 self.imp()
                     .workspace
                     .user_directory
                     .apply_user_groups(groups);
-                self.invalidate_composer_completions();
+                self.invalidate_completion_data(CompletionData::People);
             }
             RuntimeEventKind::ConversationOpenCompleted { channel_id } => {
                 let title = self.conversation_title(&channel_id);
@@ -9476,6 +9574,7 @@ impl ConduitWindow {
         imp.failed_image_assets.borrow_mut().clear();
         imp.recovering_image_assets.borrow_mut().clear();
         *imp.custom_emojis.borrow_mut() = Arc::default();
+        self.invalidate_completion_data(CompletionData::All);
         self.set_composer_canonical_text(ComposerTarget::Message, "");
         self.set_composer_canonical_text(ComposerTarget::Thread, "");
         for target in COMPOSER_TARGETS {
@@ -9686,7 +9785,7 @@ impl ConduitWindow {
                 .set_custom_emojis(&self.imp().custom_emojis.borrow());
             write_status_dialog_test_state(self, state);
         }
-        self.invalidate_composer_completions();
+        self.invalidate_completion_data(CompletionData::Emoji);
     }
 
     fn handle_runtime_error(&self, context: &OperationContext, failure: &RuntimeFailure) {
@@ -10038,6 +10137,7 @@ impl ConduitWindow {
             self.apply_workspace_timeline_projection(revision, application.timeline_changes());
         }
         if application.conversation_changed() {
+            self.invalidate_completion_data(CompletionData::Channels);
             if !application.removals().is_empty() {
                 remove_patch_departures_from_discovery(
                     Arc::make_mut(&mut self.imp().discovered_channels.borrow_mut()),
@@ -10191,7 +10291,7 @@ impl ConduitWindow {
         for target in COMPOSER_TARGETS {
             self.refresh_composer_mention_names(target);
         }
-        self.invalidate_composer_completions();
+        self.invalidate_completion_data(CompletionData::People);
         let mut affected_user_ids = affected_user_ids.into_iter().collect::<Vec<_>>();
         affected_user_ids.sort();
         self.patch_users_on_timelines(&affected_user_ids);
@@ -10344,6 +10444,7 @@ impl ConduitWindow {
     }
 
     fn sync_conversations_from_catalog(&self) {
+        self.invalidate_completion_data(CompletionData::Channels);
         *self.imp().sidebar_error.borrow_mut() = None;
         self.request_conversation_user_names();
         // Restore, notification and URI intents below select from workspace
@@ -10355,6 +10456,7 @@ impl ConduitWindow {
     }
 
     fn sync_changed_conversations(&self, changed_channel_ids: &[String], structure_changed: bool) {
+        self.invalidate_completion_data(CompletionData::Channels);
         *self.imp().sidebar_error.borrow_mut() = None;
         self.request_changed_conversation_user_names(changed_channel_ids);
         if structure_changed || !self.render_changed_conversations(changed_channel_ids) {
