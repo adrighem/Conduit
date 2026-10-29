@@ -464,8 +464,7 @@ fn resolve_sourceview_style_scheme() -> Option<sourceview5::StyleScheme> {
     mgr.scheme(preferred).or_else(|| mgr.scheme(fallback))
 }
 
-pub fn build_code_block_widget(code: &str, lang: Option<&str>) -> Widget {
-    register_timeline_css();
+fn build_code_view(code: &str, lang: Option<&str>) -> sourceview5::View {
     let buffer = sourceview5::Buffer::new(None);
     buffer.set_text(code);
 
@@ -483,9 +482,57 @@ pub fn build_code_block_widget(code: &str, lang: Option<&str>) -> Widget {
     view.set_editable(false);
     view.set_cursor_visible(false);
     view.set_monospace(true);
-    let line_count = code.lines().count();
-    view.set_show_line_numbers(line_count > 1);
+    view.set_show_line_numbers(code.lines().count() > 1);
     view.set_wrap_mode(gtk::WrapMode::WordChar);
+    view
+}
+
+/// The plain monospace text a code block shows until its highlighted view
+/// replaces it.
+fn code_placeholder(code: &str) -> Label {
+    let label = Label::new(Some(code));
+    label.set_wrap(true);
+    label.set_wrap_mode(pango::WrapMode::WordChar);
+    label.set_selectable(true);
+    label.set_focus_on_click(false);
+    label.set_xalign(0.0);
+    label.add_css_class("monospace");
+    label
+}
+
+/// Swaps `placeholder` for the highlighted source view at idle priority,
+/// after the first frame that maps it. A source view per block was the
+/// costliest part of a row bind; rows that never show skip it.
+fn upgrade_code_block_when_mapped(placeholder: &Label, code: &str, lang: Option<&str>) {
+    let code = code.to_string();
+    let lang = lang.map(str::to_string);
+    let scheduled = std::cell::Cell::new(false);
+    placeholder.connect_map(move |placeholder| {
+        if scheduled.replace(true) {
+            return;
+        }
+        let weak = placeholder.downgrade();
+        let code = code.clone();
+        let lang = lang.clone();
+        glib::idle_add_local_once(move || {
+            let Some(placeholder) = weak.upgrade() else {
+                return;
+            };
+            let Some(container) = placeholder.parent().and_downcast::<Box>() else {
+                return;
+            };
+            let view = build_code_view(&code, lang.as_deref());
+            container.insert_child_after(&view, Some(&placeholder));
+            container.remove(&placeholder);
+        });
+    });
+}
+
+pub fn build_code_block_widget(code: &str, lang: Option<&str>) -> Widget {
+    register_timeline_css();
+    let line_count = code.lines().count();
+    let placeholder = code_placeholder(code);
+    upgrade_code_block_when_mapped(&placeholder, code, lang);
 
     let container = Box::new(Orientation::Vertical, 4);
     container.add_css_class("code-block");
@@ -522,7 +569,7 @@ pub fn build_code_block_widget(code: &str, lang: Option<&str>) -> Widget {
         container.append(&header);
     }
 
-    container.append(&view);
+    container.append(&placeholder);
     container.upcast::<Widget>()
 }
 
