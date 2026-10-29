@@ -88,6 +88,10 @@ pub(crate) fn run_gtk_test<F: FnOnce() + Send + 'static>(f: F) {
         std::thread::Builder::new()
             .name("gtk-test-worker".into())
             .spawn(move || {
+                // gtk_init would otherwise apply the user's locale to the
+                // whole test process, so date tests on other threads would
+                // format month names in, say, Dutch depending on test order.
+                gtk::disable_setlocale();
                 let ok = std::panic::catch_unwind(gtk::init)
                     .ok()
                     .and_then(|r| r.ok())
