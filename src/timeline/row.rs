@@ -13,6 +13,7 @@ use crate::models::{SlackFile, SlackMessage};
 use super::actions::{
     ActionHandler, HoverEvent, OpenMediaCallback, TimelineAction, ToggleReactionCallback,
 };
+use super::cache::decode::deferred_texture_picture;
 use super::cache::{
     get_or_load_texture, is_media_collapsed, resolve_cached_asset_path, set_media_collapsed,
 };
@@ -175,7 +176,8 @@ pub fn wrap_collapsible_media(media: Widget, ts: &str, slot: &str, title: Option
 }
 
 /// Loads `path` as an animated `Picture` when it's a multi-frame image (GIF/
-/// animated WebP), falling back to the shared static-texture cache otherwise.
+/// animated WebP), otherwise as a static texture decoded off the GTK thread
+/// once the picture is mapped (see [`deferred_texture_picture`]).
 /// Generalizes the animation driver already used for custom emoji reactions
 /// (see `load_custom_emoji_picture`) to arbitrary message/attachment images.
 pub fn load_animated_or_static_picture(
@@ -185,12 +187,9 @@ pub fn load_animated_or_static_picture(
     content_fit: gtk::ContentFit,
 ) -> Widget {
     let longest_side = width.max(height);
-    let paintable = crate::animated_image::animated_paintable(path, longest_side)
-        .or_else(|| get_or_load_texture(path).map(|t| t.upcast()));
-    let pic = match paintable {
+    let pic = match crate::animated_image::animated_paintable(path, longest_side) {
         Some(paintable) => Picture::for_paintable(&paintable),
-        // Failed or over the decode budget: decoding again would not help.
-        None => Picture::new(),
+        None => deferred_texture_picture(path),
     };
     pic.set_size_request(width, height);
     pic.set_can_shrink(true);
@@ -279,10 +278,7 @@ fn render_files(
             let overlay = gtk::Overlay::new();
 
             if let Some(path) = local_thumb {
-                let pic = match get_or_load_texture(&path) {
-                    Some(tex) => Picture::for_paintable(&tex),
-                    None => Picture::new(),
-                };
+                let pic = deferred_texture_picture(&path);
                 pic.set_content_fit(gtk::ContentFit::ScaleDown);
                 pic.set_size_request(600, 340);
                 pic.set_tooltip_text(Some(&title));
