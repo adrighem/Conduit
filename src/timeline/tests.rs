@@ -119,10 +119,26 @@ fn start_gtk_test_runner() -> GtkTestRunner {
     Ok(tx)
 }
 
+/// Whether a test thread named `thread_name` may call `run_gtk_test`. libtest
+/// names each test thread after its path; names that are not test paths (no
+/// `::`) are not checked.
+fn graphical_placement_ok(thread_name: &str) -> bool {
+    !thread_name.contains("::") || thread_name.contains("::graphical::")
+}
+
 /// Runs `f` on a shared GTK thread. Returns at once, passing as skipped,
 /// unless `CONDUIT_GRAPHICAL_TESTS` is set; then GTK must initialise or the
-/// test panics, so a missing display never passes silently.
+/// test panics, so a missing display never passes silently. The caller must
+/// live in a `mod graphical`, which is how CI selects graphical tests.
 pub(crate) fn run_gtk_test<F: FnOnce() + Send + 'static>(f: F) {
+    let current = std::thread::current();
+    if let Some(name) = current.name() {
+        assert!(
+            graphical_placement_ok(name),
+            "{name} uses run_gtk_test outside a `mod graphical`; move it there, \
+             or CI's `graphical::` filter will never run it"
+        );
+    }
     if !graphical_tests_enabled() {
         return;
     }
@@ -174,6 +190,13 @@ fn rich_text_usergroup_element_renders_its_handle() {
         pango.contains("<a href=\"conduit-usergroup://S0614TZR7\">"),
         "group pill should link to its members: {pango}"
     );
+}
+
+#[test]
+fn graphical_placement_accepts_only_graphical_modules_or_non_test_threads() {
+    assert!(graphical_placement_ok("a::graphical::b"));
+    assert!(!graphical_placement_ok("a::tests::b"));
+    assert!(graphical_placement_ok("gtk-test-worker"));
 }
 
 #[test]
