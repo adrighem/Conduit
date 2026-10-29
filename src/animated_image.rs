@@ -177,6 +177,12 @@ pub(crate) fn animated_paintable(path: &Path, display_size: i32) -> Option<gdk::
     {
         return None;
     }
+    // Headers that declare one frame need no animation decode: the static
+    // path decodes the file once instead of twice.
+    if crate::image_header::declared_frame_count(path) == Some(1) {
+        remember_static(path);
+        return None;
+    }
     let animation = crate::debug::trace_image_decode(
         "animation",
         path,
@@ -185,13 +191,7 @@ pub(crate) fn animated_paintable(path: &Path, display_size: i32) -> Option<gdk::
     )
     .ok()?;
     if animation.is_static_image() {
-        STATIC_FILES.with(|files| {
-            let mut files = files.borrow_mut();
-            if files.len() >= MAX_STATIC_FILES {
-                files.clear();
-            }
-            files.insert(path.to_path_buf());
-        });
+        remember_static(path);
         return None;
     }
     let player = AnimatedImage::new(
@@ -204,6 +204,16 @@ pub(crate) fn animated_paintable(path: &Path, display_size: i32) -> Option<gdk::
         players.insert(key, player.downgrade());
     });
     Some(player.upcast())
+}
+
+fn remember_static(path: &Path) {
+    STATIC_FILES.with(|files| {
+        let mut files = files.borrow_mut();
+        if files.len() >= MAX_STATIC_FILES {
+            files.clear();
+        }
+        files.insert(path.to_path_buf());
+    });
 }
 
 /// Forgets which files were found to be static, e.g. on workspace sign-out.
@@ -276,7 +286,7 @@ pub(crate) fn within_decode_budget(path: &Path) -> bool {
     let frames = if is_webp {
         let Some(frames) = std::fs::File::open(path)
             .ok()
-            .and_then(|file| webp_frame_count(std::io::BufReader::new(file)))
+            .and_then(|file| crate::image_header::webp_frame_count(std::io::BufReader::new(file)))
         else {
             return false;
         };
@@ -311,27 +321,6 @@ pub(crate) fn file_info(path: &Path) -> Option<(gdk_pixbuf::PixbufFormat, i32, i
     crate::debug::trace_image_decode("file_info", path, crate::debug::ImageLoader::Pixbuf, || {
         gdk_pixbuf::Pixbuf::file_info(path)
     })
-}
-
-/// Number of frames in a RIFF WebP: its `ANMF` chunks, or 1 for a still.
-/// Walks chunk headers only. `None` when the stream is not a WebP.
-fn webp_frame_count(mut reader: impl std::io::Read + std::io::Seek) -> Option<u64> {
-    let mut header = [0u8; 12];
-    reader.read_exact(&mut header).ok()?;
-    if &header[..4] != b"RIFF" || &header[8..] != b"WEBP" {
-        return None;
-    }
-    let mut frames = 0u64;
-    let mut chunk = [0u8; 8];
-    while reader.read_exact(&mut chunk).is_ok() {
-        if &chunk[..4] == b"ANMF" {
-            frames += 1;
-        }
-        let size = i64::from(u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]));
-        // Chunk payloads are padded to an even length.
-        reader.seek_relative(size + (size & 1)).ok()?;
-    }
-    Some(frames.max(1))
 }
 
 #[cfg(test)]
@@ -426,6 +415,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn perf_guard_static_gif_is_decoded_at_most_once() {
+        let path = write_temp("guard-once.gif", GIF);
+        let before = crate::debug::IMAGE_DECODES.get();
+        // The row-build sequence: animation probe, then the static texture.
+        assert!(animated_paintable(&path, 18).is_none());
+        let texture = crate::timeline::cache::get_or_load_texture(&path);
+        let decodes = crate::debug::IMAGE_DECODES.get() - before;
+        std::fs::remove_file(path).ok();
+        assert!(texture.is_some(), "the static path must still load it");
+        assert_eq!(decodes, 1, "a one-frame GIF must not be decoded twice");
+    }
+
+    #[test]
     fn single_frame_gif_has_no_player() {
         let path = write_temp("still.gif", GIF);
         assert!(animated_paintable(&path, 18).is_none());
@@ -465,37 +467,6 @@ pub(crate) mod tests {
         let junk = write_temp("budget.bin", b"not an image");
         assert!(!within_decode_budget(&junk));
         std::fs::remove_file(junk).ok();
-    }
-
-    fn riff_webp(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
-        let mut body = b"WEBP".to_vec();
-        for (tag, payload) in chunks {
-            body.extend_from_slice(*tag);
-            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            body.extend_from_slice(payload);
-            if payload.len() % 2 == 1 {
-                body.push(0);
-            }
-        }
-        let mut bytes = b"RIFF".to_vec();
-        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&body);
-        bytes
-    }
-
-    #[test]
-    fn webp_frame_count_counts_anmf_chunks() {
-        let count = |bytes: Vec<u8>| webp_frame_count(std::io::Cursor::new(bytes));
-        let anim = riff_webp(&[
-            (b"VP8X", &[0; 10]),
-            (b"ANIM", &[0; 6]),
-            (b"ANMF", &[0; 3]),
-            (b"ANMF", &[0; 16]),
-            (b"ANMF", &[]),
-        ]);
-        assert_eq!(count(anim), Some(3));
-        assert_eq!(count(riff_webp(&[(b"VP8 ", &[0; 5])])), Some(1));
-        assert_eq!(count(ANIMATED_GIF.to_vec()), None);
     }
 
     #[test]
