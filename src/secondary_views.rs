@@ -383,86 +383,92 @@ mod tests {
         assert!(replaced.get());
     }
 
-    #[test]
-    fn secondary_view_switches_between_status_and_list_gtk() {
-        run_gtk_test(|| {
-            let _ = adw::init();
-            let view = SecondaryView::new();
-            let context = test_context();
+    /// Tests that create GTK widgets. They run only when
+    /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
+    mod graphical {
+        use super::*;
 
-            view.show_loading(SecondaryKind::Files, "Loading files");
-            assert_eq!(
-                view.stack.visible_child_name().as_deref(),
-                Some(STATUS_PAGE)
-            );
-            assert!(view.status_page.paintable().is_some());
+        #[test]
+        fn secondary_view_switches_between_status_and_list_gtk() {
+            run_gtk_test(|| {
+                let _ = adw::init();
+                let view = SecondaryView::new();
+                let context = test_context();
 
-            view.show_rows(SecondaryKind::Threads, sample_rows(), &context);
-            assert_eq!(view.stack.visible_child_name().as_deref(), Some(LIST_PAGE));
-            assert_eq!(view.store.n_items(), 4);
+                view.show_loading(SecondaryKind::Files, "Loading files");
+                assert_eq!(
+                    view.stack.visible_child_name().as_deref(),
+                    Some(STATUS_PAGE)
+                );
+                assert!(view.status_page.paintable().is_some());
 
-            view.show_rows(SecondaryKind::Saved, Vec::new(), &context);
-            assert_eq!(
-                view.stack.visible_child_name().as_deref(),
-                Some(STATUS_PAGE)
-            );
-            assert_eq!(view.store.n_items(), 0);
-            assert_eq!(
-                view.status_page.title(),
-                SecondaryKind::Saved.empty_state().title
-            );
-            assert!(view.status_page.paintable().is_none());
+                view.show_rows(SecondaryKind::Threads, sample_rows(), &context);
+                assert_eq!(view.stack.visible_child_name().as_deref(), Some(LIST_PAGE));
+                assert_eq!(view.store.n_items(), 4);
 
-            view.show_error(SecondaryKind::Search, "Search results", "offline");
-            assert_eq!(view.status_page.description().as_deref(), Some("offline"));
-        });
-    }
+                view.show_rows(SecondaryKind::Saved, Vec::new(), &context);
+                assert_eq!(
+                    view.stack.visible_child_name().as_deref(),
+                    Some(STATUS_PAGE)
+                );
+                assert_eq!(view.store.n_items(), 0);
+                assert_eq!(
+                    view.status_page.title(),
+                    SecondaryKind::Saved.empty_state().title
+                );
+                assert!(view.status_page.paintable().is_none());
 
-    #[test]
-    fn secondary_rows_build_cards_and_dispatch_actions_gtk() {
-        run_gtk_test(|| {
-            let _ = adw::init();
-            let context = test_context();
-            let actions = Rc::new(RefCell::new(Vec::new()));
-            let sink = actions.clone();
-            let dispatch: Dispatch = Rc::new(move |action| sink.borrow_mut().push(action));
+                view.show_error(SecondaryKind::Search, "Search results", "offline");
+                assert_eq!(view.status_page.description().as_deref(), Some("offline"));
+            });
+        }
 
-            let widgets = sample_rows()
-                .iter()
-                .map(|row| rows::build_row(row, &context, &dispatch))
-                .collect::<Vec<_>>();
-            assert!(widgets.iter().all(|widget| widget.is::<adw::Clamp>()));
+        #[test]
+        fn secondary_rows_build_cards_and_dispatch_actions_gtk() {
+            run_gtk_test(|| {
+                let _ = adw::init();
+                let context = test_context();
+                let actions = Rc::new(RefCell::new(Vec::new()));
+                let sink = actions.clone();
+                let dispatch: Dispatch = Rc::new(move |action| sink.borrow_mut().push(action));
 
-            assert!(
-                find_button(&widgets[1], "Open in Slack").is_none(),
-                "search results open in Conduit, not in Slack"
-            );
-            find_button(&widgets[3], "Mark Complete")
-                .expect("saved card can be completed")
-                .emit_clicked();
-            let actions = actions.borrow();
-            assert!(matches!(
-                &actions[0],
-                SecondaryAction::RemoveSaved { channel_id, ts, .. } if channel_id == "C1" && ts == "4.0"
-            ));
-        });
-    }
+                let widgets = sample_rows()
+                    .iter()
+                    .map(|row| rows::build_row(row, &context, &dispatch))
+                    .collect::<Vec<_>>();
+                assert!(widgets.iter().all(|widget| widget.is::<adw::Clamp>()));
 
-    #[test]
-    fn list_activation_runs_primary_action_gtk() {
-        run_gtk_test(|| {
-            let _ = adw::init();
-            let view = SecondaryView::new();
-            let opened = Rc::new(RefCell::new(None));
-            let sink = opened.clone();
-            view.set_on_action(move |action| *sink.borrow_mut() = Some(action));
-            view.show_rows(SecondaryKind::Threads, sample_rows(), &test_context());
+                assert!(
+                    find_button(&widgets[1], "Open in Slack").is_none(),
+                    "search results open in Conduit, not in Slack"
+                );
+                find_button(&widgets[3], "Mark Complete")
+                    .expect("saved card can be completed")
+                    .emit_clicked();
+                let actions = actions.borrow();
+                assert!(matches!(
+                    &actions[0],
+                    SecondaryAction::RemoveSaved { channel_id, ts, .. } if channel_id == "C1" && ts == "4.0"
+                ));
+            });
+        }
 
-            view.list_view.emit_by_name::<()>("activate", &[&0_u32]);
-            assert!(matches!(
-                opened.borrow().as_ref(),
-                Some(SecondaryAction::OpenThread { thread_ts, .. }) if thread_ts == "1.0"
-            ));
-        });
+        #[test]
+        fn list_activation_runs_primary_action_gtk() {
+            run_gtk_test(|| {
+                let _ = adw::init();
+                let view = SecondaryView::new();
+                let opened = Rc::new(RefCell::new(None));
+                let sink = opened.clone();
+                view.set_on_action(move |action| *sink.borrow_mut() = Some(action));
+                view.show_rows(SecondaryKind::Threads, sample_rows(), &test_context());
+
+                view.list_view.emit_by_name::<()>("activate", &[&0_u32]);
+                assert!(matches!(
+                    opened.borrow().as_ref(),
+                    Some(SecondaryAction::OpenThread { thread_ts, .. }) if thread_ts == "1.0"
+                ));
+            });
+        }
     }
 }

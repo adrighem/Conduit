@@ -420,22 +420,6 @@ pub(crate) mod tests {
         !\xf9\x04\x00\x0a\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02L\x01\x00;";
 
     #[test]
-    fn animated_gif_shares_one_player_per_display_size() {
-        // A player schedules its frames on the default main context, which
-        // the GTK test thread holds while other tests pump it.
-        crate::timeline_message_widget::tests::run_gtk_test(|| {
-            let path = write_temp("shared.gif", ANIMATED_GIF);
-            let first = animated_paintable(&path, 18).expect("animated paintable");
-            let second = animated_paintable(&path, 18).expect("animated paintable");
-            let other_size = animated_paintable(&path, 32).expect("animated paintable");
-            assert_eq!(first, second);
-            assert_ne!(first, other_size);
-            assert_eq!(first.intrinsic_width(), 1);
-            std::fs::remove_file(path).ok();
-        });
-    }
-
-    #[test]
     fn perf_guard_static_gif_is_decoded_at_most_once() {
         let path = write_temp("guard-once.gif", GIF);
         let before = crate::debug::IMAGE_DECODES.get();
@@ -521,5 +505,27 @@ pub(crate) mod tests {
         assert!(!may_be_animated(&junk_path));
         std::fs::remove_file(png_path).ok();
         std::fs::remove_file(junk_path).ok();
+    }
+
+    /// Tests that create GTK widgets. They run only when
+    /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
+    mod graphical {
+        use super::*;
+
+        #[test]
+        fn animated_gif_shares_one_player_per_display_size() {
+            // A player schedules its frames on the default main context, which
+            // the GTK test thread holds while other tests pump it.
+            crate::timeline_message_widget::tests::run_gtk_test(|| {
+                let path = write_temp("shared.gif", ANIMATED_GIF);
+                let first = animated_paintable(&path, 18).expect("animated paintable");
+                let second = animated_paintable(&path, 18).expect("animated paintable");
+                let other_size = animated_paintable(&path, 32).expect("animated paintable");
+                assert_eq!(first, second);
+                assert_ne!(first, other_size);
+                assert_eq!(first.intrinsic_width(), 1);
+                std::fs::remove_file(path).ok();
+            });
+        }
     }
 }

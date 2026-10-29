@@ -1581,58 +1581,64 @@ mod tests {
         }
     }
 
-    /// A store shrinking out from under an in-flight centering retry (e.g.
-    /// `splice_changed_items` dropping rows while a scroll-to-focus pass is
-    /// still settling) must not leave the retry spinning on every frame
-    /// forever: it should notice the target index is no longer valid and
-    /// stop on the very next tick.
-    #[test]
-    fn center_row_after_layout_stops_when_target_index_is_out_of_bounds() {
-        run_gtk_test(|| {
-            let ctx = test_context();
-            let messages = (0..5)
-                .map(|i| SlackMessage {
-                    ts: format!("170000000{i}.000100"),
-                    user: Some("U123".to_string()),
-                    text: Some(format!("message {i}")),
-                    ..Default::default()
-                })
-                .collect::<Vec<_>>();
-            let view = NativeTimelineView::new();
-            let window = gtk::Window::new();
-            window.set_default_size(400, 500);
-            window.set_child(Some(view.widget()));
-            window.present();
-            view.set_messages(&messages, &ctx, None);
-            pump(300);
+    /// Tests that create GTK widgets. They run only when
+    /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
+    mod graphical {
+        use super::*;
 
-            // Simulate the target row having fallen out of the store (e.g. an
-            // incremental splice shrank it) before centering could finish.
-            let out_of_range_index = view.store.n_items() + 100;
-            let vadj = view.scrolled_window.vadjustment();
-            let start = std::time::Instant::now();
-            let done = center_row_after_layout(
-                &view.list_view,
-                vadj,
-                view.bound_items.clone(),
-                out_of_range_index,
-                view.store.n_items(),
-            );
+        /// A store shrinking out from under an in-flight centering retry (e.g.
+        /// `splice_changed_items` dropping rows while a scroll-to-focus pass is
+        /// still settling) must not leave the retry spinning on every frame
+        /// forever: it should notice the target index is no longer valid and
+        /// stop on the very next tick.
+        #[test]
+        fn center_row_after_layout_stops_when_target_index_is_out_of_bounds() {
+            run_gtk_test(|| {
+                let ctx = test_context();
+                let messages = (0..5)
+                    .map(|i| SlackMessage {
+                        ts: format!("170000000{i}.000100"),
+                        user: Some("U123".to_string()),
+                        text: Some(format!("message {i}")),
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                let view = NativeTimelineView::new();
+                let window = gtk::Window::new();
+                window.set_default_size(400, 500);
+                window.set_child(Some(view.widget()));
+                window.present();
+                view.set_messages(&messages, &ctx, None);
+                pump(300);
 
-            pump_until_done(&done, 2_000);
-            let elapsed = start.elapsed();
+                // Simulate the target row having fallen out of the store (e.g. an
+                // incremental splice shrank it) before centering could finish.
+                let out_of_range_index = view.store.n_items() + 100;
+                let vadj = view.scrolled_window.vadjustment();
+                let start = std::time::Instant::now();
+                let done = center_row_after_layout(
+                    &view.list_view,
+                    vadj,
+                    view.bound_items.clone(),
+                    out_of_range_index,
+                    view.store.n_items(),
+                );
 
-            assert!(
-                done.get(),
-                "an out-of-bounds target should stop the retry instead of spinning forever"
-            );
-            assert!(
-                elapsed < CENTER_ROW_DEADLINE,
-                "an out-of-bounds index should be noticed well before the \
-                 {CENTER_ROW_DEADLINE:?} retry deadline, took {elapsed:?}"
-            );
+                pump_until_done(&done, 2_000);
+                let elapsed = start.elapsed();
 
-            window.destroy();
-        });
+                assert!(
+                    done.get(),
+                    "an out-of-bounds target should stop the retry instead of spinning forever"
+                );
+                assert!(
+                    elapsed < CENTER_ROW_DEADLINE,
+                    "an out-of-bounds index should be noticed well before the \
+                     {CENTER_ROW_DEADLINE:?} retry deadline, took {elapsed:?}"
+                );
+
+                window.destroy();
+            });
+        }
     }
 }

@@ -748,24 +748,30 @@ mod tests {
         assert!(ACCENT_CLASSES.with(|seen| seen.borrow().is_empty()));
     }
 
-    #[test]
-    fn call_button_has_suggested_action() {
-        crate::timeline::tests::run_gtk_test(|| {
-            let context = MessageRenderContext::default();
-            let sources = MediaSources {
-                resolve: &|_| None,
-                is_failed: &|_| false,
-            };
-            let renderer = DocumentRenderer::new(&context, sources, "123.456", None);
+    /// Tests that create GTK widgets. They run only when
+    /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
+    mod graphical {
+        use super::*;
 
-            let call_control =
-                MessageControl::call("Join Huddle", Some("https://slack.com".into()));
-            let button = renderer.control_button(&call_control);
-            assert!(button.has_css_class("suggested-action"));
+        #[test]
+        fn call_button_has_suggested_action() {
+            crate::timeline::tests::run_gtk_test(|| {
+                let context = MessageRenderContext::default();
+                let sources = MediaSources {
+                    resolve: &|_| None,
+                    is_failed: &|_| false,
+                };
+                let renderer = DocumentRenderer::new(&context, sources, "123.456", None);
 
-            let regular_control = MessageControl::new("Regular", None);
-            let regular_button = renderer.control_button(&regular_control);
-            assert!(!regular_button.has_css_class("suggested-action"));
-        });
+                let call_control =
+                    MessageControl::call("Join Huddle", Some("https://slack.com".into()));
+                let button = renderer.control_button(&call_control);
+                assert!(button.has_css_class("suggested-action"));
+
+                let regular_control = MessageControl::new("Regular", None);
+                let regular_button = renderer.control_button(&regular_control);
+                assert!(!regular_button.has_css_class("suggested-action"));
+            });
+        }
     }
 }
