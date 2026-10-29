@@ -35,6 +35,33 @@ pub fn extract_user_ids(message: &SlackMessage) -> Vec<String> {
     ids
 }
 
+/// Ids of `<#C...>` channel mentions that carry no `|label` fallback, so the
+/// title has to come from the channel catalog.
+pub fn extract_channel_ids(message: &SlackMessage) -> Vec<String> {
+    let text = message.visible_text();
+    let mut ids = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find("<#") {
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find('>') else {
+            break;
+        };
+        let (id, label) = rest[..end].split_once('|').unwrap_or((&rest[..end], ""));
+        let id = id.trim();
+        let valid = !id.is_empty()
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
+        if valid && label.trim().is_empty() {
+            ids.push(id.to_string());
+        }
+        rest = &rest[end + 1..];
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 pub fn extract_mentions(text: &str, ids: &mut Vec<String>) {
     let mut rest = text;
     while let Some(start) = rest.find("<@") {
@@ -248,6 +275,19 @@ mod tests {
         assert_eq!(
             extract_user_ids(&message),
             vec!["U123".to_string(), "U456".to_string(), "U999".to_string()]
+        );
+    }
+
+    #[test]
+    fn extracts_only_unlabelled_channel_mentions() {
+        let message = SlackMessage {
+            text: Some("see <#C1> and <#C2|ops>, <#C1>, <#c3> <#C4|> <#C5".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            extract_channel_ids(&message),
+            vec!["C1".to_string(), "C4".to_string()]
         );
     }
 

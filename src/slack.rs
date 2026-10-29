@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -45,9 +46,14 @@ const THREAD_CONTEXT_MAX_PAGES: usize = 20;
 const DEFAULT_DEBUG_CONVERSATION_PROPERTY_LIMIT: usize = 20;
 const DEBUG_CONVERSATION_PROPERTIES_ENV: &str = "CONDUIT_DEBUG_CONVERSATION_PROPERTIES";
 const CONVERSATIONS_LIST_METHOD: &str = "conversations.list";
-/// `conversations.list` is a Tier 2 method (about 20 requests a minute), so
-/// full discovery waits this long between pages instead of hitting 429s.
-pub(crate) const DISCOVERY_PAGE_INTERVAL: Duration = Duration::from_secs(3);
+/// `conversations.list` is a Tier 2 method (about 20 requests a minute) and
+/// Slack filters archived channels after paging, so pages can be sparse.
+/// Discovery therefore waits this long between pages...
+pub(crate) const DISCOVERY_PAGE_INTERVAL: Duration = Duration::from_secs(4);
+/// ...doubling the wait for the rest of the run after each 429, up to this.
+pub(crate) const DISCOVERY_MAX_PAGE_INTERVAL: Duration = Duration::from_secs(32);
+/// Pages one discovery run may fetch; the sweep resumes next session.
+pub(crate) const DISCOVERY_MAX_PAGES: usize = 300;
 const USERS_CONVERSATIONS_METHOD: &str = "users.conversations";
 const USERS_LIST_METHOD: &str = "users.list";
 const SLACK_API_BASE_URL: &str = "https://slack.com/api";
@@ -376,6 +382,88 @@ pub struct SlackApi {
     access_token: String,
     browser_cookie_d: Option<String>,
     user_agent: Option<String>,
+    rate_limit_hits: Arc<AtomicU32>,
+}
+
+/// One page of `conversations.list`.
+pub(crate) struct DiscoveryPage {
+    pub(crate) channels: Vec<SlackConversation>,
+    pub(crate) next_cursor: Option<String>,
+}
+
+/// Why a discovery run stopped before the last page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiscoveryStop {
+    PageCap,
+    RepeatedCursor,
+}
+
+/// Paces and bounds one discovery run: a pause before every page but the
+/// first, a longer pause after rate limiting, a page cap and a guard against
+/// a cursor that comes back.
+#[derive(Debug)]
+pub(crate) struct DiscoveryPaging {
+    interval: Duration,
+    max_interval: Duration,
+    max_pages: usize,
+    pages: usize,
+    seen_cursors: HashSet<String>,
+}
+
+impl DiscoveryPaging {
+    pub(crate) fn new() -> Self {
+        Self::with_limits(
+            DISCOVERY_PAGE_INTERVAL,
+            DISCOVERY_MAX_PAGE_INTERVAL,
+            DISCOVERY_MAX_PAGES,
+        )
+    }
+
+    pub(crate) fn with_limits(
+        interval: Duration,
+        max_interval: Duration,
+        max_pages: usize,
+    ) -> Self {
+        Self {
+            interval,
+            max_interval,
+            max_pages,
+            pages: 0,
+            seen_cursors: HashSet::new(),
+        }
+    }
+
+    /// Admits the page about to be requested and returns how long to wait
+    /// first, or why the run must stop.
+    pub(crate) fn begin_page(
+        &mut self,
+        cursor: Option<&str>,
+    ) -> std::result::Result<Duration, DiscoveryStop> {
+        if self.pages >= self.max_pages {
+            return Err(DiscoveryStop::PageCap);
+        }
+        if let Some(cursor) = cursor {
+            if !self.seen_cursors.insert(cursor.to_string()) {
+                return Err(DiscoveryStop::RepeatedCursor);
+            }
+        }
+        let pause = if self.pages == 0 {
+            Duration::ZERO
+        } else {
+            self.interval
+        };
+        self.pages += 1;
+        Ok(pause)
+    }
+
+    /// Doubles the pause for the rest of the run, up to the maximum.
+    pub(crate) fn note_rate_limited(&mut self) {
+        self.interval = (self.interval * 2).min(self.max_interval);
+    }
+
+    pub(crate) fn pages(&self) -> usize {
+        self.pages
+    }
 }
 
 async fn send_tracked_slack_request(
@@ -738,6 +826,7 @@ impl SlackApi {
             access_token: token.access_token,
             browser_cookie_d: token.browser_cookie_d,
             user_agent: token.user_agent,
+            rate_limit_hits: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -942,43 +1031,27 @@ impl SlackApi {
         Ok(conversations)
     }
 
-    /// Lists every accessible public or private channel, including channels the
-    /// current user has not joined yet. Pages are paced to stay under Slack's
-    /// rate limit; the pause holds only a Background runtime permit.
-    pub async fn discover_conversations(&self) -> Result<Vec<SlackConversation>> {
-        self.discover_conversations_paced(DISCOVERY_PAGE_INTERVAL)
-            .await
+    /// Fetches one page of every accessible public or private channel,
+    /// including channels the current user has not joined yet. Callers drive
+    /// the paging (see [`DiscoveryPaging`]) so a sweep can pause, persist and
+    /// resume between pages.
+    pub(crate) async fn discovery_page(&self, cursor: Option<&str>) -> Result<DiscoveryPage> {
+        let params = paginated_list_params(cursor, true);
+        let response: ConversationListResponse =
+            self.post_form(CONVERSATIONS_LIST_METHOD, &params).await?;
+        Ok(DiscoveryPage {
+            channels: response
+                .channels
+                .into_iter()
+                .filter(is_discoverable_conversation)
+                .collect(),
+            next_cursor: next_cursor(response.response_metadata),
+        })
     }
 
-    pub(crate) async fn discover_conversations_paced(
-        &self,
-        page_interval: Duration,
-    ) -> Result<Vec<SlackConversation>> {
-        let mut cursor: Option<String> = None;
-        let mut conversations = Vec::new();
-
-        loop {
-            if cursor.is_some() {
-                tokio::time::sleep(page_interval).await;
-            }
-            let params = paginated_list_params(cursor.as_deref(), true);
-            let response: ConversationListResponse =
-                self.post_form(CONVERSATIONS_LIST_METHOD, &params).await?;
-            conversations.extend(
-                response
-                    .channels
-                    .into_iter()
-                    .filter(is_discoverable_conversation),
-            );
-
-            cursor = next_cursor(response.response_metadata);
-            if cursor.is_none() {
-                break;
-            }
-        }
-
-        conversations.sort_by_key(|conversation| conversation.display_name().to_lowercase());
-        Ok(conversations)
+    /// Number of HTTP 429 responses seen by this client and its clones.
+    pub(crate) fn rate_limit_hits(&self) -> u32 {
+        self.rate_limit_hits.load(Ordering::Relaxed)
     }
 
     /// Lists workspace users across every page returned by Slack.
@@ -1905,6 +1978,7 @@ impl SlackApi {
             .with_context(|| format!("failed to call Slack method {method}"))?;
 
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                self.rate_limit_hits.fetch_add(1, Ordering::Relaxed);
                 let retry_after = retry_after_delay(&response);
                 if retries >= MAX_RATE_LIMIT_RETRIES {
                     crate::debug::log(

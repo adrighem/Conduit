@@ -1801,6 +1801,16 @@ fn conversation_sync_completion_needs_catalog_sync(workspace_ready: bool) -> boo
     !workspace_ready
 }
 
+fn upsert_discovered_channel(discovered: &mut Vec<SlackConversation>, channel: SlackConversation) {
+    match discovered
+        .iter_mut()
+        .find(|existing| existing.id == channel.id)
+    {
+        Some(existing) => *existing = channel,
+        None => discovered.push(channel),
+    }
+}
+
 fn remove_patch_departures_from_discovery(
     discovered: &mut Vec<SlackConversation>,
     removals: &[ConversationPatchRemoval],
@@ -7386,6 +7396,41 @@ impl ConduitWindow {
                     .complete(std::time::Instant::now());
                 *self.imp().discovered_channels.borrow_mut() = Arc::new(channels);
                 self.refresh_open_conversation_picker();
+                self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
+            }
+            RuntimeEventKind::DiscoveredChannelsHydrated(channels) => {
+                {
+                    let mut discovered = self.imp().discovered_channels.borrow_mut();
+                    let discovered = Arc::make_mut(&mut discovered);
+                    for channel in channels {
+                        upsert_discovered_channel(discovered, channel);
+                    }
+                }
+                self.refresh_open_conversation_picker();
+                self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
+            }
+            RuntimeEventKind::ChannelInfoLoaded {
+                channel_id,
+                conversation,
+            } => {
+                let next = self
+                    .imp()
+                    .workspace
+                    .user_directory
+                    .channel_lookups
+                    .borrow_mut()
+                    .finish(&channel_id, conversation.is_some());
+                if let Some(next) = next {
+                    self.send_command(RuntimeCommand::LoadChannelInfo { channel_id: next });
+                }
+                if let Some(conversation) = conversation {
+                    upsert_discovered_channel(
+                        Arc::make_mut(&mut self.imp().discovered_channels.borrow_mut()),
+                        *conversation,
+                    );
+                    self.refresh_open_conversation_picker();
+                    self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
+                }
             }
             RuntimeEventKind::ConversationPeopleDiscovered(users) => {
                 *self
@@ -13647,6 +13692,39 @@ impl ConduitWindow {
         ids.dedup();
 
         self.request_user_ids(ids);
+        self.request_channel_names(messages);
+    }
+
+    /// Asks Slack for the titles of `<#C...>` mentions of channels that are
+    /// neither joined nor discovered. See `ChannelNameLookups` for the bounds.
+    fn request_channel_names(&self, messages: &[SlackMessage]) {
+        let ids = messages
+            .iter()
+            .flat_map(rendering::extract_channel_ids)
+            .collect::<HashSet<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        let imp = self.imp();
+        let missing = {
+            let conversations = imp.workspace.conversations.borrow();
+            let discovered = imp.discovered_channels.borrow();
+            ids.into_iter()
+                .filter(|id| {
+                    conversations.get(id).is_none()
+                        && !discovered.iter().any(|channel| &channel.id == id)
+                })
+                .collect::<Vec<_>>()
+        };
+        let to_send = imp
+            .workspace
+            .user_directory
+            .channel_lookups
+            .borrow_mut()
+            .request(missing);
+        for channel_id in to_send {
+            self.send_command(RuntimeCommand::LoadChannelInfo { channel_id });
+        }
     }
 
     fn request_conversation_user_names(&self) {

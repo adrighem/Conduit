@@ -113,6 +113,11 @@ pub enum RuntimeCommand {
     LoadUser {
         user_id: String,
     },
+    /// Resolves one channel (for a `<#C...>` mention) that is neither joined
+    /// nor discovered, with `conversations.info`.
+    LoadChannelInfo {
+        channel_id: String,
+    },
     LoadUserProfile {
         user_id: String,
     },
@@ -347,6 +352,7 @@ pub enum RuntimeAdmissionKey {
     Navigation(NavigationSlot),
     WorkspaceRefresh,
     ConversationDiscovery(ConversationDiscoveryScope),
+    ChannelInfo(OpaqueAdmissionTarget),
     User {
         scope: UserLoadScope,
         target: OpaqueAdmissionTarget,
