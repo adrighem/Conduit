@@ -1636,20 +1636,26 @@ pub(crate) mod decode {
             assert!(matches!(result, Err(DecodeError::Permanent(_))));
         }
 
-        #[test]
-        fn corrupt_images_fail_permanently() {
-            crate::timeline::tests::run_gtk_test(|| {
-                // A valid PNG header over garbage.
-                let mut corrupt = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x10".to_vec();
-                corrupt.extend_from_slice(&[0x5a; 64]);
-                let path = temp_file("decode-corrupt.png", &corrupt);
-                let result = decode_texture_file(&path);
-                std::fs::remove_file(&path).ok();
-                assert!(
-                    matches!(result, Err(DecodeError::Permanent(_))),
-                    "{result:?}"
-                );
-            });
+        /// Tests that create GTK widgets. They run only when
+        /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
+        mod graphical {
+            use super::*;
+
+            #[test]
+            fn corrupt_images_fail_permanently() {
+                crate::timeline::tests::run_gtk_test(|| {
+                    // A valid PNG header over garbage.
+                    let mut corrupt = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x10".to_vec();
+                    corrupt.extend_from_slice(&[0x5a; 64]);
+                    let path = temp_file("decode-corrupt.png", &corrupt);
+                    let result = decode_texture_file(&path);
+                    std::fs::remove_file(&path).ok();
+                    assert!(
+                        matches!(result, Err(DecodeError::Permanent(_))),
+                        "{result:?}"
+                    );
+                });
+            }
         }
     }
 }

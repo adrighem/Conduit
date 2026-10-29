@@ -241,27 +241,33 @@ mod tests {
         assert!(access.message && access.profile);
     }
 
-    #[test]
-    fn user_mention_popover_builds_menu_and_popover() {
-        crate::timeline_message_widget::tests::run_gtk_test(|| {
-            let label = gtk::Label::new(None);
-            let context = MessageRenderContext {
-                current_user_id: Some("U_SELF".to_string()),
-                ..Default::default()
-            };
-            let action_taken = Rc::new(std::cell::Cell::new(false));
-            let on_action = {
-                let action_taken = action_taken.clone();
-                Rc::new(move |_action| {
-                    action_taken.set(true);
-                })
-            };
-            let popover = user_mention_popover(&label, "U_OTHER", &context, on_action, None);
-            assert!(popover.is_some());
-            let popover = popover.unwrap();
-            let res = popover.activate_action("author.message", None);
-            assert!(res.is_ok());
-            assert!(action_taken.get());
-        });
+    /// Tests that create GTK widgets. They run only when
+    /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
+    mod graphical {
+        use super::*;
+
+        #[test]
+        fn user_mention_popover_builds_menu_and_popover() {
+            crate::timeline_message_widget::tests::run_gtk_test(|| {
+                let label = gtk::Label::new(None);
+                let context = MessageRenderContext {
+                    current_user_id: Some("U_SELF".to_string()),
+                    ..Default::default()
+                };
+                let action_taken = Rc::new(std::cell::Cell::new(false));
+                let on_action = {
+                    let action_taken = action_taken.clone();
+                    Rc::new(move |_action| {
+                        action_taken.set(true);
+                    })
+                };
+                let popover = user_mention_popover(&label, "U_OTHER", &context, on_action, None);
+                assert!(popover.is_some());
+                let popover = popover.unwrap();
+                let res = popover.activate_action("author.message", None);
+                assert!(res.is_ok());
+                assert!(action_taken.get());
+            });
+        }
     }
 }

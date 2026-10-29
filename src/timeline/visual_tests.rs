@@ -10,7 +10,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -158,20 +157,6 @@ fn ink_by_tooltip(window: &gtk::Window, bar: &Box) -> HashMap<String, Ink> {
     inks
 }
 
-/// Runs `f` on the GTK test thread. Plain `cargo test` skips it without a
-/// display; under `CONDUIT_REQUIRE_DISPLAY` (meson's Xvfb run) a skip fails.
-fn run_visual_test<F: FnOnce() + Send + 'static>(f: F) {
-    let ran = Arc::new(AtomicBool::new(false));
-    let ran_inner = ran.clone();
-    run_gtk_test(move || {
-        f();
-        ran_inner.store(true, Ordering::SeqCst);
-    });
-    if std::env::var_os("CONDUIT_REQUIRE_DISPLAY").is_some() {
-        assert!(ran.load(Ordering::SeqCst), "GTK could not open a display");
-    }
-}
-
 /// Context with `:visual_solid:`, a fully opaque custom emoji whose ink box
 /// is exactly its rendered size: a font-independent size reference.
 fn solid_emoji_context(temp_dir: &TempTestDir) -> (MessageRenderContext, String) {
@@ -213,119 +198,126 @@ fn ink_side(window: &gtk::Window, widget: &impl IsA<Widget>) -> u32 {
     ink.width.max(ink.height)
 }
 
-#[test]
-fn quick_bar_add_reaction_sits_between_emoji_and_action_icons() {
-    run_visual_test(|| {
-        register_source_icons();
-        // Same stylesheet as the app, so results do not depend on test order.
-        super::row::register_timeline_css();
+/// Tests that create GTK widgets. They run only when
+/// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
+mod graphical {
+    use super::*;
 
-        let temp_dir = TempTestDir::new("visual-quick-bar");
-        let (context, img_url) = solid_emoji_context(&temp_dir);
-        let reactions = vec![crate::emoji::EmojiEntry {
-            name: "visual_solid".to_string(),
-            label: "visual_solid".to_string(),
-            category: "Workspace",
-            value: crate::emoji::EmojiValue::CustomImage(img_url),
-        }];
+    #[test]
+    fn quick_bar_add_reaction_sits_between_emoji_and_action_icons() {
+        run_gtk_test(|| {
+            register_source_icons();
+            // Same stylesheet as the app, so results do not depend on test order.
+            crate::timeline::row::register_timeline_css();
 
-        let quick_bar = Box::new(Orientation::Horizontal, 2);
-        quick_bar.add_css_class("card");
-        let on_action: ActionSlot = Rc::new(RefCell::new(None));
-        let state = QuickBarState {
-            on_action: &on_action,
-            hover_generation: &Rc::new(Cell::new(0)),
-            hovered: &Rc::new(RefCell::new(None)),
-            current_popover: &Rc::new(RefCell::new(None)),
-            bar_motion: &gtk::EventControllerMotion::new(),
-        };
-        rebuild_quick_bar(
-            &quick_bar,
-            "1700000000.000100",
-            &reactions,
-            &context,
-            &state,
-        );
+            let temp_dir = TempTestDir::new("visual-quick-bar");
+            let (context, img_url) = solid_emoji_context(&temp_dir);
+            let reactions = vec![crate::emoji::EmojiEntry {
+                name: "visual_solid".to_string(),
+                label: "visual_solid".to_string(),
+                category: "Workspace",
+                value: crate::emoji::EmojiValue::CustomImage(img_url),
+            }];
 
-        let window = show_in_window(&quick_bar);
-        render(&window, &quick_bar, Some("quick-bar"));
-        let inks = ink_by_tooltip(&window, &quick_bar);
-        window.destroy();
+            let quick_bar = Box::new(Orientation::Horizontal, 2);
+            quick_bar.add_css_class("card");
+            let on_action: ActionSlot = Rc::new(RefCell::new(None));
+            let state = QuickBarState {
+                on_action: &on_action,
+                hover_generation: &Rc::new(Cell::new(0)),
+                hovered: &Rc::new(RefCell::new(None)),
+                current_popover: &Rc::new(RefCell::new(None)),
+                bar_motion: &gtk::EventControllerMotion::new(),
+            };
+            rebuild_quick_bar(
+                &quick_bar,
+                "1700000000.000100",
+                &reactions,
+                &context,
+                &state,
+            );
 
-        let emoji = inks[":visual_solid:"];
-        let add = inks["Add reaction..."];
-        let reply = inks["Reply in thread"];
-        let emoji_side = emoji.width.max(emoji.height) as f32;
-        let add_side = add.width.max(add.height) as f32;
-        let reply_side = reply.width.max(reply.height) as f32;
+            let window = show_in_window(&quick_bar);
+            render(&window, &quick_bar, Some("quick-bar"));
+            let inks = ink_by_tooltip(&window, &quick_bar);
+            window.destroy();
 
-        assert!(
-            emoji_side >= 32.0,
-            "reference emoji should be at least 32px: {emoji:?}"
-        );
-        assert!(
-            (0.6..=0.85).contains(&(add_side / emoji_side)),
-            "add-reaction glyph {add:?} should be 60-85% of emoji {emoji:?}"
-        );
-        assert!(
-            add_side > reply_side,
-            "add-reaction glyph {add:?} should read larger than action icon {reply:?}"
-        );
-    });
-}
+            let emoji = inks[":visual_solid:"];
+            let add = inks["Add reaction..."];
+            let reply = inks["Reply in thread"];
+            let emoji_side = emoji.width.max(emoji.height) as f32;
+            let add_side = add.width.max(add.height) as f32;
+            let reply_side = reply.width.max(reply.height) as f32;
 
-#[test]
-fn message_emoji_render_inline_at_22px_and_jumbo_at_reaction_size() {
-    run_visual_test(|| {
-        super::row::register_timeline_css();
-        let temp_dir = TempTestDir::new("visual-message-emoji");
-        let (context, _) = solid_emoji_context(&temp_dir);
-        let is_picture = |w: &Widget| w.is::<gtk::Picture>();
+            assert!(
+                emoji_side >= 32.0,
+                "reference emoji should be at least 32px: {emoji:?}"
+            );
+            assert!(
+                (0.6..=0.85).contains(&(add_side / emoji_side)),
+                "add-reaction glyph {add:?} should be 60-85% of emoji {emoji:?}"
+            );
+            assert!(
+                add_side > reply_side,
+                "add-reaction glyph {add:?} should read larger than action icon {reply:?}"
+            );
+        });
+    }
 
-        // Inline: emoji next to text, custom and unicode at the same size.
-        let inline = Box::new(Orientation::Vertical, 0);
-        render_text_content("hi :visual_solid: there", &inline, &context, None);
-        let unicode = Box::new(Orientation::Vertical, 0);
-        let pango = crate::message_markup::mrkdwn_to_pango(":smile:", &context);
-        unicode.append(&create_message_text_widget(&pango, &context, None));
-        // Emoji-only: rendered with the reaction widgets.
-        let jumbo = Box::new(Orientation::Vertical, 0);
-        render_text_content(":visual_solid: :smile:", &jumbo, &context, None);
+    #[test]
+    fn message_emoji_render_inline_at_22px_and_jumbo_at_reaction_size() {
+        run_gtk_test(|| {
+            crate::timeline::row::register_timeline_css();
+            let temp_dir = TempTestDir::new("visual-message-emoji");
+            let (context, _) = solid_emoji_context(&temp_dir);
+            let is_picture = |w: &Widget| w.is::<gtk::Picture>();
 
-        let page = Box::new(Orientation::Vertical, 8);
-        page.set_size_request(320, -1);
-        page.append(&inline);
-        page.append(&unicode);
-        page.append(&jumbo);
-        let window = show_in_window(&page);
-        render(&window, &page, Some("message-emoji"));
+            // Inline: emoji next to text, custom and unicode at the same size.
+            let inline = Box::new(Orientation::Vertical, 0);
+            render_text_content("hi :visual_solid: there", &inline, &context, None);
+            let unicode = Box::new(Orientation::Vertical, 0);
+            let pango = crate::message_markup::mrkdwn_to_pango(":smile:", &context);
+            unicode.append(&create_message_text_widget(&pango, &context, None));
+            // Emoji-only: rendered with the reaction widgets.
+            let jumbo = Box::new(Orientation::Vertical, 0);
+            render_text_content(":visual_solid: :smile:", &jumbo, &context, None);
 
-        let inline_custom = find_widget(inline.upcast_ref(), &is_picture).expect("inline picture");
-        let inline_custom = ink_side(&window, &inline_custom);
-        let inline_unicode = ink_side(&window, &unicode);
-        let jumbo_custom = find_widget(jumbo.upcast_ref(), &is_picture).expect("jumbo picture");
-        let jumbo_custom = ink_side(&window, &jumbo_custom);
-        let jumbo_unicode = find_widget(jumbo.upcast_ref(), &|w| w.is::<gtk::Label>())
-            .expect("jumbo unicode label");
-        let jumbo_unicode = ink_side(&window, &jumbo_unicode);
-        window.destroy();
+            let page = Box::new(Orientation::Vertical, 8);
+            page.set_size_request(320, -1);
+            page.append(&inline);
+            page.append(&unicode);
+            page.append(&jumbo);
+            let window = show_in_window(&page);
+            render(&window, &page, Some("message-emoji"));
 
-        let inline_size = crate::message_markup::INLINE_EMOJI_SIZE as u32;
-        let jumbo_size = super::reactions::REACTION_EMOJI_SIZE as u32;
-        assert_eq!(inline_custom, inline_size, "inline custom emoji");
-        assert!(
-            jumbo_custom >= jumbo_size,
-            "jumbo custom emoji {jumbo_custom} should match reactions ({jumbo_size}px)"
-        );
-        // Glyph ink depends on the emoji font; allow its padding either way.
-        let near = |ink: u32, target: u32| ink * 4 >= target * 3 && ink * 4 <= target * 5;
-        assert!(
-            near(inline_unicode, inline_custom),
-            "inline unicode {inline_unicode} should match inline custom {inline_custom}"
-        );
-        assert!(
-            near(jumbo_unicode, jumbo_custom),
-            "jumbo unicode {jumbo_unicode} should match jumbo custom {jumbo_custom}"
-        );
-    });
+            let inline_custom =
+                find_widget(inline.upcast_ref(), &is_picture).expect("inline picture");
+            let inline_custom = ink_side(&window, &inline_custom);
+            let inline_unicode = ink_side(&window, &unicode);
+            let jumbo_custom = find_widget(jumbo.upcast_ref(), &is_picture).expect("jumbo picture");
+            let jumbo_custom = ink_side(&window, &jumbo_custom);
+            let jumbo_unicode = find_widget(jumbo.upcast_ref(), &|w| w.is::<gtk::Label>())
+                .expect("jumbo unicode label");
+            let jumbo_unicode = ink_side(&window, &jumbo_unicode);
+            window.destroy();
+
+            let inline_size = crate::message_markup::INLINE_EMOJI_SIZE as u32;
+            let jumbo_size = crate::timeline::reactions::REACTION_EMOJI_SIZE as u32;
+            assert_eq!(inline_custom, inline_size, "inline custom emoji");
+            assert!(
+                jumbo_custom >= jumbo_size,
+                "jumbo custom emoji {jumbo_custom} should match reactions ({jumbo_size}px)"
+            );
+            // Glyph ink depends on the emoji font; allow its padding either way.
+            let near = |ink: u32, target: u32| ink * 4 >= target * 3 && ink * 4 <= target * 5;
+            assert!(
+                near(inline_unicode, inline_custom),
+                "inline unicode {inline_unicode} should match inline custom {inline_custom}"
+            );
+            assert!(
+                near(jumbo_unicode, jumbo_custom),
+                "jumbo unicode {jumbo_unicode} should match jumbo custom {jumbo_custom}"
+            );
+        });
+    }
 }
