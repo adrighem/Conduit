@@ -1975,6 +1975,29 @@ fn composer_attachment_previews_distinguish_images_videos_and_files() {
 }
 
 #[test]
+fn composer_attachment_previews_skip_images_over_the_decode_budget() {
+    let image = Path::new("bomb.gif");
+    assert_eq!(
+        composer_attachment_preview(image, |_| true),
+        ComposerAttachmentPreviewKind::Image
+    );
+    assert_eq!(
+        composer_attachment_preview(image, |_| false),
+        ComposerAttachmentPreviewKind::File
+    );
+    // Only images are probed: other kinds never decode.
+    let never_probed = |path: &Path| panic!("probed {}", path.display());
+    assert_eq!(
+        composer_attachment_preview(Path::new("demo.webm"), never_probed),
+        ComposerAttachmentPreviewKind::Video
+    );
+    assert_eq!(
+        composer_attachment_preview(Path::new("notes.pdf"), never_probed),
+        ComposerAttachmentPreviewKind::File
+    );
+}
+
+#[test]
 fn stale_staging_cleanup_preserves_files_referenced_by_drafts() {
     let directory = PathBuf::from("/tmp/conduit-staging");
     let retained = directory.join("retained.png");
