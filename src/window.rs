@@ -80,13 +80,12 @@ use crate::runtime::{
     RuntimeOperation, RuntimeTarget, SessionId, UploadAttachment,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
-#[cfg(test)]
-use crate::sidebar::SidebarItemKey;
 use crate::sidebar::{
-    self, ConversationKind, ConversationPickerAction, ConversationPickerItem,
-    ConversationPickerSections, KeyedSidebarItem, SidebarItemModel, SidebarProjection,
-    SidebarProjectionOperation, SidebarRowModel, SidebarSectionKind,
+    self, ConversationKind, ConversationPickerAction, KeyedSidebarItem, SidebarItemModel,
+    SidebarProjection, SidebarProjectionOperation, SidebarRowModel, SidebarSectionKind,
 };
+#[cfg(test)]
+use crate::sidebar::{ConversationPickerItem, ConversationPickerSections, SidebarItemKey};
 use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
 use crate::slack_link::{
     resolve_slack_uri, slack_app_web_fallback, SlackFileAction, SlackUri, SlackUriResolution,
@@ -386,6 +385,7 @@ mod imp {
         pub discovered_channels: RefCell<Arc<Vec<SlackConversation>>>,
         pub(super) conversation_titles: RefCell<ConversationTitlesCache>,
         pub(super) conversation_picker_view: RefCell<Option<ConversationPickerView>>,
+        pub(super) conversation_picker_refresh: Cell<PickerRefreshGate>,
         pub(super) people_picker_view: RefCell<Option<PeoplePickerView>>,
         pub(super) collapsed_sidebar_sections: RefCell<HashSet<SidebarSectionKind>>,
         pub(super) pending_last_conversation: RefCell<Option<LastConversation>>,
@@ -450,7 +450,6 @@ mod imp {
         pub(super) sidebar_projection: RefCell<SidebarProjection>,
         pub(super) sidebar_filter_generation: Cell<u64>,
         pub(super) picker_filter_generation: Cell<u64>,
-        pub(super) picker_population_generation: Cell<u64>,
         pub(super) navigation_history: RefCell<Vec<MainNavigationTarget>>,
         pub(super) restoring_navigation: Cell<bool>,
         pub(super) profile_visible: Cell<bool>,
@@ -2659,7 +2658,7 @@ fn user_projection_invalidations<'a, I>(
     affected_user_ids: &[String],
     current_user_id: Option<&str>,
     visible_channel_id: Option<&str>,
-    picker_open: bool,
+    open_picker_lists_people: Option<bool>,
 ) -> UiInvalidations
 where
     I: IntoIterator<Item = &'a SlackConversation>,
@@ -2690,7 +2689,11 @@ where
     if sidebar {
         invalidations.insert(UiInvalidations::SIDEBAR);
     }
-    if picker_open && !affected.is_empty() {
+    // A picker without discovery lists only known conversations, the same
+    // rows the sidebar check covers; one with discovery lists every person.
+    let picker = open_picker_lists_people
+        .is_some_and(|lists_people| sidebar || (lists_people && !affected.is_empty()));
+    if picker {
         invalidations.insert(UiInvalidations::PICKER);
     }
     if title {
@@ -7357,7 +7360,7 @@ impl ConduitWindow {
                     .discovery
                     .complete(std::time::Instant::now());
                 *self.imp().discovered_channels.borrow_mut() = Arc::new(channels);
-                self.refresh_open_conversation_picker();
+                self.invalidate_conversation_picker();
                 self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
             }
             RuntimeEventKind::DiscoveredChannelsHydrated(channels) => {
@@ -7368,7 +7371,7 @@ impl ConduitWindow {
                         upsert_discovered_channel(discovered, channel);
                     }
                 }
-                self.refresh_open_conversation_picker();
+                self.invalidate_conversation_picker();
                 self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
             }
             RuntimeEventKind::ChannelInfoLoaded { channel_id, result } => {
@@ -7395,7 +7398,7 @@ impl ConduitWindow {
                         Arc::make_mut(&mut self.imp().discovered_channels.borrow_mut()),
                         *conversation,
                     );
-                    self.refresh_open_conversation_picker();
+                    self.invalidate_conversation_picker();
                     self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
                 }
             }
@@ -7406,7 +7409,7 @@ impl ConduitWindow {
                     .user_directory
                     .discovered_users
                     .borrow_mut() = users;
-                self.refresh_open_conversation_picker();
+                self.invalidate_conversation_picker();
                 self.refresh_open_people_picker(true);
                 for target in COMPOSER_TARGETS {
                     self.refresh_composer_completion(target);
@@ -10086,7 +10089,10 @@ impl ConduitWindow {
                 affected_user_ids,
                 current_user_id.as_deref(),
                 visible_channel_id.as_deref(),
-                imp.conversation_picker_view.borrow().is_some(),
+                imp.conversation_picker_view
+                    .borrow()
+                    .as_ref()
+                    .map(|view| view.include_discovery),
             )
         };
         if !invalidations.is_empty() {
@@ -10319,7 +10325,7 @@ impl ConduitWindow {
         self.imp().workspace_ready.set(true);
         let explicit_intent_opened = self.activate_pending_navigation_intents();
         self.restore_last_conversation(false, explicit_intent_opened);
-        self.refresh_open_conversation_picker();
+        self.invalidate_conversation_picker();
 
         if !self.imp().workspace.conversations.borrow().is_empty()
             && !self.imp().initial_sync_complete.get()
@@ -11583,31 +11589,58 @@ impl ConduitWindow {
         search.set_placeholder_text(Some(placeholder));
         container.append(&search);
 
-        let list = gtk::ListBox::new();
-        list.set_selection_mode(gtk::SelectionMode::Single);
-        list.set_activate_on_single_click(true);
-        list.add_css_class("navigation-sidebar");
+        let weak_window = self.downgrade();
+        let (list, store) = conversation_picker_list(move |entry| {
+            weak_window.upgrade().map_or_else(
+                || gtk::Label::new(None).upcast(),
+                |window| window.conversation_picker_entry_widget(entry),
+            )
+        });
 
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_vexpand(true);
         scroller.set_child(Some(&list));
         container.append(&scroller);
 
-        let actions: Rc<RefCell<HashMap<i32, SidebarRowAction>>> =
-            Rc::new(RefCell::new(HashMap::new()));
-        self.append_placeholder(&list, &gettext("Loading conversations…"));
+        set_conversation_picker_entries(
+            &store,
+            vec![ConversationPickerListEntry::Placeholder(gettext(
+                "Loading conversations…",
+            ))],
+        );
 
         *self.imp().conversation_picker_view.borrow_mut() = Some(ConversationPickerView {
             list: list.clone(),
+            store: store.clone(),
             search: search.clone(),
-            actions: actions.clone(),
             include_discovery,
+        });
+        self.imp()
+            .conversation_picker_refresh
+            .set(PickerRefreshGate::default());
+
+        let weak_window = self.downgrade();
+        list.connect_map(move |list| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let is_active = window
+                .imp()
+                .conversation_picker_view
+                .borrow()
+                .as_ref()
+                .is_some_and(|view| view.list == *list);
+            let mut gate = window.imp().conversation_picker_refresh.get();
+            let rebuild = is_active && gate.shown();
+            window.imp().conversation_picker_refresh.set(gate);
+            if rebuild {
+                window.refresh_open_conversation_picker();
+            }
         });
 
         let weak_window = self.downgrade();
         search.connect_search_changed(move |_| {
             if let Some(window) = weak_window.upgrade() {
-                window.cancel_conversation_picker_population();
                 window.schedule_picker_filter();
             }
         });
@@ -11629,7 +11662,6 @@ impl ConduitWindow {
                     }
                 };
                 if closed_active_picker {
-                    window.cancel_conversation_picker_population();
                     let generation = window
                         .imp()
                         .picker_filter_generation
@@ -11642,11 +11674,9 @@ impl ConduitWindow {
         });
 
         let weak_window = self.downgrade();
-        let actions_for_activate = actions.clone();
         let dialog_for_activate = dialog.clone();
-        let on_activate = Rc::new(on_activate);
-        list.connect_row_activated(move |_, row| {
-            let action = sidebar_row_action_for_index(&actions_for_activate.borrow(), row.index());
+        list.connect_activate(move |_, position| {
+            let action = conversation_picker_action_at(&store, position);
             if let (Some(window), Some(action)) = (weak_window.upgrade(), action) {
                 if on_activate(&window, action) {
                     dialog_for_activate.close();
@@ -11673,10 +11703,24 @@ impl ConduitWindow {
         });
     }
 
+    /// Coalesces a picker rebuild into the next frame flush, and skips it
+    /// entirely while no conversation picker is open.
+    fn invalidate_conversation_picker(&self) {
+        if self.imp().conversation_picker_view.borrow().is_some() {
+            self.queue_ui_invalidations(UiInvalidations::PICKER);
+        }
+    }
+
     fn refresh_open_conversation_picker(&self) {
         let Some(view) = self.imp().conversation_picker_view.borrow().clone() else {
             return;
         };
+        let mut gate = self.imp().conversation_picker_refresh.get();
+        let rebuild = gate.request(view.list.is_mapped());
+        self.imp().conversation_picker_refresh.set(gate);
+        if !rebuild {
+            return;
+        }
         let query = view.search.text();
         let sections = {
             let imp = self.imp();
@@ -11703,127 +11747,42 @@ impl ConduitWindow {
                 query.as_str(),
             )
         };
-        self.populate_conversation_picker_list(&view.list, &view.actions, &sections);
-    }
-
-    fn populate_conversation_picker_list(
-        &self,
-        list: &gtk::ListBox,
-        actions: &Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
-        sections: &ConversationPickerSections,
-    ) {
-        let generation = self.cancel_conversation_picker_population();
-        self.clear_list(list);
-        actions.borrow_mut().clear();
-        let mut population = ConversationPickerPopulation::new(
-            generation,
-            conversation_picker_population_entries(sections),
+        set_conversation_picker_entries(
+            &view.store,
+            conversation_picker_population_entries(&sections),
         );
-        if let Some(batch) = population.next_batch(generation) {
-            self.append_conversation_picker_batch(list, actions, batch);
-        }
-        if population.is_empty() {
-            return;
-        }
+    }
 
-        let weak_window = self.downgrade();
-        let list = list.clone();
-        let actions = actions.clone();
-        glib::idle_add_local(move || {
-            let Some(window) = weak_window.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            if !window.conversation_picker_population_is_active(&list, generation) {
-                return glib::ControlFlow::Break;
+    fn conversation_picker_entry_widget(&self, entry: &ConversationPickerListEntry) -> gtk::Widget {
+        match entry {
+            ConversationPickerListEntry::Header(title) => {
+                let label = gtk::Label::new(Some(title));
+                label.set_xalign(0.0);
+                label.set_margin_top(10);
+                label.set_margin_bottom(4);
+                label.set_margin_start(9);
+                label.set_margin_end(9);
+                label.add_css_class("caption");
+                label.add_css_class("heading");
+                label.upcast()
             }
-            let Some(batch) = population.next_batch(generation) else {
-                return glib::ControlFlow::Break;
-            };
-            window.append_conversation_picker_batch(&list, &actions, batch);
-            if population.is_empty() {
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
+            ConversationPickerListEntry::Item(item) => {
+                let row = sidebar_row_widget(
+                    &item.row,
+                    SidebarRowLayout::switcher(),
+                    &self.imp().custom_emojis.borrow(),
+                );
+                let content = row
+                    .child()
+                    .expect("picker conversation row should have content");
+                row.set_child(None::<&gtk::Widget>);
+                let accessible_label = item.row.accessible_label();
+                content.set_tooltip_text(Some(&accessible_label));
+                content.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
+                content
             }
-        });
-    }
-
-    fn cancel_conversation_picker_population(&self) -> u64 {
-        let generation = self
-            .imp()
-            .picker_population_generation
-            .get()
-            .saturating_add(1);
-        self.imp().picker_population_generation.set(generation);
-        generation
-    }
-
-    fn conversation_picker_population_is_active(
-        &self,
-        list: &gtk::ListBox,
-        generation: u64,
-    ) -> bool {
-        self.imp().picker_population_generation.get() == generation
-            && self
-                .imp()
-                .conversation_picker_view
-                .borrow()
-                .as_ref()
-                .is_some_and(|view| view.list == *list)
-    }
-
-    fn append_conversation_picker_batch(
-        &self,
-        list: &gtk::ListBox,
-        actions: &Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
-        batch: Vec<ConversationPickerListEntry>,
-    ) {
-        for entry in batch {
-            match entry {
-                ConversationPickerListEntry::Header(title) => {
-                    self.append_picker_section_header(list, &title)
-                }
-                ConversationPickerListEntry::Item(item) => {
-                    self.append_conversation_picker_row(list, actions, &item)
-                }
-                ConversationPickerListEntry::Placeholder(text) => {
-                    self.append_placeholder(list, &text)
-                }
-            }
+            ConversationPickerListEntry::Placeholder(text) => self.placeholder_label(text).upcast(),
         }
-    }
-
-    fn append_picker_section_header(&self, list: &gtk::ListBox, title: &str) {
-        let row = gtk::ListBoxRow::new();
-        row.set_selectable(false);
-        row.set_activatable(false);
-        let label = gtk::Label::new(Some(title));
-        label.set_xalign(0.0);
-        label.set_margin_top(10);
-        label.set_margin_bottom(4);
-        label.set_margin_start(9);
-        label.set_margin_end(9);
-        label.add_css_class("caption");
-        label.add_css_class("heading");
-        row.set_child(Some(&label));
-        list.append(&row);
-    }
-
-    fn append_conversation_picker_row(
-        &self,
-        list: &gtk::ListBox,
-        actions: &Rc<RefCell<HashMap<i32, SidebarRowAction>>>,
-        item: &ConversationPickerItem,
-    ) {
-        let row = sidebar_row_widget(
-            &item.row,
-            SidebarRowLayout::switcher(),
-            &self.imp().custom_emojis.borrow(),
-        );
-        list.append(&row);
-        actions
-            .borrow_mut()
-            .insert(row.index(), SidebarRowAction::from_picker_item(item));
     }
 
     fn refresh_current_conversation_title(&self) {
