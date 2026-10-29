@@ -7729,9 +7729,6 @@ fn expected_runtime_admission(command: &RuntimeCommand) -> RuntimeAdmissionPolic
         RuntimeCommand::DiscoverConversations => RuntimeAdmissionPolicy::coalescible(
             RuntimeAdmissionKey::ConversationDiscovery(ConversationDiscoveryScope::Full),
         ),
-        RuntimeCommand::DiscoverChannels => RuntimeAdmissionPolicy::coalescible(
-            RuntimeAdmissionKey::ConversationDiscovery(ConversationDiscoveryScope::Channels),
-        ),
         RuntimeCommand::LoadHistory { .. }
         | RuntimeCommand::LoadOlderHistory { .. }
         | RuntimeCommand::SearchMessages { .. }
@@ -7841,7 +7838,6 @@ fn expected_legacy_scheduling(
             (true, None, RuntimeTaskLane::Interactive)
         }
         RuntimeCommand::RefreshConversations
-        | RuntimeCommand::DiscoverChannels
         | RuntimeCommand::DiscoverConversations
         | RuntimeCommand::LoadUser { .. }
         | RuntimeCommand::LoadUserProfile { .. } => (true, None, RuntimeTaskLane::Background),
@@ -7888,7 +7884,6 @@ fn runtime_command_fixtures() -> Vec<RuntimeCommand> {
         RuntimeCommand::Disconnect,
         RuntimeCommand::RefreshConversations,
         RuntimeCommand::UpdateAttentionPreferences(AttentionPreferences::default()),
-        RuntimeCommand::DiscoverChannels,
         RuntimeCommand::DiscoverConversations,
         RuntimeCommand::JoinConversation {
             channel_id: "C1".to_string(),
@@ -8054,7 +8049,7 @@ fn runtime_command_fixtures() -> Vec<RuntimeCommand> {
 #[test]
 fn runtime_command_admission_metadata_is_exhaustive_and_behavior_neutral() {
     let commands = runtime_command_fixtures();
-    assert_eq!(commands.len(), 46);
+    assert_eq!(commands.len(), 45);
 
     for command in commands {
         let descriptor = command.descriptor();
@@ -8144,10 +8139,6 @@ fn runtime_admission_keys_partition_replaceable_work() {
             xoxd_token: "token-b".to_string(),
             user_agent: None,
         })
-    );
-    assert_ne!(
-        key(RuntimeCommand::DiscoverConversations),
-        key(RuntimeCommand::DiscoverChannels)
     );
     assert_ne!(
         key(RuntimeCommand::LoadUser {
@@ -8282,16 +8273,6 @@ fn runtime_command_descriptor_owns_scheduling_policy() {
     let background = RuntimeCommand::DiscoverConversations.descriptor();
     assert_eq!(background.lane, RuntimeTaskLane::Background);
     assert_eq!(background.navigation_slot, None);
-
-    let channel_discovery = RuntimeCommand::DiscoverChannels.descriptor();
-    assert_eq!(channel_discovery.lane, RuntimeTaskLane::Background);
-    assert_eq!(
-        channel_discovery.context,
-        OperationContext::new(
-            RuntimeOperation::ConversationDiscovery,
-            RuntimeTarget::Workspace,
-        )
-    );
 
     let image = RuntimeCommand::LoadImageAsset {
         key: "preview".to_string(),

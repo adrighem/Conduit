@@ -342,13 +342,6 @@ impl RuntimeCommand {
                     ConversationDiscoveryScope::Full,
                 )),
             ),
-            Self::DiscoverChannels => RuntimeCommandDescriptor::request(
-                workspace(RuntimeOperation::ConversationDiscovery),
-                RuntimeTaskLane::Background,
-                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::ConversationDiscovery(
-                    ConversationDiscoveryScope::Channels,
-                )),
-            ),
             Self::JoinConversation { channel_id } => RuntimeCommandDescriptor::request(
                 channel(RuntimeOperation::OpenConversation, channel_id),
                 RuntimeTaskLane::Interactive,
@@ -5169,13 +5162,6 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                     crate::debug::log("runtime", &format!("UserGroupsFetchFailed error={error:#}"))
                 }
             }
-            let channels = api.discover_conversations().await?;
-            context
-                .events
-                .send_event(RuntimeEventKind::ConversationChannelsDiscovered(channels));
-        }
-        RuntimeCommand::DiscoverChannels => {
-            let api = require_slack(context.slack)?;
             let channels = api.discover_conversations().await?;
             context
                 .events

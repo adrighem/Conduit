@@ -7033,6 +7033,9 @@ impl ConduitWindow {
         let channel_token = channel_token_at_caret(&text, caret).filter(|token| {
             !self.composer_range_intersects_semantic(target, token.start, token.end)
         });
+        if mention_token.is_some() || channel_token.is_some() {
+            self.request_discovery();
+        }
         let (token, entries) = if let Some(token) = mention_token {
             let candidates = self.composer_mention_candidates();
             let entries = search_mention_candidates(&candidates, &token.query, 10)
@@ -7346,7 +7349,6 @@ impl ConduitWindow {
             RuntimeEventKind::Authenticated(auth) => {
                 if !self.imp().connect_requested.get() {
                     self.show_workspace(auth);
-                    self.send_command(RuntimeCommand::DiscoverConversations);
                     // Feeds the Threads rail pill before the view is opened.
                     self.load_followed_threads(None);
                 }
@@ -7376,6 +7378,11 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::ConversationChannelsDiscovered(channels) => {
+                self.imp()
+                    .workspace
+                    .user_directory
+                    .discovery
+                    .complete(std::time::Instant::now());
                 *self.imp().discovered_channels.borrow_mut() = Arc::new(channels);
                 self.refresh_open_conversation_picker();
             }
@@ -10967,7 +10974,17 @@ impl ConduitWindow {
                 }
             },
         );
-        self.send_command(RuntimeCommand::DiscoverChannels);
+        self.request_discovery();
+    }
+
+    /// Lists channels, people and user groups for the pickers and composer
+    /// completion. Paging every channel is costly, so it runs on first use
+    /// and then at most once per `DISCOVERY_TTL`, never at startup.
+    fn request_discovery(&self) {
+        let discovery = &self.imp().workspace.user_directory.discovery;
+        if discovery.should_request(std::time::Instant::now()) {
+            self.send_command(RuntimeCommand::DiscoverConversations);
+        }
     }
 
     fn show_change_status_dialog(&self) {
@@ -11345,7 +11362,7 @@ impl ConduitWindow {
         dialog.present();
         search.grab_focus();
         self.refresh_open_people_picker(has_discovered_people);
-        self.send_command(RuntimeCommand::DiscoverConversations);
+        self.request_discovery();
     }
 
     fn refresh_open_people_picker(&self, discovery_complete: bool) {
