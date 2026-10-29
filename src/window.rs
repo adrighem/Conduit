@@ -93,6 +93,7 @@ use crate::slack_link::{
 };
 use crate::status_dialog::*;
 use crate::thread_pane::ThreadPane;
+use crate::timeline::cache::decode;
 use crate::workspace_pipeline::{TimelineTarget, WorkspaceRevision};
 use crate::workspace_state::{
     ChannelLookupOutcome, ConversationOpenCoordinator, ConversationOpenIntent,
@@ -899,7 +900,7 @@ fn composer_attachment_preview(
 /// The preview of an image attachment. A worker decodes it once the picture
 /// is mapped, behind a placeholder of the size the header declares.
 fn composer_image_preview(path: &Path) -> gtk::Picture {
-    let picture = crate::timeline::cache::decode::deferred_texture_picture(path);
+    let picture = decode::deferred_texture_picture(path);
     picture.set_can_shrink(true);
     picture.set_content_fit(gtk::ContentFit::Cover);
     picture.set_size_request(72, 54);
@@ -1463,8 +1464,7 @@ struct MediaViewer {
     surface_stack: gtk::Stack,
     content_stack: gtk::Stack,
     image_scroller: gtk::ScrolledWindow,
-    image: gtk::DrawingArea,
-    image_source: Rc<RefCell<Option<gdk_pixbuf::Pixbuf>>>,
+    image: ViewerImage,
     title: gtk::Label,
     zoom_label: gtk::Label,
     zoom_out_button: gtk::Button,
@@ -1475,8 +1475,96 @@ struct MediaViewer {
     gallery: Vec<MediaGalleryItem>,
     index: usize,
     zoom: f64,
-    natural_size: (i32, i32),
     loaded_path: Option<PathBuf>,
+}
+
+/// The image the media viewer shows. A worker decodes it, and a result lands
+/// only while it is still the one asked for: closing the viewer or moving to
+/// another item makes it stale.
+#[derive(Debug, Clone)]
+struct ViewerImage {
+    picture: gtk::Picture,
+    texture: Rc<RefCell<Option<gtk::gdk::Texture>>>,
+    ticket: decode::DecodeTicket,
+}
+
+impl ViewerImage {
+    fn new() -> Self {
+        let picture = gtk::Picture::new();
+        picture.set_halign(gtk::Align::Center);
+        picture.set_valign(gtk::Align::Center);
+        picture.set_content_fit(gtk::ContentFit::Fill);
+        Self {
+            picture,
+            texture: Rc::default(),
+            ticket: decode::DecodeTicket::default(),
+        }
+    }
+
+    /// Drops the image shown, and whatever is still decoding for it.
+    fn clear(&self) {
+        self.ticket.invalidate();
+        self.texture.take();
+        self.picture.set_paintable(None::<&gtk::gdk::Paintable>);
+    }
+
+    /// Decodes the image at `path` off the GTK thread and keeps it. `done`
+    /// runs once on the GTK thread with how that went, unless the image was
+    /// cleared or another one asked for first. The worker judges the decode
+    /// budget on the bytes it reads.
+    fn load(&self, path: &Path, done: impl Fn(Result<(), String>) + 'static) {
+        self.clear();
+        let done = Rc::new(done);
+        let show = {
+            let image = self.clone();
+            let done = done.clone();
+            Rc::new(move |texture: &gtk::gdk::Texture| {
+                image.texture.replace(Some(texture.clone()));
+                done(Ok(()));
+            })
+        };
+        let on_decoded = show.clone();
+        let on_failed = done.clone();
+        let requested = decode::request_texture_notifying(
+            path,
+            decode::TextureSpec::Full,
+            &self.ticket,
+            move |texture| on_decoded(texture),
+            Some(Box::new(move |error| {
+                let (decode::DecodeError::Permanent(message)
+                | decode::DecodeError::Transient(message)) = error;
+                on_failed(Err(message.clone()));
+            })),
+        );
+        match requested {
+            decode::Requested::Ready(texture) => show(&texture),
+            decode::Requested::Failed => done(Err("it cannot be decoded".to_string())),
+            decode::Requested::Pending => {}
+        }
+    }
+
+    /// Size of the image as decoded, `(0, 0)` while there is none.
+    fn natural_size(&self) -> (i32, i32) {
+        self.texture
+            .borrow()
+            .as_ref()
+            .map_or((0, 0), |texture| (texture.width(), texture.height()))
+    }
+
+    /// Lays the image out at `size`: the picture is as large as its
+    /// paintable's intrinsic size, so the texture is wrapped in one fitted
+    /// to the longest side.
+    fn set_display_size(&self, size: (i32, i32)) {
+        let texture = self.texture.borrow();
+        let Some(texture) = texture.as_ref() else {
+            return;
+        };
+        let fitted = decode::DeferredPaintable::fitted(
+            texture.upcast_ref::<gtk::gdk::Paintable>(),
+            size.0.max(size.1),
+        );
+        self.picture.set_paintable(Some(&fitted));
+    }
 }
 
 fn sidebar_section_accessible_label(title: &str, collapsed: bool) -> String {
@@ -1604,15 +1692,12 @@ fn apply_media_zoom(viewer: &MediaViewer) {
         .set_label(&format!("{:.0}%", viewer.zoom * 100.0));
     let viewport_width = viewer.image_scroller.width().max(1);
     let viewport_height = viewer.image_scroller.height().max(1);
-    let (width, height) = media_zoom_size(
-        viewer.natural_size,
+    let size = media_zoom_size(
+        viewer.image.natural_size(),
         (viewport_width, viewport_height),
         viewer.zoom,
     );
-    viewer.image.set_content_width(width);
-    viewer.image.set_content_height(height);
-    viewer.image.queue_resize();
-    viewer.image.queue_draw();
+    viewer.image.set_display_size(size);
 }
 
 fn media_zoom_size(natural: (i32, i32), viewport: (i32, i32), zoom: f64) -> (i32, i32) {
@@ -3749,30 +3834,12 @@ impl ConduitWindow {
         let image_scroller = gtk::ScrolledWindow::new();
         image_scroller.set_hexpand(true);
         image_scroller.set_vexpand(true);
-        let image = gtk::DrawingArea::new();
-        image.set_halign(gtk::Align::Center);
-        image.set_valign(gtk::Align::Center);
-        let image_source = Rc::new(RefCell::new(None::<gdk_pixbuf::Pixbuf>));
-        let draw_source = image_source.clone();
-        image.set_draw_func(move |_, context, width, height| {
-            let source = draw_source.borrow();
-            let Some(pixbuf) = source.as_ref() else {
-                return;
-            };
-            let source_width = pixbuf.width().max(1) as f64;
-            let source_height = pixbuf.height().max(1) as f64;
-            context.scale(
-                width.max(1) as f64 / source_width,
-                height.max(1) as f64 / source_height,
-            );
-            context.set_source_pixbuf(pixbuf, 0.0, 0.0);
-            let _ = context.paint();
-        });
+        let image = ViewerImage::new();
         let image_canvas = gtk::CenterBox::new();
         image_canvas.set_orientation(gtk::Orientation::Vertical);
         image_canvas.set_hexpand(true);
         image_canvas.set_vexpand(true);
-        image_canvas.set_center_widget(Some(&image));
+        image_canvas.set_center_widget(Some(&image.picture));
         image_scroller.set_child(Some(&image_canvas));
         content_stack.add_named(&image_scroller, Some("image"));
 
@@ -3799,7 +3866,6 @@ impl ConduitWindow {
             content_stack,
             image_scroller,
             image,
-            image_source,
             title,
             zoom_label,
             zoom_out_button: zoom_out,
@@ -3810,7 +3876,6 @@ impl ConduitWindow {
             gallery: Vec::new(),
             index: 0,
             zoom: 1.0,
-            natural_size: (0, 0),
             loaded_path: None,
         }
     }
@@ -3951,6 +4016,7 @@ impl ConduitWindow {
             };
             viewer.title.set_label(&item.name);
             viewer.loaded_path = None;
+            viewer.image.clear();
             viewer.content_stack.set_visible_child_name("loading");
             for button in [
                 &viewer.zoom_out_button,
@@ -4027,6 +4093,7 @@ impl ConduitWindow {
 
     fn close_media_viewer(&self) {
         if let Some(viewer) = self.imp().media_viewer.borrow().as_ref() {
+            viewer.image.clear();
             if let Some(child) = viewer.content_stack.child_by_name("video") {
                 if let Ok(video) = child.downcast::<gtk::Video>() {
                     if let Some(stream) = video.media_stream() {
@@ -4151,28 +4218,15 @@ impl ConduitWindow {
         };
         viewer.loaded_path = Some(path.clone());
         if mime_type.starts_with("image/") {
-            // A tiny attachment can still decode to gigabytes of pixels.
-            if !crate::animated_image::within_decode_budget(&path) {
-                self.set_status("Could not display image: it is too large to decode");
-                return;
-            }
-            match gdk_pixbuf::Pixbuf::from_file(&path) {
-                Ok(pixbuf) => {
-                    viewer.natural_size = (pixbuf.width(), pixbuf.height());
-                    *viewer.image_source.borrow_mut() = Some(pixbuf);
-                    viewer.content_stack.set_visible_child_name("image");
-                    for button in [
-                        &viewer.zoom_out_button,
-                        &viewer.zoom_in_button,
-                        &viewer.zoom_reset_button,
-                    ] {
-                        button.set_sensitive(true);
-                    }
-                    apply_media_zoom(viewer);
-                    self.set_status("Image loaded");
+            let image = viewer.image.clone();
+            // Released first: an image already decoded shows at once.
+            drop(viewer_ref);
+            let weak_window = self.downgrade();
+            image.load(&path, move |result| {
+                if let Some(window) = weak_window.upgrade() {
+                    window.viewer_image_ready(result);
                 }
-                Err(error) => self.set_status(&format!("Could not display image: {error}")),
-            }
+            });
             return;
         }
 
@@ -4200,6 +4254,30 @@ impl ConduitWindow {
         viewer.content_stack.set_visible_child_name("video");
         viewer.zoom_label.set_label("--");
         self.set_status("Video loaded");
+    }
+
+    /// The viewer's image has been decoded, or could not be.
+    fn viewer_image_ready(&self, result: Result<(), String>) {
+        if let Err(message) = result {
+            self.set_status(&format!("Could not display image: {message}"));
+            return;
+        }
+        {
+            let mut viewer_ref = self.imp().media_viewer.borrow_mut();
+            let Some(viewer) = viewer_ref.as_mut() else {
+                return;
+            };
+            viewer.content_stack.set_visible_child_name("image");
+            for button in [
+                &viewer.zoom_out_button,
+                &viewer.zoom_in_button,
+                &viewer.zoom_reset_button,
+            ] {
+                button.set_sensitive(true);
+            }
+            apply_media_zoom(viewer);
+        }
+        self.set_status("Image loaded");
     }
 
     /// Applies the mark to the window's ledger copy for zero-latency UI; the

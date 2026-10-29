@@ -3252,9 +3252,22 @@ fn perf_guard_window_loads_no_image_file_on_the_gtk_thread() {
         "Picture::for_file",
         "Picture::for_filename",
         ".set_filename(",
+        "Pixbuf::from_file",
+        "Texture::from_file",
     ] {
         assert!(!source.contains(forbidden), "{forbidden} decodes in place");
     }
+}
+
+#[test]
+fn perf_guard_closing_or_switching_media_drops_the_pending_image() {
+    // Both paths must make the viewer's in-flight decode stale; the window
+    // itself cannot be built without a display and an application.
+    let source = include_str!("../window.rs");
+    assert!(
+        source.matches("viewer.image.clear()").count() >= 2,
+        "load_current_media and close_media_viewer must clear the viewer image"
+    );
 }
 
 /// Tests that create GTK widgets. They run only when
@@ -3266,6 +3279,137 @@ mod graphical {
         pump, pump_until, run_gtk_test, save_test_image, ManualDecodes, TempTestDir,
     };
 
+    /// Runs `ViewerImage::load` with a recorder for its outcomes.
+    fn load_viewer_image(image: &ViewerImage, path: &Path) -> Rc<RefCell<Vec<Result<(), String>>>> {
+        let outcomes = Rc::new(RefCell::new(Vec::new()));
+        let sink = outcomes.clone();
+        image.load(path, move |result| sink.borrow_mut().push(result));
+        outcomes
+    }
+
+    fn viewer_window(image: &ViewerImage) -> gtk::Window {
+        let window = gtk::Window::new();
+        window.set_default_size(300, 200);
+        window.set_child(Some(&image.picture));
+        window.present();
+        window
+    }
+
+    #[test]
+    fn perf_guard_viewer_image_decodes_off_the_gtk_thread() {
+        run_gtk_test(|| {
+            let _ = adw::init();
+            let decodes = ManualDecodes::install();
+            let dir = TempTestDir::new("viewer-image");
+            let path = dir.path().join("photo.png");
+            save_test_image(&path, "png", 90, 60);
+            let image = ViewerImage::new();
+            let window = viewer_window(&image);
+            let before = crate::debug::IMAGE_DECODES.get();
+            let outcomes = load_viewer_image(&image, &path);
+            pump(20);
+            assert_eq!(
+                crate::debug::IMAGE_DECODES.get() - before,
+                0,
+                "the viewer must leave its decode to a worker"
+            );
+            assert_eq!(decodes.0.running().len(), 1);
+            assert!(outcomes.borrow().is_empty(), "nothing to show yet");
+            assert_eq!(image.natural_size(), (0, 0));
+
+            decodes.finish_all();
+            assert_eq!(*outcomes.borrow(), vec![Ok(())]);
+            assert_eq!(image.natural_size(), (90, 60));
+            // Shown at the size the zoom asks for.
+            image.set_display_size((45, 30));
+            pump(50);
+            assert_eq!((image.picture.width(), image.picture.height()), (45, 30));
+            // Decoded once, so showing it again needs no worker.
+            let again = load_viewer_image(&image, &path);
+            assert_eq!(*again.borrow(), vec![Ok(())]);
+            assert!(decodes.0.running().is_empty());
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn viewer_ignores_a_result_that_lands_after_it_was_closed() {
+        run_gtk_test(|| {
+            let _ = adw::init();
+            let decodes = ManualDecodes::install();
+            let dir = TempTestDir::new("viewer-closed");
+            let path = dir.path().join("photo.png");
+            save_test_image(&path, "png", 90, 60);
+            let image = ViewerImage::new();
+            let outcomes = load_viewer_image(&image, &path);
+            // Closing the viewer, or moving to another item, clears it.
+            image.clear();
+            decodes.finish_all();
+            assert!(outcomes.borrow().is_empty(), "a stale result was applied");
+            assert_eq!(image.natural_size(), (0, 0));
+            assert!(image.picture.paintable().is_none());
+        });
+    }
+
+    #[test]
+    fn viewer_ignores_a_result_for_an_image_it_moved_on_from() {
+        run_gtk_test(|| {
+            let _ = adw::init();
+            let decodes = ManualDecodes::install();
+            let dir = TempTestDir::new("viewer-switched");
+            let first = dir.path().join("first.png");
+            let second = dir.path().join("second.png");
+            save_test_image(&first, "png", 90, 60);
+            save_test_image(&second, "png", 40, 30);
+            let image = ViewerImage::new();
+            let first_outcomes = load_viewer_image(&image, &first);
+            let second_outcomes = load_viewer_image(&image, &second);
+            // The second one's decode lands first, the first one's late.
+            let running = decodes.0.running();
+            assert_eq!(running.len(), 2, "{running:?}");
+            for key in [&running[1], &running[0]] {
+                let index = decodes
+                    .0
+                    .running()
+                    .iter()
+                    .position(|running| running == key)
+                    .expect("still running");
+                decodes.0.complete(index, decode::decode_now_for_tests(key));
+            }
+            assert_eq!(*second_outcomes.borrow(), vec![Ok(())]);
+            assert!(first_outcomes.borrow().is_empty());
+            assert_eq!(image.natural_size(), (40, 30));
+        });
+    }
+
+    #[test]
+    fn viewer_reports_images_that_cannot_be_decoded() {
+        run_gtk_test(|| {
+            let _ = adw::init();
+            let decodes = ManualDecodes::install();
+            let dir = TempTestDir::new("viewer-broken");
+            let broken = dir.path().join("broken.png");
+            std::fs::write(&broken, b"not an image").expect("write");
+            // 50 bytes that declare a canvas of 3.6 GB of pixels.
+            let bomb = dir.path().join("bomb.gif");
+            let mut bytes = crate::animated_image::tests::ANIMATED_GIF.to_vec();
+            bytes[6..10].copy_from_slice(&[0x30, 0x75, 0x30, 0x75]);
+            std::fs::write(&bomb, bytes).expect("write");
+            let image = ViewerImage::new();
+            for path in [&broken, &bomb] {
+                let outcomes = load_viewer_image(&image, path);
+                assert!(outcomes.borrow().is_empty());
+                decodes.finish_all();
+                let outcomes = outcomes.borrow();
+                assert_eq!(outcomes.len(), 1, "{path:?} was never reported");
+                assert!(matches!(&outcomes[0], Err(message) if !message.is_empty()));
+            }
+            assert_eq!(image.natural_size(), (0, 0));
+            // Known to fail: reported at once.
+            let outcomes = load_viewer_image(&image, &broken);
+            assert_eq!(outcomes.borrow().len(), 1);
+        });
+    }
     #[test]
     fn perf_guard_composer_image_preview_decodes_off_the_gtk_thread() {
         run_gtk_test(|| {

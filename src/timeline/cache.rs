@@ -778,6 +778,8 @@ pub(crate) mod decode {
     }
 
     pub(crate) type Done<T> = Box<dyn FnOnce(Result<T, DecodeError>)>;
+    /// Told that a decode a waiter asked for failed for good.
+    pub(crate) type Fail = Box<dyn FnOnce(&DecodeError)>;
     type Lookup<K, T> = Box<dyn Fn(&K) -> Option<T>>;
     type Store<K, T> = Box<dyn Fn(&K, &T)>;
     pub(crate) type Timer = Box<dyn FnOnce()>;
@@ -806,6 +808,7 @@ pub(crate) mod decode {
         ticket: Weak<Cell<u64>>,
         generation: u64,
         deliver: Box<dyn FnOnce(&T)>,
+        fail: Option<Fail>,
     }
 
     impl<T> Waiter<T> {
@@ -827,6 +830,13 @@ pub(crate) mod decode {
         waiters: Vec<Waiter<T>>,
         state: JobState,
         retries: u32,
+    }
+
+    /// How a decode ended for the waiters it had.
+    enum Settled<T> {
+        Decoded(T, Vec<Waiter<T>>),
+        /// Failed for good: permanent, or transient with the retries spent.
+        Failed(DecodeError, Vec<Waiter<T>>),
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -902,6 +912,19 @@ pub(crate) mod decode {
             ticket: &DecodeTicket,
             deliver: impl FnOnce(&T) + 'static,
         ) -> Requested<T> {
+            self.request_notifying(key, ticket, deliver, None)
+        }
+
+        /// [`Scheduler::request`], where `fail` also hears of a decode that
+        /// fails after this returned [`Requested::Pending`], for a caller
+        /// that cannot leave its user waiting on an image that never comes.
+        pub(crate) fn request_notifying(
+            &self,
+            key: K,
+            ticket: &DecodeTicket,
+            deliver: impl FnOnce(&T) + 'static,
+            fail: Option<Fail>,
+        ) -> Requested<T> {
             let mut state = self.state.borrow_mut();
             if let Some(value) = (state.lookup)(&key) {
                 return Requested::Ready(value);
@@ -920,6 +943,7 @@ pub(crate) mod decode {
                 ticket: Rc::downgrade(&ticket.0),
                 generation: ticket.0.get(),
                 deliver: Box::new(deliver),
+                fail,
             };
             let job = state.jobs.entry(key.clone()).or_insert_with(|| Job {
                 waiters: Vec::new(),
@@ -1014,12 +1038,20 @@ pub(crate) mod decode {
                 delivery
             };
             // Outside the borrow: a delivery may request more textures.
-            if let Some((value, waiters)) = delivery {
-                for waiter in waiters {
-                    if waiter.is_current() {
+            match delivery {
+                Some(Settled::Decoded(value, waiters)) => {
+                    for waiter in waiters.into_iter().filter(Waiter::is_current) {
                         (waiter.deliver)(&value);
                     }
                 }
+                Some(Settled::Failed(error, waiters)) => {
+                    for waiter in waiters.into_iter().filter(Waiter::is_current) {
+                        if let Some(fail) = waiter.fail {
+                            fail(&error);
+                        }
+                    }
+                }
+                None => {}
             }
         }
 
@@ -1028,14 +1060,14 @@ pub(crate) mod decode {
             state: &mut State<K, T>,
             key: K,
             result: Result<T, DecodeError>,
-        ) -> Option<(T, Vec<Waiter<T>>)> {
+        ) -> Option<Settled<T>> {
             match result {
                 Ok(value) => {
                     (state.store)(&key, &value);
                     let job = state.jobs.remove(&key)?;
-                    Some((value, job.waiters))
+                    Some(Settled::Decoded(value, job.waiters))
                 }
-                Err(DecodeError::Transient(_)) => {
+                Err(DecodeError::Transient(message)) => {
                     let job = state.jobs.get_mut(&key)?;
                     if job.retries < MAX_TRANSIENT_RETRIES {
                         job.retries += 1;
@@ -1050,17 +1082,24 @@ pub(crate) mod decode {
                                 }
                             }),
                         );
+                        None
                     } else {
-                        state.jobs.remove(&key);
+                        let job = state.jobs.remove(&key)?;
                         let until = state.executor.now() + TRANSIENT_COOLDOWN;
                         remember_failure(state, key, Failure::TransientUntil(until));
+                        Some(Settled::Failed(
+                            DecodeError::Transient(message),
+                            job.waiters,
+                        ))
                     }
-                    None
                 }
-                Err(DecodeError::Permanent(_)) => {
-                    state.jobs.remove(&key);
+                Err(DecodeError::Permanent(message)) => {
+                    let job = state.jobs.remove(&key);
                     remember_failure(state, key, Failure::Permanent);
-                    None
+                    Some(Settled::Failed(
+                        DecodeError::Permanent(message),
+                        job?.waiters,
+                    ))
                 }
             }
         }
@@ -1247,11 +1286,25 @@ pub(crate) mod decode {
         ticket: &DecodeTicket,
         deliver: impl FnOnce(&gdk::Texture) + 'static,
     ) -> Requested<gdk::Texture> {
-        let requested = scheduler().request(texture_key(path, spec), ticket, move |decoded| {
+        request_texture_notifying(path, spec, ticket, deliver, None)
+    }
+
+    /// [`request_texture`], where `fail` hears of a decode that fails after
+    /// this returned [`Requested::Pending`].
+    pub(crate) fn request_texture_notifying(
+        path: &Path,
+        spec: TextureSpec,
+        ticket: &DecodeTicket,
+        deliver: impl FnOnce(&gdk::Texture) + 'static,
+        fail: Option<Fail>,
+    ) -> Requested<gdk::Texture> {
+        let deliver = move |decoded: &Decoded| {
             if let Decoded::Texture(texture) = decoded {
                 deliver(texture);
             }
-        });
+        };
+        let requested =
+            scheduler().request_notifying(texture_key(path, spec), ticket, deliver, fail);
         match requested {
             Requested::Ready(Decoded::Texture(texture)) => Requested::Ready(texture),
             Requested::Pending => Requested::Pending,
@@ -1880,6 +1933,72 @@ pub(crate) mod decode {
             assert!(pending(harness.request("a", &ticket)));
             harness.complete("a", Ok(1));
             assert_eq!(*harness.delivered.borrow(), vec![("a", 1)]);
+        }
+
+        /// Requests `key` the way a caller that must not wait forever does.
+        fn request_notifying(
+            harness: &Harness,
+            key: &'static str,
+            ticket: &DecodeTicket,
+            failures: &Rc<RefCell<Vec<DecodeError>>>,
+        ) -> Requested<u32> {
+            let failures = failures.clone();
+            harness.scheduler.request_notifying(
+                key,
+                ticket,
+                |_| {},
+                Some(Box::new(move |error| {
+                    failures.borrow_mut().push(error.clone())
+                })),
+            )
+        }
+
+        #[test]
+        fn failures_reach_the_waiters_that_asked_to_hear_of_them() {
+            let harness = Harness::new();
+            let failures = Rc::default();
+            let ticket = DecodeTicket::default();
+            let silent = DecodeTicket::default();
+            assert!(pending(request_notifying(
+                &harness, "a", &ticket, &failures
+            )));
+            // Waiters that did not ask, or are stale, hear nothing.
+            harness.request("a", &silent);
+            let stale = DecodeTicket::default();
+            assert!(pending(request_notifying(&harness, "a", &stale, &failures)));
+            stale.invalidate();
+            harness.complete("a", Err(DecodeError::Permanent("corrupt".into())));
+            assert_eq!(
+                *failures.borrow(),
+                vec![DecodeError::Permanent("corrupt".into())]
+            );
+            assert!(harness.delivered.borrow().is_empty());
+        }
+
+        #[test]
+        fn transient_failures_are_reported_once_the_retry_fails_too() {
+            let harness = Harness::new();
+            let failures = Rc::default();
+            let ticket = DecodeTicket::default();
+            request_notifying(&harness, "a", &ticket, &failures);
+            harness.complete("a", transient());
+            assert!(failures.borrow().is_empty(), "a retry is still coming");
+            harness.executor.fire_timers();
+            harness.complete("a", transient());
+            assert_eq!(
+                *failures.borrow(),
+                vec![DecodeError::Transient("missing".into())]
+            );
+        }
+
+        #[test]
+        fn successful_decodes_are_not_reported_as_failures() {
+            let harness = Harness::new();
+            let failures = Rc::default();
+            let ticket = DecodeTicket::default();
+            request_notifying(&harness, "a", &ticket, &failures);
+            harness.complete("a", Ok(7));
+            assert!(failures.borrow().is_empty());
         }
 
         #[test]
