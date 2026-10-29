@@ -3022,6 +3022,71 @@ mod graphical {
     }
 
     #[test]
+    fn perf_guard_code_blocks_build_source_views_only_once_shown() {
+        run_gtk_test(|| {
+            let code = "fn main() {\n    println!(\"hi\");\n}";
+            let rows = Box::new(Orientation::Vertical, 0);
+            for i in 0..10 {
+                let message = SlackMessage {
+                    ts: format!("1700000{i:03}.000100"),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("Try:\n```rust\n{code}\n```")),
+                    ..Default::default()
+                };
+                rows.append(&build_timeline_message_widget(
+                    &message,
+                    &test_context(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                ));
+            }
+            let views = || {
+                descendants(rows.upcast_ref())
+                    .into_iter()
+                    .filter_map(|widget| widget.downcast::<sourceview5::View>().ok())
+                    .collect::<Vec<_>>()
+            };
+            let code_text = |widget: &Widget| {
+                widget
+                    .clone()
+                    .downcast::<Label>()
+                    .ok()
+                    .filter(|label| label.text() == code)
+            };
+            let placeholders = || {
+                descendants(rows.upcast_ref())
+                    .iter()
+                    .filter_map(code_text)
+                    .count()
+            };
+            assert_eq!(views().len(), 0, "binding rows builds no source views");
+            assert_eq!(placeholders(), 10, "code shows as plain text first");
+            pump(50);
+            assert_eq!(views().len(), 0, "rows that never show stay plain");
+
+            let window = gtk::Window::new();
+            window.set_child(Some(&rows));
+            window.present();
+            pump_until(2000, || views().len() == 10);
+            let views = views();
+            assert_eq!(views.len(), 10, "shown code blocks get highlighted views");
+            assert_eq!(placeholders(), 0, "each view replaces its placeholder");
+            for view in &views {
+                let buffer = view.buffer();
+                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+                assert_eq!(text, code);
+                assert!(sourceview5::prelude::ViewExt::shows_line_numbers(view));
+                assert!(view.parent().is_some_and(|p| p.has_css_class("code-block")));
+            }
+            window.destroy();
+        });
+    }
+
+    #[test]
     fn avatar_never_loads_untrusted_url_as_local_path() {
         run_gtk_test(|| {
             // A real, loadable PNG on disk: the old fallback would have opened it
