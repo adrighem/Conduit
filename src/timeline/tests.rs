@@ -1080,7 +1080,9 @@ mod graphical {
                 true,
             );
             let button = find_menu_button(widget.upcast_ref()).expect("author menu button");
-            assert!(button.menu_model().is_some());
+            // The menu itself is built on first open; see
+            // perf_guard_author_menus_build_their_popover_on_first_open.
+            assert!(button.is_sensitive(), "the button can open its menu");
             let mut focusable = 0;
             let mut stack = vec![widget.clone().upcast::<Widget>()];
             while let Some(current) = stack.pop() {
@@ -1135,6 +1137,69 @@ mod graphical {
                 true,
             );
             assert!(find_menu_button(widget.upcast_ref()).is_none());
+        });
+    }
+
+    #[test]
+    fn perf_guard_author_menus_build_their_popover_on_first_open() {
+        run_gtk_test(|| {
+            let on_action: Rc<dyn Fn(TimelineAction)> = Rc::new(|_| {});
+            let rows = Box::new(Orientation::Vertical, 0);
+            for i in 0..20 {
+                let message = SlackMessage {
+                    ts: format!("1700000{i:03}.000100"),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("message {i}")),
+                    ..Default::default()
+                };
+                rows.append(&build_timeline_message_widget(
+                    &message,
+                    &test_context(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&on_action),
+                    true,
+                ));
+            }
+            let window = gtk::Window::new();
+            window.set_child(Some(&rows));
+            window.present();
+            pump(50);
+
+            let all = descendants(rows.upcast_ref());
+            let buttons: Vec<gtk::MenuButton> = all
+                .iter()
+                .filter_map(|widget| widget.clone().downcast::<gtk::MenuButton>().ok())
+                .collect();
+            assert_eq!(buttons.len(), 40, "avatar and name per header");
+            let popovers =
+                |widgets: &[Widget]| widgets.iter().filter(|w| w.is::<gtk::Popover>()).count();
+            assert_eq!(popovers(&all), 0, "binding rows builds no popover menus");
+
+            let name_button = buttons
+                .iter()
+                .find(|b| b.first_child().is_some_and(|toggle| toggle.is_focusable()))
+                .expect("name button");
+            name_button.popup();
+            pump_until(2000, || {
+                name_button.popover().is_some_and(|p| p.is_visible())
+            });
+            let popover = name_button.popover().and_downcast::<gtk::PopoverMenu>();
+            assert!(
+                popover.is_some_and(|p| p.is_visible()),
+                "first open shows the menu"
+            );
+            let model = name_button.menu_model().expect("menu built on open");
+            assert_eq!(model.n_items(), 2, "Message… and Profile");
+            name_button.popdown();
+            assert_eq!(
+                popovers(&descendants(rows.upcast_ref())),
+                1,
+                "only the opened one"
+            );
+            window.destroy();
         });
     }
 
@@ -3127,6 +3192,213 @@ mod graphical {
             vadj.set_value(vadj.value() - 1.0);
             pump_until(2000, || requests.get() > 1);
             assert_eq!(requests.get(), 2, "a fresh surface pages again");
+            window.destroy();
+        });
+    }
+
+    /// Representative rows for the bind benchmark: each kind exercises
+    /// one costly builder.
+    fn bench_messages(count: usize, image_url: &str) -> Vec<SlackMessage> {
+        (0..count)
+            .map(|i| {
+                let mut message = SlackMessage {
+                    ts: format!("1700{i:06}.000100"),
+                    user: Some("U123".to_string()),
+                    ..Default::default()
+                };
+                let text = match i % 8 {
+                    0 => "Morning all, the deploy went out fine and the dashboards look calm.",
+                    1 => "<@U123> can you check <https://example.com/runbook|the runbook> today?",
+                    2 => "Try this:\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\nthen rerun.",
+                    3 => "Shipped it :bench: and :bench: again",
+                    4 => "Nice work on the release notes, very readable.",
+                    5 => "Screenshot of the graph",
+                    6 => "Thread about the outage follow-ups",
+                    _ => "> quoted from earlier\nand my reply to it",
+                };
+                message.text = Some(text.to_string());
+                match i % 8 {
+                    4 => {
+                        message.reactions = Some(
+                            ["thumbsup", "tada", "bench"]
+                                .iter()
+                                .map(|name| SlackReaction {
+                                    name: Some(name.to_string()),
+                                    count: Some(2),
+                                    users: Some(vec!["U123".to_string()]),
+                                })
+                                .collect(),
+                        );
+                    }
+                    5 => {
+                        message.files = Some(vec![
+                            SlackFile {
+                                id: Some(format!("F{i}")),
+                                mimetype: Some("image/png".to_string()),
+                                url_private: Some(image_url.to_string()),
+                                ..Default::default()
+                            },
+                            SlackFile {
+                                id: Some(format!("G{i}")),
+                                name: Some("notes.txt".to_string()),
+                                mimetype: Some("text/plain".to_string()),
+                                size: Some(2048),
+                                ..Default::default()
+                            },
+                        ]);
+                    }
+                    6 => {
+                        message.reply_count = Some(3);
+                        message.latest_reply = Some("1700000999.000100".to_string());
+                    }
+                    _ => {}
+                }
+                message
+            })
+            .collect()
+    }
+
+    type BenchStats = std::collections::BTreeMap<&'static str, (usize, f64)>;
+
+    /// Times building, then measuring, a widget inside a mapped window.
+    fn bench_component(
+        host: &Box,
+        stats: &mut BenchStats,
+        name: &'static str,
+        build: impl FnOnce() -> Option<Widget>,
+    ) {
+        let started = std::time::Instant::now();
+        let widget = build();
+        if let Some(widget) = &widget {
+            host.append(widget);
+            let _ = widget.measure(Orientation::Vertical, 600);
+        } else if name != "mrkdwn_to_pango" {
+            return;
+        }
+        let entry = stats.entry(name).or_default();
+        entry.0 += 1;
+        entry.1 += started.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    /// Bind cost per row component. Run in release under Xvfb with
+    /// `cargo test --release graphical::bench_row_components -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; prints timings"]
+    fn bench_row_components() {
+        run_gtk_test(|| {
+            let _decodes = ManualDecodes::install();
+            let assets = AssetCacheTestDir::new("row-bench");
+            let emoji_dir = TempTestDir::new("row-bench-emoji");
+            let emoji_path = emoji_dir.path().join("bench.png");
+            save_test_image(&emoji_path, "png", 32, 32);
+            let emoji_url = "https://example.com/row-bench-emoji.png".to_string();
+            crate::emoji_picker_window::invalidate_or_set_custom_emoji_cached_file(
+                &emoji_url, emoji_path,
+            );
+            let image_url = "https://files.slack.com/files-pri/T1-FB/bench.png".to_string();
+            let image_path = assets.0.join("bench.png");
+            save_test_image(&image_path, "png", 64, 48);
+            let mut ctx = test_context();
+            ctx.custom_emojis = Arc::new(HashMap::from([("bench".to_string(), emoji_url)]));
+            ctx.image_assets.insert(image_url.clone(), image_path);
+            let messages = bench_messages(152, &image_url);
+            let on_action: Rc<dyn Fn(TimelineAction)> = Rc::new(|_| {});
+            let on_thread: Rc<dyn Fn(String)> = Rc::new(|_| {});
+
+            let window = gtk::Window::new();
+            window.set_default_size(700, 500);
+            let scroller = gtk::ScrolledWindow::new();
+            window.set_child(Some(&scroller));
+            window.present();
+            pump(100);
+
+            let mut stats = BenchStats::new();
+            // The first round warms caches (CSS, fonts, language specs).
+            for _round in 0..2 {
+                stats.clear();
+                let host = Box::new(Orientation::Vertical, 0);
+                scroller.set_child(Some(&host));
+                for message in &messages {
+                    bench_component(&host, &mut stats, "full_row", || {
+                        Some(
+                            build_timeline_message_widget(
+                                message,
+                                &ctx,
+                                None,
+                                Some(&on_thread),
+                                None,
+                                None,
+                                Some(&on_action),
+                                true,
+                            )
+                            .upcast(),
+                        )
+                    });
+                    bench_component(&host, &mut stats, "avatar", || {
+                        Some(build_avatar_widget(message, &ctx))
+                    });
+                    bench_component(&host, &mut stats, "author_menu_button", || {
+                        let label = Label::new(Some("Alice"));
+                        let access = crate::author_menu::author_menu_access(
+                            Some("U123"),
+                            None,
+                            &HashSet::new(),
+                        );
+                        let button = crate::author_menu::author_menu_button(
+                            &label,
+                            "U123",
+                            "Alice",
+                            access,
+                            on_action.clone(),
+                        );
+                        Some(button.upcast())
+                    });
+                    let text = message.text.as_deref().unwrap_or_default();
+                    bench_component(&host, &mut stats, "mrkdwn_to_pango", || {
+                        let _ = crate::message_markup::mrkdwn_to_pango(text, &ctx);
+                        None
+                    });
+                    bench_component(&host, &mut stats, "render_text_content", || {
+                        let target = Box::new(Orientation::Vertical, 0);
+                        render_text_content(text, &target, &ctx, Some(&on_action));
+                        Some(target.upcast())
+                    });
+                    for segment in parse_text_segments(text) {
+                        match segment {
+                            TextSegment::CodeBlock { lang, code } => {
+                                bench_component(&host, &mut stats, "code_block", || {
+                                    Some(build_code_block_widget(&code, lang.as_deref()))
+                                });
+                            }
+                            TextSegment::Normal(normal) | TextSegment::Quote(normal) => {
+                                let pango = crate::message_markup::mrkdwn_to_pango(&normal, &ctx);
+                                let name = if pango.contains("<conduit-custom-emoji ") {
+                                    "text_custom_emoji"
+                                } else {
+                                    "text_label"
+                                };
+                                bench_component(&host, &mut stats, name, || {
+                                    Some(create_message_text_widget(&pango, &ctx, Some(&on_action)))
+                                });
+                            }
+                        }
+                    }
+                    bench_component(&host, &mut stats, "reactions", || {
+                        build_reactions_widget(message, &ctx, None).map(Cast::upcast)
+                    });
+                    bench_component(&host, &mut stats, "thread_footer", || {
+                        build_thread_replies_widget(message, &ctx, Some(&on_thread))
+                            .map(Cast::upcast)
+                    });
+                }
+            }
+            println!("component | count | total ms | ms each");
+            for (name, (count, total)) in &stats {
+                println!(
+                    "{name} | {count} | {total:.1} | {:.3}",
+                    total / (*count).max(1) as f64
+                );
+            }
             window.destroy();
         });
     }

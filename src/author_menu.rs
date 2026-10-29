@@ -62,6 +62,7 @@ fn author_menu_label(display_name: &str) -> String {
 
 /// Wraps `avatar` and `name` in a flat menu button offering "Message…" and
 /// "Profile". `on_action` is invoked with the chosen [`TimelineAction`].
+/// The popover menu is created when the button first opens.
 pub(crate) fn author_menu_button(
     child: &impl IsA<gtk::Widget>,
     user_id: &str,
@@ -97,7 +98,13 @@ pub(crate) fn author_menu_button(
 
     let button = gtk::MenuButton::new();
     button.set_child(Some(child));
-    button.set_menu_model(Some(&menu));
+    // A menu model builds its PopoverMenu at once, which dominated row
+    // binds (two per message header). Build it on first open instead.
+    button.set_create_popup_func(move |button| {
+        if button.menu_model().is_none() {
+            button.set_menu_model(Some(&menu));
+        }
+    });
     button.set_has_frame(false);
     button.set_focus_on_click(false);
     button.set_halign(gtk::Align::Start);
