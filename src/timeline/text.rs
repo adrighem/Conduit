@@ -487,8 +487,47 @@ fn build_code_view(code: &str, lang: Option<&str>) -> sourceview5::View {
     view
 }
 
+/// Width GtkTextView keeps after each line for the cursor (its
+/// `SPACE_FOR_CURSOR`), so its text wraps that much earlier than a label.
+const TEXT_VIEW_CURSOR_SPACE: i32 = 1;
+
+/// Horizontal space a code view keeps beside its text: (start, end). The
+/// start holds the line number gutter, whose width depends on the digits
+/// of the line count, so one probe view per digit count measures it.
+fn code_view_text_insets(line_count: usize) -> (i32, i32) {
+    thread_local! {
+        static INSETS: std::cell::RefCell<std::collections::HashMap<usize, (i32, i32)>> =
+            std::cell::RefCell::default();
+    }
+    let digits = if line_count > 1 {
+        line_count.to_string().len()
+    } else {
+        0
+    };
+    INSETS.with(|insets| {
+        *insets.borrow_mut().entry(digits).or_insert_with(|| {
+            let probe_lines = if digits == 0 {
+                1
+            } else {
+                10usize.pow(digits as u32 - 1).max(2)
+            };
+            let view = build_code_view(&"\n".repeat(probe_lines - 1), None);
+            let gutter = sourceview5::prelude::ViewExt::gutter(&view, gtk::TextWindowType::Left);
+            let gutter_width = if view.shows_line_numbers() {
+                gutter.measure(Orientation::Horizontal, -1).1
+            } else {
+                0
+            };
+            (
+                gutter_width + view.left_margin(),
+                view.right_margin() + TEXT_VIEW_CURSOR_SPACE,
+            )
+        })
+    })
+}
+
 /// The plain monospace text a code block shows until its highlighted view
-/// replaces it.
+/// replaces it, inset like the view's text so it wraps to the same height.
 fn code_placeholder(code: &str) -> Label {
     let label = Label::new(Some(code));
     label.set_wrap(true);
@@ -497,6 +536,17 @@ fn code_placeholder(code: &str) -> Label {
     label.set_focus_on_click(false);
     label.set_xalign(0.0);
     label.add_css_class("monospace");
+    let (start, end) = code_view_text_insets(code.lines().count());
+    label.set_margin_start(start);
+    label.set_margin_end(end);
+    // A TextView rounds each line to whole pixels; a label rounds only its
+    // total, so without this a long block drifts by a fraction per line.
+    let line_height = label.pango_context().metrics(None, None).height();
+    let attrs = pango::AttrList::new();
+    attrs.insert(pango::AttrInt::new_line_height_absolute(
+        pango::units_from_double(pango::units_to_double(line_height).round()),
+    ));
+    label.set_attributes(Some(&attrs));
     label
 }
 
