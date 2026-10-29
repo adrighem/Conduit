@@ -262,7 +262,31 @@ pub(crate) fn may_be_animated(path: &Path) -> bool {
 /// headers only. Unreadable or unrecognised files fail closed, so callers
 /// must not fall back to decoding them another way.
 pub(crate) fn within_decode_budget(path: &Path) -> bool {
-    let header = crate::image_header::declared_header(path)
+    let declared = crate::image_header::declared_header(path);
+    fits_decode_budget(declared, path, || {
+        std::fs::File::open(path)
+            .ok()
+            .and_then(|file| crate::image_header::webp_frame_count(std::io::BufReader::new(file)))
+    })
+}
+
+/// [`within_decode_budget`] for `bytes` already read from `path`, judged from
+/// those same bytes, so the file cannot change between the check and the
+/// decode. Only formats our header parser does not know fall back to
+/// gdk-pixbuf's probe of `path`, as [`within_decode_budget`] does.
+pub(crate) fn bytes_within_decode_budget(bytes: &[u8], path: &Path) -> bool {
+    let declared = crate::image_header::header(&mut std::io::Cursor::new(bytes));
+    fits_decode_budget(declared, path, || {
+        crate::image_header::webp_frame_count(std::io::Cursor::new(bytes))
+    })
+}
+
+fn fits_decode_budget(
+    declared: Option<(crate::image_header::ImageFormat, u32, u32)>,
+    path: &Path,
+    webp_frames: impl FnOnce() -> Option<u64>,
+) -> bool {
+    let header = declared
         .map(|(format, width, height)| {
             (
                 format == crate::image_header::ImageFormat::Webp,
@@ -284,10 +308,7 @@ pub(crate) fn within_decode_budget(path: &Path) -> bool {
     // The WebP loader decodes every frame up front; gdk-pixbuf keeps GIF
     // frames compressed and composites them on demand, so they cost one.
     let frames = if is_webp {
-        let Some(frames) = std::fs::File::open(path)
-            .ok()
-            .and_then(|file| crate::image_header::webp_frame_count(std::io::BufReader::new(file)))
-        else {
+        let Some(frames) = webp_frames() else {
             return false;
         };
         frames
@@ -467,6 +488,16 @@ pub(crate) mod tests {
         let junk = write_temp("budget.bin", b"not an image");
         assert!(!within_decode_budget(&junk));
         std::fs::remove_file(junk).ok();
+    }
+
+    #[test]
+    fn bytes_budget_judges_the_bytes_not_the_file() {
+        // The file at `path` is small, but the bytes about to be decoded
+        // declare a 30000x30000 canvas: the bytes decide.
+        let path = write_temp("budget-bytes.gif", ANIMATED_GIF);
+        assert!(!bytes_within_decode_budget(&oversized_gif(), &path));
+        assert!(bytes_within_decode_budget(ANIMATED_GIF, &path));
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

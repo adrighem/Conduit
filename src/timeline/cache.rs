@@ -106,6 +106,7 @@ thread_local! {
 pub fn clear_timeline_view_caches() {
     COLLAPSED_MEDIA.with(|set| set.borrow_mut().clear());
     TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
+    decode::reset_texture_decodes();
     REACTION_TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
     crate::animated_image::clear_caches();
     crate::timeline_document_widget::clear_document_accent_cache();
@@ -685,5 +686,848 @@ mod texture_cache_tests {
         }
         assert!(!has(&mut cache, "a"));
         assert!(has(&mut cache, "b") && has(&mut cache, "c"));
+    }
+}
+
+/// Static textures decoded off the GTK thread.
+///
+/// A worker reads each file once, checks the decode budget on those bytes
+/// and decodes the same bytes, so a cache prune or atomic rename between
+/// check and decode cannot hand the loader another file. Results come back
+/// to the GTK thread, which alone fills [`TEXTURE_CACHE`] and paints.
+// Callers arrive with the next commit.
+#[allow(dead_code)]
+pub(crate) mod decode {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::hash::Hash;
+    use std::io::Read;
+    use std::path::{Path, PathBuf};
+    use std::rc::{Rc, Weak};
+    use std::time::{Duration, Instant};
+
+    use gtk::{gdk, gio, glib};
+
+    use super::TEXTURE_CACHE;
+
+    /// Decodes running at once: each may be a sandboxed glycin subprocess,
+    /// and GIO's worker pool is shared with file I/O.
+    pub(crate) const MAX_IN_FLIGHT: usize = 3;
+    /// Retries of a transient failure (missing file, read error).
+    pub(crate) const MAX_TRANSIENT_RETRIES: u32 = 1;
+    pub(crate) const RETRY_DELAY: Duration = Duration::from_secs(2);
+    /// How long a key whose retries ran out is refused before trying again.
+    pub(crate) const TRANSIENT_COOLDOWN: Duration = Duration::from_secs(30);
+    const MAX_FAILED: usize = 4096;
+    /// Largest file a worker reads. Downloads are capped at this size.
+    pub(crate) const MAX_ASSET_BYTES: usize = crate::slack::MAX_PREVIEW_IMAGE_BYTES;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum DecodeError {
+        /// Decoding again cannot help: over budget, too large, corrupt or an
+        /// unsupported format.
+        Permanent(String),
+        /// The file may be back shortly: missing (pruned and re-downloaded)
+        /// or unreadable for now.
+        Transient(String),
+    }
+
+    /// How a texture is decoded. Part of the dedupe key, so scaled decodes
+    /// can join later without sharing a full-size result.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(crate) enum TextureSpec {
+        Full,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub(crate) struct TextureKey {
+        pub(crate) path: PathBuf,
+        pub(crate) spec: TextureSpec,
+    }
+
+    pub(crate) type Done<T> = Box<dyn FnOnce(Result<T, DecodeError>)>;
+    type Lookup<K, T> = Box<dyn Fn(&K) -> Option<T>>;
+    type Store<K, T> = Box<dyn Fn(&K, &T)>;
+    pub(crate) type Timer = Box<dyn FnOnce()>;
+
+    /// Where decodes run. `spawn` and `after` must call back later on the
+    /// GTK thread, never from inside the call itself.
+    pub(crate) trait DecodeExecutor<K, T> {
+        fn spawn(&self, key: K, done: Done<T>);
+        fn after(&self, delay: Duration, fire: Timer);
+        fn now(&self) -> Instant;
+    }
+
+    /// A waiter's liveness and generation. The requester keeps the ticket;
+    /// dropping it kills its waiters and [`DecodeTicket::invalidate`] makes
+    /// them stale. Results for either are still cached, never applied.
+    #[derive(Clone, Default)]
+    pub(crate) struct DecodeTicket(Rc<Cell<u64>>);
+
+    impl DecodeTicket {
+        pub(crate) fn invalidate(&self) {
+            self.0.set(self.0.get().wrapping_add(1));
+        }
+    }
+
+    struct Waiter<T> {
+        ticket: Weak<Cell<u64>>,
+        generation: u64,
+        deliver: Box<dyn FnOnce(&T)>,
+    }
+
+    impl<T> Waiter<T> {
+        fn is_current(&self) -> bool {
+            self.ticket
+                .upgrade()
+                .is_some_and(|generation| generation.get() == self.generation)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum JobState {
+        Queued,
+        Running,
+        AwaitingRetry,
+    }
+
+    struct Job<T> {
+        waiters: Vec<Waiter<T>>,
+        state: JobState,
+        retries: u32,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Failure {
+        Permanent,
+        TransientUntil(Instant),
+    }
+
+    /// What a request found.
+    pub(crate) enum Requested<T> {
+        /// Already cached: apply it now.
+        Ready(T),
+        /// Queued or joined a running decode; `deliver` runs on completion
+        /// if the ticket is still current.
+        Pending,
+        /// Known to fail; show the empty placeholder.
+        Failed,
+    }
+
+    struct State<K, T> {
+        executor: Rc<dyn DecodeExecutor<K, T>>,
+        lookup: Lookup<K, T>,
+        store: Store<K, T>,
+        /// Bumped by [`Scheduler::reset`]; older completions are dropped.
+        epoch: u64,
+        /// Decodes executing, whatever their epoch.
+        running: usize,
+        jobs: HashMap<K, Job<T>>,
+        /// Queued keys; the last requested is dispatched first, since it is
+        /// what was bound most recently.
+        queue: Vec<K>,
+        failed: HashMap<K, Failure>,
+    }
+
+    /// Deduplicating decode queue with at most [`MAX_IN_FLIGHT`] decodes
+    /// running. GTK-free, so tests drive it with a [`ManualExecutor`].
+    pub(crate) struct Scheduler<K, T> {
+        state: Rc<RefCell<State<K, T>>>,
+    }
+
+    impl<K, T> Clone for Scheduler<K, T> {
+        fn clone(&self) -> Self {
+            Self {
+                state: self.state.clone(),
+            }
+        }
+    }
+
+    impl<K: Clone + Eq + Hash + 'static, T: Clone + 'static> Scheduler<K, T> {
+        pub(crate) fn new(
+            executor: Rc<dyn DecodeExecutor<K, T>>,
+            lookup: impl Fn(&K) -> Option<T> + 'static,
+            store: impl Fn(&K, &T) + 'static,
+        ) -> Self {
+            Self {
+                state: Rc::new(RefCell::new(State {
+                    executor,
+                    lookup: Box::new(lookup),
+                    store: Box::new(store),
+                    epoch: 0,
+                    running: 0,
+                    jobs: HashMap::new(),
+                    queue: Vec::new(),
+                    failed: HashMap::new(),
+                })),
+            }
+        }
+
+        /// Asks for `key` on behalf of `ticket`'s current generation.
+        pub(crate) fn request(
+            &self,
+            key: K,
+            ticket: &DecodeTicket,
+            deliver: impl FnOnce(&T) + 'static,
+        ) -> Requested<T> {
+            let mut state = self.state.borrow_mut();
+            if let Some(value) = (state.lookup)(&key) {
+                return Requested::Ready(value);
+            }
+            match state.failed.get(&key) {
+                Some(Failure::Permanent) => return Requested::Failed,
+                Some(Failure::TransientUntil(until)) => {
+                    if state.executor.now() < *until {
+                        return Requested::Failed;
+                    }
+                    state.failed.remove(&key);
+                }
+                None => {}
+            }
+            let waiter = Waiter {
+                ticket: Rc::downgrade(&ticket.0),
+                generation: ticket.0.get(),
+                deliver: Box::new(deliver),
+            };
+            let job = state.jobs.entry(key.clone()).or_insert_with(|| Job {
+                waiters: Vec::new(),
+                state: JobState::Queued,
+                retries: 0,
+            });
+            job.waiters.retain(Waiter::is_current);
+            job.waiters.push(waiter);
+            if job.state == JobState::Queued {
+                // Re-requesting moves the key to the front of the line.
+                state.queue.retain(|queued| queued != &key);
+                state.queue.push(key);
+            }
+            self.pump(&mut state);
+            Requested::Pending
+        }
+
+        /// Whether `key` is known to fail right now.
+        pub(crate) fn is_failed(&self, key: &K) -> bool {
+            let state = self.state.borrow();
+            match state.failed.get(key) {
+                Some(Failure::Permanent) => true,
+                Some(Failure::TransientUntil(until)) => state.executor.now() < *until,
+                None => false,
+            }
+        }
+
+        /// Forgets known failures and results in progress: decodes already
+        /// running finish, but are neither cached nor delivered. Waiters
+        /// still current are queued afresh, so no visible image is left
+        /// waiting on a dropped result.
+        pub(crate) fn reset(&self) {
+            let mut state = self.state.borrow_mut();
+            state.epoch = state.epoch.wrapping_add(1);
+            state.failed.clear();
+            state.queue.clear();
+            let mut requeued = Vec::new();
+            state.jobs.retain(|key, job| {
+                job.waiters.retain(Waiter::is_current);
+                job.state = JobState::Queued;
+                job.retries = 0;
+                let keep = !job.waiters.is_empty();
+                if keep {
+                    requeued.push(key.clone());
+                }
+                keep
+            });
+            state.queue = requeued;
+            self.pump(&mut state);
+        }
+
+        fn pump(&self, state: &mut State<K, T>) {
+            while state.running < MAX_IN_FLIGHT {
+                let Some(key) = state.queue.pop() else {
+                    return;
+                };
+                let Some(job) = state.jobs.get_mut(&key) else {
+                    continue;
+                };
+                job.waiters.retain(Waiter::is_current);
+                if job.waiters.is_empty() {
+                    // Scrolled past before its turn: skip the decode.
+                    state.jobs.remove(&key);
+                    continue;
+                }
+                job.state = JobState::Running;
+                state.running += 1;
+                let weak = Rc::downgrade(&self.state);
+                let epoch = state.epoch;
+                let done_key = key.clone();
+                state.executor.spawn(
+                    key,
+                    Box::new(move |result| {
+                        if let Some(state) = weak.upgrade() {
+                            Scheduler { state }.complete(epoch, done_key, result);
+                        }
+                    }),
+                );
+            }
+        }
+
+        fn complete(&self, epoch: u64, key: K, result: Result<T, DecodeError>) {
+            let delivery = {
+                let mut state = self.state.borrow_mut();
+                state.running = state.running.saturating_sub(1);
+                let delivery = if epoch == state.epoch {
+                    self.settle(&mut state, key, result)
+                } else {
+                    None
+                };
+                self.pump(&mut state);
+                delivery
+            };
+            // Outside the borrow: a delivery may request more textures.
+            if let Some((value, waiters)) = delivery {
+                for waiter in waiters {
+                    if waiter.is_current() {
+                        (waiter.deliver)(&value);
+                    }
+                }
+            }
+        }
+
+        fn settle(
+            &self,
+            state: &mut State<K, T>,
+            key: K,
+            result: Result<T, DecodeError>,
+        ) -> Option<(T, Vec<Waiter<T>>)> {
+            match result {
+                Ok(value) => {
+                    (state.store)(&key, &value);
+                    let job = state.jobs.remove(&key)?;
+                    Some((value, job.waiters))
+                }
+                Err(DecodeError::Transient(_)) => {
+                    let job = state.jobs.get_mut(&key)?;
+                    if job.retries < MAX_TRANSIENT_RETRIES {
+                        job.retries += 1;
+                        job.state = JobState::AwaitingRetry;
+                        let weak = Rc::downgrade(&self.state);
+                        let epoch = state.epoch;
+                        state.executor.after(
+                            RETRY_DELAY,
+                            Box::new(move || {
+                                if let Some(state) = weak.upgrade() {
+                                    Scheduler { state }.retry(epoch, key);
+                                }
+                            }),
+                        );
+                    } else {
+                        state.jobs.remove(&key);
+                        let until = state.executor.now() + TRANSIENT_COOLDOWN;
+                        remember_failure(state, key, Failure::TransientUntil(until));
+                    }
+                    None
+                }
+                Err(DecodeError::Permanent(_)) => {
+                    state.jobs.remove(&key);
+                    remember_failure(state, key, Failure::Permanent);
+                    None
+                }
+            }
+        }
+
+        fn retry(&self, epoch: u64, key: K) {
+            let mut state = self.state.borrow_mut();
+            if epoch != state.epoch {
+                return;
+            }
+            let Some(job) = state.jobs.get_mut(&key) else {
+                return;
+            };
+            if job.state != JobState::AwaitingRetry {
+                return;
+            }
+            job.state = JobState::Queued;
+            state.queue.push(key);
+            self.pump(&mut state);
+        }
+    }
+
+    fn remember_failure<K: Eq + Hash, T>(state: &mut State<K, T>, key: K, failure: Failure) {
+        if state.failed.len() >= MAX_FAILED {
+            state.failed.clear();
+        }
+        state.failed.insert(key, failure);
+    }
+
+    /// Reads `path` once, checks the decode budget on those bytes and
+    /// decodes them. Runs on a worker thread.
+    pub(crate) fn decode_texture_file(path: &Path) -> Result<gdk::Texture, DecodeError> {
+        let bytes = read_capped(path, MAX_ASSET_BYTES)?;
+        if !crate::animated_image::bytes_within_decode_budget(&bytes, path) {
+            return Err(DecodeError::Permanent("over the decode budget".into()));
+        }
+        crate::debug::trace_image_decode(
+            "texture",
+            path,
+            crate::debug::ImageLoader::Texture,
+            || gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)),
+        )
+        .map_err(|error| classify_glib_error(&error))
+    }
+
+    fn read_capped(path: &Path, cap: usize) -> Result<Vec<u8>, DecodeError> {
+        let transient = |error: std::io::Error| DecodeError::Transient(error.to_string());
+        let file = std::fs::File::open(path).map_err(transient)?;
+        let limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+        let mut bytes = Vec::new();
+        file.take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(transient)?;
+        if bytes.len() > cap {
+            return Err(DecodeError::Permanent(format!("larger than {cap} bytes")));
+        }
+        Ok(bytes)
+    }
+
+    /// File errors may clear once the asset is downloaded again; loader
+    /// errors (`gdk-pixbuf-error`, `gdk-texture-error`) mean the bytes are bad.
+    pub(crate) fn classify_glib_error(error: &glib::Error) -> DecodeError {
+        if error.kind::<glib::FileError>().is_some() {
+            DecodeError::Transient(error.to_string())
+        } else {
+            DecodeError::Permanent(error.to_string())
+        }
+    }
+
+    /// Decodes on GIO's blocking pool and completes on the GTK thread.
+    struct GioExecutor;
+
+    impl DecodeExecutor<TextureKey, gdk::Texture> for GioExecutor {
+        fn spawn(&self, key: TextureKey, done: Done<gdk::Texture>) {
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || decode_texture_file(&key.path))
+                    .await
+                    .unwrap_or_else(|_| Err(DecodeError::Permanent("decode panicked".into())));
+                done(result);
+            });
+        }
+
+        fn after(&self, delay: Duration, fire: Timer) {
+            glib::timeout_add_local_once(delay, fire);
+        }
+
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+
+    type TextureScheduler = Scheduler<TextureKey, gdk::Texture>;
+
+    fn texture_scheduler(
+        executor: Rc<dyn DecodeExecutor<TextureKey, gdk::Texture>>,
+    ) -> TextureScheduler {
+        Scheduler::new(
+            executor,
+            |key: &TextureKey| TEXTURE_CACHE.with(|cache| cache.borrow_mut().get(&key.path)),
+            |key: &TextureKey, texture: &gdk::Texture| {
+                TEXTURE_CACHE.with(|cache| {
+                    cache.borrow_mut().insert(key.path.clone(), texture.clone());
+                });
+            },
+        )
+    }
+
+    thread_local! {
+        static SCHEDULER: RefCell<Option<TextureScheduler>> = const { RefCell::new(None) };
+    }
+
+    fn scheduler() -> TextureScheduler {
+        SCHEDULER.with(|slot| {
+            slot.borrow_mut()
+                .get_or_insert_with(|| texture_scheduler(Rc::new(GioExecutor)))
+                .clone()
+        })
+    }
+
+    fn full_size(path: &Path) -> TextureKey {
+        TextureKey {
+            path: path.to_path_buf(),
+            spec: TextureSpec::Full,
+        }
+    }
+
+    /// The full-size texture of `path`: [`Requested::Ready`] from the cache,
+    /// or decoded off the GTK thread and passed to `deliver` while `ticket`
+    /// stays current.
+    pub(crate) fn request_texture(
+        path: &Path,
+        ticket: &DecodeTicket,
+        deliver: impl FnOnce(&gdk::Texture) + 'static,
+    ) -> Requested<gdk::Texture> {
+        scheduler().request(full_size(path), ticket, deliver)
+    }
+
+    /// Whether decoding `path` is known to fail, so a row can skip the
+    /// placeholder.
+    pub(crate) fn texture_failed(path: &Path) -> bool {
+        scheduler().is_failed(&full_size(path))
+    }
+
+    pub(crate) fn reset_texture_decodes() {
+        SCHEDULER.with(|slot| {
+            if let Some(scheduler) = slot.borrow().as_ref() {
+                scheduler.reset();
+            }
+        });
+    }
+
+    /// Replaces this thread's scheduler with a fresh one on `executor`.
+    /// `run_gtk_test` runs every GTK test on one thread, so tests that
+    /// count decodes start from here.
+    #[cfg(test)]
+    pub(crate) fn install_texture_executor_for_tests(
+        executor: Rc<dyn DecodeExecutor<TextureKey, gdk::Texture>>,
+    ) {
+        SCHEDULER.with(|slot| *slot.borrow_mut() = Some(texture_scheduler(executor)));
+    }
+
+    /// Back to a fresh scheduler on the real worker pool.
+    #[cfg(test)]
+    pub(crate) fn reset_texture_decoder_for_tests() {
+        SCHEDULER.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    /// Records jobs and timers; the test completes them in any order.
+    #[cfg(test)]
+    pub(crate) struct ManualExecutor<K, T> {
+        jobs: RefCell<Vec<(K, Done<T>)>>,
+        timers: RefCell<Vec<(Duration, Timer)>>,
+        now: Cell<Instant>,
+    }
+
+    #[cfg(test)]
+    impl<K: Clone, T> ManualExecutor<K, T> {
+        pub(crate) fn new() -> Rc<Self> {
+            Rc::new(Self {
+                jobs: RefCell::new(Vec::new()),
+                timers: RefCell::new(Vec::new()),
+                now: Cell::new(Instant::now()),
+            })
+        }
+
+        /// Keys of the decodes running now, in dispatch order.
+        pub(crate) fn running(&self) -> Vec<K> {
+            self.jobs
+                .borrow()
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect()
+        }
+
+        /// Finishes the `index`th running decode with `result`.
+        pub(crate) fn complete(&self, index: usize, result: Result<T, DecodeError>) {
+            let (_, done) = self.jobs.borrow_mut().remove(index);
+            done(result);
+        }
+
+        pub(crate) fn advance(&self, by: Duration) {
+            self.now.set(self.now.get() + by);
+        }
+
+        /// Fires every pending timer, as the main loop would once due.
+        pub(crate) fn fire_timers(&self) {
+            let timers = std::mem::take(&mut *self.timers.borrow_mut());
+            for (_, fire) in timers {
+                fire();
+            }
+        }
+
+        pub(crate) fn timer_delays(&self) -> Vec<Duration> {
+            self.timers
+                .borrow()
+                .iter()
+                .map(|(delay, _)| *delay)
+                .collect()
+        }
+    }
+
+    #[cfg(test)]
+    impl<K, T> DecodeExecutor<K, T> for ManualExecutor<K, T> {
+        fn spawn(&self, key: K, done: Done<T>) {
+            self.jobs.borrow_mut().push((key, done));
+        }
+
+        fn after(&self, delay: Duration, fire: Timer) {
+            self.timers.borrow_mut().push((delay, fire));
+        }
+
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashSet;
+
+        type TestScheduler = Scheduler<&'static str, u32>;
+
+        struct Harness {
+            executor: Rc<ManualExecutor<&'static str, u32>>,
+            scheduler: TestScheduler,
+            cache: Rc<RefCell<HashMap<&'static str, u32>>>,
+            delivered: Rc<RefCell<Vec<(&'static str, u32)>>>,
+        }
+
+        impl Harness {
+            fn new() -> Self {
+                let executor = ManualExecutor::new();
+                let cache = Rc::new(RefCell::new(HashMap::new()));
+                let lookup = cache.clone();
+                let store = cache.clone();
+                let scheduler = Scheduler::new(
+                    executor.clone(),
+                    move |key: &&'static str| lookup.borrow().get(key).copied(),
+                    move |key: &&'static str, value: &u32| {
+                        store.borrow_mut().insert(*key, *value);
+                    },
+                );
+                Self {
+                    executor,
+                    scheduler,
+                    cache,
+                    delivered: Rc::default(),
+                }
+            }
+
+            fn request(&self, key: &'static str, ticket: &DecodeTicket) -> Requested<u32> {
+                let delivered = self.delivered.clone();
+                self.scheduler.request(key, ticket, move |value| {
+                    delivered.borrow_mut().push((key, *value));
+                })
+            }
+
+            fn complete(&self, key: &'static str, result: Result<u32, DecodeError>) {
+                let index = self
+                    .executor
+                    .running()
+                    .iter()
+                    .position(|running| *running == key)
+                    .expect("decode is running");
+                self.executor.complete(index, result);
+            }
+        }
+
+        fn pending(requested: Requested<u32>) -> bool {
+            matches!(requested, Requested::Pending)
+        }
+
+        fn transient() -> Result<u32, DecodeError> {
+            Err(DecodeError::Transient("missing".into()))
+        }
+
+        #[test]
+        fn repeat_requests_share_one_decode() {
+            let harness = Harness::new();
+            let tickets: Vec<DecodeTicket> = (0..40).map(|_| DecodeTicket::default()).collect();
+            for ticket in &tickets {
+                assert!(pending(harness.request("a", ticket)));
+            }
+            assert_eq!(harness.executor.running(), vec!["a"]);
+            harness.complete("a", Ok(7));
+            assert_eq!(harness.delivered.borrow().len(), 40);
+            assert!(matches!(
+                harness.request("a", &tickets[0]),
+                Requested::Ready(7)
+            ));
+            assert!(harness.executor.running().is_empty());
+        }
+
+        #[test]
+        fn at_most_three_decodes_run_and_the_newest_request_goes_first() {
+            let harness = Harness::new();
+            let ticket = DecodeTicket::default();
+            for key in ["a", "b", "c", "d", "e"] {
+                harness.request(key, &ticket);
+            }
+            assert_eq!(harness.executor.running(), vec!["a", "b", "c"]);
+            // Completions arrive out of order; each frees one slot.
+            harness.complete("b", Ok(2));
+            assert_eq!(harness.executor.running(), vec!["a", "c", "e"]);
+            harness.complete("e", Ok(5));
+            harness.complete("a", Ok(1));
+            assert_eq!(harness.executor.running(), vec!["c", "d"]);
+            harness.complete("d", Ok(4));
+            harness.complete("c", Ok(3));
+            let delivered: HashSet<_> = harness.delivered.borrow().iter().copied().collect();
+            assert_eq!(
+                delivered,
+                HashSet::from([("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5)])
+            );
+        }
+
+        #[test]
+        fn stale_and_dead_waiters_are_cached_but_not_applied() {
+            let harness = Harness::new();
+            let stale = DecodeTicket::default();
+            let dead = DecodeTicket::default();
+            let live = DecodeTicket::default();
+            harness.request("a", &stale);
+            harness.request("a", &dead);
+            harness.request("a", &live);
+            stale.invalidate();
+            drop(dead);
+            harness.complete("a", Ok(1));
+            assert_eq!(*harness.delivered.borrow(), vec![("a", 1)]);
+            assert_eq!(harness.cache.borrow().get("a"), Some(&1));
+
+            // A running decode nobody waits for any more is still cached.
+            let gone = DecodeTicket::default();
+            harness.request("b", &gone);
+            gone.invalidate();
+            harness.complete("b", Ok(2));
+            assert_eq!(harness.delivered.borrow().len(), 1);
+            assert_eq!(harness.cache.borrow().get("b"), Some(&2));
+        }
+
+        #[test]
+        fn queued_work_without_current_waiters_is_never_decoded() {
+            let harness = Harness::new();
+            let visible = DecodeTicket::default();
+            let scrolled_past = DecodeTicket::default();
+            for key in ["a", "b", "c"] {
+                harness.request(key, &visible);
+            }
+            harness.request("d", &scrolled_past);
+            scrolled_past.invalidate();
+            harness.complete("a", Ok(1));
+            assert_eq!(harness.executor.running(), vec!["b", "c"]);
+            // Requested again on map: queued afresh and decoded.
+            harness.request("d", &scrolled_past);
+            assert_eq!(harness.executor.running(), vec!["b", "c", "d"]);
+        }
+
+        #[test]
+        fn reset_drops_results_from_before_it() {
+            let harness = Harness::new();
+            let ticket = DecodeTicket::default();
+            harness.request("a", &ticket);
+            let gone = DecodeTicket::default();
+            harness.request("b", &gone);
+            drop(gone);
+            harness.scheduler.reset();
+            // The live waiter's decode starts over; the dead one's does not.
+            assert_eq!(harness.executor.running(), vec!["a", "b", "a"]);
+            harness.executor.complete(0, Ok(1));
+            harness.executor.complete(0, Ok(2));
+            assert!(harness.delivered.borrow().is_empty());
+            assert!(harness.cache.borrow().is_empty());
+            harness.complete("a", Ok(3));
+            assert_eq!(*harness.delivered.borrow(), vec![("a", 3)]);
+        }
+
+        #[test]
+        fn permanent_failures_are_never_decoded_again() {
+            let harness = Harness::new();
+            let ticket = DecodeTicket::default();
+            harness.request("a", &ticket);
+            harness.complete("a", Err(DecodeError::Permanent("corrupt".into())));
+            assert!(harness.executor.timer_delays().is_empty());
+            assert!(harness.scheduler.is_failed(&"a"));
+            assert!(matches!(harness.request("a", &ticket), Requested::Failed));
+            harness.executor.advance(TRANSIENT_COOLDOWN * 10);
+            assert!(matches!(harness.request("a", &ticket), Requested::Failed));
+            assert!(harness.executor.running().is_empty());
+        }
+
+        #[test]
+        fn transient_failures_retry_once_after_a_delay_then_cool_down() {
+            let harness = Harness::new();
+            let ticket = DecodeTicket::default();
+            harness.request("a", &ticket);
+            harness.complete("a", transient());
+            assert!(harness.executor.running().is_empty());
+            assert_eq!(harness.executor.timer_delays(), vec![RETRY_DELAY]);
+            // Requests meanwhile join the pending retry.
+            assert!(pending(harness.request("a", &ticket)));
+            assert!(harness.executor.running().is_empty());
+
+            harness.executor.fire_timers();
+            assert_eq!(harness.executor.running(), vec!["a"]);
+            harness.complete("a", transient());
+            assert!(harness.executor.timer_delays().is_empty(), "no retry storm");
+            assert!(matches!(harness.request("a", &ticket), Requested::Failed));
+
+            harness.executor.advance(TRANSIENT_COOLDOWN);
+            assert!(pending(harness.request("a", &ticket)));
+            harness.complete("a", Ok(1));
+            assert_eq!(*harness.delivered.borrow(), vec![("a", 1)]);
+        }
+
+        #[test]
+        fn glib_errors_split_into_transient_and_permanent() {
+            let missing = glib::Error::new(glib::FileError::Noent, "gone");
+            assert!(matches!(
+                classify_glib_error(&missing),
+                DecodeError::Transient(_)
+            ));
+            let corrupt = glib::Error::new(gdk_pixbuf::PixbufError::CorruptImage, "bad");
+            assert!(matches!(
+                classify_glib_error(&corrupt),
+                DecodeError::Permanent(_)
+            ));
+            let unsupported = glib::Error::new(gdk::TextureError::UnsupportedFormat, "?");
+            assert!(matches!(
+                classify_glib_error(&unsupported),
+                DecodeError::Permanent(_)
+            ));
+        }
+
+        fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
+            let path = std::env::temp_dir().join(format!("conduit-{}-{name}", std::process::id()));
+            std::fs::write(&path, bytes).expect("write temp image");
+            path
+        }
+
+        #[test]
+        fn oversized_header_is_rejected_from_the_bytes_without_decoding() {
+            // A 1x1 GIF whose header declares a 30000x30000 canvas.
+            let mut bomb = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;".to_vec();
+            bomb[6..10].copy_from_slice(&[0x30, 0x75, 0x30, 0x75]);
+            let path = temp_file("decode-bomb.gif", &bomb);
+            let before = crate::debug::IMAGE_DECODES.get();
+            let result = decode_texture_file(&path);
+            std::fs::remove_file(&path).ok();
+            assert!(matches!(result, Err(DecodeError::Permanent(_))));
+            assert_eq!(crate::debug::IMAGE_DECODES.get(), before, "never decoded");
+        }
+
+        #[test]
+        fn missing_files_are_transient_and_oversized_files_permanent() {
+            let missing = std::env::temp_dir().join("conduit-decode-missing.png");
+            assert!(matches!(
+                decode_texture_file(&missing),
+                Err(DecodeError::Transient(_))
+            ));
+            let path = temp_file("decode-large.bin", &[0u8; 64]);
+            let result = read_capped(&path, 63);
+            std::fs::remove_file(&path).ok();
+            assert!(matches!(result, Err(DecodeError::Permanent(_))));
+        }
+
+        #[test]
+        fn corrupt_images_fail_permanently() {
+            crate::timeline::tests::run_gtk_test(|| {
+                // A valid PNG header over garbage.
+                let mut corrupt = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x10".to_vec();
+                corrupt.extend_from_slice(&[0x5a; 64]);
+                let path = temp_file("decode-corrupt.png", &corrupt);
+                let result = decode_texture_file(&path);
+                std::fs::remove_file(&path).ok();
+                assert!(
+                    matches!(result, Err(DecodeError::Permanent(_))),
+                    "{result:?}"
+                );
+            });
+        }
     }
 }
