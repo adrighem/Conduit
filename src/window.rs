@@ -874,6 +874,22 @@ fn composer_attachment_preview_kind(path: &Path) -> ComposerAttachmentPreviewKin
     }
 }
 
+/// [`composer_attachment_preview_kind`], except that an image `within_budget`
+/// rejects (unreadable, or declaring too many pixels) previews as a plain
+/// file: gdk-pixbuf's glycin loaders abort the process on a large enough
+/// canvas.
+fn composer_attachment_preview(
+    path: &Path,
+    within_budget: impl FnOnce(&Path) -> bool,
+) -> ComposerAttachmentPreviewKind {
+    match composer_attachment_preview_kind(path) {
+        ComposerAttachmentPreviewKind::Image if !within_budget(path) => {
+            ComposerAttachmentPreviewKind::File
+        }
+        kind => kind,
+    }
+}
+
 const COMPOSER_BOLD_TAG: &str = "composer-bold";
 const COMPOSER_ITALIC_TAG: &str = "composer-italic";
 const COMPOSER_UNDERLINE_TAG: &str = "composer-underline";
@@ -5858,7 +5874,11 @@ impl ConduitWindow {
             row.set_margin_end(6);
             row.set_size_request(180, -1);
 
-            let preview: gtk::Widget = match composer_attachment_preview_kind(&attachment.path) {
+            let preview_kind = composer_attachment_preview(
+                &attachment.path,
+                crate::animated_image::within_decode_budget,
+            );
+            let preview: gtk::Widget = match preview_kind {
                 ComposerAttachmentPreviewKind::Image => {
                     let picture = gtk::Picture::for_file(&gio::File::for_path(&attachment.path));
                     picture.set_can_shrink(true);
