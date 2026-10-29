@@ -1181,8 +1181,7 @@ mod tests {
         use super::*;
         use crate::animated_image::tests::ANIMATED_GIF;
         use crate::timeline::tests::{
-            descendants, pump, pump_until, run_gtk_test, save_test_image, ManualDecodes,
-            TempTestDir,
+            descendants, run_gtk_test, save_test_image, wait_for, ManualDecodes, TempTestDir,
         };
 
         const QUERY: &str = "qqx";
@@ -1205,6 +1204,10 @@ mod tests {
                         Some((stack.widget_name().to_string(), container, stack))
                     })
                     .collect()
+            }
+
+            fn urls(&self) -> Vec<String> {
+                self.cells().into_iter().map(|(url, ..)| url).collect()
             }
 
             fn search(&self, query: &str) {
@@ -1262,7 +1265,12 @@ mod tests {
                 picker,
             };
             picker.search(QUERY);
-            pump_until(3000, || picker.cells().len() == 7);
+            wait_for(
+                5000,
+                "the picker to show its seven emoji",
+                || format!("{:?}", picker.urls()),
+                || picker.cells().len() == 7,
+            );
             picker
         }
 
@@ -1273,14 +1281,18 @@ mod tests {
                 let decodes = ManualDecodes::install();
                 let before = crate::debug::IMAGE_DECODES.get();
                 let picker = open_picker();
-                pump_until(2000, || {
-                    picker
-                        .cells()
-                        .iter()
-                        .all(|(_, container, _)| container.is_mapped())
-                        && decodes.0.running().len() == decode::MAX_IN_FLIGHT
-                });
-                pump(20);
+                wait_for(
+                    5000,
+                    "every cell mapped and three decodes running",
+                    || format!("{:?} running {:?}", picker.urls(), decodes.0.running()),
+                    || {
+                        picker
+                            .cells()
+                            .iter()
+                            .all(|(_, container, _)| container.is_mapped())
+                            && decodes.0.running().len() == decode::MAX_IN_FLIGHT
+                    },
+                );
                 assert_eq!(
                     crate::debug::IMAGE_DECODES.get() - before,
                     0,
@@ -1294,7 +1306,16 @@ mod tests {
                 }
 
                 let finished = decodes.finish_all();
-                pump(20);
+                wait_for(
+                    5000,
+                    "every cell to show its image",
+                    || format!("{:?}", picker.urls()),
+                    || {
+                        cells.iter().all(|(_, _, stack)| {
+                            stack.visible_child_name().as_deref() == Some("pic")
+                        })
+                    },
+                );
                 let unique: HashSet<_> = finished.iter().collect();
                 assert_eq!(finished.len(), 6, "one decode per file: {finished:?}");
                 assert_eq!(unique.len(), finished.len(), "no file decoded twice");
@@ -1363,7 +1384,12 @@ mod tests {
                 let window = gtk::Window::new();
                 window.set_child(Some(&slot.container));
                 window.present();
-                pump_until(2000, || slot.container.is_mapped());
+                wait_for(
+                    5000,
+                    "the cell to be mapped",
+                    || "unmapped".to_string(),
+                    || slot.container.is_mapped(),
+                );
                 // Bound to one emoji, then to another before the first
                 // one's decode has landed, as a scrolled grid does.
                 for (index, side) in [20, 24].into_iter().enumerate() {
@@ -1402,14 +1428,44 @@ mod tests {
                 let _ = adw::init();
                 let decodes = ManualDecodes::install();
                 let picker = open_picker();
-                pump_until(500, || !decodes.0.running().is_empty());
+                wait_for(
+                    5000,
+                    "every cell mapped and three decodes running",
+                    || format!("{:?} running {:?}", picker.urls(), decodes.0.running()),
+                    || {
+                        picker
+                            .cells()
+                            .iter()
+                            .all(|(_, container, _)| container.is_mapped())
+                            && decodes.0.running().len() == decode::MAX_IN_FLIGHT
+                    },
+                );
                 picker.picker.window.set_visible(false);
-                pump(50);
+                wait_for(
+                    5000,
+                    "every cell to be unmapped",
+                    || format!("{:?}", picker.urls()),
+                    || {
+                        picker
+                            .cells()
+                            .iter()
+                            .all(|(_, container, _)| !container.is_mapped())
+                    },
+                );
                 // Whatever was queued for cells that are no longer shown is
                 // skipped: finishing the running decodes starts nothing new.
-                let running = decodes.0.running().len();
+                let running = decodes.0.running();
                 let finished = decodes.finish_all();
-                assert_eq!(finished.len(), running, "no queued decode started");
+                assert_eq!(
+                    finished.len(),
+                    running.len(),
+                    "a queued decode started: running {running:?}, finished {finished:?}, cells {:?}",
+                    picker
+                        .cells()
+                        .iter()
+                        .map(|(url, container, _)| (url.clone(), container.is_mapped()))
+                        .collect::<Vec<_>>()
+                );
             });
         }
     }

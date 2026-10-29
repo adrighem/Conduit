@@ -3276,7 +3276,7 @@ mod graphical {
     use super::*;
     use crate::timeline::cache::decode;
     use crate::timeline::tests::{
-        pump, pump_until, run_gtk_test, save_test_image, ManualDecodes, TempTestDir,
+        run_gtk_test, save_test_image, wait_for, ManualDecodes, TempTestDir,
     };
 
     /// Runs `ViewerImage::load` with a recorder for its outcomes.
@@ -3307,7 +3307,6 @@ mod graphical {
             let window = viewer_window(&image);
             let before = crate::debug::IMAGE_DECODES.get();
             let outcomes = load_viewer_image(&image, &path);
-            pump(20);
             assert_eq!(
                 crate::debug::IMAGE_DECODES.get() - before,
                 0,
@@ -3322,8 +3321,12 @@ mod graphical {
             assert_eq!(image.natural_size(), (90, 60));
             // Shown at the size the zoom asks for.
             image.set_display_size((45, 30));
-            pump(50);
-            assert_eq!((image.picture.width(), image.picture.height()), (45, 30));
+            wait_for(
+                5000,
+                "the picture to lay out at the zoomed size",
+                || format!("{}x{}", image.picture.width(), image.picture.height()),
+                || (image.picture.width(), image.picture.height()) == (45, 30),
+            );
             // Decoded once, so showing it again needs no worker.
             let again = load_viewer_image(&image, &path);
             assert_eq!(*again.borrow(), vec![Ok(())]);
@@ -3423,8 +3426,12 @@ mod graphical {
             let window = gtk::Window::new();
             window.set_child(Some(&preview));
             window.present();
-            pump_until(500, || !decodes.0.running().is_empty());
-            pump(20);
+            wait_for(
+                5000,
+                "the mapped preview to ask for its decode",
+                || format!("running {:?}", decodes.0.running()),
+                || !decodes.0.running().is_empty(),
+            );
             assert_eq!(
                 crate::debug::IMAGE_DECODES.get() - before,
                 0,
@@ -3441,7 +3448,12 @@ mod graphical {
                 (72, 54)
             );
             decodes.finish_all();
-            pump(20);
+            wait_for(
+                5000,
+                "the decoded image to paint",
+                || format!("running {:?}", decodes.0.running()),
+                || shown.content().is_some(),
+            );
             let texture = shown.content().expect("decoded image paints in place");
             assert_eq!(texture.intrinsic_width(), 90);
             window.destroy();
