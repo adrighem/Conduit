@@ -157,16 +157,37 @@ impl DiscoveryGate {
 
 /// Mention-name lookups (`conversations.info`) in flight at once.
 pub(crate) const CHANNEL_LOOKUP_CONCURRENCY: usize = 3;
+/// A lookup that failed for a transient reason is retried once after this.
+pub(crate) const CHANNEL_LOOKUP_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChannelLookupOutcome {
+    Resolved,
+    /// Slack said the channel is unknown or off limits; never asked again.
+    Permanent,
+    /// Network, 5xx or rate limit: retried once, then given up for the session.
+    Transient,
+}
+
+/// What to do after a lookup finished.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChannelLookupFinish {
+    pub(crate) next: Option<String>,
+    /// Call `begin_retry` after this delay.
+    pub(crate) retry_after: Option<Duration>,
+}
 
 /// Resolves `<#C...>` mention names that neither the member channels nor the
 /// discovered ones know: each id is asked once, at most
-/// `CHANNEL_LOOKUP_CONCURRENCY` at a time, and ids that could not be resolved
-/// are not asked again this session.
+/// `CHANNEL_LOOKUP_CONCURRENCY` at a time. Permanent failures are remembered
+/// for the session; transient ones get a single delayed retry.
 #[derive(Debug, Default)]
 pub(crate) struct ChannelNameLookups {
     in_flight: HashSet<String>,
     queued: VecDeque<String>,
     unresolved: HashSet<String>,
+    retry_pending: HashSet<String>,
+    retried: HashSet<String>,
 }
 
 impl ChannelNameLookups {
@@ -175,6 +196,7 @@ impl ChannelNameLookups {
         for id in ids {
             if !self.in_flight.contains(&id)
                 && !self.unresolved.contains(&id)
+                && !self.retry_pending.contains(&id)
                 && !self.queued.contains(&id)
             {
                 self.queued.push_back(id);
@@ -183,13 +205,40 @@ impl ChannelNameLookups {
         std::iter::from_fn(|| self.next_to_send()).collect()
     }
 
-    /// Records a lookup result and returns the next id to send, if any.
-    pub(crate) fn finish(&mut self, id: &str, resolved: bool) -> Option<String> {
+    /// Records a lookup result.
+    pub(crate) fn finish(
+        &mut self,
+        id: &str,
+        outcome: ChannelLookupOutcome,
+    ) -> ChannelLookupFinish {
         self.in_flight.remove(id);
-        if !resolved {
-            self.unresolved.insert(id.to_string());
+        let mut retry_after = None;
+        match outcome {
+            ChannelLookupOutcome::Resolved => {}
+            ChannelLookupOutcome::Permanent => {
+                self.unresolved.insert(id.to_string());
+            }
+            ChannelLookupOutcome::Transient => {
+                if self.retried.insert(id.to_string()) {
+                    self.retry_pending.insert(id.to_string());
+                    retry_after = Some(CHANNEL_LOOKUP_RETRY_AFTER);
+                } else {
+                    self.unresolved.insert(id.to_string());
+                }
+            }
         }
-        self.next_to_send()
+        ChannelLookupFinish {
+            next: self.next_to_send(),
+            retry_after,
+        }
+    }
+
+    /// Queues the delayed retry and returns the ids that may be sent now.
+    pub(crate) fn begin_retry(&mut self, id: &str) -> Vec<String> {
+        if self.retry_pending.remove(id) {
+            self.queued.push_back(id.to_string());
+        }
+        std::iter::from_fn(|| self.next_to_send()).collect()
     }
 
     fn next_to_send(&mut self) -> Option<String> {
@@ -3745,25 +3794,54 @@ mod tests {
 
         // Each answer frees one slot, so the cap holds while the queue drains.
         let mut total = sent.len();
-        let mut next = lookups.finish("C0", true);
+        let mut next = lookups.finish("C0", ChannelLookupOutcome::Resolved).next;
         while let Some(id) = next {
             total += 1;
             assert!(lookups.in_flight.len() <= CHANNEL_LOOKUP_CONCURRENCY);
-            next = lookups.finish(&id, true);
+            next = lookups.finish(&id, ChannelLookupOutcome::Resolved).next;
         }
         assert_eq!(lookups.in_flight.len(), 2);
         assert_eq!(total, 10);
     }
 
     #[test]
-    fn unresolved_channel_names_are_not_asked_again_this_session() {
+    fn permanent_channel_name_failures_are_not_asked_again_this_session() {
         let mut lookups = ChannelNameLookups::default();
         assert_eq!(lookups.request(["C1".to_string()]), ["C1"]);
-        assert_eq!(lookups.finish("C1", false), None);
+        let finish = lookups.finish("C1", ChannelLookupOutcome::Permanent);
+        assert_eq!(finish, ChannelLookupFinish::default());
         assert!(lookups.request(["C1".to_string()]).is_empty());
 
         lookups.reset();
         assert_eq!(lookups.request(["C1".to_string()]), ["C1"]);
+    }
+
+    #[test]
+    fn resolved_channel_names_do_not_enter_the_negative_cache() {
+        let mut lookups = ChannelNameLookups::default();
+        assert_eq!(lookups.request(["C1".to_string()]), ["C1"]);
+        lookups.finish("C1", ChannelLookupOutcome::Resolved);
+        assert!(lookups.unresolved.is_empty());
+    }
+
+    #[test]
+    fn transient_channel_name_failures_retry_once_then_give_up() {
+        let mut lookups = ChannelNameLookups::default();
+        assert_eq!(lookups.request(["C1".to_string()]), ["C1"]);
+
+        // First failure: not negatively cached, retried after the backoff,
+        // and not re-requested while it waits.
+        let finish = lookups.finish("C1", ChannelLookupOutcome::Transient);
+        assert_eq!(finish.retry_after, Some(CHANNEL_LOOKUP_RETRY_AFTER));
+        assert!(lookups.unresolved.is_empty());
+        assert!(lookups.request(["C1".to_string()]).is_empty());
+        assert_eq!(lookups.begin_retry("C1"), ["C1"]);
+        assert!(lookups.begin_retry("C1").is_empty());
+
+        // Second failure: no more retries this session.
+        let finish = lookups.finish("C1", ChannelLookupOutcome::Transient);
+        assert_eq!(finish.retry_after, None);
+        assert!(lookups.request(["C1".to_string()]).is_empty());
     }
 
     #[test]

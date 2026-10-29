@@ -10032,7 +10032,8 @@ fn cached_conversation_user_ids_selects_known_direct_message_members() {
     );
 }
 
-/// Serves `users.list` and records every requested API method.
+/// Serves `users.list` and `usergroups.list` and records every requested API
+/// method.
 struct MethodCountingSlackServer {
     address: std::net::SocketAddr,
     methods: Arc<Mutex<Vec<String>>>,
@@ -10069,10 +10070,12 @@ fn spawn_method_counting_slack_server() -> MethodCountingSlackServer {
                 .unwrap_or_default()
                 .to_string();
             thread_methods.lock().unwrap().push(method.clone());
-            let body = if method == "users.list" {
-                r#"{"ok":true,"members":[{"id":"U0","name":"ada"},{"id":"U1","name":"bob"}]}"#
-            } else {
-                r#"{"ok":false,"error":"unexpected_method"}"#
+            let body = match method.as_str() {
+                "users.list" => {
+                    r#"{"ok":true,"members":[{"id":"U0","name":"ada"},{"id":"U1","name":"bob","is_bot":true}]}"#
+                }
+                "usergroups.list" => r#"{"ok":true,"usergroups":[{"id":"S1","handle":"eng"}]}"#,
+                _ => r#"{"ok":false,"error":"unexpected_method"}"#,
             };
             request
                 .respond(tiny_http::Response::from_string(body).with_header(
@@ -10360,6 +10363,110 @@ fn perf_guard_stored_discovery_inside_the_ttl_makes_no_conversations_list_calls(
         assert!(server.finish().is_empty());
         let _ = std::fs::remove_dir_all(directory);
     });
+}
+
+#[test]
+fn perf_guard_fully_warm_start_makes_no_discovery_calls() {
+    discovery_test_runtime().block_on(async {
+        let (store, directory) = discovery_test_store("discovery-warm");
+        let store_option = Some(store.clone());
+        let (sender, _receiver) = runtime_event_channel();
+        let events = RuntimeEventSender {
+            sender,
+            session: SessionId::default().next(),
+            request: None,
+            fallback: OperationContext::new(
+                RuntimeOperation::Conversations,
+                RuntimeTarget::Workspace,
+            ),
+            workspace_patch_send_gate: None,
+        };
+
+        // A first session pays for the listings once.
+        let server = spawn_method_counting_slack_server();
+        let mut slack = SlackApi::new(StoredToken {
+            access_token: "test-token".to_string(),
+            ..Default::default()
+        });
+        slack.api_base_url = format!("http://{}/api", server.address);
+        list_user_directory(
+            &events,
+            &slack,
+            &store_option,
+            &WorkspaceReducerAdapter::default(),
+            USER_DIRECTORY_REUSE,
+        )
+        .await
+        .unwrap();
+        list_user_groups(&slack, &store_option).await.unwrap();
+        store
+            .complete_discovery_sweep(vec![discovered_channel("C1")], unix_now_ms())
+            .await
+            .unwrap();
+        assert_eq!(
+            server.finish(),
+            vec!["users.list".to_string(), "usergroups.list".to_string()]
+        );
+
+        // The next session finds all three fresh, flags included.
+        let server = spawn_method_counting_slack_server();
+        slack.api_base_url = format!("http://{}/api", server.address);
+        let users = list_user_directory(
+            &events,
+            &slack,
+            &store_option,
+            &WorkspaceReducerAdapter::default(),
+            USER_DIRECTORY_REUSE,
+        )
+        .await
+        .unwrap();
+        let groups = list_user_groups(&slack, &store_option).await.unwrap();
+        let channels = discover_channels_with(&slack, &store_option, fast_paging(300))
+            .await
+            .unwrap();
+
+        assert!(server.finish().is_empty());
+        assert_eq!(users.len(), 2);
+        assert!(users
+            .iter()
+            .any(|user| user.id.as_deref() == Some("U1") && user.is_bot == Some(true)));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(channel_ids(&channels), ["C1"]);
+        let _ = std::fs::remove_dir_all(directory);
+    });
+}
+
+#[test]
+fn channel_info_errors_are_permanent_only_for_lasting_slack_answers() {
+    let api = |code: &str| SlackError::Api {
+        method: "conversations.info".to_string(),
+        code: code.to_string(),
+    };
+    for code in [
+        "channel_not_found",
+        "not_in_channel",
+        "missing_scope",
+        "access_denied",
+    ] {
+        assert!(channel_info_error_is_permanent(&api(code)), "{code}");
+    }
+    for code in [
+        "internal_error",
+        "service_unavailable",
+        "request_timeout",
+        "ratelimited",
+    ] {
+        assert!(!channel_info_error_is_permanent(&api(code)), "{code}");
+    }
+    assert!(!channel_info_error_is_permanent(&SlackError::RateLimited {
+        method: "conversations.info".to_string(),
+    }));
+    assert!(!channel_info_error_is_permanent(&SlackError::Other(
+        anyhow::anyhow!("connection reset")
+    )));
+    assert!(channel_info_error_is_permanent(
+        &SlackError::InvalidParameters
+    ));
 }
 
 #[test]

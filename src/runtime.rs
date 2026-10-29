@@ -77,6 +77,7 @@ const USER_DIRECTORY_REUSE: Duration = Duration::from_secs(10 * 60);
 /// A discovery sweep persists its resume point and results every this many
 /// pages, so quitting mid-sweep loses at most a few pages of work.
 const DISCOVERY_PROGRESS_EVERY_PAGES: usize = 10;
+const USER_GROUPS_OPERATION: &str = "user_groups";
 const USER_DIRECTORY_OPERATION: &str = "user_directory";
 const USER_DIRECTORY_TARGET: &str = "workspace";
 const CONVERSATION_MEMBER_PAGE_LIMIT: usize = 25;
@@ -808,6 +809,16 @@ fn authentication_failure(
     }
 }
 
+/// Outcome of an on-demand `conversations.info` for a mention name.
+#[derive(Debug)]
+pub enum ChannelInfoResult {
+    Found(Box<SlackConversation>),
+    /// Slack answered that the channel is unknown or off limits.
+    Unavailable,
+    /// The request failed for a reason that may pass (network, 5xx, 429).
+    Failed,
+}
+
 #[derive(Debug)]
 pub enum RuntimeEventKind {
     Status(String),
@@ -826,7 +837,7 @@ pub enum RuntimeEventKind {
     /// cannot be resolved (not found or no access).
     ChannelInfoLoaded {
         channel_id: String,
-        conversation: Option<Box<SlackConversation>>,
+        result: ChannelInfoResult,
     },
     ConversationPeopleDiscovered(Vec<SlackUser>),
     UserGroupsDiscovered(Vec<SlackUserGroup>),
@@ -5191,7 +5202,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .send_event(RuntimeEventKind::ConversationPeopleDiscovered(users));
             // Best-effort: tokens granted before `usergroups:read` was
             // requested get `missing_scope`, which must not block discovery.
-            match api.user_groups().await {
+            match list_user_groups(api, context.workspace_store).await {
                 Ok(groups) => context
                     .events
                     .send_event(RuntimeEventKind::UserGroupsDiscovered(groups)),
@@ -5207,21 +5218,25 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
         RuntimeCommand::LoadChannelInfo { channel_id } => {
             let api = require_slack(context.slack)?;
             // Best effort: a channel the user cannot see is a normal answer.
-            let conversation = match api.conversation_info(&channel_id).await {
-                Ok(conversation) => Some(conversation),
+            let result = match api.conversation_info(&channel_id).await {
+                Ok(conversation) => ChannelInfoResult::Found(Box::new(conversation)),
                 Err(error) => {
                     crate::debug::log(
                         "runtime",
                         &format!("ChannelInfoLoadFailed channel_id={channel_id} error={error:#}"),
                     );
-                    None
+                    if channel_info_error_is_permanent(&error) {
+                        ChannelInfoResult::Unavailable
+                    } else {
+                        ChannelInfoResult::Failed
+                    }
                 }
             };
-            if let (Some(conversation), Some(store)) =
-                (&conversation, context.workspace_store.as_ref())
+            if let (ChannelInfoResult::Found(conversation), Some(store)) =
+                (&result, context.workspace_store.as_ref())
             {
                 if let Err(error) = store
-                    .upsert_discovered_channels(vec![conversation.clone()])
+                    .upsert_discovered_channels(vec![(**conversation).clone()])
                     .await
                 {
                     crate::debug::log(
@@ -5232,10 +5247,7 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             }
             context
                 .events
-                .send_event(RuntimeEventKind::ChannelInfoLoaded {
-                    channel_id,
-                    conversation: conversation.map(Box::new),
-                });
+                .send_event(RuntimeEventKind::ChannelInfoLoaded { channel_id, result });
         }
         RuntimeCommand::JoinConversation { channel_id } => {
             let api = require_slack(context.slack)?;
@@ -8116,6 +8128,74 @@ fn unix_now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// The persisted `users.list` records, when they are under
+/// `USER_DIRECTORY_TTL_MS` old. Records from before they were persisted do not
+/// exist, so an empty set counts as missing.
+async fn persisted_user_directory(
+    store: &WorkspaceStore,
+) -> std::result::Result<Option<Vec<SlackUser>>, StoreError> {
+    let freshness = store
+        .load_sync_freshness(USER_DIRECTORY_OPERATION, USER_DIRECTORY_TARGET)
+        .await?;
+    let refreshed_at_ms = freshness.and_then(|freshness| freshness.refreshed_at_ms);
+    if !user_directory_is_fresh(refreshed_at_ms, unix_now_ms()) {
+        return Ok(None);
+    }
+    let users = store.load_discovered_users().await?;
+    Ok((!users.is_empty()).then_some(users))
+}
+
+/// User groups for `@` completion, persisted like the user directory and
+/// listed again only after `USER_DIRECTORY_TTL_MS`.
+async fn list_user_groups(
+    api: &SlackApi,
+    workspace_store: &Option<WorkspaceStore>,
+) -> Result<Vec<SlackUserGroup>> {
+    if let Some(store) = workspace_store.as_ref() {
+        let freshness = store
+            .load_sync_freshness(USER_GROUPS_OPERATION, USER_DIRECTORY_TARGET)
+            .await?;
+        let refreshed_at_ms = freshness.and_then(|freshness| freshness.refreshed_at_ms);
+        if user_directory_is_fresh(refreshed_at_ms, unix_now_ms()) {
+            return Ok(store.load_discovered_user_groups().await?);
+        }
+    }
+    let groups = api.user_groups().await?;
+    if let Some(store) = workspace_store.as_ref() {
+        store.replace_discovered_user_groups(&groups).await?;
+        store
+            .store_sync_freshness(
+                USER_GROUPS_OPERATION,
+                USER_DIRECTORY_TARGET,
+                SyncFreshness {
+                    refreshed_at_ms: Some(unix_now_ms()),
+                    retry_count: 0,
+                    retry_after_ms: None,
+                },
+            )
+            .await?;
+    }
+    Ok(groups)
+}
+
+/// Whether a failed `conversations.info` is a lasting answer from Slack (no
+/// such channel, no access, missing scope) rather than a transient failure.
+fn channel_info_error_is_permanent(error: &SlackError) -> bool {
+    match error {
+        SlackError::Api { code, .. } => !matches!(
+            code.as_str(),
+            "internal_error"
+                | "fatal_error"
+                | "service_unavailable"
+                | "request_timeout"
+                | "ratelimited"
+                | "rate_limited"
+        ),
+        SlackError::Validation { .. } | SlackError::InvalidParameters => true,
+        SlackError::RateLimited { .. } | SlackError::Other(_) => false,
+    }
+}
+
 /// Lists the workspace users, persists them and records the refresh time.
 /// Concurrent callers queue on the listing lock and reuse a listing younger
 /// than `reuse` rather than paging `users.list` again.
@@ -8133,6 +8213,21 @@ async fn list_user_directory(
     {
         return Ok(listing.users.clone());
     }
+    if let Some(store) = workspace_store.as_ref() {
+        match persisted_user_directory(store).await {
+            Ok(Some(users)) => {
+                *listing = Some(UserDirectoryListing {
+                    users: users.clone(),
+                    listed_at: std::time::Instant::now(),
+                });
+                return Ok(users);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::debug::log("store", &format!("UserDirectoryLoadFailed error={error:#}"))
+            }
+        }
+    }
     let base_revision = workspace.revision();
     let users = api.users().await?;
     workspace
@@ -8144,6 +8239,7 @@ async fn list_user_directory(
         )
         .await?;
     if let Some(store) = workspace_store.as_ref() {
+        store.replace_discovered_users(&users).await?;
         store
             .store_sync_freshness(
                 USER_DIRECTORY_OPERATION,

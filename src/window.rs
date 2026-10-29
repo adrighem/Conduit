@@ -71,10 +71,10 @@ use crate::models::{
 use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
 use crate::rendering;
 use crate::runtime::{
-    preview_workspace_cache_key, preview_workspace_scope, AppRuntime, OperationContext, RequestId,
-    RuntimeCommand, RuntimeCommandRejection, RuntimeEvent, RuntimeEventKind, RuntimeEventMeta,
-    RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity, RuntimeOperation, RuntimeTarget,
-    SessionId, UploadAttachment,
+    preview_workspace_cache_key, preview_workspace_scope, AppRuntime, ChannelInfoResult,
+    OperationContext, RequestId, RuntimeCommand, RuntimeCommandRejection, RuntimeEvent,
+    RuntimeEventKind, RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity,
+    RuntimeOperation, RuntimeTarget, SessionId, UploadAttachment,
 };
 use crate::shortcuts::WINDOW_SHORTCUTS;
 #[cfg(test)]
@@ -93,11 +93,12 @@ use crate::status_dialog::*;
 use crate::thread_pane::ThreadPane;
 use crate::workspace_pipeline::{TimelineTarget, WorkspaceRevision};
 use crate::workspace_state::{
-    ConversationOpenCoordinator, ConversationOpenIntent, ConversationOpenPosition,
-    ConversationOpenRenderAction, ConversationPatchRemoval, ConversationSelectionDecision,
-    MainMessageView, ThreadApplyOutcome, ThreadOpenOutcome, TimelineProjectionApplication,
-    TimelineProjectionOperation, WorkspaceLifecycle, WorkspaceLifecycleEvent,
-    WorkspaceScrollBehavior, WorkspaceSessionState, DISCOVERY_STARTUP_DELAY,
+    ChannelLookupOutcome, ConversationOpenCoordinator, ConversationOpenIntent,
+    ConversationOpenPosition, ConversationOpenRenderAction, ConversationPatchRemoval,
+    ConversationSelectionDecision, MainMessageView, ThreadApplyOutcome, ThreadOpenOutcome,
+    TimelineProjectionApplication, TimelineProjectionOperation, WorkspaceLifecycle,
+    WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState,
+    DISCOVERY_STARTUP_DELAY,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -7409,21 +7410,26 @@ impl ConduitWindow {
                 self.refresh_open_conversation_picker();
                 self.queue_ui_invalidations(UiInvalidations::MAIN | UiInvalidations::THREAD);
             }
-            RuntimeEventKind::ChannelInfoLoaded {
-                channel_id,
-                conversation,
-            } => {
-                let next = self
+            RuntimeEventKind::ChannelInfoLoaded { channel_id, result } => {
+                let outcome = match &result {
+                    ChannelInfoResult::Found(_) => ChannelLookupOutcome::Resolved,
+                    ChannelInfoResult::Unavailable => ChannelLookupOutcome::Permanent,
+                    ChannelInfoResult::Failed => ChannelLookupOutcome::Transient,
+                };
+                let finish = self
                     .imp()
                     .workspace
                     .user_directory
                     .channel_lookups
                     .borrow_mut()
-                    .finish(&channel_id, conversation.is_some());
-                if let Some(next) = next {
+                    .finish(&channel_id, outcome);
+                if let Some(next) = finish.next {
                     self.send_command(RuntimeCommand::LoadChannelInfo { channel_id: next });
                 }
-                if let Some(conversation) = conversation {
+                if let Some(delay) = finish.retry_after {
+                    self.schedule_channel_lookup_retry(channel_id, delay);
+                }
+                if let ChannelInfoResult::Found(conversation) = result {
                     upsert_discovered_channel(
                         Arc::make_mut(&mut self.imp().discovered_channels.borrow_mut()),
                         *conversation,
@@ -13725,6 +13731,25 @@ impl ConduitWindow {
         for channel_id in to_send {
             self.send_command(RuntimeCommand::LoadChannelInfo { channel_id });
         }
+    }
+
+    fn schedule_channel_lookup_retry(&self, channel_id: String, delay: Duration) {
+        let weak_window = self.downgrade();
+        glib::timeout_add_local_once(delay, move || {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let to_send = window
+                .imp()
+                .workspace
+                .user_directory
+                .channel_lookups
+                .borrow_mut()
+                .begin_retry(&channel_id);
+            for channel_id in to_send {
+                window.send_command(RuntimeCommand::LoadChannelInfo { channel_id });
+            }
+        });
     }
 
     fn request_conversation_user_names(&self) {
