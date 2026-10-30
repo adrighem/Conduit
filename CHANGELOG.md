@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.9.0](https://github.com/adrighem/Conduit/compare/v0.8.0...v0.9.0) (2026-10-30)
+
+
+### Features
+
+* **timeline:** mark message unread from overflow menu, hold auto-read until switch ([7451323](https://github.com/adrighem/Conduit/commit/7451323dd3fee77555fef4bcc30963d05a86b46b))
+
+
+### Bug Fixes
+
+* **composer:** check the decode budget before previewing attachments ([874ffc5](https://github.com/adrighem/Conduit/commit/874ffc5aced445765faf8bd821a0ecda2a01704f))
+* **emoji:** complete name prefixes before word matches ([04a050d](https://github.com/adrighem/Conduit/commit/04a050d4c5f8a3c42c6507d0af718244f0cc73c8))
+* **emoji:** resolve Slack names via emoji-datasource table ([f26a014](https://github.com/adrighem/Conduit/commit/f26a0145835bf474613c439ebdb02f0d20679752))
+* **markup:** keep bold, italic and code spans on one line ([22bfa3c](https://github.com/adrighem/Conduit/commit/22bfa3c4d886f2125e1c053be42e9da8d53763b0))
+* **members:** match off-thread avatars to rows by user id ([b13832a](https://github.com/adrighem/Conduit/commit/b13832ade9a3e027c11957899f33c994384fd733))
+* **reactions:** 20px quick bar emoji, size unicode glyphs like custom emoji ([3e68cd9](https://github.com/adrighem/Conduit/commit/3e68cd9e6ca549226cf69a74901ba12a85a14af8))
+* **threads:** clear thread unreads Slack's client.counts reports as read ([6e1ce48](https://github.com/adrighem/Conduit/commit/6e1ce48908e5e0091726bfc76776bf199a69f1ab))
+* **threads:** sync thread read state from Slack across clients ([4501d9f](https://github.com/adrighem/Conduit/commit/4501d9fa010a5a95e321c86d8bde0a5595668907))
+* **timeline:** align quick action bar with the hovered row's top edge ([1d9397c](https://github.com/adrighem/Conduit/commit/1d9397caab2033260c628193614071cc52c231be))
+* **timeline:** keep action double-dispatch guard across re-renders ([50208b9](https://github.com/adrighem/Conduit/commit/50208b9a8199d36b763f0a0260cd93ac2d581b7b))
+* **timeline:** keep code block height when highlighting swaps in ([7268f45](https://github.com/adrighem/Conduit/commit/7268f4585348ae45d0008da8d45c6476baac5cfb))
+* **timeline:** keep paging off until a bottom pin lands ([741062a](https://github.com/adrighem/Conduit/commit/741062aee57cec6f7c52ae4e898fb3b7f91d2a52))
+* **timeline:** read recent reactions on hover, not when rows bind ([76d6940](https://github.com/adrighem/Conduit/commit/76d6940599e867b505dd829da51e7e0f09f03f39))
+* **timeline:** rebind rows at local midnight ([6f468ae](https://github.com/adrighem/Conduit/commit/6f468aee6532c5d8123b59757b2789cca88bbd53))
+* **timeline:** rebuild only rows whose rendering changed, keep text selection ([3935e30](https://github.com/adrighem/Conduit/commit/3935e305bfa48024fd550ff7a78d2edfba8715e1))
+
+
+### Performance Improvements
+
+* **auth:** keep keyring calls off the runtime dispatch loop ([f28144b](https://github.com/adrighem/Conduit/commit/f28144be359efcf4eee97a39f4a090b9251fba38))
+* **composer:** filter mention suggestions incrementally from a cached index ([7704353](https://github.com/adrighem/Conduit/commit/7704353f7af26b0bc192987a9d643309a14e86d3))
+* **composer:** key the completion indexes on data stamps instead of invalidating ([73b0ee5](https://github.com/adrighem/Conduit/commit/73b0ee5edd007f661a0160eecf0137b943b81514))
+* **images:** add an off-thread texture decode scheduler ([b4474f4](https://github.com/adrighem/Conduit/commit/b4474f4c61259262108cc8b223c228cd0b8743ba))
+* **images:** bound the texture cache by bytes ([e3f1f9a](https://github.com/adrighem/Conduit/commit/e3f1f9a6563cd33967eeb348b9293f8a0472b503))
+* **images:** count GIF frames from headers to skip double decodes ([6d123bd](https://github.com/adrighem/Conduit/commit/6d123bdc253f5330a03d8551c35b31b22dc7754c))
+* **images:** decode emoji picker, file thumbnails and attachment previews off the GTK thread ([198deb8](https://github.com/adrighem/Conduit/commit/198deb88f22d6fa6c0ea09b9c452599a27396d62))
+* **images:** decode reaction emoji and avatars off the GTK thread ([2ef3bc3](https://github.com/adrighem/Conduit/commit/2ef3bc363213c7c47729e2b146c54caf17577f46))
+* **images:** load animations off the GTK thread ([77897b9](https://github.com/adrighem/Conduit/commit/77897b93abe20143bb5a6e595ea0516037936cfc))
+* **images:** probe image headers in-process before glycin ([4485ce9](https://github.com/adrighem/Conduit/commit/4485ce9ce3682a587be71554deb814492f872420))
+* instrument timeline binds, image decodes and API fan-out ([f8959ea](https://github.com/adrighem/Conduit/commit/f8959eae3c0effe4a512c4e78fd7fc465c0247ae))
+* log image decode format and backend ([4e13a15](https://github.com/adrighem/Conduit/commit/4e13a1585ed5e1c23cb2359dede867f76a1472c7))
+* **picker:** diff the people picker instead of rebuilding every row ([2760581](https://github.com/adrighem/Conduit/commit/27605818445438ed6304679e17fb83e34652b241))
+* **picker:** keep scroll and selection on refresh, gate people and completion ([3675129](https://github.com/adrighem/Conduit/commit/36751291b70d275381e65c0d4826f37a34b279d3))
+* **picker:** virtualize the conversation picker and skip hidden rebuilds ([1873e20](https://github.com/adrighem/Conduit/commit/1873e20506324861e23426ecf0c80551fa06e49c))
+* **reactions:** decode small PNG/JPEG reaction emoji in-process ([b9b6c1a](https://github.com/adrighem/Conduit/commit/b9b6c1a957ca0b6374c486c6a761f495d4c3d89f))
+* **sidebar:** coalesce full sidebar renders to one per frame ([774bcab](https://github.com/adrighem/Conduit/commit/774bcab6f99f5ed2e1ac5df3a8c76168b8283e44))
+* **startup:** cap history prefetch at 12 and run it 3 at a time ([4ddebd1](https://github.com/adrighem/Conduit/commit/4ddebd11b893b67621de64ac04162a483585d12a))
+* **startup:** fill user names from users.list instead of users.info ([44e740e](https://github.com/adrighem/Conduit/commit/44e740e835ccf400b113f86f3f43ae6c552f6b82))
+* **startup:** persist and resume channel discovery, resolve mentions on demand ([1e86dfd](https://github.com/adrighem/Conduit/commit/1e86dfd2c41f602799d7e6a3a96b742dacba1046))
+* **startup:** run conversation discovery lazily instead of on every login ([27afd71](https://github.com/adrighem/Conduit/commit/27afd71d567408fe913a5c971f33bed9150fe044))
+* **startup:** serve people and user groups from the store when fresh ([9f76ed3](https://github.com/adrighem/Conduit/commit/9f76ed32758f8b807d08c1058aa1154f92b3cb81))
+* **startup:** start paced discovery in the background after login ([f622a32](https://github.com/adrighem/Conduit/commit/f622a32222bc4d747cf735a0227b5227d2956fc7))
+* **timeline:** build author menu popovers on first open ([02ab1e8](https://github.com/adrighem/Conduit/commit/02ab1e8e2a3e3070a1e33312077ec6d2d7a93bd8))
+* **timeline:** decode timeline images and inline emoji off the GTK thread ([a2f6e1f](https://github.com/adrighem/Conduit/commit/a2f6e1f600db6efd66710916f311d8890e618dbd))
+* **timeline:** highlight code blocks once they are shown ([0d6f6fd](https://github.com/adrighem/Conduit/commit/0d6f6fda08babb3206d5e5db86102b43e8b95435))
+* **timeline:** rebind only rows that use an arrived image ([c9c8d5c](https://github.com/adrighem/Conduit/commit/c9c8d5c77ce14d7c22ab5727713e6f14f4ae7362))
+* **timeline:** stop rebinding every row on re-render ([1461f93](https://github.com/adrighem/Conduit/commit/1461f930b3d044615ddef7492ee2261d13d323ff))
+* **users:** patch timelines once per user directory change ([67134f8](https://github.com/adrighem/Conduit/commit/67134f844d76cae871affb61a60a25dc5e7df496))
+* **viewer:** decode full-size images off the GTK thread ([af10c92](https://github.com/adrighem/Conduit/commit/af10c92f1ad3301ab25f589da945b5602a47354f))
+
 ## [0.8.0](https://github.com/adrighem/Conduit/compare/v0.7.1...v0.8.0) (2026-10-24)
 
 Headline: the message timeline is now a native GTK4 subsystem, replacing the webview runtime ([35658bf](https://github.com/adrighem/Conduit/commit/35658bfbaa8270de933ee716695e55f285cfb843)).
