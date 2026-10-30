@@ -215,6 +215,19 @@ fn test_mrkdwn_to_pango_nested_formatting() {
 }
 
 #[test]
+fn test_mrkdwn_to_pango_does_not_span_newlines_or_bullet_lists() {
+    let context = MessageRenderContext::default();
+    let bullets = "* one\n* two";
+    assert_eq!(mrkdwn_to_pango(bullets, &context), "* one\n* two");
+
+    let tight_multiline = "*one\n*two";
+    assert_eq!(mrkdwn_to_pango(tight_multiline, &context), "*one\n*two");
+
+    let spaced_asterisks = "* one * two";
+    assert_eq!(mrkdwn_to_pango(spaced_asterisks, &context), "* one * two");
+}
+
+#[test]
 fn render_context_equality_tracks_shared_directories_and_per_render_fields() {
     let mut titles = HashMap::new();
     titles.insert("C1".to_string(), "#general".to_string());

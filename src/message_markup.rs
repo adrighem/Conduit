@@ -329,12 +329,14 @@ fn mrkdwn_to_pango_inline(text: &str, context: &MessageRenderContext) -> String 
             continue;
         }
         if rest.starts_with('`') {
-            if let Some(end) = rest[1..].find('`') {
-                output.push_str("<tt>");
-                output.push_str(&escape_pango(&rest[1..1 + end]));
-                output.push_str("</tt>");
-                rest = &rest[end + 2..];
-                continue;
+            if let Some(end) = rest[1..].split('\n').next().and_then(|line| line.find('`')) {
+                if !rest[1..1 + end].trim().is_empty() {
+                    output.push_str("<tt>");
+                    output.push_str(&escape_pango(&rest[1..1 + end]));
+                    output.push_str("</tt>");
+                    rest = &rest[end + 2..];
+                    continue;
+                }
             }
         }
 
@@ -544,9 +546,13 @@ fn render_wrapped_pango(
     }
 
     let marker_len = marker.len_utf8();
-    let end = text[marker_len..].find(marker)?;
-    let inner = &text[marker_len..marker_len + end];
-    if inner.trim().is_empty() {
+    let line = text[marker_len..].split('\n').next()?;
+    let end = line.find(marker)?;
+    let inner = &line[..end];
+    if inner.is_empty()
+        || inner.starts_with(char::is_whitespace)
+        || inner.ends_with(char::is_whitespace)
+    {
         return None;
     }
 
