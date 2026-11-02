@@ -227,8 +227,9 @@ release changes.
 - File and workspace-search views currently use bounded result sets.
 - The view labeled **Later** uses Slack's frozen legacy stars APIs. It does not
   synchronize with items added to or removed from Slack's current Later feature.
-- Priority projects Slack conversation stars. Slack's separate paid-plan VIP
-  preference is not available through the public API.
+- Priority projects Slack conversation stars. A group DM joins Priority when one
+  of its members has a starred 1:1 DM. Slack's separate paid-plan VIP preference
+  is not available through the public API.
 - Conduit renders edited and deleted message states but does not yet provide message
   editing or deletion controls.
 - Rich composer formatting, typing indicators, general live presence, sidebar

@@ -354,6 +354,7 @@ fn sidebar_row(id: &str, title: &str) -> SidebarRowModel {
         mention_count: 0,
         selected: false,
         starred: false,
+        starred_member: false,
         private: true,
         muted: false,
         external: false,

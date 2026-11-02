@@ -1674,7 +1674,7 @@ fn sidebar_row_has_stable_incremental_membership(row: &SidebarRowModel) -> bool 
         row.kind,
         ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage
     ) || row.selected
-        || row.starred
+        || row.in_priority()
 }
 
 fn toggle_sidebar_section_state(
@@ -10503,6 +10503,17 @@ impl ConduitWindow {
                 .huddle
                 .as_ref()
                 .map(|huddle| huddle.channel_id.clone());
+            // Group DM rows need the full starred-user set; skip the scan
+            // when no group DM changed.
+            let starred_user_ids = changed_channel_ids
+                .iter()
+                .filter_map(|channel_id| conversations.get(channel_id))
+                .any(|conversation| {
+                    sidebar::conversation_kind(conversation) == ConversationKind::GroupDirectMessage
+                })
+                .then(|| {
+                    sidebar::starred_user_ids(conversations.iter(), current_user_id.as_deref())
+                });
             let options = sidebar::SidebarBuildOptions {
                 selected_channel: selected_channel.as_deref(),
                 active_huddle_channel_id: active_huddle_channel_id.as_deref(),
@@ -10518,6 +10529,7 @@ impl ConduitWindow {
                 user_full_names: Some(&user_full_names),
                 user_statuses: Some(&user_statuses),
                 user_avatar_urls: Some(&user_avatar_urls),
+                starred_user_ids: starred_user_ids.as_ref(),
             };
             let mut rows = Vec::with_capacity(changed_channel_ids.len());
             for channel_id in changed_channel_ids {
@@ -10803,6 +10815,7 @@ impl ConduitWindow {
                     user_full_names: Some(&imp.workspace.user_directory.user_full_names.borrow()),
                     user_statuses: Some(&imp.workspace.user_directory.user_statuses.borrow()),
                     user_avatar_urls: Some(&imp.workspace.user_directory.user_avatar_urls.borrow()),
+                    starred_user_ids: None,
                 },
             );
             (model, conversations.len())

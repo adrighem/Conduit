@@ -1,6 +1,7 @@
 # Conduit Project Guidance
 
 - Conduit intentionally supports one connected Slack workspace. Treat single-workspace operation as a product boundary, not as a temporary limitation or a future multi-workspace roadmap gap.
+- Priority sidebar membership is a starred conversation, or a group DM with a member whose 1:1 DM is starred (`starred_member`). The derived flag is computed per render and never persisted or sent to Slack.
 - Run `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` before every push. Enforce via `.git/hooks/pre-push`.
 
 ## Testing

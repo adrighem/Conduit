@@ -76,6 +76,9 @@ pub struct SidebarRowModel {
     pub mention_count: u64,
     pub selected: bool,
     pub starred: bool,
+    /// Group DM with a member whose 1:1 DM is starred. Derived per render and
+    /// never persisted, so it never reaches Slack or the star toggle.
+    pub starred_member: bool,
     pub private: bool,
     pub muted: bool,
     pub external: bool,
@@ -111,6 +114,12 @@ pub struct ConversationPickerSections {
 }
 
 impl SidebarRowModel {
+    /// Listed in the Priority section: starred, or a group DM with a starred
+    /// member.
+    pub fn in_priority(&self) -> bool {
+        self.starred || self.starred_member
+    }
+
     pub fn mention_badge_label(&self) -> Option<String> {
         match self.mention_count {
             0 => None,
@@ -382,6 +391,7 @@ fn sidebar_row_can_update_in_place(previous: &SidebarRowModel, next: &SidebarRow
         && previous.kind == next.kind
         && previous.selected == next.selected
         && previous.starred == next.starred
+        && previous.starred_member == next.starred_member
         && previous.user_deleted == next.user_deleted
         && previous.search_aliases == next.search_aliases
         // Attention and drafts feed row order (see `compare_ranking`).
@@ -552,6 +562,9 @@ pub struct SidebarBuildOptions<'a> {
     pub user_full_names: Option<&'a HashMap<String, String>>,
     pub user_statuses: Option<&'a UserStatuses>,
     pub user_avatar_urls: Option<&'a HashMap<String, String>>,
+    /// Users whose 1:1 DM is starred (`starred_user_ids`). `build_sidebar_list`
+    /// computes it when absent; row patches must pass it for group DMs.
+    pub starred_user_ids: Option<&'a HashSet<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -565,6 +578,7 @@ struct SidebarRowOptions<'a> {
     user_full_names: Option<&'a HashMap<String, String>>,
     user_statuses: Option<&'a UserStatuses>,
     user_avatar_urls: Option<&'a HashMap<String, String>>,
+    starred_user_ids: Option<&'a HashSet<String>>,
 }
 
 impl SidebarRowModel {
@@ -619,6 +633,9 @@ impl SidebarRowModel {
             mention_count,
             selected: options.selected_channel == Some(conversation.id.as_str()),
             starred: conversation.is_starred(),
+            starred_member: options.starred_user_ids.is_some_and(|starred_user_ids| {
+                has_starred_member(conversation, starred_user_ids, options.current_user_id)
+            }),
             private: conversation.is_private.unwrap_or(false)
                 || conversation.is_group.unwrap_or(false)
                 || matches!(kind, ConversationKind::PrivateChannel),
@@ -682,8 +699,41 @@ pub(crate) fn sidebar_row_for_conversation(
             user_full_names: options.user_full_names,
             user_statuses: options.user_statuses,
             user_avatar_urls: options.user_avatar_urls,
+            starred_user_ids: options.starred_user_ids,
         },
     )
+}
+
+/// Users whose 1:1 DM is starred: the people a starred DM marks as priority.
+/// Archived DMs, deleted users and the current user's self-DM promote nobody.
+pub fn starred_user_ids<'a>(
+    conversations: impl IntoIterator<Item = &'a SlackConversation>,
+    current_user_id: Option<&str>,
+) -> HashSet<String> {
+    conversations
+        .into_iter()
+        .filter(|conversation| conversation_kind(conversation) == ConversationKind::DirectMessage)
+        .filter(|conversation| conversation.is_starred())
+        .filter(|conversation| {
+            !conversation.is_archived.unwrap_or(false) && !conversation.is_user_deleted()
+        })
+        .filter_map(|conversation| conversation.user.as_deref())
+        .filter(|user_id| Some(*user_id) != current_user_id)
+        .map(str::to_string)
+        .collect()
+}
+
+/// A group DM with at least one member from `starred_user_ids`.
+pub fn has_starred_member(
+    conversation: &SlackConversation,
+    starred_user_ids: &HashSet<String>,
+    current_user_id: Option<&str>,
+) -> bool {
+    !starred_user_ids.is_empty()
+        && conversation_kind(conversation) == ConversationKind::GroupDirectMessage
+        && conversation_user_ids(conversation, current_user_id)
+            .iter()
+            .any(|user_id| starred_user_ids.contains(user_id))
 }
 
 pub fn user_search_aliases(users: &[SlackUser]) -> UserSearchAliases {
@@ -748,10 +798,28 @@ where
     }
 
     let query = SearchQuery::parse(options.query);
+    let computed_starred_user_ids;
+    let starred_user_ids = match options.starred_user_ids {
+        Some(starred_user_ids) => starred_user_ids,
+        None => {
+            computed_starred_user_ids =
+                starred_user_ids(conversations.clone(), options.current_user_id);
+            &computed_starred_user_ids
+        }
+    };
+    let options = SidebarBuildOptions {
+        starred_user_ids: Some(starred_user_ids),
+        ..options
+    };
     let recent_history_direct_messages = if options.unread_only {
         HashSet::new()
     } else {
-        recent_history_direct_message_ids(conversations.clone(), options.selected_channel)
+        recent_history_direct_message_ids(
+            conversations.clone(),
+            options.selected_channel,
+            starred_user_ids,
+            options.current_user_id,
+        )
     };
     let mut rows = conversations
         .clone()
@@ -764,12 +832,14 @@ where
             if options.unread_only {
                 conversation_visible_in_unread_sidebar(conversation, options)
             } else {
-                conversation_visible_in_default_sidebar(
-                    conversation,
-                    options.selected_channel,
-                    recent_history_direct_messages.contains(&conversation.id),
-                    read_state_for(options, conversation),
-                )
+                // Starred-member group DMs stay listed like starred ones.
+                has_starred_member(conversation, starred_user_ids, options.current_user_id)
+                    || conversation_visible_in_default_sidebar(
+                        conversation,
+                        options.selected_channel,
+                        recent_history_direct_messages.contains(&conversation.id),
+                        read_state_for(options, conversation),
+                    )
             }
         })
         .map(|conversation| sidebar_row_for_conversation(conversation, user_names, options))
@@ -1130,6 +1200,7 @@ pub fn conversation_picker_sections_with_statuses(
                 mention_count: 0,
                 selected: false,
                 starred: false,
+                starred_member: false,
                 private: true,
                 muted: false,
                 external: false,
@@ -1226,7 +1297,7 @@ fn build_sidebar_sections_from_rows(
     let mut other = Vec::new();
 
     for row in rows {
-        if row.starred {
+        if row.in_priority() {
             match row.kind {
                 ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => {
                     priority_direct_messages.push(row.clone())
@@ -1358,6 +1429,8 @@ struct RecentHistoryDirectMessageCandidate {
 fn recent_history_direct_message_ids<'a>(
     conversations: impl IntoIterator<Item = &'a SlackConversation>,
     selected_channel: Option<&str>,
+    starred_user_ids: &HashSet<String>,
+    current_user_id: Option<&str>,
 ) -> HashSet<String> {
     let mut candidates = conversations
         .into_iter()
@@ -1370,6 +1443,7 @@ fn recent_history_direct_message_ids<'a>(
         })
         .filter(|conversation| selected_channel != Some(conversation.id.as_str()))
         .filter(|conversation| !conversation.is_starred())
+        .filter(|conversation| !has_starred_member(conversation, starred_user_ids, current_user_id))
         .filter(|conversation| !conversation.has_active_direct_message_hint())
         .filter(|conversation| !conversation.is_user_deleted() && !conversation.is_dormant())
         .filter_map(|conversation| {
@@ -1701,6 +1775,7 @@ mod tests {
             mention_count: 0,
             selected,
             starred: false,
+            starred_member: false,
             private: false,
             muted: false,
             external: false,
@@ -1950,6 +2025,139 @@ mod tests {
             .all(|section| section.kind != SidebarSectionKind::Priority));
     }
 
+    fn mpim_with_members(id: &str, name: &str, members: &[&str]) -> SlackConversation {
+        let mut conversation = mpim(id, name);
+        conversation
+            .extra
+            .insert("members".to_string(), serde_json::json!(members));
+        conversation
+    }
+
+    fn starred_dm(id: &str, user: &str) -> SlackConversation {
+        let mut conversation = dm(id, user);
+        conversation.set_starred(true);
+        conversation
+    }
+
+    fn priority_ids(model: SidebarListModel) -> Vec<String> {
+        list_sections(model)
+            .into_iter()
+            .find(|section| section.kind == SidebarSectionKind::Priority)
+            .map(|section| section.rows.into_iter().map(|row| row.id).collect())
+            .unwrap_or_default()
+    }
+
+    fn me() -> SidebarBuildOptions<'static> {
+        SidebarBuildOptions {
+            current_user_id: Some("UME"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn group_dm_with_starred_member_joins_priority_without_being_starred() {
+        let conversations = [
+            starred_dm("D1", "U1"),
+            mpim_with_members("G1", "mpdm-ada--bob--me-1", &["UME", "U1", "U2"]),
+            mpim_with_members("G2", "mpdm-bob--cy--me-1", &["UME", "U2", "U3"]),
+        ];
+
+        let model = build_sidebar_list(&conversations, &HashMap::new(), me());
+        let sections = list_sections(model);
+        let priority = section(&sections, SidebarSectionKind::Priority);
+        let g1 = priority.rows.iter().find(|row| row.id == "G1").unwrap();
+
+        assert_eq!(
+            priority
+                .rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["D1", "G1"]
+        );
+        assert!(g1.starred_member && !g1.starred);
+        assert!(!conversations[1].is_starred());
+    }
+
+    #[test]
+    fn starred_member_group_dm_stays_visible_when_dormant() {
+        let mut group = mpim_with_members("G1", "mpdm-ada--me-1", &["UME", "U1"]);
+        group
+            .extra
+            .insert("is_dormant".to_string(), serde_json::json!(true));
+        let conversations = [starred_dm("D1", "U1"), group];
+
+        assert_eq!(
+            priority_ids(build_sidebar_list(&conversations, &HashMap::new(), me())),
+            vec!["D1", "G1"]
+        );
+    }
+
+    #[test]
+    fn self_dm_archived_and_deleted_stars_promote_no_group_dm() {
+        let mut archived = starred_dm("D2", "U2");
+        archived.is_archived = Some(true);
+        let mut deleted = starred_dm("D3", "U3");
+        deleted
+            .extra
+            .insert("is_user_deleted".to_string(), serde_json::json!(true));
+        let conversations = [
+            starred_dm("D1", "UME"),
+            archived,
+            deleted,
+            mpim_with_members("G1", "mpdm-x-1", &["UME", "U2", "U3"]),
+        ];
+
+        assert!(starred_user_ids(&conversations, Some("UME")).is_empty());
+        let row = sidebar_row_for_conversation(&conversations[3], &HashMap::new(), me());
+        assert!(!row.in_priority());
+    }
+
+    #[test]
+    fn starred_member_group_dms_do_not_consume_recent_history_slots() {
+        let mut group = mpim_with_members("G1", "mpdm-ada--me-1", &["UME", "U1"]);
+        group
+            .extra
+            .insert("latest".to_string(), serde_json::json!("1.000001"));
+        let conversations = [starred_dm("D1", "U1"), group];
+        let starred = starred_user_ids(&conversations, Some("UME"));
+
+        assert!(
+            recent_history_direct_message_ids(&conversations, None, &starred, Some("UME"))
+                .is_empty()
+        );
+        assert!(recent_history_direct_message_ids(
+            &conversations,
+            None,
+            &HashSet::new(),
+            Some("UME")
+        )
+        .contains("G1"));
+    }
+
+    #[test]
+    fn unstarring_a_member_dm_blocks_an_in_place_group_dm_patch() {
+        let group = mpim_with_members("G1", "mpdm-ada--me-1", &["UME", "U1"]);
+        let mut member_dm = starred_dm("D1", "U1");
+        let model = build_sidebar_list([&member_dm, &group], &HashMap::new(), me());
+        let mut projection = SidebarProjection::default();
+        projection.reconcile(&model.keyed_items());
+
+        member_dm.set_starred(false);
+        let starred = starred_user_ids([&member_dm], Some("UME"));
+        let row = sidebar_row_for_conversation(
+            &group,
+            &HashMap::new(),
+            SidebarBuildOptions {
+                starred_user_ids: Some(&starred),
+                ..me()
+            },
+        );
+
+        assert!(!row.starred_member);
+        assert_eq!(projection.update_conversation_rows(&[row]), None);
+    }
+
     #[test]
     fn default_sidebar_visibility_keeps_recent_dms_and_hides_inactive_dms() {
         let active_channel = channel("C1", "general");
@@ -1978,7 +2186,7 @@ mod tests {
             unopened_group_dm.clone(),
         ];
         let recent_history_direct_messages =
-            recent_history_direct_message_ids(&conversations, None);
+            recent_history_direct_message_ids(&conversations, None, &HashSet::new(), None);
 
         assert!(conversation_visible_in_default_sidebar(
             &active_channel,
