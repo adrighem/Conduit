@@ -7,6 +7,7 @@ use gettextrs::gettext;
 use gtk::{gio, glib};
 
 use crate::models::SlackUser;
+use crate::search::{normalize_for_search, SearchQuery, PRIMARY_FIELD_WEIGHT};
 use crate::sidebar::{
     self, ConversationPickerAction, ConversationPickerItem, ConversationPickerSections,
 };
@@ -57,7 +58,8 @@ impl PickerRefreshGate {
     }
 }
 
-/// A person the people picker lists; the lowercased name is computed once.
+/// A person the people picker lists; the search-normalized name is computed
+/// once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeoplePickerPerson {
     pub user_id: String,
@@ -67,7 +69,7 @@ pub struct PeoplePickerPerson {
 
 impl PeoplePickerPerson {
     pub fn new(user_id: String, name: String) -> Self {
-        let searchable_name = name.to_lowercase();
+        let searchable_name = normalize_for_search(&name);
         Self {
             user_id,
             name,
@@ -91,9 +93,9 @@ impl PeoplePickerEntry {
     }
 }
 
-/// The entries the people picker shows for `people` and the lowercased,
-/// trimmed search `query`: the people whose name contains it, or a
-/// placeholder while there is nobody to list.
+/// The entries the people picker shows for `people` and the search `query`:
+/// the people whose name matches it (case and accent insensitive, like every
+/// other filter), or a placeholder while there is nobody to list.
 pub fn people_picker_list_entries(
     people: &[PeoplePickerPerson],
     discovery_complete: bool,
@@ -108,9 +110,14 @@ pub fn people_picker_list_entries(
             },
         ))];
     }
+    let query = SearchQuery::parse(query);
     people
         .iter()
-        .filter(|person| query.is_empty() || person.searchable_name.contains(query))
+        .filter(|person| {
+            query
+                .score_normalized([(person.searchable_name.as_str(), PRIMARY_FIELD_WEIGHT)])
+                .is_some()
+        })
         .cloned()
         .map(PeoplePickerEntry::Person)
         .collect()
@@ -997,6 +1004,8 @@ mod tests {
         assert_eq!(ids(""), ["U1", "U2", "U3"]);
         assert_eq!(ids("ada"), ["U1", "U3"]);
         assert_eq!(ids("zoë"), ["U3"]);
+        assert_eq!(ids("zoe"), ["U3"]);
+        assert_eq!(ids("ZOË"), ["U3"]);
         assert!(ids("nobody").is_empty());
         assert!(matches!(
             people_picker_list_entries(&[], false, "ada").as_slice(),

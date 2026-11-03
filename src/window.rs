@@ -8995,19 +8995,24 @@ impl ConduitWindow {
         self.close_thread_pane();
     }
 
-    /// Builds the profile dialog input from the workspace directory, if the
-    /// user is known.
-    fn profile_dialog_input(&self, user_id: &str) -> Option<crate::profile_dialog::ProfileInput> {
-        let imp = self.imp();
-        let user = imp.workspace.users.borrow().get(user_id).cloned()?;
-        let avatar_url = imp
-            .workspace
+    /// The avatar image URL of `user_id`: the directory's, else the profile's.
+    fn user_avatar_url(&self, user_id: &str) -> Option<String> {
+        let workspace = &self.imp().workspace;
+        workspace
             .user_directory
             .user_avatar_urls
             .borrow()
             .get(user_id)
             .cloned()
-            .or_else(|| user.avatar_url());
+            .or_else(|| workspace.users.borrow().get(user_id)?.avatar_url())
+    }
+
+    /// Builds the profile dialog input from the workspace directory, if the
+    /// user is known.
+    fn profile_dialog_input(&self, user_id: &str) -> Option<crate::profile_dialog::ProfileInput> {
+        let imp = self.imp();
+        let user = imp.workspace.users.borrow().get(user_id).cloned()?;
+        let avatar_url = self.user_avatar_url(user_id);
         let context = self.message_html_context(None);
         let avatar_path = avatar_url.and_then(|url| {
             crate::timeline_message_widget::resolve_cached_asset_path(&url, &context)
@@ -9069,7 +9074,8 @@ impl ConduitWindow {
         let emojis = imp.custom_emojis.borrow();
         let catalog = crate::emoji::EmojiCatalog::new(&emojis);
         let now = current_unix_seconds();
-        user_ids
+        let mut missing_avatars = Vec::new();
+        let rows = user_ids
             .iter()
             .map(|user_id| {
                 let user = users.get(user_id);
@@ -9093,13 +9099,17 @@ impl ConduitWindow {
                             .join(" ")
                     })
                     .unwrap_or_default();
-                let avatar_path = avatar_urls
+                let avatar_url = avatar_urls
                     .get(user_id)
                     .cloned()
-                    .or_else(|| user.and_then(SlackUser::avatar_url))
-                    .and_then(|url| {
-                        crate::timeline_message_widget::resolve_cached_asset_path(&url, &context)
-                    });
+                    .or_else(|| user.and_then(SlackUser::avatar_url));
+                let avatar_path = avatar_url.as_deref().and_then(|url| {
+                    crate::timeline_message_widget::resolve_cached_asset_path(url, &context)
+                });
+                if avatar_path.is_none() {
+                    missing_avatars
+                        .extend(avatar_url.as_deref().and_then(bounded_image_asset_request));
+                }
                 crate::channel_details::MemberRow {
                     user_id: user_id.clone(),
                     name,
@@ -9107,7 +9117,12 @@ impl ConduitWindow {
                     avatar_path,
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        drop((emojis, avatar_urls, user_names, users));
+        // The rows show initials until each image lands; `patch_image_asset`
+        // then swaps the picture into the open member list.
+        self.send_image_asset_requests(missing_avatars);
+        rows
     }
 
     fn channel_details_callbacks(&self) -> crate::channel_details_dialog::Callbacks {
@@ -9315,6 +9330,9 @@ impl ConduitWindow {
         self.send_command(RuntimeCommand::LoadUserProfile {
             user_id: user_id.to_string(),
         });
+        if let Some(url) = self.user_avatar_url(user_id) {
+            self.send_image_asset_requests(bounded_image_asset_request(&url).into_iter().collect());
+        }
     }
 
     /// Opens Slack message permalinks into a known conversation in Conduit,
@@ -10041,6 +10059,30 @@ impl ConduitWindow {
     /// Refreshes the surfaces that show image asset `key` (an avatar, custom
     /// emoji or preview). Timelines re-render the affected rows in place, so
     /// scroll position and focus are kept; assets nothing shows are ignored.
+    /// Shows the arrived avatar image `key` in the open profile dialog and
+    /// member list, which are not timeline rows and rebind on their own.
+    fn show_arrived_avatar(&self, key: &str, avatar_user_ids: &[String]) {
+        let profile_user = crate::profile_dialog::open_user_id();
+        if avatar_user_ids.is_empty() && profile_user.is_none() {
+            return;
+        }
+        let context = self.message_html_context(None);
+        let Some(path) = crate::timeline_message_widget::resolve_cached_asset_path(key, &context)
+        else {
+            return;
+        };
+        for user_id in avatar_user_ids {
+            crate::channel_details_dialog::set_member_avatar_path(user_id, &path);
+        }
+        if let Some(user_id) = profile_user {
+            if avatar_user_ids.contains(&user_id)
+                || self.user_avatar_url(&user_id).as_deref() == Some(key)
+            {
+                self.refresh_profile_dialog(&user_id);
+            }
+        }
+    }
+
     fn patch_image_asset(&self, key: &str) {
         self.sync_workspace_icon(key);
         let avatar_user_ids = self
@@ -10052,6 +10094,7 @@ impl ConduitWindow {
             .iter()
             .filter_map(|(user_id, url)| (url == key).then_some(user_id.clone()))
             .collect::<Vec<_>>();
+        self.show_arrived_avatar(key, &avatar_user_ids);
         let (main_uses_asset, timeline_rows, thread_rows, main_view) = {
             let custom_emojis = self.imp().custom_emojis.borrow();
             let main_uses = self.main_view_uses_image_asset(&custom_emojis, key)
@@ -11646,7 +11689,7 @@ impl ConduitWindow {
         let shown_for_search = shown.clone();
         let complete_for_search = discovery_complete.clone();
         search.connect_search_changed(move |search| {
-            let query = search.text().trim().to_lowercase();
+            let query = search.text().trim().to_string();
             model_for_search.show(
                 &query,
                 people_picker_list_entries(
@@ -11736,7 +11779,7 @@ impl ConduitWindow {
 
         // Only people added, removed or renamed since the last refresh touch
         // the list; checked people, the scroll position and the search stay.
-        let query = view.search.text().trim().to_lowercase();
+        let query = view.search.text().trim().to_string();
         view.model.show(
             &query,
             people_picker_list_entries(&people, discovery_complete, &query),

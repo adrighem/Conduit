@@ -140,6 +140,15 @@ pub(crate) fn append_members(channel_id: &str, user_ids: &[String], complete: bo
     }
 }
 
+/// Shows the arrived avatar image `path` for `user_id` in the open dialog's
+/// member list, if that member is listed.
+pub(crate) fn set_member_avatar_path(user_id: &str, path: &std::path::Path) {
+    let inner = CURRENT.with(|current| current.borrow().clone());
+    if let Some(inner) = inner {
+        inner.set_member_avatar_path(user_id, path);
+    }
+}
+
 /// Closes the dialog for `channel_id`, e.g. after leaving it.
 pub(crate) fn close(channel_id: &str) {
     if let Some(inner) = current_for(channel_id) {

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1778,16 +1779,77 @@ pub struct SlackProfileField {
 }
 
 impl SlackProfileField {
-    pub fn display_value(&self) -> Option<&str> {
-        self.alt
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                self.value
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-            })
+    /// The field text for display: `alt`, else `value`. A `value` Slack sent
+    /// as a `rich_text` block array is flattened to plain text, and one with
+    /// no text yields `None`.
+    pub fn display_value(&self) -> Option<Cow<'_, str>> {
+        let non_blank = |value: &&str| !value.trim().is_empty();
+        if let Some(alt) = self.alt.as_deref().filter(non_blank) {
+            return Some(Cow::Borrowed(alt));
+        }
+        let value = self.value.as_deref().filter(non_blank)?;
+        match rich_text_blocks_plain_text(value) {
+            Some(text) => Some(text)
+                .filter(|text| !text.trim().is_empty())
+                .map(Cow::Owned),
+            None => Some(Cow::Borrowed(value)),
+        }
     }
+}
+
+/// Plain text of a JSON array of `rich_text` blocks, or `None` when `value`
+/// is not one.
+fn rich_text_blocks_plain_text(value: &str) -> Option<String> {
+    if !value.trim_start().starts_with('[') {
+        return None;
+    }
+    let blocks = serde_json::from_str::<Vec<Value>>(value).ok()?;
+    if blocks.is_empty()
+        || !blocks
+            .iter()
+            .all(|block| block.get("type").and_then(Value::as_str) == Some("rich_text"))
+    {
+        return None;
+    }
+    let mut lines = Vec::new();
+    for block in &blocks {
+        collect_rich_text_lines(block, &mut lines);
+    }
+    Some(lines.join("\n"))
+}
+
+fn collect_rich_text_lines(node: &Value, lines: &mut Vec<String>) {
+    let Some(elements) = node.get("elements").and_then(Value::as_array) else {
+        return;
+    };
+    let is_container = elements
+        .iter()
+        .any(|element| element.get("elements").is_some());
+    if is_container {
+        for element in elements {
+            collect_rich_text_lines(element, lines);
+        }
+        return;
+    }
+    let line = elements
+        .iter()
+        .map(
+            |element| match element.get("type").and_then(Value::as_str) {
+                Some("emoji") => element
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(|name| format!(":{name}:"))
+                    .unwrap_or_default(),
+                _ => element
+                    .get("text")
+                    .or_else(|| element.get("url"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            },
+        )
+        .collect::<String>();
+    lines.push(line);
 }
 
 impl SlackUserProfile {
@@ -2090,6 +2152,33 @@ mod tests {
             "A request needs review\nPeople team\nReview request\nChoose an outcome\nOwner: People operations\nApprove"
         );
         assert!(message.is_notification_worthy());
+    }
+
+    #[test]
+    fn profile_field_flattens_rich_text_values() {
+        let field = |value: &str| SlackProfileField {
+            value: Some(value.to_string()),
+            ..Default::default()
+        };
+        let rich = r#"[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[{"type":"text","text":"UX Designer"}]}],"block_id":"8vceX"}]"#;
+        assert_eq!(field(rich).display_value().as_deref(), Some("UX Designer"));
+
+        let empty =
+            r#"[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[]}]}]"#;
+        assert_eq!(field(empty).display_value(), None);
+
+        assert_eq!(
+            field("[not json").display_value().as_deref(),
+            Some("[not json")
+        );
+        assert_eq!(field("plain").display_value().as_deref(), Some("plain"));
+
+        let with_alt = SlackProfileField {
+            value: Some(rich.to_string()),
+            alt: Some("Alt".to_string()),
+            label: None,
+        };
+        assert_eq!(with_alt.display_value().as_deref(), Some("Alt"));
     }
 
     #[test]

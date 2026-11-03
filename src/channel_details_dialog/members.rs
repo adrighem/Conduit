@@ -181,6 +181,32 @@ impl Inner {
         });
     }
 
+    /// Shows `path` as the avatar of `user_id` once its image has arrived: the
+    /// row is replaced in place so the list rebinds it.
+    pub(super) fn set_member_avatar_path(&self, user_id: &str, path: &std::path::Path) {
+        let Some(row) = self.members.rows.borrow_mut().get_mut(user_id).map(|row| {
+            row.avatar_path = Some(path.to_path_buf());
+            row.clone()
+        }) else {
+            return;
+        };
+        if let Some(visible) = self
+            .members
+            .visible
+            .borrow_mut()
+            .iter_mut()
+            .find(|member| member.user_id == user_id)
+        {
+            *visible = row;
+        }
+        let store = &self.members.store;
+        if let Some(position) = (0..store.n_items())
+            .find(|position| store.string(*position).as_deref() == Some(user_id))
+        {
+            store.splice(position, 1, &[user_id]);
+        }
+    }
+
     pub(super) fn refresh_members_title(&self) {
         let count = if self.members_complete.get() {
             Some(self.member_ids.borrow().len())

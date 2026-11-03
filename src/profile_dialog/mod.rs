@@ -40,6 +40,16 @@ fn current_for(user_id: &str) -> Option<ProfileDialog> {
     })
 }
 
+/// The user whose profile dialog is open, if any.
+pub(crate) fn open_user_id() -> Option<String> {
+    CURRENT.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .map(|dialog| dialog.user_id.clone())
+    })
+}
+
 /// Presents the profile dialog for `user_id`, replacing any open one. Shows
 /// `initial` right away when the user is already known, otherwise a spinner
 /// until [`update`] delivers the profile.

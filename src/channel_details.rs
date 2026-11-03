@@ -10,6 +10,9 @@ use serde_json::Value;
 
 use crate::emoji::{EmojiCatalog, EmojiValue};
 use crate::models::SlackConversation;
+use crate::search::{
+    SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
+};
 use crate::sidebar::ConversationKind;
 
 /// What the conversation title does when clicked.
@@ -244,18 +247,22 @@ pub(crate) struct MemberRow {
     pub(crate) avatar_path: Option<std::path::PathBuf>,
 }
 
-/// Case-insensitive match on name, status text or user ID.
-pub(crate) fn member_matches(row: &MemberRow, query: &str) -> bool {
-    let query = query.trim().to_lowercase();
-    query.is_empty()
-        || row.name.to_lowercase().contains(&query)
-        || row.status.to_lowercase().contains(&query)
-        || row.user_id.to_lowercase().contains(&query)
+/// Matches name, status text or user ID like every other filter: case and
+/// accent insensitive, each query word a prefix or part of a word.
+pub(crate) fn member_matches(row: &MemberRow, query: &SearchQuery) -> bool {
+    query
+        .score([
+            SearchField::new(&row.name, PRIMARY_FIELD_WEIGHT),
+            SearchField::new(&row.status, SECONDARY_FIELD_WEIGHT),
+            SearchField::new(&row.user_id, ID_FIELD_WEIGHT),
+        ])
+        .is_some()
 }
 
 pub(crate) fn filter_members<'a>(rows: &'a [MemberRow], query: &str) -> Vec<&'a MemberRow> {
+    let query = SearchQuery::parse(query);
     rows.iter()
-        .filter(|row| member_matches(row, query))
+        .filter(|row| member_matches(row, &query))
         .collect()
 }
 
@@ -372,6 +379,7 @@ mod tests {
         assert_eq!(filter_members(&rows, "vacation")[0].user_id, "U2");
         assert_eq!(filter_members(&rows, "u2")[0].name, "Grace Hopper");
         assert!(filter_members(&rows, "zzz").is_empty());
+        assert_eq!(filter_members(&rows, "grâce")[0].user_id, "U2");
     }
 
     #[test]

@@ -19,6 +19,7 @@ use gtk::{gio, glib};
 use sha2::{Digest, Sha256};
 
 use crate::emoji::{EmojiCatalog, EmojiEntry, EmojiValue};
+use crate::search::{SearchField, SearchQuery, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT};
 use crate::timeline::cache::decode::{self, DecodeTicket, Decoded, Requested, TextureSpec};
 
 const CATEGORY_ICONS: &[(&str, &str)] = &[
@@ -954,7 +955,7 @@ impl EmojiPickerWindow {
             let empty_label = empty_label.clone();
 
             move |query: &str, category: &str| {
-                let q = query.trim().to_lowercase();
+                let q = SearchQuery::parse(query);
                 let filter_category = if category == "All" {
                     None
                 } else {
@@ -968,12 +969,13 @@ impl EmojiPickerWindow {
                             continue;
                         }
                     }
-                    if !q.is_empty() {
-                        let name_match = entry.name.to_lowercase().contains(&q);
-                        let label_match = entry.label.to_lowercase().contains(&q);
-                        if !name_match && !label_match {
-                            continue;
-                        }
+                    if q.score([
+                        SearchField::new(&entry.name, PRIMARY_FIELD_WEIGHT),
+                        SearchField::new(&entry.label, SECONDARY_FIELD_WEIGHT),
+                    ])
+                    .is_none()
+                    {
+                        continue;
                     }
                     matching.push(glib::BoxedAnyObject::new(entry.clone()));
                 }

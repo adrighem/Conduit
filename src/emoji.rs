@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use crate::search::SearchQuery;
 use crate::search::{
-    CompletionEntry, CompletionIndex, CompletionMatches, MatchScore, SearchField,
-    PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
+    normalize_for_search, CompletionEntry, CompletionIndex, CompletionMatches, MatchScore,
+    SearchField, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
 };
 
 mod slack_names;
@@ -371,7 +371,7 @@ impl EmojiPickerModel {
     /// Entries matching `query`, names starting with it first (as Slack
     /// completes `:sm` to `smile`, not `flag-sm`), then by relevance band.
     fn ranked_entries(&self, query: &str) -> Vec<&EmojiEntry> {
-        let prefix = query.trim().to_lowercase();
+        let prefix = normalize_for_search(query.trim());
         let query = SearchQuery::parse(query);
         let mut matches = self
             .entries()
@@ -382,7 +382,7 @@ impl EmojiPickerModel {
                     SearchField::new(&entry.name, PRIMARY_FIELD_WEIGHT),
                     SearchField::new(&entry.label, SECONDARY_FIELD_WEIGHT),
                 ])?;
-                let name_prefix = entry.name.to_lowercase().starts_with(&prefix);
+                let name_prefix = normalize_for_search(&entry.name).starts_with(&prefix);
                 Some((emoji_rank(name_prefix, score), index, entry))
             })
             .collect::<Vec<_>>();
@@ -414,7 +414,7 @@ pub fn emoji_completion_index(entries: Vec<EmojiEntry>) -> EmojiCompletionIndex 
                         SearchField::new(&entry.name, PRIMARY_FIELD_WEIGHT),
                         SearchField::new(&entry.label, SECONDARY_FIELD_WEIGHT),
                     ],
-                    entry.name.to_lowercase(),
+                    normalize_for_search(&entry.name),
                     None,
                     position,
                 )
@@ -432,7 +432,7 @@ pub fn search_emoji_index(
     matches: &mut Option<CompletionMatches>,
     limit: usize,
 ) -> Vec<EmojiEntry> {
-    let prefix = query.trim().to_lowercase();
+    let prefix = normalize_for_search(query.trim());
     index.search(query, matches, limit, |entry, score| {
         emoji_rank(entry.name_key.starts_with(&prefix), score)
     })

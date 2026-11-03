@@ -177,7 +177,7 @@ pub(crate) fn profile_view_model(
         for (id, field) in fields {
             push(
                 field.label.clone().unwrap_or_else(|| id.clone()),
-                non_empty(field.display_value()),
+                non_empty(field.display_value().as_deref()),
                 RowKind::Text,
             );
         }
