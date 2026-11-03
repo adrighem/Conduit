@@ -100,7 +100,7 @@ Sections are rendered in this order:
 4. `Direct messages`
 5. `Other`
 
-`Priority` lists starred conversations, direct messages first, and also keeps them in their normal section. A group direct message joins `Priority` when any other member's one-to-one DM is starred, and it stays listed even when dormant. That membership is derived on every render and never written to the conversation's star, so it never reaches Slack or the star toggle. Archived DMs, deleted users and the self-DM promote no group DM.
+`Priority` lists starred conversations, direct messages first, and also keeps them in their normal section. A group direct message joins `Priority` when any other member's one-to-one DM is starred, and it is listed only while it is selected, unread or last active within 4 hours. That membership is derived on every render and never written to the conversation's star, so it never reaches Slack or the star toggle. Archived DMs, deleted users and the self-DM promote no group DM.
 
 One-to-one and group direct messages share the `Direct messages` section and are sorted together. Their distinct conversation kinds are retained for row icons, accessibility labels, and Slack-specific behavior.
 
@@ -132,7 +132,7 @@ Classification uses Slack conversation flags:
 
 Archived conversations are filtered out before section construction.
 
-Channels remain visible in the sidebar. Direct messages, including group direct messages, are shown when selected, unread, or marked active by Slack. Up to 20 additional read DMs are retained from Slack's latest-message and read-cursor activity hints. Deleted-user and dormant DMs are excluded from those active/history sets unless selected or unread. **Show All Conversations**, switchers, and pickers retain the complete non-archived loaded catalog.
+Channels remain visible in the sidebar. Group direct messages are shown only when selected, unread, explicitly starred, or when their latest message is under 4 hours old (`GROUP_DM_RECENT_WINDOW_SECONDS`); the window is evaluated on each render and spends no history slots. One-to-one direct messages are shown when selected, unread, or marked active by Slack. Up to 20 additional read DMs are retained from Slack's latest-message and read-cursor activity hints. Deleted-user and dormant DMs are excluded from those active/history sets unless selected or unread. **Show All Conversations**, switchers, and pickers retain the complete non-archived loaded catalog.
 
 ## Row Model
 

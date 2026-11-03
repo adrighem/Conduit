@@ -15,6 +15,10 @@ pub type UserStatuses = HashMap<String, SlackUserStatus>;
 // history projection while selected and explicitly active DMs stay uncapped.
 const RECENT_HISTORY_DIRECT_MESSAGE_LIMIT: usize = 20;
 
+// Group DMs are numerous, so unless selected, unread or explicitly starred
+// they only stay listed while their latest message is this recent.
+const GROUP_DM_RECENT_WINDOW_SECONDS: f64 = 4.0 * 60.0 * 60.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationKind {
     PublicChannel,
@@ -832,8 +836,9 @@ where
             if options.unread_only {
                 conversation_visible_in_unread_sidebar(conversation, options)
             } else {
-                // Starred-member group DMs stay listed like starred ones.
-                has_starred_member(conversation, starred_user_ids, options.current_user_id)
+                // Starred-member group DMs join Priority only while recent.
+                (has_starred_member(conversation, starred_user_ids, options.current_user_id)
+                    && group_direct_message_is_recent(conversation))
                     || conversation_visible_in_default_sidebar(
                         conversation,
                         options.selected_channel,
@@ -1394,7 +1399,13 @@ pub fn conversation_visible_in_default_sidebar(
     }
 
     match conversation_kind(conversation) {
-        ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => {
+        ConversationKind::GroupDirectMessage => {
+            if has_unread_activity(read_state) {
+                return !conversation.is_user_deleted();
+            }
+            !conversation.is_user_deleted() && group_direct_message_is_recent(conversation)
+        }
+        ConversationKind::DirectMessage => {
             if has_unread_activity(read_state) {
                 return !conversation.is_user_deleted();
             }
@@ -1435,12 +1446,7 @@ fn recent_history_direct_message_ids<'a>(
     let mut candidates = conversations
         .into_iter()
         .filter(|conversation| !conversation.is_archived.unwrap_or(false))
-        .filter(|conversation| {
-            matches!(
-                conversation_kind(conversation),
-                ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage
-            )
-        })
+        .filter(|conversation| conversation_kind(conversation) == ConversationKind::DirectMessage)
         .filter(|conversation| selected_channel != Some(conversation.id.as_str()))
         .filter(|conversation| !conversation.is_starred())
         .filter(|conversation| !has_starred_member(conversation, starred_user_ids, current_user_id))
@@ -1468,6 +1474,11 @@ fn recent_history_direct_message_ids<'a>(
         .take(RECENT_HISTORY_DIRECT_MESSAGE_LIMIT)
         .map(|candidate| candidate.id)
         .collect()
+}
+
+fn group_direct_message_is_recent(conversation: &SlackConversation) -> bool {
+    let activity = conversation_activity_score(conversation);
+    activity > 0.0 && current_unix_seconds() as f64 - activity <= GROUP_DM_RECENT_WINDOW_SECONDS
 }
 
 fn conversation_activity_score(conversation: &SlackConversation) -> f64 {
@@ -2033,6 +2044,14 @@ mod tests {
         conversation
     }
 
+    fn latest_ago(mut conversation: SlackConversation, seconds: i64) -> SlackConversation {
+        conversation.extra.insert(
+            "latest".to_string(),
+            serde_json::json!(format!("{}.000001", current_unix_seconds() - seconds)),
+        );
+        conversation
+    }
+
     fn starred_dm(id: &str, user: &str) -> SlackConversation {
         let mut conversation = dm(id, user);
         conversation.set_starred(true);
@@ -2058,8 +2077,14 @@ mod tests {
     fn group_dm_with_starred_member_joins_priority_without_being_starred() {
         let conversations = [
             starred_dm("D1", "U1"),
-            mpim_with_members("G1", "mpdm-ada--bob--me-1", &["UME", "U1", "U2"]),
-            mpim_with_members("G2", "mpdm-bob--cy--me-1", &["UME", "U2", "U3"]),
+            latest_ago(
+                mpim_with_members("G1", "mpdm-ada--bob--me-1", &["UME", "U1", "U2"]),
+                60,
+            ),
+            latest_ago(
+                mpim_with_members("G2", "mpdm-bob--cy--me-1", &["UME", "U2", "U3"]),
+                60,
+            ),
         ];
 
         let model = build_sidebar_list(&conversations, &HashMap::new(), me());
@@ -2080,17 +2105,53 @@ mod tests {
     }
 
     #[test]
-    fn starred_member_group_dm_stays_visible_when_dormant() {
-        let mut group = mpim_with_members("G1", "mpdm-ada--me-1", &["UME", "U1"]);
-        group
-            .extra
-            .insert("is_dormant".to_string(), serde_json::json!(true));
-        let conversations = [starred_dm("D1", "U1"), group];
+    fn starred_member_group_dm_lists_only_while_recent() {
+        let member = mpim_with_members("G1", "mpdm-ada--me-1", &["UME", "U1"]);
+        let recent = latest_ago(member.clone(), 3 * 60 * 60);
+        let stale = latest_ago(member, 5 * 60 * 60);
 
         assert_eq!(
-            priority_ids(build_sidebar_list(&conversations, &HashMap::new(), me())),
+            priority_ids(build_sidebar_list(
+                &[starred_dm("D1", "U1"), recent],
+                &HashMap::new(),
+                me()
+            )),
             vec!["D1", "G1"]
         );
+        assert_eq!(
+            priority_ids(build_sidebar_list(
+                &[starred_dm("D1", "U1"), stale],
+                &HashMap::new(),
+                me()
+            )),
+            vec!["D1"]
+        );
+    }
+
+    #[test]
+    fn stale_group_dm_lists_when_selected_or_explicitly_starred() {
+        let stale = latest_ago(mpim("M1", "triage"), 5 * 60 * 60);
+        let mut starred = stale.clone();
+        starred.set_starred(true);
+
+        assert!(conversation_visible_in_default_sidebar(
+            &stale,
+            Some("M1"),
+            false,
+            None
+        ));
+        assert!(conversation_visible_in_default_sidebar(
+            &starred, None, false, None
+        ));
+        assert!(!conversation_visible_in_default_sidebar(
+            &stale, None, false, None
+        ));
+        assert!(conversation_visible_in_default_sidebar(
+            &latest_ago(mpim("M1", "triage"), 60),
+            None,
+            false,
+            None
+        ));
     }
 
     #[test]
@@ -2115,10 +2176,10 @@ mod tests {
 
     #[test]
     fn starred_member_group_dms_do_not_consume_recent_history_slots() {
-        let mut group = mpim_with_members("G1", "mpdm-ada--me-1", &["UME", "U1"]);
-        group
-            .extra
-            .insert("latest".to_string(), serde_json::json!("1.000001"));
+        let group = latest_ago(
+            mpim_with_members("G1", "mpdm-ada--me-1", &["UME", "U1"]),
+            60,
+        );
         let conversations = [starred_dm("D1", "U1"), group];
         let starred = starred_user_ids(&conversations, Some("UME"));
 
@@ -2132,12 +2193,15 @@ mod tests {
             &HashSet::new(),
             Some("UME")
         )
-        .contains("G1"));
+        .is_empty());
     }
 
     #[test]
     fn unstarring_a_member_dm_blocks_an_in_place_group_dm_patch() {
-        let group = mpim_with_members("G1", "mpdm-ada--me-1", &["UME", "U1"]);
+        let group = latest_ago(
+            mpim_with_members("G1", "mpdm-ada--me-1", &["UME", "U1"]),
+            60,
+        );
         let mut member_dm = starred_dm("D1", "U1");
         let model = build_sidebar_list([&member_dm, &group], &HashMap::new(), me());
         let mut projection = SidebarProjection::default();
@@ -2169,10 +2233,7 @@ mod tests {
         priority_dm
             .extra
             .insert("priority".to_string(), serde_json::json!(0.42));
-        let mut recent_group_dm = mpim("M_RECENT", "recent");
-        recent_group_dm
-            .extra
-            .insert("latest".to_string(), serde_json::json!("1710000000.000001"));
+        let recent_group_dm = latest_ago(mpim("M_RECENT", "recent"), 60);
         let inactive_dm = dm("D_INACTIVE", "U_INACTIVE");
         let mut unopened_group_dm = mpim("M_UNOPENED", "unopened");
         unopened_group_dm
@@ -2441,6 +2502,7 @@ mod tests {
             "is_open": true,
             "members": ["U1", "U2"]
         }))
+        .map(|conversation| latest_ago(conversation, 60))
         .expect("failed to parse group DM");
         let names = HashMap::from([
             ("U1".to_string(), "Ada".to_string()),
@@ -3053,6 +3115,7 @@ mod tests {
             "is_open": true,
             "members": ["U1", "U2"]
         }))
+        .map(|conversation| latest_ago(conversation, 60))
         .expect("failed to parse group direct message");
         let channel = channel("C1", "fatness-robust");
         let user_names = HashMap::from([
@@ -3084,6 +3147,7 @@ mod tests {
             "is_open": true,
             "members": ["U_SELF", "U_RICHARD", "U_OTHER"]
         }))
+        .map(|conversation| latest_ago(conversation, 60))
         .expect("failed to parse group DM");
         let user_names = HashMap::from([
             ("U_SELF".to_string(), "Vincent".to_string()),
@@ -3197,6 +3261,7 @@ mod tests {
             "is_open": true,
             "members": ["U_SELF", "U_FAT", "U_ROB"]
         }))
+        .map(|conversation| latest_ago(conversation, 60))
         .expect("failed to parse full-match group DM");
         let partial_match: SlackConversation = serde_json::from_value(serde_json::json!({
             "id": "G_PARTIAL",
@@ -3204,6 +3269,7 @@ mod tests {
             "is_open": true,
             "members": ["U_SELF", "U_AARON", "U_BOTH"]
         }))
+        .map(|conversation| latest_ago(conversation, 60))
         .expect("failed to parse partial-match group DM");
         let user_names = HashMap::from([
             ("U_SELF".to_string(), "Vincent".to_string()),

@@ -380,6 +380,13 @@ fn incremental_sidebar_membership_falls_back_at_the_recent_dm_boundary() {
     assert!(sidebar_row_has_stable_incremental_membership(&direct));
 
     direct.starred = false;
+    direct.starred_member = true;
+    direct.kind = ConversationKind::GroupDirectMessage;
+    assert!(!sidebar_row_has_stable_incremental_membership(&direct));
+    direct.starred = true;
+    assert!(sidebar_row_has_stable_incremental_membership(&direct));
+
+    direct.starred = false;
     direct.kind = ConversationKind::PublicChannel;
     assert!(sidebar_row_has_stable_incremental_membership(&direct));
 }

@@ -1670,11 +1670,13 @@ fn sidebar_selected_position(items: &[KeyedSidebarItem]) -> u32 {
 }
 
 fn sidebar_row_has_stable_incremental_membership(row: &SidebarRowModel) -> bool {
-    !matches!(
-        row.kind,
-        ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage
-    ) || row.selected
-        || row.in_priority()
+    // Group DMs enter and leave the list as their latest message ages, so
+    // only a selected or starred one is stable.
+    match row.kind {
+        ConversationKind::GroupDirectMessage => row.selected || row.starred,
+        ConversationKind::DirectMessage => row.selected || row.in_priority(),
+        _ => true,
+    }
 }
 
 fn toggle_sidebar_section_state(
