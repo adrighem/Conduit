@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -69,6 +69,8 @@ pub struct NativeTimelineView {
     asset_update_rows: Rc<RefCell<HashSet<String>>>,
     read_mark_target: ReadMarkTarget,
     latest_message_ts: Rc<RefCell<Option<String>>>,
+    /// Raw text of loaded thread roots, for broadcast reply banners.
+    thread_root_texts: Rc<RefCell<HashMap<String, String>>>,
     read_candidate: Rc<RefCell<Option<String>>>,
     read_generation: Rc<Cell<u64>>,
     /// True while a dwell timer for `read_candidate` is in flight, so a
@@ -131,6 +133,8 @@ impl NativeTimelineView {
         // actually do or when they fire.
         let current_popover: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
         let opens_threads = Rc::new(Cell::new(true));
+        let thread_root_texts: Rc<RefCell<HashMap<String, String>>> =
+            Rc::new(RefCell::new(HashMap::new()));
 
         let quick_bar = Box::new(Orientation::Horizontal, 2);
         quick_bar.add_css_class("card");
@@ -203,6 +207,7 @@ impl NativeTimelineView {
         let context_clone = context.clone();
         let on_action_clone = on_action.clone();
         let opens_threads_for_bind = opens_threads.clone();
+        let thread_root_texts_for_bind = thread_root_texts.clone();
         let highlight_ts: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let highlight_ts_for_bind = highlight_ts.clone();
         let hovered_for_bind = hovered.clone();
@@ -380,7 +385,13 @@ impl NativeTimelineView {
                     })
                 };
                 let show_header = !msg_obj.hide_header();
-                let msg_widget = build_timeline_message_widget(
+                let root_preview = msg.thread_root_ts().and_then(|root_ts| {
+                    thread_root_texts_for_bind
+                        .borrow()
+                        .get(root_ts)
+                        .and_then(|text| thread_root_preview(text, ctx))
+                });
+                let msg_widget = build_timeline_message_widget_with_root(
                     &msg,
                     ctx,
                     Some(&cb_media),
@@ -389,6 +400,7 @@ impl NativeTimelineView {
                     Some(&cb_hover),
                     Some(&cb_author),
                     show_header,
+                    root_preview.as_deref(),
                 );
                 if highlight_ts_for_bind.borrow().as_deref() == Some(msg.ts.as_str()) {
                     msg_widget.add_css_class(FOCUS_TARGET_CLASS);
@@ -787,6 +799,7 @@ impl NativeTimelineView {
             asset_update_rows: Rc::default(),
             read_mark_target,
             latest_message_ts,
+            thread_root_texts,
             read_candidate,
             read_generation,
             dwell_pending,
@@ -1098,6 +1111,21 @@ impl NativeTimelineView {
             |previous| context.delta_from(previous),
         );
         let previous_highlight = self.highlight_ts.borrow().clone();
+        {
+            let roots: HashSet<&str> = messages
+                .iter()
+                .filter(|msg| is_thread_broadcast(msg))
+                .filter_map(SlackMessage::thread_root_ts)
+                .collect();
+            let mut texts = self.thread_root_texts.borrow_mut();
+            texts.clear();
+            texts.extend(
+                messages
+                    .iter()
+                    .filter(|msg| roots.contains(msg.ts.as_str()))
+                    .filter_map(|msg| msg.text.clone().map(|text| (msg.ts.clone(), text))),
+            );
+        }
         *self.latest_message_ts.borrow_mut() = messages.first().map(|msg| msg.ts.clone());
         self.reset_read_candidate();
         // Removing the focused row would hand focus to GTK's fallback, which

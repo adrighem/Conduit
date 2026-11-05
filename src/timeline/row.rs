@@ -496,9 +496,9 @@ pub fn build_thread_replies_widget(
 
     let thread_footer = Box::new(Orientation::Horizontal, 6);
     let count_str = if reply_count == 1 {
-        "1 reply".to_string()
+        "1 post".to_string()
     } else {
-        format!("{reply_count} replies")
+        format!("{reply_count} posts")
     };
     let label_text = if let Some(latest_ts) = &message.latest_reply {
         if let Some((_m, _full, short)) =
@@ -673,6 +673,49 @@ pub(crate) fn build_timeline_message_widget(
     on_author_action: Option<&ActionHandler>,
     show_header: bool,
 ) -> Box {
+    build_timeline_message_widget_with_root(
+        message,
+        context,
+        on_open_media,
+        on_open_thread,
+        on_toggle_reaction,
+        on_hover,
+        on_author_action,
+        show_header,
+        None,
+    )
+}
+
+/// Longest thread root excerpt shown in a broadcast reply's banner.
+const THREAD_ROOT_PREVIEW_CHARS: usize = 80;
+
+/// First line of a thread root's text as plain text, for the banner link.
+pub(crate) fn thread_root_preview(text: &str, context: &MessageRenderContext) -> Option<String> {
+    let plain = crate::channel_details::slack_text_to_plain(text, &context.custom_emojis, &|id| {
+        context.user_names.get(id).cloned()
+    });
+    let line = plain.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let mut preview: String = line.chars().take(THREAD_ROOT_PREVIEW_CHARS).collect();
+    if line.chars().count() > THREAD_ROOT_PREVIEW_CHARS {
+        preview.push('\u{2026}');
+    }
+    Some(preview)
+}
+
+/// `thread_root_preview` is the plain excerpt of the thread's first post when
+/// the caller has it; a broadcast reply links to its thread either way.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_timeline_message_widget_with_root(
+    message: &SlackMessage,
+    context: &MessageRenderContext,
+    on_open_media: Option<&OpenMediaCallback>,
+    on_open_thread: Option<&Rc<dyn Fn(String)>>,
+    on_toggle_reaction: Option<&ToggleReactionCallback>,
+    on_hover: Option<&Rc<dyn Fn(HoverEvent)>>,
+    on_author_action: Option<&ActionHandler>,
+    show_header: bool,
+    thread_root_preview: Option<&str>,
+) -> Box {
     register_timeline_css();
     if let Some(subtype) = message.subtype.as_deref() {
         if matches!(
@@ -713,13 +756,25 @@ pub(crate) fn build_timeline_message_widget(
     if message.is_thread_broadcast == Some(true)
         || message.subtype.as_deref() == Some("thread_broadcast")
     {
-        let broadcast_box = Box::new(Orientation::Horizontal, 4);
-        broadcast_box.add_css_class("thread-broadcast-banner");
-        let pill_label = Label::new(Some("also sent to channel"));
-        pill_label.add_css_class("dim-label");
-        pill_label.add_css_class("pill");
-        broadcast_box.append(&pill_label);
-        root_box.append(&broadcast_box);
+        if let (Some(open_thread), Some(root_ts)) = (on_open_thread, message.thread_root_ts()) {
+            let broadcast_box = Box::new(Orientation::Horizontal, 4);
+            broadcast_box.add_css_class("thread-broadcast-banner");
+            let prefix = Label::new(Some("Thread reply:"));
+            prefix.add_css_class("dim-label");
+            broadcast_box.append(&prefix);
+            let link = Button::with_label(thread_root_preview.unwrap_or("View thread"));
+            link.add_css_class("flat");
+            link.add_css_class("link");
+            link.set_focus_on_click(false);
+            if let Some(label) = link.child().and_downcast::<Label>() {
+                label.set_ellipsize(pango::EllipsizeMode::End);
+            }
+            let open_thread = open_thread.clone();
+            let root_ts = root_ts.to_string();
+            link.connect_clicked(move |_| open_thread(root_ts.clone()));
+            broadcast_box.append(&link);
+            root_box.append(&broadcast_box);
+        }
     }
 
     // Avatar column beside a body column holding header, content, reactions

@@ -878,6 +878,20 @@ fn store_splices_replace_only_changed_rows() {
     assert_eq!((splices[0].position, splices[0].removed), (0, 2));
 }
 
+#[test]
+fn thread_root_preview_is_a_plain_first_line_capped_in_length() {
+    let ctx = test_context();
+    assert_eq!(
+        thread_root_preview("\n  Hi <@U123>, &lt;ping&gt;\nsecond line", &ctx).as_deref(),
+        Some("Hi @Alice, <ping>")
+    );
+    assert_eq!(thread_root_preview(" \n ", &ctx), None);
+    let long = "x".repeat(200);
+    let preview = thread_root_preview(&long, &ctx).expect("preview");
+    assert_eq!(preview.chars().count(), 81);
+    assert!(preview.ends_with('\u{2026}'));
+}
+
 /// Tests that create GTK widgets. They run only when
 /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
 mod graphical {
@@ -1474,6 +1488,36 @@ mod graphical {
             let widget_bc =
                 build_timeline_message_widget(&msg_bc, &ctx, None, None, None, None, None, true);
             assert_eq!(widget_bc.orientation(), Orientation::Vertical);
+
+            // A broadcast reply links to its thread with the root's excerpt.
+            let opened = Rc::new(RefCell::new(None));
+            let open_thread: Rc<dyn Fn(String)> = {
+                let opened = opened.clone();
+                Rc::new(move |ts| *opened.borrow_mut() = Some(ts))
+            };
+            let msg_bc_reply = SlackMessage {
+                thread_ts: Some("1700000000.0000100".to_string()),
+                ..msg_bc.clone()
+            };
+            let widget_link = build_timeline_message_widget_with_root(
+                &msg_bc_reply,
+                &ctx,
+                None,
+                Some(&open_thread),
+                None,
+                None,
+                None,
+                true,
+                Some("Root post"),
+            );
+            let link = find_descendant(widget_link.upcast_ref::<Widget>(), &|w| {
+                w.downcast_ref::<Button>()
+                    .is_some_and(|button| button.label().as_deref() == Some("Root post"))
+            })
+            .and_downcast::<Button>()
+            .expect("thread root link");
+            link.emit_clicked();
+            assert_eq!(opened.borrow().as_deref(), Some("1700000000.0000100"));
 
             // 11. Native timeline view & update_image_asset
             let timeline_view = NativeTimelineView::new();
