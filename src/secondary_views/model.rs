@@ -92,6 +92,8 @@ pub(crate) struct SearchRow {
     pub(crate) location: Option<SearchMessageLocation>,
     pub(crate) channel_title: String,
     pub(crate) author: String,
+    /// Slack user id of the sender, for the avatar; `None` for bots and apps.
+    pub(crate) author_user_id: Option<String>,
     pub(crate) ts: Option<String>,
     pub(crate) plain_text: String,
     /// Pango markup: escaped text with query terms in bold.
@@ -129,8 +131,24 @@ pub(crate) struct SavedRow {
     pub(crate) message: SlackMessage,
 }
 
+/// A person or channel found by name in the local directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectoryRow {
+    pub(crate) title: String,
+    pub(crate) detail: String,
+    pub(crate) target: DirectoryTarget,
+    pub(crate) icon_name: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DirectoryTarget {
+    Person(String),
+    Conversation(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SecondaryRow {
+    Directory(DirectoryRow),
     Thread(ThreadRow),
     Search(SearchRow),
     File(FileRow),
@@ -190,13 +208,21 @@ impl SecondaryRow {
         match self {
             Self::Thread(row) => Some(&row.root),
             Self::Saved(row) => Some(&row.message),
-            Self::Search(_) | Self::File(_) => None,
+            Self::Directory(_) | Self::Search(_) | Self::File(_) => None,
         }
     }
 
     /// What activating the row (click, Enter) does.
     pub(crate) fn primary_action(&self) -> Option<SecondaryAction> {
         match self {
+            Self::Directory(row) => Some(SecondaryAction::Author(match &row.target {
+                DirectoryTarget::Person(user_id) => {
+                    crate::timeline_message_widget::TimelineAction::MessageUser(user_id.clone())
+                }
+                DirectoryTarget::Conversation(channel_id) => {
+                    crate::timeline_message_widget::TimelineAction::OpenChannel(channel_id.clone())
+                }
+            })),
             Self::Thread(row) => Some(SecondaryAction::OpenThread {
                 channel_id: row.channel_id.clone(),
                 thread_ts: row.root.ts.clone(),
@@ -256,6 +282,7 @@ impl SecondaryRow {
                 parts.extend(row.channel_title.clone());
                 parts.join(", ")
             }
+            Self::Directory(row) => format!("{}, {}", row.title, row.detail),
             Self::Saved(row) => gettext("Saved message in {channel} by {author}: {text}")
                 .replace("{channel}", &row.channel_title)
                 .replace("{author}", &message_author(&row.message, context))
@@ -544,6 +571,7 @@ pub(super) mod tests {
             location: None,
             channel_title: "Slack".to_string(),
             author: "Bob".to_string(),
+            author_user_id: None,
             ts: None,
             plain_text: String::new(),
             snippet_markup: String::new(),

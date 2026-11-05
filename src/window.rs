@@ -312,6 +312,14 @@ mod imp {
         #[template_child]
         pub message_search_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
+        pub search_type_dropdown: TemplateChild<gtk::DropDown>,
+        #[template_child]
+        pub search_from_dropdown: TemplateChild<gtk::DropDown>,
+        #[template_child]
+        pub search_in_dropdown: TemplateChild<gtk::DropDown>,
+        #[template_child]
+        pub search_date_dropdown: TemplateChild<gtk::DropDown>,
+        #[template_child]
         pub huddle_revealer: TemplateChild<gtk::Revealer>,
         #[template_child]
         pub huddle_title_label: TemplateChild<gtk::Label>,
@@ -464,6 +472,12 @@ mod imp {
         pub(super) secondary_view: RefCell<Option<crate::secondary_views::SecondaryView>>,
         /// Query of the search currently shown, for result highlighting.
         pub(super) search_query: RefCell<String>,
+        /// User ids behind the "From" dropdown rows after "From anyone".
+        pub(super) search_from_options: RefCell<Vec<String>>,
+        /// `in:` modifiers behind the "In" dropdown rows after "In any conversation".
+        pub(super) search_in_options: RefCell<Vec<String>>,
+        /// Set while the dropdown models are rebuilt, so that does not search.
+        pub(super) updating_search_filters: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -4730,6 +4744,42 @@ impl ConduitWindow {
                 }
             });
 
+        for dropdown in [
+            &imp.search_type_dropdown,
+            &imp.search_from_dropdown,
+            &imp.search_in_dropdown,
+            &imp.search_date_dropdown,
+        ] {
+            let weak_window = self.downgrade();
+            dropdown.connect_selected_notify(move |_| {
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                let imp = window.imp();
+                if imp.updating_search_filters.get() {
+                    return;
+                }
+                // Message filters mean nothing for a local name search.
+                let local = crate::secondary_views::SearchScope::from_index(
+                    imp.search_type_dropdown.selected(),
+                )
+                .is_local();
+                for dropdown in [
+                    &imp.search_from_dropdown,
+                    &imp.search_in_dropdown,
+                    &imp.search_date_dropdown,
+                ] {
+                    dropdown.set_sensitive(!local);
+                }
+                let searching = local
+                    || !imp.message_search_entry.text().trim().is_empty()
+                    || !window.current_search_filters().is_empty();
+                if searching {
+                    window.search_messages();
+                }
+            });
+        }
+
         imp.message_search_bar
             .connect_entry(&imp.message_search_entry.get());
         let weak_window = self.downgrade();
@@ -7902,6 +7952,12 @@ impl ConduitWindow {
                     self.recover_missing_message_context(&location);
                 }
             }
+            // A reply that lands after switching to a local name search.
+            RuntimeEventKind::SearchLoaded(_)
+                if crate::secondary_views::SearchScope::from_index(
+                    self.imp().search_type_dropdown.selected(),
+                )
+                .is_local() => {}
             RuntimeEventKind::SearchLoaded(results) => {
                 let visible = self
                     .imp()
@@ -8668,7 +8724,15 @@ impl ConduitWindow {
 
     fn search_messages(&self) {
         let query = self.imp().message_search_entry.text().trim().to_string();
-        if query.is_empty() {
+        let filters = self.current_search_filters();
+        let scope = crate::secondary_views::SearchScope::from_index(
+            self.imp().search_type_dropdown.selected(),
+        );
+        if scope.is_local() {
+            self.search_directory(scope, query);
+            return;
+        }
+        if query.is_empty() && filters.is_empty() {
             self.set_status("Enter a message search query");
             return;
         }
@@ -8685,8 +8749,11 @@ impl ConduitWindow {
             crate::secondary_views::SecondaryKind::Search,
             &gettext("Searching"),
         );
-        self.imp().search_query.replace(query.clone());
-        self.send_command(RuntimeCommand::SearchMessages { query });
+        // Highlighting follows what was typed; the filters ride along as
+        // query modifiers, which highlighting skips.
+        let api_query = filters.api_query(&query);
+        self.imp().search_query.replace(query);
+        self.send_command(RuntimeCommand::SearchMessages { query: api_query });
         self.imp().workspace_split.set_show_content(true);
     }
 
@@ -8698,8 +8765,168 @@ impl ConduitWindow {
         entry.select_region(0, -1);
     }
 
+    /// Lists people or channels by name from the local directory in the
+    /// Search view; nothing is sent to Slack.
+    fn search_directory(&self, scope: crate::secondary_views::SearchScope, query: String) {
+        use crate::secondary_views::{channel_rows, people_rows, SearchScope, SecondaryRow};
+        if !self.flush_current_drafts() {
+            return;
+        }
+        self.record_navigation(&MainNavigationTarget::Search);
+        {
+            let mut view = self.imp().workspace.view.borrow_mut();
+            view.start_search();
+            view.apply_search_results(Vec::new());
+        }
+        self.render_closed_thread();
+        self.queue_sidebar_render_after_view_change();
+        self.imp()
+            .message_title
+            .set_title(&gettext("Search results"));
+        let context = self.message_html_context(None);
+        let directory = &self.imp().workspace.user_directory;
+        let rows = match scope {
+            SearchScope::People => people_rows(
+                &directory.user_names.borrow(),
+                &directory.user_full_names.borrow(),
+                &directory.user_search_aliases.borrow(),
+                &query,
+            ),
+            _ => channel_rows(
+                self.imp()
+                    .workspace
+                    .conversations
+                    .borrow()
+                    .iter()
+                    .map(|conversation| {
+                        (
+                            conversation.id.clone(),
+                            self.conversation_title(&conversation.id),
+                            sidebar::conversation_kind(conversation),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                &query,
+            ),
+        };
+        self.imp().search_query.replace(query);
+        self.show_secondary_rows(
+            crate::secondary_views::SecondaryKind::Search,
+            rows.into_iter().map(SecondaryRow::Directory).collect(),
+            &context,
+        );
+        self.imp().workspace_split.set_show_content(true);
+    }
+
+    fn current_search_filters(&self) -> crate::secondary_views::SearchFilters {
+        let imp = self.imp();
+        // Row 0 of "From" and "In" is the "any" entry; the rest map to ids.
+        let option = |dropdown: &gtk::DropDown, options: &RefCell<Vec<String>>| {
+            let index = usize::try_from(dropdown.selected()).ok()?.checked_sub(1)?;
+            options.borrow().get(index).cloned()
+        };
+        let after = (imp.search_date_dropdown.selected() == 1)
+            .then(|| {
+                glib::DateTime::now_local()
+                    .ok()?
+                    .add_days(-7)
+                    .ok()?
+                    .format("%Y-%m-%d")
+                    .ok()
+                    .map(|day| day.to_string())
+            })
+            .flatten();
+        crate::secondary_views::SearchFilters {
+            direct_messages_only: crate::secondary_views::SearchScope::from_index(
+                imp.search_type_dropdown.selected(),
+            ) == crate::secondary_views::SearchScope::DirectMessages,
+            from_user: option(&imp.search_from_dropdown, &imp.search_from_options),
+            conversation_modifier: option(&imp.search_in_dropdown, &imp.search_in_options),
+            after,
+        }
+    }
+
+    /// Fills the "From" and "In" dropdowns from the cached directory and
+    /// conversation list, keeping each current pick when it is still listed.
+    fn refresh_search_filter_options(&self) {
+        let imp = self.imp();
+        imp.updating_search_filters.set(true);
+        let mut people: Vec<(String, String)> = imp
+            .workspace
+            .user_directory
+            .user_names
+            .borrow()
+            .iter()
+            .map(|(id, name)| (name.clone(), id.clone()))
+            .collect();
+        people.sort_by_cached_key(|(name, id)| {
+            (crate::search::normalize_for_search(name), id.clone())
+        });
+        let mut conversations: Vec<(String, String)> = imp
+            .workspace
+            .conversations
+            .borrow()
+            .iter()
+            .filter_map(|conversation| {
+                let modifier = crate::secondary_views::conversation_modifier(
+                    sidebar::conversation_kind(conversation),
+                    &conversation.id,
+                    conversation.user.as_deref(),
+                )?;
+                Some((self.conversation_title(&conversation.id), modifier))
+            })
+            .collect();
+        conversations.sort_by_cached_key(|(title, modifier)| {
+            (crate::search::normalize_for_search(title), modifier.clone())
+        });
+        Self::fill_search_dropdown(
+            &imp.search_from_dropdown,
+            &imp.search_from_options,
+            &gettext("From anyone"),
+            people,
+        );
+        Self::fill_search_dropdown(
+            &imp.search_in_dropdown,
+            &imp.search_in_options,
+            &gettext("In any conversation"),
+            conversations,
+        );
+        imp.updating_search_filters.set(false);
+    }
+
+    fn fill_search_dropdown(
+        dropdown: &gtk::DropDown,
+        options: &RefCell<Vec<String>>,
+        any_label: &str,
+        entries: Vec<(String, String)>,
+    ) {
+        let previous = usize::try_from(dropdown.selected())
+            .ok()
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| options.borrow().get(index).cloned());
+        let labels: Vec<&str> = std::iter::once(any_label)
+            .chain(entries.iter().map(|(label, _)| label.as_str()))
+            .collect();
+        dropdown.set_model(Some(&gtk::StringList::new(&labels)));
+        dropdown.set_enable_search(true);
+        dropdown.set_expression(Some(&gtk::PropertyExpression::new(
+            gtk::StringObject::static_type(),
+            None::<&gtk::Expression>,
+            "string",
+        )));
+        let ids: Vec<String> = entries.into_iter().map(|(_, id)| id).collect();
+        let selected = previous
+            .and_then(|previous| ids.iter().position(|id| *id == previous))
+            .map_or(0, |index| index as u32 + 1);
+        *options.borrow_mut() = ids;
+        dropdown.set_selected(selected);
+    }
+
     fn set_workspace_search_visible(&self, visible: bool) {
         let imp = self.imp();
+        if visible && !imp.message_search_bar.is_search_mode() {
+            self.refresh_search_filter_options();
+        }
         if imp.message_search_bar.is_search_mode() != visible {
             imp.message_search_bar.set_search_mode(visible);
         }

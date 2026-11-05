@@ -553,10 +553,62 @@
                                   <object class="GtkSearchBar" id="message_search_bar">
                                     <property name="show-close-button">True</property>
                                     <property name="child">
-                                      <object class="GtkSearchEntry" id="message_search_entry">
-                                        <property name="hexpand">True</property>
-                                        <property name="max-width-chars">48</property>
-                                        <property name="placeholder-text" translatable="yes">Search workspace messages</property>
+                                      <object class="GtkBox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="spacing">6</property>
+                                        <child>
+                                          <object class="GtkSearchEntry" id="message_search_entry">
+                                            <property name="hexpand">True</property>
+                                            <property name="max-width-chars">48</property>
+                                            <property name="placeholder-text" translatable="yes">Search workspace messages</property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkBox" id="message_search_filters">
+                                            <property name="spacing">6</property>
+                                            <property name="halign">center</property>
+                                            <child>
+                                              <object class="GtkDropDown" id="search_type_dropdown">
+                                                <property name="tooltip-text" translatable="yes">Type</property>
+                                                <property name="model">
+                                                  <object class="GtkStringList">
+                                                    <items><item translatable="yes">All messages</item><item translatable="yes">Direct messages</item><item translatable="yes">People</item><item translatable="yes">Channels</item></items>
+                                                  </object>
+                                                </property>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkDropDown" id="search_from_dropdown">
+                                                <property name="tooltip-text" translatable="yes">From</property>
+                                                <property name="model">
+                                                  <object class="GtkStringList">
+                                                    <items><item translatable="yes">From anyone</item></items>
+                                                  </object>
+                                                </property>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkDropDown" id="search_in_dropdown">
+                                                <property name="tooltip-text" translatable="yes">In</property>
+                                                <property name="model">
+                                                  <object class="GtkStringList">
+                                                    <items><item translatable="yes">In any conversation</item></items>
+                                                  </object>
+                                                </property>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkDropDown" id="search_date_dropdown">
+                                                <property name="tooltip-text" translatable="yes">Date</property>
+                                                <property name="model">
+                                                  <object class="GtkStringList">
+                                                    <items><item translatable="yes">Any time</item><item translatable="yes">Last 7 days</item></items>
+                                                  </object>
+                                                </property>
+                                              </object>
+                                            </child>
+                                          </object>
+                                        </child>
                                       </object>
                                     </property>
                                   </object>

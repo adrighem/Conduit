@@ -208,8 +208,10 @@ defensively and falls back to normal Web API refreshes when needed.
 - Sanitized rendering for Slack links and mentions, edited and deleted message
   states, common Block Kit and bot attachments, code blocks, media previews, and
   custom emoji.
-- Workspace message search, source-message navigation, Slack permalink handling,
-  and an internal image and video viewer.
+- Workspace message search with Type (all messages, direct messages, People or
+  Channels), From, In and Last 7 days filters (Slack applies all but People and
+  Channels, which match names in the local directory), source-message
+  navigation, Slack permalink handling, and an internal image and video viewer.
 - Status viewing and editing, person profile actions, relevant desktop
   notifications, and optional realtime updates.
 - Transactional SQLite caching for responsive startup and offline context, with

@@ -21,7 +21,9 @@ pub(crate) use files::file_rows;
 pub(crate) use model::{
     saved_rows, thread_rows, SecondaryAction, SecondaryKind, SecondaryRow, ThreadState,
 };
-pub(crate) use search::search_rows;
+pub(crate) use search::{
+    channel_rows, conversation_modifier, people_rows, search_rows, SearchFilters, SearchScope,
+};
 
 use crate::message_markup::{ContextDelta, MessageRenderContext};
 use rows::Dispatch;
@@ -400,6 +402,7 @@ mod tests {
                 location: SearchMessageLocation::new("C1", "3.0", None),
                 channel_title: "#general".to_string(),
                 author: "Alice".to_string(),
+                author_user_id: Some("U1".to_string()),
                 ts: Some("3.0".to_string()),
                 plain_text: "ship it".to_string(),
                 snippet_markup: "<b>ship</b> it".to_string(),

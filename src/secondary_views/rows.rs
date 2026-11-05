@@ -6,11 +6,14 @@ use adw::prelude::*;
 use gettextrs::gettext;
 use gtk::pango;
 
-use super::model::{FileRow, SavedRow, SearchRow, SecondaryAction, SecondaryRow, ThreadRow};
+use super::model::{
+    DirectoryRow, DirectoryTarget, FileRow, SavedRow, SearchRow, SecondaryAction, SecondaryRow,
+    ThreadRow,
+};
 use crate::message_markup::MessageRenderContext;
 use crate::timeline::cache::decode;
 use crate::timeline_message_widget::{
-    build_timeline_message_widget, resolve_cached_asset_path, TimelineAction,
+    build_timeline_message_widget, resolve_cached_asset_path, TimelineAction, TIMELINE_AVATAR_SIZE,
 };
 
 pub(crate) type Dispatch = Rc<dyn Fn(SecondaryAction)>;
@@ -62,7 +65,8 @@ pub(crate) fn build_row(
     register_css();
     let card = match row {
         SecondaryRow::Thread(row) => thread_card(row, context, dispatch),
-        SecondaryRow::Search(row) => search_card(row),
+        SecondaryRow::Directory(row) => directory_card(row, context),
+        SecondaryRow::Search(row) => search_card(row, context),
         SecondaryRow::File(row) => file_card(row, context),
         SecondaryRow::Saved(row) => saved_card(row, context, dispatch),
     };
@@ -197,8 +201,68 @@ fn thread_card(row: &ThreadRow, context: &MessageRenderContext, dispatch: &Dispa
     card
 }
 
-fn search_card(row: &SearchRow) -> gtk::Box {
+/// The sender's avatar: their cached picture when there is one, else initials.
+fn author_avatar(row: &SearchRow, context: &MessageRenderContext) -> adw::Avatar {
+    let avatar = adw::Avatar::new(TIMELINE_AVATAR_SIZE, Some(&row.author), true);
+    avatar.set_valign(gtk::Align::Start);
+    // Only cached downloads: the URL comes from Slack and must never be
+    // opened as a local path.
+    let path = row
+        .author_user_id
+        .as_deref()
+        .and_then(|user_id| context.user_avatar_urls.get(user_id))
+        .and_then(|url| resolve_cached_asset_path(url, context));
+    if let Some(path) = path {
+        decode::set_avatar_image_when_mapped(&avatar, &path);
+    }
+    avatar
+}
+
+/// A person (avatar) or channel (kind icon) with its detail line.
+fn directory_card(row: &DirectoryRow, context: &MessageRenderContext) -> gtk::Box {
     let card = card_box();
+    card.set_orientation(gtk::Orientation::Horizontal);
+    card.set_spacing(10);
+    match &row.target {
+        DirectoryTarget::Person(user_id) => {
+            let avatar = adw::Avatar::new(TIMELINE_AVATAR_SIZE, Some(&row.title), true);
+            let path = context
+                .user_avatar_urls
+                .get(user_id)
+                .and_then(|url| resolve_cached_asset_path(url, context));
+            if let Some(path) = path {
+                decode::set_avatar_image_when_mapped(&avatar, &path);
+            }
+            card.append(&avatar);
+        }
+        DirectoryTarget::Conversation(_) => {
+            let icon = gtk::Image::from_icon_name(row.icon_name);
+            icon.set_pixel_size(20);
+            icon.set_size_request(TIMELINE_AVATAR_SIZE, TIMELINE_AVATAR_SIZE);
+            card.append(&icon);
+        }
+    }
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    text.set_valign(gtk::Align::Center);
+    text.set_hexpand(true);
+    let title = gtk::Label::new(Some(&row.title));
+    title.set_xalign(0.0);
+    title.set_ellipsize(pango::EllipsizeMode::End);
+    title.add_css_class("heading");
+    text.append(&title);
+    text.append(&caption(&row.detail));
+    card.append(&text);
+    card
+}
+
+fn search_card(row: &SearchRow, context: &MessageRenderContext) -> gtk::Box {
+    let card = card_box();
+    card.set_orientation(gtk::Orientation::Horizontal);
+    card.set_spacing(10);
+    card.append(&author_avatar(row, context));
+
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    body.set_hexpand(true);
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let author = heading(&row.author);
     header.append(&author);
@@ -208,7 +272,7 @@ fn search_card(row: &SearchRow) -> gtk::Box {
     if let Some(time) = row.ts.as_deref().and_then(timestamp_label) {
         header.append(&time);
     }
-    card.append(&header);
+    body.append(&header);
 
     let snippet = gtk::Label::new(None);
     snippet.set_markup(&row.snippet_markup);
@@ -218,7 +282,8 @@ fn search_card(row: &SearchRow) -> gtk::Box {
     snippet.set_lines(SNIPPET_LINES);
     snippet.set_ellipsize(pango::EllipsizeMode::End);
     snippet.add_css_class("body");
-    card.append(&snippet);
+    body.append(&snippet);
+    card.append(&body);
     card
 }
 
