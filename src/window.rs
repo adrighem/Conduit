@@ -3578,6 +3578,15 @@ impl ConduitWindow {
             TimelineAction::MessageUser(user_id) => {
                 self.send_command(RuntimeCommand::OpenDirectMessage { user_id });
             }
+            TimelineAction::OpenChannel(channel_id) => {
+                match self.known_conversation_title(&channel_id) {
+                    Some(title) => self.select_conversation(&channel_id, &title),
+                    None => self.set_status(&gettext("Conversation is not available.")),
+                }
+            }
+            TimelineAction::ShowChannelDetails(channel_id) => {
+                self.show_channel_details_for(&channel_id)
+            }
             TimelineAction::OpenLink(uri) => self.open_link(&uri),
             TimelineAction::ShowProfile(user_id) => self.show_profile_dialog(&user_id),
             TimelineAction::ShowUserGroup(group_id) => self.show_user_group_details(&group_id),
@@ -9421,7 +9430,21 @@ impl ConduitWindow {
     /// Opens the channel details dialog for the visible conversation and
     /// loads fresh info and members; the dialog updates in place.
     fn show_channel_details(&self) {
-        let Some(conversation) = self.visible_conversation() else {
+        if let Some(channel_id) = self.visible_channel_id() {
+            self.show_channel_details_for(&channel_id);
+        }
+    }
+
+    fn show_channel_details_for(&self, channel_id: &str) {
+        let conversation = self
+            .imp()
+            .workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .cloned();
+        let Some(conversation) = conversation else {
+            self.set_status(&gettext("Conversation is not available."));
             return;
         };
         let Some(input) = self.channel_details_input(&conversation, false) else {

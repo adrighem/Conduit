@@ -236,6 +236,7 @@ pub enum TimelineScrollBehavior {
 }
 
 /// Prefix of user group mention links; the timeline opens the group's members.
+pub const CHANNEL_URL_PREFIX: &str = "conduit-channel://";
 pub const USER_GROUP_URL_PREFIX: &str = "conduit-usergroup://";
 
 /// Prefix of message target action links, which stay clickable in
@@ -450,7 +451,7 @@ fn render_slack_entity_pango(
         } else {
             "#"
         };
-        mention_pill_pango(prefix, display)
+        channel_mention_link_pango(channel_id, &mention_pill_pango(prefix, display))
     } else if let Some((url, label)) = raw.split_once('|') {
         if is_http_url(url) || url.starts_with(MESSAGE_TARGET_URL_PREFIX) {
             external_link_pango(url, label)
@@ -466,6 +467,13 @@ fn render_slack_entity_pango(
     };
 
     Some((rendered, end + 1))
+}
+
+fn channel_mention_link_pango(channel_id: &str, pill: &str) -> String {
+    format!(
+        "<a href=\"{CHANNEL_URL_PREFIX}{}\">{pill}</a>",
+        escape_pango(channel_id)
+    )
 }
 
 fn render_bare_channel_reference_pango(
@@ -488,7 +496,10 @@ fn render_bare_channel_reference_pango(
     } else {
         "#"
     };
-    Some((mention_pill_pango(prefix, display), id_length + 1))
+    Some((
+        channel_mention_link_pango(channel_id, &mention_pill_pango(prefix, display)),
+        id_length + 1,
+    ))
 }
 
 fn user_group_mention_pango(raw: &str, context: &MessageRenderContext) -> String {

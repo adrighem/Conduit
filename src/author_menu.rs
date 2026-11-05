@@ -133,8 +133,6 @@ pub(crate) fn user_mention_popover(
     if !access.any() {
         return None;
     }
-    let group = gio::SimpleActionGroup::new();
-    let menu = gio::Menu::new();
     let entries: [MenuEntry; 2] = [
         (
             "message",
@@ -149,12 +147,54 @@ pub(crate) fn user_mention_popover(
             TimelineAction::ShowProfile,
         ),
     ];
+    Some(mention_popover(
+        parent,
+        user_id,
+        entries,
+        on_action,
+        pointing_to,
+    ))
+}
+
+/// Builds "Message" and "Details" popover menu anchored to `parent` widget for `channel_id`.
+pub(crate) fn channel_mention_popover(
+    parent: &impl IsA<gtk::Widget>,
+    channel_id: &str,
+    on_action: Rc<dyn Fn(TimelineAction)>,
+    pointing_to: Option<gtk::gdk::Rectangle>,
+) -> gtk::PopoverMenu {
+    let entries: [MenuEntry; 2] = [
+        (
+            "message",
+            gettext("Message"),
+            true,
+            TimelineAction::OpenChannel,
+        ),
+        (
+            "details",
+            gettext("Details"),
+            true,
+            TimelineAction::ShowChannelDetails,
+        ),
+    ];
+    mention_popover(parent, channel_id, entries, on_action, pointing_to)
+}
+
+fn mention_popover(
+    parent: &impl IsA<gtk::Widget>,
+    target_id: &str,
+    entries: [MenuEntry; 2],
+    on_action: Rc<dyn Fn(TimelineAction)>,
+    pointing_to: Option<gtk::gdk::Rectangle>,
+) -> gtk::PopoverMenu {
+    let group = gio::SimpleActionGroup::new();
+    let menu = gio::Menu::new();
     for (name, label, enabled, make_action) in entries {
         let action = gio::SimpleAction::new(name, None);
         action.set_enabled(enabled);
         let on_action = on_action.clone();
-        let user_id = user_id.to_string();
-        action.connect_activate(move |_, _| on_action(make_action(user_id.clone())));
+        let target_id = target_id.to_string();
+        action.connect_activate(move |_, _| on_action(make_action(target_id.clone())));
         group.add_action(&action);
         menu.append(Some(&label), Some(&format!("author.{name}")));
     }
@@ -177,7 +217,7 @@ pub(crate) fn user_mention_popover(
             }
         });
     });
-    Some(popover)
+    popover
 }
 
 /// Shows "Message…" and "Profile" popover menu anchored to `parent` widget for `user_id`.
@@ -191,6 +231,16 @@ pub(crate) fn show_user_mention_popover(
     if let Some(popover) = user_mention_popover(parent, user_id, context, on_action, pointing_to) {
         popover.popup();
     }
+}
+
+/// Shows the channel mention menu anchored to `parent` widget for `channel_id`.
+pub(crate) fn show_channel_mention_popover(
+    parent: &impl IsA<gtk::Widget>,
+    channel_id: &str,
+    on_action: Rc<dyn Fn(TimelineAction)>,
+    pointing_to: Option<gtk::gdk::Rectangle>,
+) {
+    channel_mention_popover(parent, channel_id, on_action, pointing_to).popup();
 }
 
 #[cfg(test)]

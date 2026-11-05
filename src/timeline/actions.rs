@@ -46,6 +46,10 @@ pub(crate) enum TimelineAction {
     CopyMessageWithMetadata(String),
     /// Open (or create) the direct message with this user.
     MessageUser(String),
+    /// Open this channel (or group conversation), from a channel mention.
+    OpenChannel(String),
+    /// Show the details dialog of this channel, from a channel mention.
+    ShowChannelDetails(String),
     /// A link in message text; Slack message permalinks open in Conduit.
     OpenLink(String),
     /// Show the native profile dialog for this user.

@@ -161,7 +161,7 @@ fn test_mrkdwn_to_pango_mentions() {
     let output = mrkdwn_to_pango(input, &context);
     assert_eq!(
         output,
-        "<a href=\"conduit-user://U123\"><span background=\"#D6ECFF\" foreground=\"#1264A3\"> @Alice </span></a> in <span background=\"#D6ECFF\" foreground=\"#1264A3\"> #general </span> and <span background=\"#D6ECFF\" foreground=\"#1264A3\"> #C999 </span>"
+        "<a href=\"conduit-user://U123\"><span background=\"#D6ECFF\" foreground=\"#1264A3\"> @Alice </span></a> in <a href=\"conduit-channel://C123\"><span background=\"#D6ECFF\" foreground=\"#1264A3\"> #general </span></a> and <a href=\"conduit-channel://C999\"><span background=\"#D6ECFF\" foreground=\"#1264A3\"> #C999 </span></a>"
     );
 }
 
@@ -175,8 +175,17 @@ fn test_mrkdwn_to_pango_private_channel_mention() {
     let output = mrkdwn_to_pango("<#C123|secret-room>", &context);
     assert_eq!(
         output,
-        "<span background=\"#D6ECFF\" foreground=\"#1264A3\"> 🔒 secret-room </span>"
+        "<a href=\"conduit-channel://C123\"><span background=\"#D6ECFF\" foreground=\"#1264A3\"> 🔒 secret-room </span></a>"
     );
+}
+
+#[test]
+fn test_mrkdwn_to_pango_bare_channel_reference_links_to_channel() {
+    let mut context = MessageRenderContext::default();
+    Arc::make_mut(&mut context.conversation_titles)
+        .insert("C123".to_string(), "general".to_string());
+    let output = mrkdwn_to_pango("see #C123", &context);
+    assert!(output.contains("<a href=\"conduit-channel://C123\">"));
 }
 
 #[test]

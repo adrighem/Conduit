@@ -187,6 +187,17 @@ pub(crate) fn attach_label_links(
                 );
             }
             glib::Propagation::Stop
+        } else if let Some(channel_id) = uri.strip_prefix(crate::message_markup::CHANNEL_URL_PREFIX)
+        {
+            if let Some(on_action) = on_action.as_ref() {
+                crate::author_menu::show_channel_mention_popover(
+                    label,
+                    channel_id,
+                    on_action.clone(),
+                    None,
+                );
+            }
+            glib::Propagation::Stop
         } else if let Some(on_action) = on_action.as_ref() {
             on_action(link_action(uri));
             glib::Propagation::Stop
@@ -245,6 +256,18 @@ fn attach_text_view_links(
                             &click_view,
                             user_id,
                             &context,
+                            on_action.clone(),
+                            Some(rect),
+                        );
+                    }
+                } else if let Some(channel_id) =
+                    href.strip_prefix(crate::message_markup::CHANNEL_URL_PREFIX)
+                {
+                    if let Some(on_action) = on_action.as_ref() {
+                        let rect = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+                        crate::author_menu::show_channel_mention_popover(
+                            &click_view,
+                            channel_id,
                             on_action.clone(),
                             Some(rect),
                         );
