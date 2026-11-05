@@ -345,8 +345,13 @@ links remain in the browser unless Slack or the browser hands off a `slack://` U
 | Messages / Unreads / Files / Later (legacy stars) | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` / `Ctrl+4` |
 | Focus composer | `Ctrl+M` |
 | Upload file | `Ctrl+O` |
+| Back / forward through visited conversations and views | `Alt+Left` / `Alt+Right` |
 | Close thread | `Ctrl+Shift+W` |
 | Show the complete shortcut list | `Ctrl+?` |
+
+Opening a new conversation drops the forward history. Long-pressing the Back
+button lists the back history; picking an entry jumps there as if Back had been
+pressed that many times.
 
 In a composer, `Enter` sends when no completion menu is open. `Shift+Enter` inserts
 a newline; `Ctrl+Enter` is also accepted as a newline alias. When completion is open,

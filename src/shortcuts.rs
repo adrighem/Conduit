@@ -77,6 +77,10 @@ pub const WINDOW_SHORTCUTS: &[ActionShortcut] = &[
         accelerators: &["<alt>Left"],
     },
     ActionShortcut {
+        action: "win.go-forward",
+        accelerators: &["<alt>Right"],
+    },
+    ActionShortcut {
         action: "win.close-thread",
         accelerators: &["<control><shift>w"],
     },
@@ -125,6 +129,10 @@ mod tests {
         assert_eq!(
             accelerators_for_action("win.go-back").unwrap(),
             ["<alt>Left"]
+        );
+        assert_eq!(
+            accelerators_for_action("win.go-forward").unwrap(),
+            ["<alt>Right"]
         );
     }
 

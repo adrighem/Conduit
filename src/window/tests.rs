@@ -79,37 +79,69 @@ fn composer_completion_description_announces_group_mentions() {
     );
 }
 
+fn visit(history: &mut NavigationHistory<u32>, current: u32, target: u32) {
+    history.visit(current, &target);
+}
+
 #[test]
 fn navigation_history_keeps_distinct_bounded_visits() {
-    let mut history = Vec::new();
-    let threads = MainNavigationTarget::Threads;
-    remember_navigation(
-        &mut history,
-        MainNavigationTarget::Conversation("C1".into()),
-        &threads,
-    );
-    remember_navigation(
-        &mut history,
-        MainNavigationTarget::Conversation("C1".into()),
-        &threads,
-    );
+    let mut history = NavigationHistory::default();
+    visit(&mut history, 1, 0);
+    visit(&mut history, 1, 0);
+    assert_eq!(history.back, vec![1]);
+    visit(&mut history, 5, 5);
+    assert_eq!(history.back, vec![1]);
+
+    for index in 2..=(MAX_NAVIGATION_HISTORY as u32 + 2) {
+        visit(&mut history, index, 0);
+    }
+    assert_eq!(history.back.len(), MAX_NAVIGATION_HISTORY);
     assert_eq!(
-        history,
-        vec![MainNavigationTarget::Conversation("C1".into())]
+        history.back.last(),
+        Some(&(MAX_NAVIGATION_HISTORY as u32 + 2))
+    );
+}
+
+#[test]
+fn navigation_history_goes_back_and_forward_and_drops_forward_on_new_visit() {
+    let mut history = NavigationHistory::default();
+    // Visited A(1) B(2) C(3), now on D(4).
+    visit(&mut history, 1, 2);
+    visit(&mut history, 2, 3);
+    visit(&mut history, 3, 4);
+    assert_eq!(
+        history.back_entries().copied().collect::<Vec<_>>(),
+        [3, 2, 1]
     );
 
-    for index in 0..=MAX_NAVIGATION_HISTORY {
-        remember_navigation(
-            &mut history,
-            MainNavigationTarget::Conversation(format!("C{index}")),
-            &threads,
-        );
+    assert_eq!(history.go_back(Some(4), 1), Some(3));
+    assert_eq!(history.go_forward(Some(3), 1), Some(4));
+    assert_eq!(history.go_forward(Some(4), 1), None);
+
+    // Three steps back equals three single steps.
+    let seeded = || NavigationHistory {
+        back: vec![1, 2, 3],
+        ..NavigationHistory::default()
+    };
+    let (mut stepped, mut jumped) = (seeded(), seeded());
+    assert_eq!(jumped.go_back(Some(4), 3), Some(1));
+    let mut current = 4;
+    for _ in 0..3 {
+        current = stepped.go_back(Some(current), 1).unwrap();
     }
-    assert_eq!(history.len(), MAX_NAVIGATION_HISTORY);
-    assert_eq!(
-        history.last(),
-        Some(&MainNavigationTarget::Conversation("C100".into()))
-    );
+    assert_eq!(current, 1);
+    assert_eq!(jumped.back, stepped.back);
+    assert_eq!(jumped.forward, stepped.forward);
+    assert_eq!(jumped.go_back(Some(1), 1), None);
+    assert_eq!(jumped.go_back(Some(1), 9), None);
+
+    // Forward walks the same way, then a new visit replaces it.
+    assert_eq!(jumped.go_forward(Some(1), 2), Some(3));
+    assert_eq!(jumped.back, vec![1, 2]);
+    assert_eq!(jumped.forward, vec![4]);
+    visit(&mut jumped, 3, 9);
+    assert!(jumped.forward.is_empty());
+    assert_eq!(jumped.back, vec![1, 2, 3]);
 }
 
 #[test]

@@ -458,7 +458,7 @@ mod imp {
         pub(super) sidebar_projection: RefCell<SidebarProjection>,
         pub(super) sidebar_filter_generation: Cell<u64>,
         pub(super) picker_filter_generation: Cell<u64>,
-        pub(super) navigation_history: RefCell<Vec<MainNavigationTarget>>,
+        pub(super) navigation_history: RefCell<NavigationHistory<MainNavigationTarget>>,
         pub(super) restoring_navigation: Cell<bool>,
         pub(super) profile_visible: Cell<bool>,
         pub(super) secondary_view: RefCell<Option<crate::secondary_views::SecondaryView>>,
@@ -1772,17 +1772,80 @@ enum MainNavigationTarget {
 
 const MAX_NAVIGATION_HISTORY: usize = 100;
 
-fn remember_navigation(
-    history: &mut Vec<MainNavigationTarget>,
-    current: MainNavigationTarget,
-    target: &MainNavigationTarget,
-) {
-    if &current == target || history.last() == Some(&current) {
-        return;
+/// Browser-style visit history: `back` holds earlier visits (newest last),
+/// `forward` the visits undone by going back (next one last).
+#[derive(Debug)]
+struct NavigationHistory<T> {
+    back: Vec<T>,
+    forward: Vec<T>,
+}
+
+impl<T> Default for NavigationHistory<T> {
+    fn default() -> Self {
+        Self {
+            back: Vec::new(),
+            forward: Vec::new(),
+        }
     }
-    history.push(current);
-    if history.len() > MAX_NAVIGATION_HISTORY {
-        history.remove(0);
+}
+
+impl<T: PartialEq> NavigationHistory<T> {
+    fn can_go_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    /// Earlier visits, most recent first: entry `i` is `i + 1` steps back.
+    fn back_entries(&self) -> impl Iterator<Item = &T> {
+        self.back.iter().rev()
+    }
+
+    fn clear(&mut self) {
+        self.back.clear();
+        self.forward.clear();
+    }
+
+    /// Records leaving `current` for a new `target`, which replaces any
+    /// forward history.
+    fn visit(&mut self, current: T, target: &T) {
+        if &current == target || self.back.last() == Some(&current) {
+            return;
+        }
+        self.back.push(current);
+        trim_navigation_stack(&mut self.back);
+        self.forward.clear();
+    }
+
+    /// Moves `steps` visits back as if stepping once per visit. `current`
+    /// and the visits passed over become forward history.
+    fn go_back(&mut self, current: Option<T>, steps: usize) -> Option<T> {
+        jump_navigation(&mut self.back, &mut self.forward, current, steps)
+    }
+
+    fn go_forward(&mut self, current: Option<T>, steps: usize) -> Option<T> {
+        jump_navigation(&mut self.forward, &mut self.back, current, steps)
+    }
+}
+
+fn jump_navigation<T>(
+    from: &mut Vec<T>,
+    to: &mut Vec<T>,
+    current: Option<T>,
+    steps: usize,
+) -> Option<T> {
+    if steps == 0 || steps > from.len() {
+        return None;
+    }
+    let mut passed = from.split_off(from.len() - steps);
+    let target = passed.remove(0);
+    to.extend(current);
+    to.extend(passed.into_iter().rev());
+    trim_navigation_stack(to);
+    Some(target)
+}
+
+fn trim_navigation_stack<T>(stack: &mut Vec<T>) {
+    if stack.len() > MAX_NAVIGATION_HISTORY {
+        stack.drain(..stack.len() - MAX_NAVIGATION_HISTORY);
     }
 }
 
@@ -5174,6 +5237,8 @@ impl ConduitWindow {
         self.add_window_action("new-message", |window| window.show_new_message_picker());
         self.add_window_action("new-channel", |window| window.show_new_channel_dialog());
         self.add_window_action("go-back", |window| window.go_back());
+        self.add_window_action("go-forward", |window| window.go_forward());
+        self.setup_back_history_menu();
         self.add_window_action("search-workspace", |window| window.focus_workspace_search());
         self.add_window_action("show-messages", |window| window.show_messages());
         self.add_window_action("show-files", |window| window.show_files());
@@ -8339,20 +8404,22 @@ impl ConduitWindow {
         let Some(current) = self.current_navigation_target() else {
             return;
         };
-        let mut history = imp.navigation_history.borrow_mut();
-        remember_navigation(&mut history, current, target);
-        drop(history);
+        imp.navigation_history.borrow_mut().visit(current, target);
         self.sync_back_button();
     }
 
     fn sync_back_button(&self) {
         let imp = self.imp();
         imp.navigation_back_button.set_sensitive(
-            imp.profile_visible.get() || !imp.navigation_history.borrow().is_empty(),
+            imp.profile_visible.get() || imp.navigation_history.borrow().can_go_back(),
         );
     }
 
     fn go_back(&self) {
+        self.go_back_steps(1);
+    }
+
+    fn go_back_steps(&self, steps: usize) {
         if self.message_edit_submission_pending() {
             self.set_status(&gettext("Wait for the edited message to finish saving."));
             return;
@@ -8364,9 +8431,35 @@ impl ConduitWindow {
             self.refresh_current_conversation_title();
             self.queue_ui_invalidations(UiInvalidations::MAIN);
             self.sync_back_button();
+            // A profile covers the view, so one step only uncovers it.
+            if steps <= 1 {
+                return;
+            }
+            return self.go_back_steps(steps - 1);
+        }
+        let current = self.current_navigation_target();
+        let target = imp.navigation_history.borrow_mut().go_back(current, steps);
+        self.restore_navigation(target);
+    }
+
+    fn go_forward(&self) {
+        if self.message_edit_submission_pending() {
+            self.set_status(&gettext("Wait for the edited message to finish saving."));
             return;
         }
-        let Some(target) = imp.navigation_history.borrow_mut().pop() else {
+        self.close_thread();
+        let current = self.current_navigation_target();
+        let target = self
+            .imp()
+            .navigation_history
+            .borrow_mut()
+            .go_forward(current, 1);
+        self.restore_navigation(target);
+    }
+
+    fn restore_navigation(&self, target: Option<MainNavigationTarget>) {
+        let imp = self.imp();
+        let Some(target) = target else {
             self.sync_back_button();
             return;
         };
@@ -8379,6 +8472,7 @@ impl ConduitWindow {
             MainNavigationTarget::Threads => self.show_threads(),
             MainNavigationTarget::Search => {
                 if !self.flush_current_drafts() {
+                    imp.restoring_navigation.set(false);
                     return;
                 }
                 imp.workspace.view.borrow_mut().show_search();
@@ -8392,6 +8486,81 @@ impl ConduitWindow {
         }
         imp.restoring_navigation.set(false);
         self.sync_back_button();
+    }
+
+    fn navigation_target_title(&self, target: &MainNavigationTarget) -> String {
+        match target {
+            MainNavigationTarget::Conversation(channel_id) => self.conversation_title(channel_id),
+            MainNavigationTarget::Threads => gettext("Threads"),
+            MainNavigationTarget::Search => gettext("Search"),
+            MainNavigationTarget::Files => gettext("Files"),
+            MainNavigationTarget::Saved => gettext("Saved"),
+        }
+    }
+
+    /// Long press on the back button: lists the back history, newest first.
+    /// Picking an entry jumps there as if Back had been pressed that often.
+    fn show_back_history_menu(&self) {
+        let imp = self.imp();
+        let titles: Vec<String> = imp
+            .navigation_history
+            .borrow()
+            .back_entries()
+            .map(|target| self.navigation_target_title(target))
+            .collect();
+        if titles.is_empty() {
+            return;
+        }
+        let popover = gtk::Popover::new();
+        popover.set_has_arrow(false);
+        popover.set_position(gtk::PositionType::Bottom);
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        for (index, title) in titles.iter().enumerate() {
+            let button = gtk::Button::with_label(title);
+            button.add_css_class("flat");
+            if let Some(label) = button.child().and_downcast::<gtk::Label>() {
+                label.set_xalign(0.0);
+                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                label.set_width_chars(24);
+                label.set_max_width_chars(40);
+            }
+            let weak_window = self.downgrade();
+            let popover = popover.clone();
+            button.connect_clicked(move |_| {
+                popover.popdown();
+                if let Some(window) = weak_window.upgrade() {
+                    window.go_back_steps(index + 1);
+                }
+            });
+            list.append(&button);
+        }
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(360)
+            .child(&list)
+            .build();
+        popover.set_child(Some(&scroller));
+        popover.set_parent(&*imp.navigation_back_button);
+        popover.connect_closed(|popover| {
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
+        popover.popup();
+    }
+
+    fn setup_back_history_menu(&self) {
+        let long_press = gtk::GestureLongPress::new();
+        long_press.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak_window = self.downgrade();
+        long_press.connect_pressed(move |gesture, _, _| {
+            // Claiming cancels the button's own click on release.
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            if let Some(window) = weak_window.upgrade() {
+                window.show_back_history_menu();
+            }
+        });
+        self.imp().navigation_back_button.add_controller(long_press);
     }
 
     fn show_messages(&self) {
