@@ -776,7 +776,7 @@ fn workspace_search_ignores_quoted_modifier_values_when_filtering_results() {
 }
 
 #[test]
-fn workspace_search_results_match_all_content_substrings() {
+fn workspace_search_ranks_confirmed_substring_matches_first_and_keeps_the_rest() {
     let matches = vec![
         SearchMatch {
             username: Some("Ada Lovelace".to_string()),
@@ -790,12 +790,16 @@ fn workspace_search_results_match_all_content_substrings() {
         },
     ];
 
-    let filtered = filter_workspace_search_matches("SUPP bro from:ada", matches);
+    let filtered = rank_workspace_search_matches("SUPP bro from:ada", matches);
 
-    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered.len(), 2);
     assert_eq!(
         filtered[0].text.as_deref(),
         Some("The broker needs online payment support")
+    );
+    assert_eq!(
+        filtered[1].text.as_deref(),
+        Some("The broker migration is complete")
     );
 }
 
@@ -812,7 +816,7 @@ fn workspace_search_prioritizes_relevance_bands_over_api_order() {
         },
     ];
 
-    let ranked = filter_workspace_search_matches("support", matches);
+    let ranked = rank_workspace_search_matches("support", matches);
 
     assert_eq!(ranked[0].text.as_deref(), Some("support"));
     assert_eq!(ranked[1].text.as_deref(), Some("supportive"));
@@ -833,7 +837,7 @@ fn workspace_search_preserves_api_order_within_a_relevance_band() {
         },
     ];
 
-    let ranked = filter_workspace_search_matches("support", matches);
+    let ranked = rank_workspace_search_matches("support", matches);
 
     assert_eq!(ranked[0].username.as_deref(), Some("Zed"));
     assert_eq!(ranked[1].username.as_deref(), Some("Ada"));
@@ -847,7 +851,7 @@ fn modifier_only_workspace_search_keeps_api_results() {
     }];
 
     assert_eq!(
-        filter_workspace_search_matches("from:ada in:general", matches).len(),
+        rank_workspace_search_matches("from:ada in:general", matches).len(),
         1
     );
 }

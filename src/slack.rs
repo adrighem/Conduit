@@ -23,7 +23,8 @@ use crate::models::{
 };
 use crate::rich_message::SlackControlAction;
 use crate::search::{
-    SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
+    MatchScore, SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT,
+    SECONDARY_FIELD_WEIGHT,
 };
 use crate::slack_message_wire::{deserialize_message, deserialize_messages};
 
@@ -324,13 +325,17 @@ fn workspace_search_content_query(query: &str) -> String {
         .join(" ")
 }
 
-fn filter_workspace_search_matches(query: &str, matches: Vec<SearchMatch>) -> Vec<SearchMatch> {
+/// Orders Slack's hits by local relevance band. Slack already decided what
+/// matches (stemming, thread parents, file names, ...), so hits the local
+/// scorer cannot confirm are kept and sorted after confirmed ones, in
+/// Slack's order.
+fn rank_workspace_search_matches(query: &str, matches: Vec<SearchMatch>) -> Vec<SearchMatch> {
     let content_query = workspace_search_content_query(query);
     let search_query = SearchQuery::parse(&content_query);
     let mut ranked = matches
         .into_iter()
         .enumerate()
-        .filter_map(|(original_index, item)| {
+        .map(|(original_index, item)| {
             let score = search_query.score([
                 SearchField::new(
                     item.text.as_deref().unwrap_or_default(),
@@ -355,15 +360,15 @@ fn filter_workspace_search_matches(query: &str, matches: Vec<SearchMatch>) -> Ve
                         .unwrap_or_default(),
                     ID_FIELD_WEIGHT,
                 ),
-            ])?;
-            Some((score, original_index, item))
+            ]);
+            (score, original_index, item)
         })
         .collect::<Vec<_>>();
     ranked.sort_by(
         |(left_score, left_index, _), (right_score, right_index, _)| {
             right_score
-                .band()
-                .cmp(&left_score.band())
+                .map(MatchScore::band)
+                .cmp(&left_score.map(MatchScore::band))
                 .then_with(|| left_index.cmp(right_index))
         },
     );
@@ -1346,7 +1351,7 @@ impl SlackApi {
                 ],
             )
             .await?;
-        Ok(filter_workspace_search_matches(
+        Ok(rank_workspace_search_matches(
             query,
             response.messages.matches,
         ))
