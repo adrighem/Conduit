@@ -1108,6 +1108,63 @@ fn message_title_opens_details_only_for_channels_and_group_dms() {
 }
 
 #[test]
+fn message_title_shows_private_lock_only_for_private_channels() {
+    let conversation = |json: serde_json::Value| -> SlackConversation {
+        serde_json::from_value(json).expect("conversation fixture")
+    };
+    let public_channel =
+        conversation(serde_json::json!({"id": "C1", "is_channel": true, "is_private": false}));
+    let private_channel =
+        conversation(serde_json::json!({"id": "C2", "is_channel": true, "is_private": true}));
+    let legacy_private_group = conversation(serde_json::json!({"id": "G1", "is_group": true}));
+    let group_dm = conversation(serde_json::json!({"id": "G2", "is_mpim": true}));
+    let direct = conversation(serde_json::json!({"id": "D1", "is_im": true, "user": "U1"}));
+    let view = MainMessageView::Conversation;
+
+    assert!(message_title_shows_private_lock(
+        view,
+        false,
+        Some(&private_channel)
+    ));
+    assert!(message_title_shows_private_lock(
+        view,
+        false,
+        Some(&legacy_private_group)
+    ));
+    assert!(!message_title_shows_private_lock(
+        view,
+        false,
+        Some(&public_channel)
+    ));
+    assert!(!message_title_shows_private_lock(
+        view,
+        false,
+        Some(&group_dm)
+    ));
+    assert!(!message_title_shows_private_lock(
+        view,
+        false,
+        Some(&direct)
+    ));
+    assert!(!message_title_shows_private_lock(
+        view,
+        true,
+        Some(&private_channel)
+    ));
+    assert!(!message_title_shows_private_lock(view, false, None));
+    assert!(!message_title_shows_private_lock(
+        MainMessageView::Files,
+        false,
+        Some(&private_channel)
+    ));
+    assert!(!message_title_shows_private_lock(
+        MainMessageView::Saved,
+        false,
+        Some(&private_channel)
+    ));
+}
+
+#[test]
 fn status_permission_failure_explains_profile_reauthorization() {
     let failure = RuntimeFailure {
         category: RuntimeFailureCategory::Validation,
@@ -2429,6 +2486,19 @@ fn window_template_preserves_adaptive_and_accessible_boundaries() {
     assert!(message_title_stack < message_title);
     assert!(message_title < message_title_button);
     assert!(message_title_button < message_title_action);
+    let message_title_lock = template
+        .find("GtkImage\" id=\"message_title_lock\"")
+        .expect("title button should contain lock image for private channels");
+    assert!(message_title_button < message_title_lock);
+    assert!(message_title_lock < message_title_action);
+    let title_lock_contract = template[message_title_lock..]
+        .split_once("</object>")
+        .map(|(object, _)| object)
+        .expect("message title lock should be a complete template object");
+    assert!(title_lock_contract.contains("channel-secure-symbolic"));
+    assert!(title_lock_contract.contains("<property name=\"visible\">False</property>"));
+    assert!(title_lock_contract
+        .contains("<property name=\"tooltip-text\" translatable=\"yes\">Private</property>"));
     let title_button_contract = &template[message_title_button..message_title_action];
     assert!(title_button_contract.contains("<class name=\"flat\"/>"));
     assert!(!title_button_contract.contains("accessible-role"));
@@ -3364,6 +3434,31 @@ fn perf_guard_closing_or_switching_media_drops_the_pending_image() {
     );
 }
 
+#[test]
+fn workspace_theme_css_resets_popover_label_colors_on_active_conversations() {
+    let theme = crate::slack::SidebarTheme {
+        column_bg: "#123456".into(),
+        menu_bg_hover: "#234567".into(),
+        active_item: "#345678".into(),
+        active_item_text: "#ffffff".into(),
+        hover_item: "#456789".into(),
+        text_color: "#dddddd".into(),
+        active_presence: "#00ff00".into(),
+        mention_badge: Some("#ff0000".into()),
+        top_nav_bg: Some("#112233".into()),
+        top_nav_text: Some("#eeeeee".into()),
+    };
+    let css = workspace_theme_css(&theme);
+    assert!(
+        css.contains(".conduit-themed-sidebar .sidebar-row-content.active-conversation popover label { color: inherit; }"),
+        "active conversation context menu popover labels must inherit parent button color, not active_item_text"
+    );
+    assert!(
+        css.contains(".conduit-themed-sidebar .sidebar-row-content.active-conversation popover button.destructive-action label { color: @destructive_color; }"),
+        "active conversation destructive action buttons must keep @destructive_color"
+    );
+}
+
 /// Tests that create GTK widgets. They run only when
 /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
 mod graphical {
@@ -3551,6 +3646,140 @@ mod graphical {
             let texture = shown.content().expect("decoded image paints in place");
             assert_eq!(texture.intrinsic_width(), 90);
             window.destroy();
+        });
+    }
+
+    #[test]
+    fn sidebar_active_conversation_context_menu_popover_keeps_standard_label_color() {
+        run_gtk_test(|| {
+            let _ = adw::init();
+            let display = gtk::gdk::Display::default().expect("display for graphical test");
+
+            let theme = crate::slack::SidebarTheme {
+                column_bg: "#123456".into(),
+                menu_bg_hover: "#234567".into(),
+                active_item: "#345678".into(),
+                active_item_text: "#abcdef".into(),
+                hover_item: "#456789".into(),
+                text_color: "#dddddd".into(),
+                active_presence: "#00ff00".into(),
+                mention_badge: Some("#ff0000".into()),
+                top_nav_bg: Some("#112233".into()),
+                top_nav_text: Some("#eeeeee".into()),
+            };
+            let css = workspace_theme_css(&theme);
+            let provider = gtk::CssProvider::new();
+            provider.load_from_string(&css);
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            );
+
+            let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            sidebar.add_css_class("conduit-themed-sidebar");
+
+            let normal_content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            normal_content.add_css_class("sidebar-row-content");
+            sidebar.append(&normal_content);
+
+            let normal_popover = gtk::Popover::new();
+            normal_popover.add_css_class("sidebar-context-menu");
+            normal_popover.set_parent(&normal_content);
+            let normal_btn = gtk::Button::with_label("Mark as read");
+            normal_btn.add_css_class("flat");
+            let normal_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            normal_box.append(&normal_btn);
+            normal_popover.set_child(Some(&normal_box));
+
+            let active_content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            active_content.add_css_class("sidebar-row-content");
+            active_content.add_css_class("active-conversation");
+            sidebar.append(&active_content);
+
+            let active_title = gtk::Label::new(Some("general"));
+            active_content.append(&active_title);
+
+            let active_popover = gtk::Popover::new();
+            active_popover.add_css_class("sidebar-context-menu");
+            active_popover.set_parent(&active_content);
+            let active_btn = gtk::Button::with_label("Mark as read");
+            active_btn.add_css_class("flat");
+            let active_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            active_box.append(&active_btn);
+            active_popover.set_child(Some(&active_box));
+
+            let window = gtk::Window::new();
+            window.set_child(Some(&sidebar));
+            window.present();
+
+            normal_popover.popup();
+            active_popover.popup();
+
+            let normal_label = normal_btn
+                .child()
+                .and_downcast::<gtk::Label>()
+                .expect("button with label has gtk::Label child");
+            let active_label = active_btn
+                .child()
+                .and_downcast::<gtk::Label>()
+                .expect("button with label has gtk::Label child");
+
+            let normal_color = normal_label.color();
+            let active_color = active_label.color();
+            let title_color = active_title.color();
+
+            assert_eq!(
+                active_color, normal_color,
+                "active conversation context menu label color must match non-current conversation popover label color"
+            );
+            assert_ne!(
+                active_color, title_color,
+                "active conversation context menu label color must not be tinted with active_item_text"
+            );
+
+            normal_popover.unparent();
+            active_popover.unparent();
+            gtk::style_context_remove_provider_for_display(&display, &provider);
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn message_title_private_lock_icon_matches_channel_privacy() {
+        run_gtk_test(|| {
+            let _ = adw::init();
+            let lock = gtk::Image::from_icon_name("channel-secure-symbolic");
+            lock.set_visible(false);
+            assert_eq!(lock.icon_name().as_deref(), Some("channel-secure-symbolic"));
+            assert!(!lock.is_visible());
+
+            let private_channel = serde_json::from_value::<SlackConversation>(serde_json::json!({
+                "id": "C_PRIV",
+                "is_channel": true,
+                "is_private": true
+            }))
+            .expect("private channel fixture");
+            let public_channel = serde_json::from_value::<SlackConversation>(serde_json::json!({
+                "id": "C_PUB",
+                "is_channel": true,
+                "is_private": false
+            }))
+            .expect("public channel fixture");
+
+            lock.set_visible(message_title_shows_private_lock(
+                MainMessageView::Conversation,
+                false,
+                Some(&private_channel),
+            ));
+            assert!(lock.is_visible());
+
+            lock.set_visible(message_title_shows_private_lock(
+                MainMessageView::Conversation,
+                false,
+                Some(&public_channel),
+            ));
+            assert!(!lock.is_visible());
         });
     }
 }

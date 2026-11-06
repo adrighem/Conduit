@@ -33,6 +33,7 @@ pub(crate) struct Callbacks {
     pub(crate) on_star: Rc<dyn Fn(String, bool)>,
     pub(crate) on_edit: Rc<dyn Fn(String, ConversationTextField, String)>,
     pub(crate) on_leave: Rc<dyn Fn(String)>,
+    pub(crate) on_convert_to_channel: Rc<dyn Fn(String)>,
     pub(crate) on_profile: Rc<dyn Fn(String)>,
     /// Resolves a batch of member IDs to display rows in one pass.
     pub(crate) resolve_members: MemberResolver,
@@ -48,6 +49,7 @@ pub(crate) struct DetailsInput {
     pub(crate) title: String,
     pub(crate) layout: DetailsLayout,
     pub(crate) is_private: bool,
+    pub(crate) is_group_dm: bool,
     pub(crate) muted: bool,
     pub(crate) starred: bool,
     pub(crate) about: AboutModel,

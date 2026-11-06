@@ -7784,6 +7784,7 @@ fn expected_runtime_admission(command: &RuntimeCommand) -> RuntimeAdmissionPolic
         | RuntimeCommand::OpenDirectMessage { .. }
         | RuntimeCommand::OpenGroupDirectMessage { .. }
         | RuntimeCommand::CreateChannel { .. }
+        | RuntimeCommand::ConvertGroupDirectMessageToChannel { .. }
         | RuntimeCommand::InviteToChannel { .. }
         | RuntimeCommand::DownloadAttachment { .. }
         | RuntimeCommand::ExecuteMessageAction { .. }
@@ -7856,6 +7857,7 @@ fn expected_legacy_scheduling(
         | RuntimeCommand::SetConversationText { .. }
         | RuntimeCommand::OpenGroupDirectMessage { .. }
         | RuntimeCommand::CreateChannel { .. }
+        | RuntimeCommand::ConvertGroupDirectMessageToChannel { .. }
         | RuntimeCommand::InviteToChannel { .. }
         | RuntimeCommand::ExecuteMessageAction { .. }
         | RuntimeCommand::PostMessage { .. }
@@ -7912,6 +7914,11 @@ fn runtime_command_fixtures() -> Vec<RuntimeCommand> {
         RuntimeCommand::CreateChannel {
             name: "channel".to_string(),
             is_private: false,
+        },
+        RuntimeCommand::ConvertGroupDirectMessageToChannel {
+            channel_id: "G1".to_string(),
+            name: "converted-channel".to_string(),
+            user_ids: vec!["U1".to_string(), "U2".to_string()],
         },
         RuntimeCommand::InviteToChannel {
             channel_id: "C1".to_string(),
@@ -8056,7 +8063,7 @@ fn runtime_command_fixtures() -> Vec<RuntimeCommand> {
 #[test]
 fn runtime_command_admission_metadata_is_exhaustive_and_behavior_neutral() {
     let commands = runtime_command_fixtures();
-    assert_eq!(commands.len(), 46);
+    assert_eq!(commands.len(), 47);
 
     for command in commands {
         let descriptor = command.descriptor();

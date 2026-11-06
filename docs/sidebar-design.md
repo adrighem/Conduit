@@ -206,12 +206,12 @@ Each conversation row is a selectable and activatable `GtkListBoxRow`. The row c
 Icons:
 
 - Public channel: `channel-public-symbolic`
-- Private channel: `channel-secure-symbolic`
+- Private channel: `channel-secure-symbolic` (shown in sidebar rows, details header, and titlebar header button)
 - Direct message: `avatar-default-symbolic`
 - Group direct message: `system-users-symbolic`
 - Unknown conversation: `dialog-question-symbolic`
 
-Rows with unread messages apply explicit bold Pango weight and the native `heading` CSS class to the title, including badge-less unread channels. Read rows apply explicit normal title weight. Unread counts remain visually emphasized with the `heading` CSS class when Slack provides a display count. Selected conversations use the native `GtkListBox` selected row state, not `suggested-action`.
+Rows with unread messages apply explicit bold Pango weight and the native `heading` CSS class to the title, including badge-less unread channels. Read rows apply explicit normal title weight. Unread counts remain visually emphasized with the `heading` CSS class when Slack provides a display count. Selected conversations use the native `GtkListBox` selected row state, not `suggested-action`. The active conversation row highlights with workspace theme colors, while context menu popovers inside active rows retain standard un-tinted label colors.
 
 Unread badge labels are capped at `99+` for counts above 99. Row titles ellipsize and the sidebar width remains stable at the shell level.
 

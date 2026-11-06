@@ -522,9 +522,24 @@
                                                   <class name="flat"/>
                                                 </style>
                                                 <property name="child">
-                                                  <object class="AdwWindowTitle" id="message_title_action">
-                                                    <property name="accessible-role">presentation</property>
-                                                    <property name="title" translatable="yes">Select a conversation</property>
+                                                  <object class="GtkBox">
+                                                    <property name="orientation">horizontal</property>
+                                                    <property name="spacing">6</property>
+                                                    <property name="halign">center</property>
+                                                    <child>
+                                                      <object class="GtkImage" id="message_title_lock">
+                                                        <property name="icon-name">channel-secure-symbolic</property>
+                                                        <property name="valign">center</property>
+                                                        <property name="visible">False</property>
+                                                        <property name="tooltip-text" translatable="yes">Private</property>
+                                                      </object>
+                                                    </child>
+                                                    <child>
+                                                      <object class="AdwWindowTitle" id="message_title_action">
+                                                        <property name="accessible-role">presentation</property>
+                                                        <property name="title" translatable="yes">Select a conversation</property>
+                                                      </object>
+                                                    </child>
                                                   </object>
                                                 </property>
                                               </object>

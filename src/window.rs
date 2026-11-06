@@ -260,6 +260,8 @@ mod imp {
         #[template_child]
         pub message_title_button: TemplateChild<gtk::Button>,
         #[template_child]
+        pub message_title_lock: TemplateChild<gtk::Image>,
+        #[template_child]
         pub message_title_action: TemplateChild<adw::WindowTitle>,
         #[template_child]
         pub message_title: TemplateChild<adw::WindowTitle>,
@@ -874,6 +876,65 @@ fn load_cached_theme_file() -> Option<crate::slack::SidebarTheme> {
     let path = crate::config::state_cache_dir().join("cached_theme.json");
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+fn workspace_theme_css(theme: &crate::slack::SidebarTheme) -> String {
+    let top_nav_bg = theme.top_nav_bg.as_deref().unwrap_or(&theme.column_bg);
+    let top_nav_text = theme.top_nav_text.as_deref().unwrap_or(&theme.text_color);
+    let mention_badge = theme.mention_badge.as_deref().unwrap_or("#e01e5a");
+    let active_item = &theme.active_item;
+    let pill_bg = hex_to_rgba(&theme.active_item, 0.15).unwrap_or_else(|| "#D6ECFF".to_string());
+
+    format!(
+        "window {{\n\
+             --headerbar-bg-color: {top_nav_bg};\n\
+             --headerbar-backdrop-color: {top_nav_bg};\n\
+             --headerbar-fg-color: {top_nav_text};\n\
+             --headerbar-shade-color: transparent;\n\
+         }}\n\
+         toolbarview > .top-bar,\n\
+         toolbarview > .top-bar:backdrop {{\n\
+             background-color: var(--headerbar-bg-color);\n\
+             color: var(--headerbar-fg-color);\n\
+         }}\n\
+         .conduit-themed-sidebar {{\n\
+             background-color: {};\n\
+             color: {};\n\
+         }}\n\
+         .conduit-themed-sidebar row {{ color: {}; }}\n\
+         .conduit-themed-sidebar row:hover,\n\
+         .conduit-themed-sidebar row:selected {{ background-color: {}; }}\n\
+         .conduit-themed-sidebar .sidebar-row-content.active-conversation,\n\
+         .conduit-themed-sidebar row:selected .sidebar-row-content.active-conversation {{\n\
+             background-color: {}; color: {}; border-radius: 9px;\n\
+         }}\n\
+         .conduit-themed-sidebar .sidebar-row-content.active-conversation label {{ color: {}; }}\n\
+         .conduit-themed-sidebar .sidebar-row-content.active-conversation popover label {{ color: inherit; }}\n\
+         .conduit-themed-sidebar .sidebar-row-content.active-conversation popover button.destructive-action label {{ color: @destructive_color; }}\n\
+         .mention-badge-pill {{ background-color: {mention_badge}; }}\n\
+         .conduit-themed-sidebar row label.mention-badge-pill,\n\
+         .conduit-themed-sidebar row:selected label.mention-badge-pill,\n\
+         .conduit-themed-sidebar .sidebar-row-content.active-conversation label.mention-badge-pill {{ color: #ffffff; }}\n\
+         .unread-separator-line {{ background-color: {}; }}\n\
+         .unread-separator-label {{ color: {}; }}\n\
+         .thread-reply-pill {{ background-color: {pill_bg}; color: {}; }}\n\
+         .reaction-pill-active {{ background-color: {pill_bg}; color: {}; }}\n\
+         .presence-active {{ background-color: {}; color: {}; }}\n\
+         .conduit-themed-sidebar switch:checked {{ background-color: {active_item}; }}\n",
+        theme.column_bg,
+        theme.text_color,
+        theme.text_color,
+        theme.menu_bg_hover,
+        theme.active_item,
+        theme.active_item_text,
+        theme.active_item_text,
+        theme.active_item,
+        theme.active_item,
+        theme.active_item,
+        theme.active_item,
+        theme.active_presence,
+        theme.active_presence,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2005,6 +2066,18 @@ fn message_title_opens_details(
                 crate::channel_details::title_behavior(sidebar::conversation_kind(conversation)),
                 Some(crate::channel_details::TitleBehavior::OpenDetails(_))
             )
+        })
+}
+
+fn message_title_shows_private_lock(
+    main_view: MainMessageView,
+    editing_message: bool,
+    conversation: Option<&SlackConversation>,
+) -> bool {
+    main_view == MainMessageView::Conversation
+        && !editing_message
+        && conversation.is_some_and(|conversation| {
+            sidebar::conversation_kind(conversation) == ConversationKind::PrivateChannel
         })
 }
 
@@ -6236,61 +6309,7 @@ impl ConduitWindow {
             save_cached_theme_file(theme);
         }
 
-        let top_nav_bg = theme.top_nav_bg.as_deref().unwrap_or(&theme.column_bg);
-        let top_nav_text = theme.top_nav_text.as_deref().unwrap_or(&theme.text_color);
-        let mention_badge = theme.mention_badge.as_deref().unwrap_or("#e01e5a");
-        let active_item = &theme.active_item;
-        let pill_bg =
-            hex_to_rgba(&theme.active_item, 0.15).unwrap_or_else(|| "#D6ECFF".to_string());
-
-        let css = format!(
-            "window {{\n\
-                 --headerbar-bg-color: {top_nav_bg};\n\
-                 --headerbar-backdrop-color: {top_nav_bg};\n\
-                 --headerbar-fg-color: {top_nav_text};\n\
-                 --headerbar-shade-color: transparent;\n\
-             }}\n\
-             toolbarview > .top-bar,\n\
-             toolbarview > .top-bar:backdrop {{\n\
-                 background-color: var(--headerbar-bg-color);\n\
-                 color: var(--headerbar-fg-color);\n\
-             }}\n\
-             .conduit-themed-sidebar {{\n\
-                 background-color: {};\n\
-                 color: {};\n\
-             }}\n\
-             .conduit-themed-sidebar row {{ color: {}; }}\n\
-             .conduit-themed-sidebar row:hover,\n\
-             .conduit-themed-sidebar row:selected {{ background-color: {}; }}\n\
-             .conduit-themed-sidebar .sidebar-row-content.active-conversation,\n\
-             .conduit-themed-sidebar row:selected .sidebar-row-content.active-conversation {{\n\
-                 background-color: {}; color: {}; border-radius: 9px;\n\
-             }}\n\
-             .conduit-themed-sidebar .sidebar-row-content.active-conversation label {{ color: {}; }}\n\
-             .mention-badge-pill {{ background-color: {mention_badge}; }}\n\
-             .conduit-themed-sidebar row label.mention-badge-pill,\n\
-             .conduit-themed-sidebar row:selected label.mention-badge-pill,\n\
-             .conduit-themed-sidebar .sidebar-row-content.active-conversation label.mention-badge-pill {{ color: #ffffff; }}\n\
-             .unread-separator-line {{ background-color: {}; }}\n\
-             .unread-separator-label {{ color: {}; }}\n\
-             .thread-reply-pill {{ background-color: {pill_bg}; color: {}; }}\n\
-             .reaction-pill-active {{ background-color: {pill_bg}; color: {}; }}\n\
-             .presence-active {{ background-color: {}; color: {}; }}\n\
-             .conduit-themed-sidebar switch:checked {{ background-color: {active_item}; }}\n",
-            theme.column_bg,
-            theme.text_color,
-            theme.text_color,
-            theme.menu_bg_hover,
-            theme.active_item,
-            theme.active_item_text,
-            theme.active_item_text,
-            theme.active_item,
-            theme.active_item,
-            theme.active_item,
-            theme.active_item,
-            theme.active_presence,
-            theme.active_presence,
-        );
+        let css = workspace_theme_css(theme);
 
         if let Some(provider) = self.imp().workspace_theme_css_provider.borrow_mut().take() {
             gtk::style_context_remove_provider_for_display(&self.display(), &provider);
@@ -9460,6 +9479,8 @@ impl ConduitWindow {
             layout,
             is_private: sidebar::conversation_kind(conversation)
                 == ConversationKind::PrivateChannel,
+            is_group_dm: sidebar::conversation_kind(conversation)
+                == ConversationKind::GroupDirectMessage,
             muted: conversation.is_muted_conversation(),
             starred: conversation.is_starred(),
             about: crate::channel_details::about_model(conversation),
@@ -9536,6 +9557,7 @@ impl ConduitWindow {
         let star_weak = with_window(&weak);
         let edit_weak = with_window(&weak);
         let leave_weak = with_window(&weak);
+        let convert_weak = with_window(&weak);
         let profile_weak = with_window(&weak);
         let member_weak = with_window(&weak);
         let name_weak = with_window(&weak);
@@ -9561,6 +9583,20 @@ impl ConduitWindow {
             on_leave: Rc::new(move |channel_id| {
                 if let Some(window) = leave_weak.upgrade() {
                     window.leave_channel(&channel_id);
+                }
+            }),
+            on_convert_to_channel: Rc::new(move |channel_id| {
+                if let Some(window) = convert_weak.upgrade() {
+                    if let Some(conversation) = window
+                        .imp()
+                        .workspace
+                        .conversations
+                        .borrow()
+                        .get(&channel_id)
+                        .cloned()
+                    {
+                        window.show_convert_group_direct_message_dialog(&conversation);
+                    }
                 }
             }),
             on_profile: Rc::new(move |user_id| {
@@ -9633,6 +9669,7 @@ impl ConduitWindow {
             title: format!("@{handle}"),
             layout: crate::channel_details::DetailsLayout::USER_GROUP,
             is_private: false,
+            is_group_dm: false,
             muted: false,
             starred: false,
             about: crate::channel_details::AboutModel {
@@ -11406,8 +11443,13 @@ impl ConduitWindow {
         pointing_to: Option<gtk::gdk::Rectangle>,
     ) {
         let popover = gtk::Popover::new();
+        popover.add_css_class("sidebar-context-menu");
         popover.set_parent(row);
         popover.set_pointing_to(pointing_to.as_ref());
+        popover.connect_closed(|popover| {
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 0);
         menu.set_margin_top(6);
         menu.set_margin_bottom(6);
@@ -11500,16 +11542,31 @@ impl ConduitWindow {
         if let Some(conversation) = conversation.as_ref() {
             let add_people_button = gtk::Button::with_label(&gettext("Add people"));
             add_people_button.add_css_class("flat");
-            let conversation = conversation.clone();
+            let conversation_for_add = conversation.clone();
             let weak_window = self.downgrade();
             let popover_for_people = popover.clone();
             add_people_button.connect_clicked(move |_| {
                 popover_for_people.popdown();
                 if let Some(window) = weak_window.upgrade() {
-                    window.show_add_people_picker(&conversation);
+                    window.show_add_people_picker(&conversation_for_add);
                 }
             });
             menu.append(&add_people_button);
+
+            if conversation.is_mpim.unwrap_or(false) {
+                let convert_button = gtk::Button::with_label(&gettext("Convert to channel"));
+                convert_button.add_css_class("flat");
+                let conversation_for_convert = conversation.clone();
+                let weak_window = self.downgrade();
+                let popover_for_convert = popover.clone();
+                convert_button.connect_clicked(move |_| {
+                    popover_for_convert.popdown();
+                    if let Some(window) = weak_window.upgrade() {
+                        window.show_convert_group_direct_message_dialog(&conversation_for_convert);
+                    }
+                });
+                menu.append(&convert_button);
+            }
         }
         if let Some(conversation) = conversation.filter(sidebar_conversation_can_leave) {
             let leave_button = gtk::Button::with_label(&gettext("Leave channel"));
@@ -12249,6 +12306,50 @@ impl ConduitWindow {
         name.grab_focus();
     }
 
+    fn show_convert_group_direct_message_dialog(&self, conversation: &SlackConversation) {
+        let dialog = gtk::Window::builder()
+            .title(gettext("Convert to channel"))
+            .transient_for(self)
+            .modal(true)
+            .default_width(440)
+            .build();
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        container.set_margin_top(18);
+        container.set_margin_bottom(18);
+        container.set_margin_start(18);
+        container.set_margin_end(18);
+        dialog.set_child(Some(&container));
+        let name = gtk::Entry::new();
+        name.set_placeholder_text(Some(&gettext("channel-name")));
+        container.append(&name);
+        let convert = gtk::Button::with_label(&gettext("Convert to channel"));
+        convert.add_css_class("suggested-action");
+        convert.set_sensitive(false);
+        container.append(&convert);
+        let convert_for_name = convert.clone();
+        name.connect_changed(move |name| {
+            convert_for_name.set_sensitive(valid_channel_name(name.text().as_str()));
+        });
+        let weak_window = self.downgrade();
+        let dialog_for_convert = dialog.clone();
+        let name_for_convert = name.clone();
+        let channel_id = conversation.id.clone();
+        let user_ids = conversation.display_user_ids();
+        convert.connect_clicked(move |_| {
+            if let Some(window) = weak_window.upgrade() {
+                if window.send_command(RuntimeCommand::ConvertGroupDirectMessageToChannel {
+                    channel_id: channel_id.clone(),
+                    name: name_for_convert.text().trim().to_string(),
+                    user_ids: user_ids.clone(),
+                }) {
+                    dialog_for_convert.close();
+                }
+            }
+        });
+        dialog.present();
+        name.grab_focus();
+    }
+
     fn show_conversation_picker<F>(
         &self,
         title: &str,
@@ -12529,6 +12630,8 @@ impl ConduitWindow {
         let action = self.current_message_title_profile_action();
         let details = action.is_none() && self.message_title_opens_details();
         let interactive = action.is_some() || details;
+        imp.message_title_lock
+            .set_visible(self.message_title_shows_private_lock());
         imp.message_title_action
             .set_title(imp.message_title.title().as_str());
         imp.message_title_action
@@ -12566,6 +12669,14 @@ impl ConduitWindow {
             )]);
         imp.message_title_stack
             .set_visible_child_name(if interactive { "profile" } else { "passive" });
+    }
+
+    fn message_title_shows_private_lock(&self) -> bool {
+        message_title_shows_private_lock(
+            self.current_main_view(),
+            self.message_edit_is_active(),
+            self.visible_conversation().as_ref(),
+        )
     }
 
     fn message_title_opens_details(&self) -> bool {

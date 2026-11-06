@@ -74,6 +74,11 @@ pub enum RuntimeCommand {
         name: String,
         is_private: bool,
     },
+    ConvertGroupDirectMessageToChannel {
+        channel_id: String,
+        name: String,
+        user_ids: Vec<String>,
+    },
     InviteToChannel {
         channel_id: String,
         user_ids: Vec<String>,

@@ -47,7 +47,7 @@ pub(crate) fn title_behavior(kind: ConversationKind) -> Option<TitleBehavior> {
         ConversationKind::DirectMessage => Some(TitleBehavior::OpenProfile),
         ConversationKind::GroupDirectMessage => Some(TitleBehavior::OpenDetails(DetailsLayout {
             about: false,
-            settings: false,
+            settings: true,
             conversation: true,
         })),
         ConversationKind::PublicChannel | ConversationKind::PrivateChannel => {
@@ -405,7 +405,7 @@ mod tests {
         else {
             panic!("group DM opens details");
         };
-        assert!(!group.about && !group.settings);
+        assert!(!group.about && group.settings);
         for kind in [
             ConversationKind::PublicChannel,
             ConversationKind::PrivateChannel,

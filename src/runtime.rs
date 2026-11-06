@@ -385,7 +385,9 @@ impl RuntimeCommand {
                 RuntimeTaskLane::Interactive,
                 RuntimeAdmissionPolicy::durable_action(),
             ),
-            Self::OpenGroupDirectMessage { .. } | Self::CreateChannel { .. } => {
+            Self::OpenGroupDirectMessage { .. }
+            | Self::CreateChannel { .. }
+            | Self::ConvertGroupDirectMessageToChannel { .. } => {
                 RuntimeCommandDescriptor::mutation(
                     workspace(RuntimeOperation::OpenConversation),
                     RuntimeTaskLane::Interactive,
@@ -5389,6 +5391,77 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
             let api = require_slack(context.slack)?;
             context.events.send_status("Creating channel");
             let conversation = api.create_channel(&name, is_private).await?;
+            context
+                .workspace
+                .apply_persisted_and_publish_with_completion(
+                    context.workspace_store.as_ref(),
+                    context.events,
+                    MutationOrigin::WebApi,
+                    WorkspaceMutation::ConversationUpsert(conversation.clone()),
+                    RuntimeEventKind::ConversationOpenCompleted {
+                        channel_id: conversation.id,
+                    },
+                )
+                .await?;
+        }
+        RuntimeCommand::ConvertGroupDirectMessageToChannel {
+            channel_id,
+            name,
+            user_ids,
+        } => {
+            let api = require_slack(context.slack)?;
+            context.events.send_status("Converting group DM to channel");
+            let converted = match api
+                .admin_conversations_convert_to_private(&channel_id, &name)
+                .await
+            {
+                Ok(()) => match api.conversation_info(&channel_id).await {
+                    Ok(conversation) => Some(conversation),
+                    Err(error) => {
+                        crate::debug::log(
+                            "runtime",
+                            &format!(
+                                "ConvertGroupDirectMessageToChannel reload failed for {channel_id}: {error}"
+                            ),
+                        );
+                        None
+                    }
+                },
+                Err(error) => {
+                    crate::debug::log(
+                        "runtime",
+                        &format!(
+                            "admin_conversations_convert_to_private failed for {channel_id}, falling back to create: {error}"
+                        ),
+                    );
+                    None
+                }
+            };
+
+            let conversation = match converted {
+                Some(conv) => conv,
+                None => {
+                    let new_channel = api.create_channel(&name, true).await?;
+                    if !user_ids.is_empty() {
+                        match api.invite_to_channel(&new_channel.id, &user_ids).await {
+                            Ok(invited) => invited,
+                            Err(error) => {
+                                crate::debug::log(
+                                    "runtime",
+                                    &format!(
+                                        "invite_to_channel failed during convert fallback for {}: {error}",
+                                        new_channel.id
+                                    ),
+                                );
+                                new_channel
+                            }
+                        }
+                    } else {
+                        new_channel
+                    }
+                }
+            };
+
             context
                 .workspace
                 .apply_persisted_and_publish_with_completion(

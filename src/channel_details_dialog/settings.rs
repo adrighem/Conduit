@@ -1,4 +1,4 @@
-//! Settings tab: leave channel.
+//! Settings tab: convert group DM or leave channel.
 
 use adw::prelude::*;
 use gettextrs::gettext;
@@ -7,6 +7,26 @@ use super::{close, Callbacks, DetailsInput};
 
 pub(super) fn build_settings(input: &DetailsInput, callbacks: &Callbacks) -> gtk::Widget {
     let page = adw::PreferencesPage::new();
+
+    if input.is_group_dm {
+        let convert_group = adw::PreferencesGroup::new();
+        convert_group.set_description(Some(&gettext(
+            "Convert this group direct message to a private channel.",
+        )));
+        let convert = adw::ButtonRow::new();
+        convert.set_title(&gettext("Convert to channel"));
+        convert_group.add(&convert);
+        page.add(&convert_group);
+
+        let channel_id = input.channel_id.clone();
+        let callbacks = callbacks.clone();
+        convert.connect_activated(move |_| {
+            close(&channel_id);
+            (callbacks.on_convert_to_channel)(channel_id.clone());
+        });
+        return page.upcast();
+    }
+
     let group = adw::PreferencesGroup::new();
     group.set_description(Some(&if input.is_private {
         gettext("You will need an invitation to rejoin this private channel.")

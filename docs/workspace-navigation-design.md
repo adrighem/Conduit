@@ -29,7 +29,7 @@ The existing sidebar row remains compact:
 - Optional muted indicator.
 - Optional external/shared indicator.
 
-The indicators are icons, not text badges, so long channel and DM names still get most of the row width.
+The indicators are icons, not text badges, so long channel and DM names still get most of the row width. Group direct messages can also be converted into named private channels through the Settings tab of the conversation details dialog.
 
 ## Deferred
 

@@ -1238,6 +1238,23 @@ impl SlackApi {
         Ok(response.channel)
     }
 
+    pub async fn admin_conversations_convert_to_private(
+        &self,
+        channel_id: &str,
+        name: &str,
+    ) -> Result<()> {
+        let channel_id = required_conversation_id(channel_id)?;
+        let name_params = channel_creation_params(name, true)?;
+        let mut params = vec![("channel_id", channel_id.to_string())];
+        if let Some((_, name_val)) = name_params.into_iter().find(|(k, _)| *k == "name") {
+            params.push(("name", name_val));
+        }
+        let _: BasicResponse = self
+            .post_form("admin.conversations.convertToPrivate", &params)
+            .await?;
+        Ok(())
+    }
+
     pub async fn invite_to_channel(
         &self,
         channel_id: &str,
