@@ -140,3 +140,5 @@
 - Mitigate this safely and robustly by:
   1. Separating technical debugging (which can print static progress details like `"token exchange succeeded"` or `"Slack returned authorize error"`) from error propagation (which can return the original dynamic error up the stack via a typed `Result` or `anyhow!`).
   2. Employing static assertion failure messages instead of formatting variables in unit-test panics when testing trace outputs or redaction behavior. This preserves full test assertion strength while entirely severing the taint flow.
+
+- 2026-11-07: The auto-triage bot (`ai-triaged`, `dependabot` labels) files one issue per Dependabot alert and does not close them when the alert is fixed. It can also invent advisories (ISSUE:44 cited a GHSA that never existed as a Dependabot alert, plus an unrelated CVE). Before acting, check the issue against `gh api repos/adrighem/Conduit/dependabot/alerts`. Dependency bump commits should use `fixes #NN`.
