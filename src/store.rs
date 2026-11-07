@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::activity::ActivityItem;
 use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
     slack_timestamp_is_after, SlackConversation, SlackMessage, SlackUser, SlackUserGroup,
@@ -54,6 +55,10 @@ const DISCOVERY_PROGRESS_KIND: &str = "channel_discovery_progress";
 const DISCOVERY_PROGRESS_KEY: &str = "channels";
 /// `sync_metadata` operation whose refresh time is the last completed sweep.
 const CHANNEL_DISCOVERY_OPERATION: &str = "channel_discovery";
+/// Stored Activity mentions and reactions, keyed by `ActivityKey::storage_key`.
+const ACTIVITY_ITEM_KIND: &str = "activity_item";
+/// `sync_metadata` operation whose refresh time is the last mention backfill.
+pub(crate) const ACTIVITY_BACKFILL_OPERATION: &str = "activity_backfill";
 const ATTENTION_DELIVERY_KIND: &str = "attention_delivery";
 const ATTENTION_DELIVERY_LEDGER_KEY: &str = "__ledger__";
 const MAX_ATTENTION_DELIVERIES: usize = 512;
@@ -1472,6 +1477,23 @@ impl WorkspaceStore {
             .collect();
         self.store_kind_map(DISCOVERED_USER_GROUP_KIND, values, true)
             .await
+    }
+
+    pub(crate) async fn load_activity_items(&self) -> Result<Vec<ActivityItem>> {
+        Ok(self
+            .load_kind_map::<ActivityItem>(ACTIVITY_ITEM_KIND)
+            .await?
+            .into_values()
+            .collect())
+    }
+
+    /// Replaces the stored Activity items with `items`.
+    pub(crate) async fn replace_activity_items(&self, items: Vec<ActivityItem>) -> Result<()> {
+        let values = items
+            .into_iter()
+            .map(|item| (item.key().storage_key(), item))
+            .collect();
+        self.store_kind_map(ACTIVITY_ITEM_KIND, values, true).await
     }
 
     pub(crate) async fn load_channel_discovery_state(&self) -> Result<ChannelDiscoveryState> {

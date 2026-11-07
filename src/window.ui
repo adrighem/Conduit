@@ -249,6 +249,51 @@
                         </child>
                         <child>
                           <object class="AdwToggle">
+                            <property name="name">activity</property>
+                            <property name="tooltip" translatable="yes">Activity</property>
+                            <property name="child">
+                              <object class="GtkOverlay">
+                                    <property name="child">
+                                      <object class="GtkBox">
+                                        <property name="orientation">vertical</property>
+                                        <property name="spacing">2</property>
+                                        <child>
+                                          <object class="GtkImage">
+                                            <property name="icon-name">emblem-important-symbolic</property>
+                                            <property name="pixel-size">22</property>
+                                            <property name="halign">center</property>
+                                            <style>
+                                              <class name="navigation-rail-icon"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkLabel">
+                                            <property name="label" translatable="yes">Activity</property>
+                                            <style>
+                                              <class name="caption"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </property>
+                                    <child type="overlay">
+                                      <object class="GtkLabel" id="activity_unread_badge">
+                                        <property name="visible">False</property>
+                                        <property name="halign">end</property>
+                                        <property name="valign">start</property>
+                                        <style>
+                                          <class name="mention-badge-pill"/>
+                                          <class name="navigation-rail-badge"/>
+                                        </style>
+                                      </object>
+                                    </child>
+                                  </object>
+                            </property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwToggle">
                             <property name="name">threads</property>
                             <property name="tooltip" translatable="yes">Threads</property>
                             <property name="child">
@@ -405,44 +450,70 @@
                                 <property name="margin-start">12</property>
                                 <property name="margin-end">12</property>
                                 <child>
-                                  <object class="GtkBox">
-                                    <property name="orientation">horizontal</property>
-                                    <property name="spacing">6</property>
-                                    <child>
-                                      <object class="GtkSearchEntry" id="sidebar_filter_entry">
-                                        <property name="hexpand">True</property>
-                                        <property name="placeholder-text" translatable="yes">Filter conversations</property>
-                                      </object>
-                                    </child>
-                                    <child>
-                                      <object class="GtkLabel" id="sidebar_unread_filter_label">
-                                        <property name="label" translatable="yes">Unread</property>
-                                        <property name="mnemonic-widget">sidebar_unread_filter_switch</property>
-                                      </object>
-                                    </child>
-                                    <child>
-                                      <object class="GtkSwitch" id="sidebar_unread_filter_switch">
-                                        <property name="valign">center</property>
-                                        <property name="tooltip-text" translatable="yes">Show Only Unread Conversations</property>
-                                        <accessibility>
-                                          <relation name="labelled-by">sidebar_unread_filter_label</relation>
-                                        </accessibility>
-                                      </object>
-                                    </child>
-                                  </object>
-                                </child>
-                                <child>
-                                  <object class="GtkScrolledWindow">
+                                  <object class="GtkStack" id="sidebar_stack">
                                     <property name="vexpand">True</property>
-                                    <property name="child">
-                                      <object class="GtkListView" id="conversation_list">
-                                        <property name="single-click-activate">True</property>
-                                        <style>
-                                          <class name="navigation-sidebar"/>
-                                          <class name="conduit-sidebar-list"/>
-                                        </style>
+                                    <child>
+                                      <object class="GtkStackPage">
+                                        <property name="name">conversations</property>
+                                        <property name="child">
+                                          <object class="GtkBox">
+                                            <property name="orientation">vertical</property>
+                                            <property name="spacing">6</property>
+                                                <child>
+                                                  <object class="GtkBox">
+                                                    <property name="orientation">horizontal</property>
+                                                    <property name="spacing">6</property>
+                                                    <child>
+                                                      <object class="GtkSearchEntry" id="sidebar_filter_entry">
+                                                        <property name="hexpand">True</property>
+                                                        <property name="placeholder-text" translatable="yes">Filter conversations</property>
+                                                      </object>
+                                                    </child>
+                                                    <child>
+                                                      <object class="GtkLabel" id="sidebar_unread_filter_label">
+                                                        <property name="label" translatable="yes">Unread</property>
+                                                        <property name="mnemonic-widget">sidebar_unread_filter_switch</property>
+                                                      </object>
+                                                    </child>
+                                                    <child>
+                                                      <object class="GtkSwitch" id="sidebar_unread_filter_switch">
+                                                        <property name="valign">center</property>
+                                                        <property name="tooltip-text" translatable="yes">Show Only Unread Conversations</property>
+                                                        <accessibility>
+                                                          <relation name="labelled-by">sidebar_unread_filter_label</relation>
+                                                        </accessibility>
+                                                      </object>
+                                                    </child>
+                                                  </object>
+                                                </child>
+                                                <child>
+                                                  <object class="GtkScrolledWindow">
+                                                    <property name="vexpand">True</property>
+                                                    <property name="child">
+                                                      <object class="GtkListView" id="conversation_list">
+                                                        <property name="single-click-activate">True</property>
+                                                        <style>
+                                                          <class name="navigation-sidebar"/>
+                                                          <class name="conduit-sidebar-list"/>
+                                                        </style>
+                                                      </object>
+                                                    </property>
+                                                  </object>
+                                                </child>
+                                          </object>
+                                        </property>
                                       </object>
-                                    </property>
+                                    </child>
+                                    <child>
+                                      <object class="GtkStackPage">
+                                        <property name="name">activity</property>
+                                        <property name="child">
+                                          <object class="GtkBox" id="sidebar_activity_page">
+                                            <property name="orientation">vertical</property>
+                                          </object>
+                                        </property>
+                                      </object>
+                                    </child>
                                   </object>
                                 </child>
                                 <child>

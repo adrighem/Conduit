@@ -1,67 +1,85 @@
-# Activity And Notifications Design
+# Activity Design
 
-> **Status: Historical design record.** This document is preserved as implementation history. Its unread-source and notification-flow statements below are superseded by [Attention And Notifications](attention-and-notifications.md), [Sidebar Design](sidebar-design.md), and [Realtime Sync Design](realtime-sync-design.md); see [README.md](../README.md) for current capabilities.
-
-## Assessment
-
-This feature makes sense for Conduit, but only as a focused attention surface.
-
-The official Slack client has a broad Activity product that aggregates mentions, replies, reactions, saved items, workflow updates, and notification policy. Conduit should not clone that full surface. A lightweight GNOME client should first answer a smaller question: "what conversations currently need my attention?"
-
-## Current Slice
-
-This slice adds a native sidebar entry named **Activity** and a main-pane attention list built from the conversation state Conduit already loads.
-
-The Activity list:
-
-- Includes conversations with unread activity from `users.conversations`.
-- Uses the same unread-field interpretation as the sidebar, including Slack extra fields whose names contain `unread`.
-- Resolves DM titles through the existing user-name cache.
-- Sorts direct messages before group DMs, then private channels, public channels, and unknown conversations; within each group, higher unread counts sort first.
-- Opens the selected conversation through the normal history load and read-marker flow.
-- Uses the existing native GIO notification path for newly detected messages.
-
-This gives users a single attention-first destination without adding another Slack token type, background event stream, or large local notification database.
+Activity is a rail destination that answers "what needs my attention?" from three sources:
+mentions of the current user, reactions to the current user's messages, and the threads the
+user takes part in. Desktop notification policy is separate; see
+[Attention And Notifications](attention-and-notifications.md).
 
 ## UI
 
-The sidebar primary row is now:
+- A rail button named **Activity** sits directly below Messages (`emblem-important-symbolic`)
+  with a badge: the number of unread mention items plus unread reaction items, hidden at 0.
+- Selecting it replaces the sidebar column (a `GtkStack` with the pages `conversations` and
+  `activity`) with the Activity list. The main pane is untouched, so opening an item shows it
+  in the main pane while the list stays up.
+- `SidebarMode::{Conversations, Activity}` lives next to `MainMessageView` in
+  `WorkspaceViewState`. Selecting Messages, Threads, Files or Later returns the sidebar to
+  Conversations; one rail toggle is active at a time and `sync_workspace_chrome` gives the
+  Activity toggle precedence while the mode is Activity.
+- The header has two toggles that are exclusive or both off, and a switch:
+  - **@ N** shows mentions only; N is the number of unread mentions.
+  - **thread icon N** shows followed threads only; N is the number of unread threads.
+  - **Unread messages** shows only unread items. Neither toggle active shows everything.
+- Rows show the sender avatar, a bold author name with "+N" for other participants (latest
+  reactor for reactions), a relative time, a two-line snippet with mentions resolved, and a
+  context line: `Thread in #channel`, `Thread in Direct message`, `Direct message` or
+  `#channel` (with the private-channel lock). A reaction row reads `Reacted :emoji: to:
+  <snippet>` and carries a chip with the emoji and its count. The trailing widget is a red
+  count pill (`mention-badge-pill`) when unread, else a check mark.
+- Activating a mention or reaction opens the conversation at that message
+  (`SecondaryAction::OpenMessage`); a thread opens in the thread pane
+  (`SecondaryAction::OpenThread`).
 
-- Home
-- Activity
-- Later
+## Model
 
-Activity uses `emblem-important-symbolic`, which is available in the Adwaita icon set used by this project.
+`src/activity.rs` holds the GTK-free model; `src/secondary_views/activity.rs` the widget and
+`src/secondary_views/model.rs` the row view models.
 
-The main-pane Activity view is rendered matching Search and Later. That keeps the implementation small and consistent with the current shell. A later native GTK list can replace this if the view grows richer than a simple attention list.
+- `ActivityItem` is keyed by `(channel_id, ts, kind)`. Kinds: `Mention { broadcast, group }`,
+  `Reaction { name, user_ids }` (one item per message and emoji, aggregated) and `ThreadReply`
+  (derived, never stored).
+- `ActivityFeed` keeps stored items newest first, deduplicated by key, capped at 200. Reaction
+  adds aggregate reactors; removing the last reactor drops the item.
+- Unread state is derived per render and never persisted. Mentions and reactions are unread
+  when their timestamp is after the conversation's `last_read` in the unread ledger (a
+  reaction's timestamp is when the reaction arrived, since the reacted message is the user's
+  own and always older than their read marker). Threads come from `ThreadRecord`
+  (`has_unread_replies`, `unread_reply_count`, `participant_user_ids`) in the thread catalog:
+  threads the user started, took part in or follows, at most the newest 100.
 
-## Notifications
+## Sources
 
-Conduit already sends native desktop notifications through `gio::Notification` when a refreshed conversation contains a newer message than the previous local timestamp.
+Nothing in Activity runs at startup against Slack.
 
-This slice keeps notification behavior conservative:
+| Source | How | Notes |
+| --- | --- | --- |
+| Live mentions | The realtime path forwards posted messages from others that contain a direct, broadcast or user-group mention. The window classifies them: direct `<@me>`, a user group the user belongs to (`<!subteam^ID>`, membership from the cached `usergroups.list`), or `@channel`/`@here`/`@everyone`. | Own messages are excluded. |
+| Backfill | One `search.messages` for `<@me>` (`sort=timestamp`, `sort_dir=desc`, `count=50`). | Sent when Activity is opened and the persisted `sync_metadata` stamp (`activity_backfill`) is missing or older than 15 minutes. |
+| Reactions | `reaction_added` and `reaction_removed` carry `item_user`; only reactions by others on the user's own messages are kept. | Live only. |
+| Threads | Derived from the thread catalog at render time. | No extra calls. |
 
-- No new background polling.
-- No per-workspace notification database.
-- No notification preference UI.
-- No app badge implementation until the target desktop/portal behavior is validated.
+Mentions and reactions persist as `activity_item` rows in `workspace_items` (written two
+seconds after a change, replacing the set) and are read from the local store at startup
+without network.
 
-## Deferred
+## Performance
 
-The following still belongs in later slices:
+- `UiInvalidations::ACTIVITY` coalesces events into one rebuild per frame. While the
+  conversation sidebar is showing, a change only marks the list stale (`PickerRefreshGate`)
+  and it is rebuilt when shown.
+- Rows are keyed. A refresh keeps the widgets of rows whose data and avatar did not change and
+  splices only the rest (`splices_around`), so scroll position and selection survive. Sort
+  keys are parsed once per item.
+- The list is a virtualized `GtkListView`.
+- `perf_guard_activity_*` tests cover the closed view, event bursts and unchanged rows.
 
-- Mentions, thread replies, and reactions aggregated from Slack APIs or realtime events.
-- Saved items with reminder/due metadata in Activity.
-- Quiet hours and preview preferences.
-- Conversation mute and per-conversation notification state.
-- App badge support where the runtime environment exposes it reliably.
-- Deeper notification deduplication once realtime events exist.
+## Gaps
 
-## Tests
-
-The implementation should keep unit coverage for:
-
-- Activity item filtering and sorting.
-- Extra unread-field support.
-- Activity HTML row rendering and empty state.
-- Sidebar selection semantics while Activity is active.
+- Reactions are live only: reactions that happened while Conduit was not running are not
+  recovered, and Slack offers no cheap query for them.
+- No `@channel`/`@here` backfill: `search.messages` for the user's id finds direct mentions
+  only. User-group mentions are live only too.
+- No invitations, keywords, app notifications or saved-item reminders.
+- A reaction that arrives after the newest message of a fully read conversation stays unread
+  until a later message in that conversation is read.
+- The 200-item cap drops the oldest stored mentions and reactions.

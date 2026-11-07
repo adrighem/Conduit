@@ -30,6 +30,7 @@ use adw::subclass::prelude::*;
 use gettextrs::gettext;
 use gtk::{gio, glib};
 
+use crate::activity::{self, ActivityObservation};
 use crate::attention::AttentionDecision;
 use crate::attention_settings;
 use crate::auth;
@@ -101,14 +102,14 @@ use crate::workspace_pipeline::{TimelineTarget, WorkspaceRevision};
 use crate::workspace_state::{
     ChannelLookupOutcome, ConversationOpenCoordinator, ConversationOpenIntent,
     ConversationOpenPosition, ConversationOpenRenderAction, ConversationPatchRemoval,
-    ConversationSelectionDecision, MainMessageView, ThreadApplyOutcome, ThreadOpenOutcome,
-    TimelineProjectionApplication, TimelineProjectionOperation, WorkspaceLifecycle,
-    WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState,
+    ConversationSelectionDecision, MainMessageView, SidebarMode, ThreadApplyOutcome,
+    ThreadOpenOutcome, TimelineProjectionApplication, TimelineProjectionOperation,
+    WorkspaceLifecycle, WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState,
     DISCOVERY_STARTUP_DELAY,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct UiInvalidations(pub u8);
+pub struct UiInvalidations(pub u16);
 
 impl UiInvalidations {
     pub const SIDEBAR: Self = Self(1 << 0);
@@ -118,6 +119,7 @@ impl UiInvalidations {
     pub const PICKER: Self = Self(1 << 4);
     pub const PEOPLE_PICKER: Self = Self(1 << 5);
     pub const COMPLETION: Self = Self(1 << 6);
+    pub const ACTIVITY: Self = Self(1 << 7);
 
     pub fn contains(self, invalidation: Self) -> bool {
         self.0 & invalidation.0 != 0
@@ -241,6 +243,12 @@ mod imp {
         pub workspace_avatar: TemplateChild<adw::Avatar>,
         #[template_child]
         pub threads_unread_badge: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub activity_unread_badge: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub sidebar_stack: TemplateChild<gtk::Stack>,
+        #[template_child]
+        pub sidebar_activity_page: TemplateChild<gtk::Box>,
         #[template_child]
         pub refresh_button: TemplateChild<gtk::Button>,
         #[template_child]
@@ -472,6 +480,10 @@ mod imp {
         pub(super) restoring_navigation: Cell<bool>,
         pub(super) profile_visible: Cell<bool>,
         pub(super) secondary_view: RefCell<Option<crate::secondary_views::SecondaryView>>,
+        pub(super) activity_view: RefCell<Option<crate::secondary_views::ActivityView>>,
+        /// Marks the Activity list stale while the conversation sidebar is up.
+        pub(super) activity_refresh: Cell<PickerRefreshGate>,
+        pub(super) activity_save_pending: Cell<bool>,
         /// Query of the search currently shown, for result highlighting.
         pub(super) search_query: RefCell<String>,
         /// User ids behind the "From" dropdown rows after "From anyone".
@@ -512,6 +524,7 @@ mod imp {
             obj.setup_cached_theme();
             obj.setup_runtime();
             obj.setup_message_view();
+            obj.setup_activity_view();
             obj.configure_accessibility();
             obj.configure_auth_ui();
             obj.setup_settings();
@@ -1831,6 +1844,7 @@ fn media_zoom_size(natural: (i32, i32), viewport: (i32, i32), zoom: f64) -> (i32
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceNavigationSelection {
     Messages,
+    Activity,
     Threads,
     Files,
     Saved,
@@ -1928,6 +1942,7 @@ impl WorkspaceNavigationSelection {
     fn toggle_name(self) -> &'static str {
         match self {
             Self::Messages => "messages",
+            Self::Activity => "activity",
             Self::Threads => "threads",
             Self::Files => "files",
             Self::Saved => "saved",
@@ -1937,6 +1952,7 @@ impl WorkspaceNavigationSelection {
     fn from_toggle_name(name: &str) -> Option<Self> {
         match name {
             "messages" => Some(Self::Messages),
+            "activity" => Some(Self::Activity),
             "threads" => Some(Self::Threads),
             "files" => Some(Self::Files),
             "saved" => Some(Self::Saved),
@@ -1954,6 +1970,18 @@ fn workspace_navigation_selection(
         MainMessageView::Files => Some(WorkspaceNavigationSelection::Files),
         MainMessageView::Saved => Some(WorkspaceNavigationSelection::Saved),
         MainMessageView::Placeholder | MainMessageView::Search => None,
+    }
+}
+
+/// The Activity list replaces the conversation sidebar whatever the main
+/// view shows, so it owns the rail selection while it is up.
+fn navigation_selection(
+    sidebar_mode: SidebarMode,
+    main_view: MainMessageView,
+) -> Option<WorkspaceNavigationSelection> {
+    match sidebar_mode {
+        SidebarMode::Activity => Some(WorkspaceNavigationSelection::Activity),
+        SidebarMode::Conversations => workspace_navigation_selection(main_view),
     }
 }
 
@@ -7773,6 +7801,19 @@ impl ConduitWindow {
                     .apply_user_groups(groups);
                 self.invalidate_composer_completions();
             }
+            RuntimeEventKind::ActivityHydrated(items) => {
+                if self.imp().workspace.activity.borrow_mut().merge(items) {
+                    self.activity_changed(false);
+                }
+            }
+            RuntimeEventKind::ActivityBackfilled(items) => {
+                if self.imp().workspace.activity.borrow_mut().merge(items) {
+                    self.activity_changed(true);
+                }
+            }
+            RuntimeEventKind::ActivityObserved(observation) => {
+                self.observe_activity(observation);
+            }
             RuntimeEventKind::ConversationOpenCompleted { channel_id } => {
                 let title = self.conversation_title(&channel_id);
                 self.select_conversation(&channel_id, &title);
@@ -8345,6 +8386,9 @@ impl ConduitWindow {
                 }
             }
         }
+        if invalidations.contains(UiInvalidations::ACTIVITY) {
+            self.rebuild_activity();
+        }
         if invalidations.contains(UiInvalidations::TITLE) {
             self.refresh_workspace_title_status();
             self.refresh_current_conversation_title();
@@ -8651,6 +8695,7 @@ impl ConduitWindow {
         if !self.flush_current_drafts() {
             return;
         }
+        self.leave_activity_sidebar();
         if let Some(channel_id) = self.selected_channel_id() {
             let title = self.conversation_title(&channel_id);
             self.select_conversation(&channel_id, &title);
@@ -8669,6 +8714,7 @@ impl ConduitWindow {
         if !self.flush_current_drafts() {
             return;
         }
+        self.leave_activity_sidebar();
         self.record_navigation(&MainNavigationTarget::Threads);
         self.imp().workspace.view.borrow_mut().show_threads();
         self.render_closed_thread();
@@ -8709,6 +8755,7 @@ impl ConduitWindow {
         if !self.flush_current_drafts() {
             return false;
         }
+        self.leave_activity_sidebar();
         self.record_navigation(&MainNavigationTarget::Files);
         let title = gettext("Files");
         self.imp().workspace.view.borrow_mut().start_files();
@@ -8727,6 +8774,7 @@ impl ConduitWindow {
         if !self.flush_current_drafts() {
             return;
         }
+        self.leave_activity_sidebar();
         self.record_navigation(&MainNavigationTarget::Saved);
         let title = gettext("Later");
         self.imp().workspace.view.borrow_mut().start_saved();
@@ -10020,6 +10068,13 @@ impl ConduitWindow {
         imp.pending_status_update.borrow_mut().take();
         imp.huddle_revealer.set_reveal_child(false);
         imp.workspace.reset();
+        imp.activity_refresh.set(PickerRefreshGate::default());
+        if let Some(view) = self.activity_view() {
+            view.show_rows(Vec::new(), &MessageRenderContext::default());
+            view.set_counts(0, 0);
+        }
+        self.refresh_activity_badge();
+        self.sync_workspace_chrome();
         crate::timeline_message_widget::clear_timeline_view_caches();
         imp.conversation_opening.borrow_mut().reset();
         imp.message_control_registry.borrow_mut().reset_session();
@@ -10169,6 +10224,219 @@ impl ConduitWindow {
                 gettext("Threads")
             };
             toggle.set_tooltip(&tooltip);
+        }
+    }
+
+    fn setup_activity_view(&self) {
+        let view = crate::secondary_views::ActivityView::new();
+        let window_weak = self.downgrade();
+        view.set_on_action(move |action| {
+            if let Some(window) = window_weak.upgrade() {
+                window.handle_secondary_action(action);
+            }
+        });
+        let window_weak = self.downgrade();
+        view.set_on_filter_changed(move || {
+            if let Some(window) = window_weak.upgrade() {
+                window.queue_ui_invalidations(UiInvalidations::ACTIVITY);
+            }
+        });
+        self.imp().sidebar_activity_page.append(view.widget());
+        *self.imp().activity_view.borrow_mut() = Some(view);
+    }
+
+    fn activity_view(&self) -> Option<crate::secondary_views::ActivityView> {
+        self.imp().activity_view.borrow().clone()
+    }
+
+    /// Replaces the conversation sidebar with the Activity list. The main
+    /// pane is left as it is.
+    fn show_activity(&self) {
+        let imp = self.imp();
+        imp.workspace
+            .view
+            .borrow_mut()
+            .set_sidebar_mode(SidebarMode::Activity);
+        self.sync_workspace_chrome();
+        let mut gate = imp.activity_refresh.get();
+        gate.shown();
+        imp.activity_refresh.set(gate);
+        self.queue_ui_invalidations(UiInvalidations::ACTIVITY);
+        // The runtime skips the search while its stamp is under 15 minutes old.
+        self.send_command(RuntimeCommand::LoadActivity);
+        imp.workspace_split.set_show_content(false);
+    }
+
+    /// Brings the conversation sidebar back; every other rail destination
+    /// calls this first.
+    fn leave_activity_sidebar(&self) {
+        let changed = self
+            .imp()
+            .workspace
+            .view
+            .borrow_mut()
+            .set_sidebar_mode(SidebarMode::Conversations);
+        if changed {
+            self.sync_workspace_chrome();
+        }
+    }
+
+    /// Queues one Activity rebuild for the next frame, but only while the
+    /// list is on screen; otherwise it is marked stale and rebuilt on show.
+    fn queue_activity_refresh(&self) {
+        let imp = self.imp();
+        let visible = imp.workspace.view.borrow().sidebar_mode() == SidebarMode::Activity;
+        let mut gate = imp.activity_refresh.get();
+        let rebuild = gate.request(visible);
+        imp.activity_refresh.set(gate);
+        if rebuild {
+            self.queue_ui_invalidations(UiInvalidations::ACTIVITY);
+        }
+    }
+
+    /// The feed changed: update the rail badge, refresh the list and, unless
+    /// the change just came from the store, persist it shortly after.
+    fn activity_changed(&self, persist: bool) {
+        self.refresh_activity_badge();
+        self.queue_activity_refresh();
+        if persist && !self.imp().activity_save_pending.replace(true) {
+            let weak_window = self.downgrade();
+            glib::timeout_add_local_once(Duration::from_secs(2), move || {
+                let Some(window) = weak_window.upgrade() else {
+                    return;
+                };
+                window.imp().activity_save_pending.set(false);
+                if window.imp().workspace_ready.get() {
+                    let items = window.imp().workspace.activity.borrow().items().to_vec();
+                    window.send_command(RuntimeCommand::SaveActivity(items));
+                }
+            });
+        }
+    }
+
+    fn observe_activity(&self, observation: ActivityObservation) {
+        let imp = self.imp();
+        let Some(me) = imp.current_user_id.borrow().clone() else {
+            return;
+        };
+        let changed = match observation {
+            ActivityObservation::Message {
+                channel_id,
+                message,
+            } => {
+                let groups = imp
+                    .workspace
+                    .user_directory
+                    .user_group_members
+                    .borrow()
+                    .clone();
+                activity::mention_item(&channel_id, &message, &me, &|group| {
+                    groups
+                        .get(group)
+                        .is_some_and(|members| members.contains(&me))
+                })
+                .is_some_and(|item| imp.workspace.activity.borrow_mut().merge([item]))
+            }
+            ActivityObservation::Reaction(change) => {
+                let text = imp
+                    .workspace
+                    .view
+                    .borrow()
+                    .channel_messages(&change.channel_id)
+                    .iter()
+                    .find(|message| message.ts == change.ts)
+                    .map(SlackMessage::visible_text)
+                    .unwrap_or_default();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let now_ts = format!("{}.{:06}", now.as_secs(), now.subsec_micros());
+                imp.workspace
+                    .activity
+                    .borrow_mut()
+                    .reaction_changed(&change, &text, &now_ts)
+            }
+        };
+        if changed {
+            self.activity_changed(true);
+        }
+    }
+
+    /// Unread mention and reaction items on the Activity rail button.
+    fn refresh_activity_badge(&self) {
+        let imp = self.imp();
+        let unread = activity::badge_count(
+            &imp.workspace.activity.borrow(),
+            &imp.workspace.read_states.borrow(),
+        );
+        let badge = &imp.activity_unread_badge;
+        badge.set_visible(unread > 0);
+        badge.set_label(&if unread > 99 {
+            "99+".to_string()
+        } else {
+            unread.to_string()
+        });
+        if let Some(toggle) = imp.navigation_toggle_group.toggle_by_name("activity") {
+            let tooltip = if unread > 0 {
+                gettext("Activity, {count} unread").replace("{count}", &unread.to_string())
+            } else {
+                gettext("Activity")
+            };
+            toggle.set_tooltip(&tooltip);
+        }
+    }
+
+    fn rebuild_activity(&self) {
+        let Some(view) = self.activity_view() else {
+            return;
+        };
+        let imp = self.imp();
+        let me = imp.current_user_id.borrow().clone();
+        let entries = activity::entries(
+            &imp.workspace.activity.borrow(),
+            &imp.workspace.read_states.borrow(),
+            &imp.workspace.threads.borrow(),
+            me.as_deref(),
+        );
+        let (mentions, threads) = activity::header_counts(&entries);
+        view.set_counts(mentions, threads);
+        let entries = activity::filter_entries(entries, view.filter(), view.unread_only());
+        self.request_user_ids(
+            crate::secondary_views::activity_user_ids(&entries)
+                .into_iter()
+                .collect(),
+        );
+        let context = self.message_html_context(None);
+        let now = u64::try_from(current_unix_seconds()).unwrap_or_default();
+        let rows = crate::secondary_views::activity_rows(
+            &entries,
+            &context,
+            &|channel_id| self.activity_channel_label(channel_id),
+            now,
+        );
+        view.show_rows(rows, &context);
+    }
+
+    fn activity_channel_label(&self, channel_id: &str) -> crate::secondary_views::ChannelLabel {
+        let kind = self
+            .imp()
+            .workspace
+            .conversations
+            .borrow()
+            .get(channel_id)
+            .map(sidebar::conversation_kind);
+        crate::secondary_views::ChannelLabel {
+            name: self.conversation_title(channel_id),
+            direct: kind.map_or_else(
+                || channel_id.starts_with('D'),
+                |kind| {
+                    matches!(
+                        kind,
+                        ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage
+                    )
+                },
+            ),
+            private: kind == Some(ConversationKind::PrivateChannel),
         }
     }
 
@@ -10676,6 +10944,10 @@ impl ConduitWindow {
                 );
             }
         }
+        if !application.read_state_changed_ids().is_empty() || application.conversation_reset() {
+            self.refresh_activity_badge();
+            self.queue_activity_refresh();
+        }
         if !application.read_state_changed_ids().is_empty() && !application.conversation_reset() {
             if !self.render_changed_conversations(application.read_state_changed_ids()) {
                 self.queue_sidebar_render();
@@ -10688,6 +10960,7 @@ impl ConduitWindow {
         }
         if application.thread_catalog_changed() {
             self.refresh_threads_badge();
+            self.queue_activity_refresh();
             // Sidebar thread sub-rows ("Thread (N responses) (M unread)")
             // are derived from the thread catalog independently of which
             // main view is active, so they need their own invalidation here.
@@ -10822,6 +11095,9 @@ impl ConduitWindow {
         };
         if !invalidations.is_empty() {
             self.queue_ui_invalidations(invalidations);
+        }
+        if !affected_user_ids.is_empty() {
+            self.queue_activity_refresh();
         }
     }
 
@@ -12801,8 +13077,10 @@ impl ConduitWindow {
     /// Programmatic syncs from `sync_workspace_chrome` already match the
     /// authoritative view, so comparing against it breaks the feedback loop.
     fn navigation_toggle_changed(&self, group: &adw::ToggleGroup) {
-        let main_view = self.imp().workspace.view.borrow().main_view();
-        let current = workspace_navigation_selection(main_view);
+        let current = {
+            let view = self.imp().workspace.view.borrow();
+            navigation_selection(view.sidebar_mode(), view.main_view())
+        };
         let requested = group
             .active_name()
             .and_then(|name| WorkspaceNavigationSelection::from_toggle_name(&name));
@@ -12811,6 +13089,7 @@ impl ConduitWindow {
         }
         match requested {
             Some(WorkspaceNavigationSelection::Messages) => self.show_messages(),
+            Some(WorkspaceNavigationSelection::Activity) => self.show_activity(),
             Some(WorkspaceNavigationSelection::Threads) => self.show_threads(),
             Some(WorkspaceNavigationSelection::Files) => self.show_files(),
             Some(WorkspaceNavigationSelection::Saved) => self.show_later(),
@@ -12824,8 +13103,17 @@ impl ConduitWindow {
     fn sync_workspace_chrome(&self) {
         let imp = self.imp();
         self.sync_back_button();
-        let main_view = imp.workspace.view.borrow().main_view();
-        let selection = workspace_navigation_selection(main_view);
+        let (main_view, sidebar_mode) = {
+            let view = imp.workspace.view.borrow();
+            (view.main_view(), view.sidebar_mode())
+        };
+        let selection = navigation_selection(sidebar_mode, main_view);
+        imp.sidebar_stack
+            .set_visible_child_name(if sidebar_mode == SidebarMode::Activity {
+                "activity"
+            } else {
+                "conversations"
+            });
         imp.navigation_toggle_group
             .set_active_name(selection.map(WorkspaceNavigationSelection::toggle_name));
         imp.message_composer

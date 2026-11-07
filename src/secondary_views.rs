@@ -3,8 +3,10 @@
 //! One list widget serves all four views: the window builds view-model rows
 //! ([`model`], [`search`], [`files`]) from workspace data and hands them to
 //! [`SecondaryView`], which renders cards ([`rows`]) and reports user intent
-//! as [`SecondaryAction`]s.
+//! as [`SecondaryAction`]s. The Activity list that replaces the conversation
+//! sidebar is its own widget ([`activity`]).
 
+mod activity;
 mod files;
 mod model;
 mod rows;
@@ -17,9 +19,11 @@ use adw::prelude::*;
 use gtk::glib::subclass::prelude::*;
 use gtk::{gio, glib};
 
+pub(crate) use activity::ActivityView;
 pub(crate) use files::file_rows;
 pub(crate) use model::{
-    saved_rows, thread_rows, SecondaryAction, SecondaryKind, SecondaryRow, ThreadState,
+    activity_rows, activity_user_ids, saved_rows, thread_rows, ChannelLabel, SecondaryAction,
+    SecondaryKind, SecondaryRow, ThreadState,
 };
 pub(crate) use search::{
     channel_rows, conversation_modifier, people_rows, search_rows, SearchFilters, SearchScope,
@@ -887,6 +891,96 @@ mod tests {
                 let after = items(&view);
                 assert_ne!(after[0], before[0]);
                 assert_eq!(after[1..], before[1..]);
+            });
+        }
+
+        fn show_activity(view: &ActivityView) -> ShownWindow {
+            let window = gtk::Window::new();
+            window.set_default_size(360, 480);
+            window.set_child(Some(view.widget()));
+            window.present();
+            wait_for(
+                5000,
+                "the window to lay out",
+                || format!("height {}", window.height()),
+                || window.height() > 0,
+            );
+            ShownWindow(window)
+        }
+
+        #[test]
+        fn activity_filter_toggles_are_exclusive_or_none_and_report_changes() {
+            run_gtk_test(|| {
+                let _ = adw::init();
+                let view = ActivityView::new();
+                let changes = Rc::new(Cell::new(0));
+                let counter = changes.clone();
+                view.set_on_filter_changed(move || counter.set(counter.get() + 1));
+                assert_eq!(view.filter(), crate::activity::ActivityFilter::All);
+
+                view.mentions_toggle.set_active(true);
+                assert_eq!(view.filter(), crate::activity::ActivityFilter::Mentions);
+                view.threads_toggle.set_active(true);
+                assert_eq!(view.filter(), crate::activity::ActivityFilter::Threads);
+                assert!(!view.mentions_toggle.is_active());
+                view.threads_toggle.set_active(false);
+                assert_eq!(view.filter(), crate::activity::ActivityFilter::All);
+                assert_eq!(changes.get(), 3, "one change per user toggle");
+
+                view.unread_switch.set_active(true);
+                assert!(view.unread_only());
+                assert_eq!(changes.get(), 4);
+
+                view.set_counts(3, 2);
+                assert_eq!(changes.get(), 4, "counts are not filter changes");
+                assert!(view.mention_count.is_visible());
+                assert_eq!(view.mention_count.label(), "3");
+                view.set_counts(0, 0);
+                assert!(!view.thread_count.is_visible());
+            });
+        }
+
+        #[test]
+        fn activity_rows_activate_their_target_and_survive_refreshes() {
+            run_gtk_test(|| {
+                let _ = adw::init();
+                let context = test_context();
+                let view = ActivityView::new();
+                let _window = show_activity(&view);
+                let actions = Rc::new(RefCell::new(Vec::new()));
+                let sink = actions.clone();
+                view.set_on_action(move |action| sink.borrow_mut().push(action));
+
+                let mut thread = activity::tests::row("3.0", "thread");
+                thread.target = model::ActivityTarget::Thread {
+                    channel_id: "C1".to_string(),
+                    thread_ts: "1.0".to_string(),
+                };
+                let rows = vec![thread, activity::tests::row("2.0", "mention")];
+                view.show_rows(rows.clone(), &context);
+                assert_eq!(view.store.n_items(), 2);
+                let before = view.store.item(1).expect("row");
+
+                view.list_view.emit_by_name::<()>("activate", &[&0u32]);
+                view.list_view.emit_by_name::<()>("activate", &[&1u32]);
+                assert!(matches!(
+                    &actions.borrow()[0],
+                    SecondaryAction::OpenThread { thread_ts, .. } if thread_ts == "1.0"
+                ));
+                assert!(matches!(
+                    &actions.borrow()[1],
+                    SecondaryAction::OpenMessage(location) if location.message_ts() == "2.0"
+                ));
+
+                // A new item above keeps the existing rows' objects.
+                let mut refreshed = vec![activity::tests::row("4.0", "new")];
+                refreshed.extend(rows);
+                view.show_rows(refreshed, &context);
+                assert_eq!(view.store.n_items(), 3);
+                assert_eq!(view.store.item(2).expect("row"), before);
+
+                view.show_rows(Vec::new(), &context);
+                assert_eq!(view.store.n_items(), 0);
             });
         }
     }

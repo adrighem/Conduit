@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::activity::ActivityFeed;
 use crate::conversation_catalog::ConversationCatalog;
 use crate::models::{
     slack_timestamp_is_after, SavedItem, SearchMatch, SearchMessageLocation, SlackConversation,
@@ -334,6 +335,7 @@ pub(crate) struct WorkspaceSessionState {
     pub(crate) view: RefCell<WorkspaceViewState>,
     pub(crate) threads: RefCell<ThreadCatalog>,
     pub(crate) read_states: RefCell<UnreadLedger>,
+    pub(crate) activity: RefCell<ActivityFeed>,
     workspace_patches: RefCell<WorkspacePatchConsumer>,
 }
 
@@ -504,6 +506,7 @@ impl WorkspaceSessionState {
         self.view.borrow_mut().reset();
         *self.threads.borrow_mut() = ThreadCatalog::default();
         *self.read_states.borrow_mut() = UnreadLedger::default();
+        *self.activity.borrow_mut() = ActivityFeed::default();
         *self.workspace_patches.borrow_mut() = WorkspacePatchConsumer::default();
     }
 
@@ -671,6 +674,15 @@ fn replace_patch_conversations(
     }
     *catalog = ConversationCatalog::from_cached(conversations.iter().cloned());
     application.record_conversation_reset();
+}
+
+/// What the sidebar column shows. Independent of [`MainMessageView`]: opening
+/// an Activity item changes the main view and leaves the Activity list up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SidebarMode {
+    #[default]
+    Conversations,
+    Activity,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -989,6 +1001,7 @@ enum ThreadLoadStatus {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkspaceViewState {
     main_view: MainMessageView,
+    sidebar_mode: SidebarMode,
     last_channel_id: Option<String>,
     channels: HashMap<String, ChannelHistoryState>,
     thread_timelines: HashMap<(String, String), Vec<SlackMessage>>,
@@ -1008,6 +1021,15 @@ pub(crate) struct WorkspaceViewState {
 impl WorkspaceViewState {
     pub(crate) fn main_view(&self) -> MainMessageView {
         self.main_view
+    }
+
+    pub(crate) fn sidebar_mode(&self) -> SidebarMode {
+        self.sidebar_mode
+    }
+
+    /// Returns whether the mode changed.
+    pub(crate) fn set_sidebar_mode(&mut self, mode: SidebarMode) -> bool {
+        std::mem::replace(&mut self.sidebar_mode, mode) != mode
     }
 
     pub(crate) fn last_channel_id(&self) -> Option<&str> {

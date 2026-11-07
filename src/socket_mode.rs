@@ -100,6 +100,10 @@ pub struct SocketModeReactionEvent {
     pub ts: String,
     pub name: String,
     pub user_id: String,
+    /// Author of the reacted message (`item_user`), when Slack names it.
+    /// Boxed so `SocketModeEvent` stays within the size the realtime queue
+    /// is tuned for.
+    pub item_user: Option<Box<str>>,
     pub added: bool,
 }
 
@@ -445,6 +449,7 @@ fn reaction_event(event: &Value, added: bool) -> Option<SocketModeReactionEvent>
         ts: item.get("ts").and_then(Value::as_str)?.to_string(),
         name: event.get("reaction").and_then(Value::as_str)?.to_string(),
         user_id: event.get("user").and_then(Value::as_str)?.to_string(),
+        item_user: non_empty_str(event, "item_user").map(Box::from),
         added,
     })
 }
@@ -961,6 +966,7 @@ mod tests {
         let event = socket_event_from_payload(&payload(serde_json::json!({
             "type": "reaction_added",
             "user": "U123",
+            "item_user": "U999",
             "reaction": "thumbsup",
             "item": {
                 "type": "message",
@@ -976,6 +982,7 @@ mod tests {
                 ts: "1710000000.000100".to_string(),
                 name: "thumbsup".to_string(),
                 user_id: "U123".to_string(),
+                item_user: Some("U999".into()),
                 added: true,
             }))
         );

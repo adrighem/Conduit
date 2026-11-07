@@ -4103,3 +4103,41 @@ fn store_and_load_sidebar_theme() {
 
     let _ = std::fs::remove_dir_all(directory);
 }
+
+#[test]
+fn activity_items_persist_replace_and_reload_without_unread_state() {
+    use crate::activity::{ActivityFeed, ActivityKind};
+
+    let directory = temp_cache_dir("activity-items");
+    let store = WorkspaceStore::new(directory.clone(), "T123:U123");
+
+    runtime().block_on(async {
+        assert!(store.load_activity_items().await.unwrap().is_empty());
+        let mention = ActivityKind::Mention {
+            broadcast: true,
+            group: None,
+        };
+        let reaction = ActivityKind::Reaction {
+            name: "tada".to_string(),
+            user_ids: vec!["U1".to_string(), "U2".to_string()],
+        };
+        let items = vec![
+            ActivityItem::new("C1", "10.0", mention, "10.0").with_text("<!here> hi"),
+            ActivityItem::new("C1", "5.0", reaction, "12.0"),
+        ];
+        store.replace_activity_items(items.clone()).await.unwrap();
+
+        let mut feed = ActivityFeed::default();
+        feed.merge(store.load_activity_items().await.unwrap());
+        let loaded = feed.items().to_vec();
+        assert_eq!(loaded, [items[1].clone(), items[0].clone()]);
+
+        store
+            .replace_activity_items(vec![items[0].clone()])
+            .await
+            .unwrap();
+        assert_eq!(store.load_activity_items().await.unwrap().len(), 1);
+    });
+
+    let _ = std::fs::remove_dir_all(directory);
+}

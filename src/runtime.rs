@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
+use crate::activity::{ActivityItem, ActivityObservation};
 #[cfg(test)]
 use crate::attention::AttentionReason;
 use crate::attention::{AttentionDecision, AttentionPreferences, DeliveryState};
@@ -47,6 +48,7 @@ use crate::socket_mode::{self, SocketModeDisconnect, SocketModeEvent, SocketMode
 use crate::store::{
     AttentionObservationStatus, ChannelDiscoveryProgress, ChannelDiscoveryState, StoreError,
     StoreErrorCategory, SyncFreshness, WorkspaceBootstrap, WorkspaceStore,
+    ACTIVITY_BACKFILL_OPERATION,
 };
 use crate::sync_scheduler::{
     AdmissionOutcome, CancellationId, CompletionOutcome, FreshnessPolicy, JobOutcome, RefreshClass,
@@ -446,6 +448,16 @@ impl RuntimeCommand {
                 workspace(RuntimeOperation::FollowedThreads),
                 NavigationSlot::Main,
             ),
+            Self::LoadActivity => RuntimeCommandDescriptor::request(
+                workspace(RuntimeOperation::Activity),
+                RuntimeTaskLane::Background,
+                RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::ActivityBackfill),
+            ),
+            Self::SaveActivity(_) => RuntimeCommandDescriptor::mutation(
+                workspace(RuntimeOperation::Activity),
+                RuntimeTaskLane::Background,
+                RuntimeAdmissionPolicy::durable_action(),
+            ),
             Self::LoadUser { user_id } => RuntimeCommandDescriptor::request(
                 OperationContext::new(RuntimeOperation::User, RuntimeTarget::User(user_id.clone())),
                 RuntimeTaskLane::Background,
@@ -843,6 +855,12 @@ pub enum RuntimeEventKind {
     },
     ConversationPeopleDiscovered(Vec<SlackUser>),
     UserGroupsDiscovered(Vec<SlackUserGroup>),
+    /// Mentions and reactions persisted by earlier sessions, read at startup.
+    ActivityHydrated(Vec<ActivityItem>),
+    /// Mentions found by the `search.messages` backfill.
+    ActivityBackfilled(Vec<ActivityItem>),
+    /// A realtime message or reaction that may belong in the Activity feed.
+    ActivityObserved(ActivityObservation),
     ConversationOpenCompleted {
         channel_id: String,
     },
@@ -1004,6 +1022,9 @@ impl RuntimeEventKind {
             }
             Self::AttentionNotificationCandidate { .. } => {
                 OperationContext::new(RuntimeOperation::SocketMode, RuntimeTarget::Workspace)
+            }
+            Self::ActivityHydrated(_) | Self::ActivityBackfilled(_) | Self::ActivityObserved(_) => {
+                OperationContext::new(RuntimeOperation::Activity, RuntimeTarget::Workspace)
             }
             Self::ConversationChannelsDiscovered(_)
             | Self::DiscoveredChannelsHydrated(_)
@@ -4804,6 +4825,15 @@ async fn load_cached_bootstrap(events: &RuntimeEventSender, connection: &Runtime
     if let Some(theme) = sidebar_theme {
         events.send_event(RuntimeEventKind::WorkspaceThemeLoaded(theme));
     }
+    match store.load_activity_items().await {
+        Ok(items) if !items.is_empty() => {
+            events.send_event(RuntimeEventKind::ActivityHydrated(items));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            crate::debug::log("store", &format!("ActivityItemsLoadFailed error={error:#}"))
+        }
+    }
     match store.load_discovered_channels().await {
         Ok(channels) if !channels.is_empty() => {
             events.send_event(RuntimeEventKind::DiscoveredChannelsHydrated(channels));
@@ -5771,6 +5801,43 @@ async fn handle_command(command: RuntimeCommand, context: &mut RuntimeContext<'_
                 .events
                 .send_event(RuntimeEventKind::SearchLoaded(results));
         }
+        RuntimeCommand::LoadActivity => {
+            let api = require_slack(context.slack)?;
+            let (Some(user_id), Some(store)) =
+                (context.current_user_id, context.workspace_store.as_ref())
+            else {
+                return Ok(());
+            };
+            let refreshed_at_ms = store
+                .load_sync_freshness(ACTIVITY_BACKFILL_OPERATION, USER_DIRECTORY_TARGET)
+                .await?
+                .and_then(|freshness| freshness.refreshed_at_ms);
+            if !crate::activity::backfill_is_due(refreshed_at_ms, unix_now_ms()) {
+                return Ok(());
+            }
+            let matches = api.search_mentions(user_id).await?;
+            store
+                .store_sync_freshness(
+                    ACTIVITY_BACKFILL_OPERATION,
+                    USER_DIRECTORY_TARGET,
+                    SyncFreshness {
+                        refreshed_at_ms: Some(unix_now_ms()),
+                        retry_count: 0,
+                        retry_after_ms: None,
+                    },
+                )
+                .await?;
+            context
+                .events
+                .send_event(RuntimeEventKind::ActivityBackfilled(
+                    crate::activity::items_from_search(&matches, user_id),
+                ));
+        }
+        RuntimeCommand::SaveActivity(items) => {
+            if let Some(store) = context.workspace_store.as_ref() {
+                store.replace_activity_items(items).await?;
+            }
+        }
         RuntimeCommand::LoadFiles => {
             let api = require_slack(context.slack)?;
             let files = api.files().await?;
@@ -6609,6 +6676,7 @@ async fn run_socket_mode(
         let workspace_for_run = workspace.clone();
         let huddles_for_run = huddles.clone();
         let team_id_for_run = team_id.clone();
+        let current_user_id_for_run = current_user_id.clone();
         let user_status_sync_for_run = user_status_sync.clone();
         let result = {
             let connected_before = &connected_before;
@@ -6646,6 +6714,7 @@ async fn run_socket_mode(
                     let events_for_event = events_for_run.clone();
                     let huddles_for_event = huddles_for_run.clone();
                     let team_id_for_event = team_id_for_run.clone();
+                    let current_user_id_for_event = current_user_id_for_run.clone();
                     let user_status_sync_for_event = user_status_sync_for_run.clone();
                     async move {
                         observe_huddle_socket_event(
@@ -6654,6 +6723,13 @@ async fn run_socket_mode(
                             &event,
                         )
                         .await?;
+                        if let Some(observation) = crate::activity::observe_socket_event(
+                            &event,
+                            current_user_id_for_event.as_deref(),
+                        ) {
+                            events_for_event
+                                .send_event(RuntimeEventKind::ActivityObserved(observation));
+                        }
                         let defer_workspace_mutation = persistence_for_event.is_some()
                             && matches!(
                                 &event,

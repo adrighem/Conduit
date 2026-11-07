@@ -203,6 +203,10 @@ impl ThreadCatalog {
         })
     }
 
+    pub(crate) fn records(&self) -> impl Iterator<Item = &ThreadRecord> {
+        self.records.values()
+    }
+
     pub(crate) fn upsert_records(&mut self, records: impl IntoIterator<Item = ThreadRecord>) {
         for record in records {
             self.records.insert(record.key.clone(), record);

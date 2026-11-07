@@ -455,7 +455,7 @@ pub(crate) fn contains_direct_mention(text: &str, current_user_id: Option<&str>)
 /// Matches Slack's `<!channel>`, `<!here>`, and `<!everyone>` broadcast
 /// entities. These notify every member of the conversation, so they carry
 /// the same priority tier as a direct mention.
-fn contains_broadcast_mention(text: &str) -> bool {
+pub(crate) fn contains_broadcast_mention(text: &str) -> bool {
     let mut rest = text;
     while let Some(start) = rest.find("<!") {
         rest = &rest[start + 2..];

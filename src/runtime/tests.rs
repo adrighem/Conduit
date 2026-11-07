@@ -3806,6 +3806,7 @@ fn realtime_socket_events_enter_the_workspace_adapter_once() {
             ts: "1.000".into(),
             name: "wave".into(),
             user_id: "U1".into(),
+            item_user: None,
             added: true,
         }),
     )
@@ -6615,6 +6616,7 @@ fn realtime_persistence_preserves_socket_event_order() {
                     ts: "1.0".into(),
                     name: "wave".into(),
                     user_id: "U_OTHER".into(),
+                    item_user: None,
                     added: true,
                 }),
             })
@@ -7738,6 +7740,9 @@ fn expected_runtime_admission(command: &RuntimeCommand) -> RuntimeAdmissionPolic
         | RuntimeCommand::LoadFollowedThreads { .. } => RuntimeAdmissionPolicy::supersedable(
             RuntimeAdmissionKey::Navigation(NavigationSlot::Main),
         ),
+        RuntimeCommand::LoadActivity => {
+            RuntimeAdmissionPolicy::coalescible(RuntimeAdmissionKey::ActivityBackfill)
+        }
         RuntimeCommand::LoadThread { .. } | RuntimeCommand::LoadOlderThread { .. } => {
             RuntimeAdmissionPolicy::supersedable(RuntimeAdmissionKey::Navigation(
                 NavigationSlot::Thread,
@@ -7779,6 +7784,7 @@ fn expected_runtime_admission(command: &RuntimeCommand) -> RuntimeAdmissionPolic
             ))
         }
         RuntimeCommand::UpdateAttentionPreferences(_)
+        | RuntimeCommand::SaveActivity(_)
         | RuntimeCommand::JoinConversation { .. }
         | RuntimeCommand::LeaveConversation { .. }
         | RuntimeCommand::OpenDirectMessage { .. }
@@ -7843,6 +7849,7 @@ fn expected_legacy_scheduling(
         }
         RuntimeCommand::RefreshConversations
         | RuntimeCommand::DiscoverConversations
+        | RuntimeCommand::LoadActivity
         | RuntimeCommand::LoadUser { .. }
         | RuntimeCommand::LoadChannelInfo { .. }
         | RuntimeCommand::LoadUserProfile { .. } => (true, None, RuntimeTaskLane::Background),
@@ -7853,6 +7860,7 @@ fn expected_legacy_scheduling(
         RuntimeCommand::SignOut
         | RuntimeCommand::Disconnect
         | RuntimeCommand::UpdateAttentionPreferences(_)
+        | RuntimeCommand::SaveActivity(_)
         | RuntimeCommand::LeaveConversation { .. }
         | RuntimeCommand::SetConversationText { .. }
         | RuntimeCommand::OpenGroupDirectMessage { .. }

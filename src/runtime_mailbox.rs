@@ -112,6 +112,11 @@ pub enum RuntimeCommand {
         share_requested: bool,
     },
     LoadSavedItems,
+    /// Backfills Activity mentions with one `search.messages`, unless the
+    /// persisted stamp is under 15 minutes old.
+    LoadActivity,
+    /// Persists the Activity items the window holds.
+    SaveActivity(Vec<crate::activity::ActivityItem>),
     LoadFollowedThreads {
         cursor: Option<String>,
     },
@@ -255,6 +260,7 @@ pub enum RuntimeOperation {
     Files,
     SavedItems,
     FollowedThreads,
+    Activity,
     User,
     Emoji,
     ImageAsset,
@@ -357,6 +363,7 @@ pub enum RuntimeAdmissionKey {
     Navigation(NavigationSlot),
     WorkspaceRefresh,
     ConversationDiscovery(ConversationDiscoveryScope),
+    ActivityBackfill,
     ChannelInfo(OpaqueAdmissionTarget),
     User {
         scope: UserLoadScope,

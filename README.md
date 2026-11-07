@@ -199,6 +199,9 @@ defensively and falls back to normal Web API refreshes when needed.
 
 - Native, adaptive GNOME navigation for channels, direct messages, group messages,
   threads, Priority, Unreads, Files, and a legacy-starred-message Later view.
+- An Activity sidebar with mentions of you (including user groups and `@channel`),
+  reactions to your messages and your threads, filterable by unread, with a rail
+  badge. Reactions are collected only while Conduit runs.
 - A complete cached catalog of subscribed conversations, a fast conversation
   switcher, and GNOME Shell search that indexes conversation metadata but not message
   history.

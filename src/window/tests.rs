@@ -2427,6 +2427,89 @@ fn workspace_navigation_selection_follows_authoritative_main_view() {
 }
 
 #[test]
+fn the_activity_sidebar_owns_the_rail_selection_whatever_the_main_view() {
+    for main_view in [
+        MainMessageView::Conversation,
+        MainMessageView::Threads,
+        MainMessageView::Search,
+        MainMessageView::Placeholder,
+    ] {
+        assert_eq!(
+            navigation_selection(SidebarMode::Activity, main_view),
+            Some(WorkspaceNavigationSelection::Activity)
+        );
+    }
+    assert_eq!(
+        navigation_selection(SidebarMode::Conversations, MainMessageView::Threads),
+        Some(WorkspaceNavigationSelection::Threads)
+    );
+    assert_eq!(
+        WorkspaceNavigationSelection::from_toggle_name("activity"),
+        Some(WorkspaceNavigationSelection::Activity)
+    );
+    assert_eq!(
+        WorkspaceNavigationSelection::Activity.toggle_name(),
+        "activity"
+    );
+}
+
+#[test]
+fn activity_invalidation_has_its_own_bit() {
+    let others = [
+        UiInvalidations::SIDEBAR,
+        UiInvalidations::MAIN,
+        UiInvalidations::THREAD,
+        UiInvalidations::TITLE,
+        UiInvalidations::PICKER,
+        UiInvalidations::PEOPLE_PICKER,
+        UiInvalidations::COMPLETION,
+    ]
+    .into_iter()
+    .fold(UiInvalidations::default(), |all, bit| all | bit);
+    assert!(!others.contains(UiInvalidations::ACTIVITY));
+    assert_eq!(UiInvalidations::ACTIVITY.0, 0x80);
+}
+
+#[test]
+fn perf_guard_activity_closed_view_queues_no_rebuild() {
+    // `queue_activity_refresh` asks the gate first: a sidebar that shows the
+    // conversations only marks the list stale, and showing it rebuilds once.
+    let mut gate = PickerRefreshGate::default();
+    let mut pending = UiInvalidations::default();
+    for _ in 0..100 {
+        if gate.request(false) {
+            pending.insert(UiInvalidations::ACTIVITY);
+        }
+    }
+    assert!(pending.is_empty());
+    assert!(gate.shown(), "the stale list rebuilds when it is shown");
+    assert!(!gate.shown());
+}
+
+#[test]
+fn perf_guard_activity_event_burst_queues_one_rebuild() {
+    let mut gate = PickerRefreshGate::default();
+    let mut pending = UiInvalidations::default();
+    let schedules = (0..100)
+        .filter(|_| gate.request(true) && pending.insert(UiInvalidations::ACTIVITY))
+        .count();
+    assert_eq!(schedules, 1, "one frame callback for the whole burst");
+    assert!(pending.take().contains(UiInvalidations::ACTIVITY));
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn perf_guard_activity_rebuilds_only_come_from_the_frame_flush() {
+    let source = include_str!("../window.rs");
+    assert_eq!(
+        source.matches("self.rebuild_activity()").count(),
+        1,
+        "only flush_ui_invalidations may rebuild the Activity list; queue \
+         UiInvalidations::ACTIVITY through queue_activity_refresh instead"
+    );
+}
+
+#[test]
 fn composer_is_only_visible_for_conversations() {
     assert!(workspace_composer_visible(MainMessageView::Conversation));
     for view in [

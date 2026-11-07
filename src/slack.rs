@@ -1374,6 +1374,24 @@ impl SlackApi {
         ))
     }
 
+    /// The newest messages that mention `user_id`, newest first, for the
+    /// Activity backfill. One request; Slack ranks by time, so no local ranking.
+    pub async fn search_mentions(&self, user_id: &str) -> Result<Vec<SearchMatch>> {
+        let response: SearchResponse = self
+            .post_form(
+                "search.messages",
+                &[
+                    ("query", format!("<@{user_id}>")),
+                    ("sort", "timestamp".to_string()),
+                    ("sort_dir", "desc".to_string()),
+                    ("count", "50".to_string()),
+                    ("page", "1".to_string()),
+                ],
+            )
+            .await?;
+        Ok(response.messages.matches)
+    }
+
     pub async fn saved_items(&self) -> Result<Vec<SavedItem>> {
         self.star_items().await
     }
