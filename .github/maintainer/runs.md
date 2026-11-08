@@ -551,7 +551,7 @@
 ## 2026-11-07 Maintainer Pass
 
 - Scope: manual pass via `gh-helper`, backlog + release PR + local in-progress work audit.
-- Closed ISSUE:41, ISSUE:42, ISSUE:43 as completed: fixed by `49a3243` (rustls 0.23.46), Dependabot alerts 3-5 fixed 2026-11-02. Commit lacked `fixes #NN` refs, so they stayed open.
-- Closed ISSUE:44 as not planned: GHSA-h2v8-394m-p7vv has no matching Dependabot alert, cited CVE-2024-45491 is unrelated (libexpat), and no `brotli` crate in `Cargo.lock`. Likely auto-triage hallucination.
+- Closed ISSUE:41, ISSUE:42, ISSUE:43 as completed: fixed by `49a3243` (rustls 0.23.46), Dependabot alerts 3-6 fixed 2026-11-02. Commit lacked `fixes #NN` refs, so they stayed open.
+- Closed ISSUE:44: first closed as not planned claiming no matching alert, which was wrong (missed alert 6 by truncating the alert list). Corrected 2026-11-08 with ISSUE:44 comment, reclosed as completed: alert 6 (GHSA-h2v8-394m-p7vv) fixed by `49a3243`. Its cited CVE-2024-45491 is unrelated.
 - PR:26 (release 0.9.0): mergeable, metadata-only diff, exact-head CI `42191032345` pass. On hold by maintainer; uncommitted Activity work not included.
 - Worktree: uncommitted Activity feature (19 files, +1150/-107, new `src/activity.rs` 765 lines, `src/secondary_views/activity.rs` 570 lines). `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` pass (1431 passed, 3 ignored). Graphical tests not run.
