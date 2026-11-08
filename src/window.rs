@@ -484,6 +484,9 @@ mod imp {
         /// Marks the Activity list stale while the conversation sidebar is up.
         pub(super) activity_refresh: Cell<PickerRefreshGate>,
         pub(super) activity_save_pending: Cell<bool>,
+        /// Scrolls the next sidebar render to the highlighted row: a
+        /// conversation opened from Activity may be outside the visible rows.
+        pub(super) reveal_sidebar_selection: Cell<bool>,
         /// Query of the search currently shown, for result highlighting.
         pub(super) search_query: RefCell<String>,
         /// User ids behind the "From" dropdown rows after "From anyone".
@@ -1982,6 +1985,25 @@ fn navigation_selection(
     match sidebar_mode {
         SidebarMode::Activity => Some(WorkspaceNavigationSelection::Activity),
         SidebarMode::Conversations => workspace_navigation_selection(main_view),
+    }
+}
+
+/// What Messages on the rail does with the main pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MessagesReturn {
+    /// The conversation is still on screen (Activity only replaced the
+    /// sidebar), so it stays as it is, thread pane included.
+    Keep,
+    /// Another view replaced the conversation: open it again.
+    Reopen(String),
+    Placeholder,
+}
+
+fn messages_return(main_view: MainMessageView, last_channel_id: Option<&str>) -> MessagesReturn {
+    match (main_view, last_channel_id) {
+        (MainMessageView::Conversation, Some(_)) => MessagesReturn::Keep,
+        (_, Some(channel_id)) => MessagesReturn::Reopen(channel_id.to_string()),
+        (_, None) => MessagesReturn::Placeholder,
     }
 }
 
@@ -8692,11 +8714,24 @@ impl ConduitWindow {
     }
 
     fn show_messages(&self) {
+        let target = {
+            let view = self.imp().workspace.view.borrow();
+            messages_return(view.main_view(), view.last_channel_id())
+        };
+        if target == MessagesReturn::Keep {
+            // Activity only covered the sidebar: keep the conversation and its
+            // thread pane, and re-derive the row highlight from workspace state.
+            self.leave_activity_sidebar();
+            self.imp().reveal_sidebar_selection.set(true);
+            self.queue_sidebar_render_after_view_change();
+            self.imp().workspace_split.set_show_content(true);
+            return;
+        }
         if !self.flush_current_drafts() {
             return;
         }
         self.leave_activity_sidebar();
-        if let Some(channel_id) = self.selected_channel_id() {
+        if let MessagesReturn::Reopen(channel_id) = target {
             let title = self.conversation_title(&channel_id);
             self.select_conversation(&channel_id, &title);
         } else {
@@ -11941,12 +11976,20 @@ impl ConduitWindow {
         apply_sidebar_store_operations(&store, projection.items(), &operations);
         let selected_position = sidebar_selected_position(projection.items());
         drop(projection);
+        let reveal = imp.reveal_sidebar_selection.take();
         if selected_position == gtk::INVALID_LIST_POSITION {
             selection.set_can_unselect(true);
             selection.set_selected(gtk::INVALID_LIST_POSITION);
         } else {
             selection.set_selected(selected_position);
             selection.set_can_unselect(false);
+            if reveal {
+                imp.conversation_list.scroll_to(
+                    selected_position,
+                    gtk::ListScrollFlags::NONE,
+                    None,
+                );
+            }
         }
     }
 

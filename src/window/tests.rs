@@ -2427,6 +2427,32 @@ fn workspace_navigation_selection_follows_authoritative_main_view() {
 }
 
 #[test]
+fn messages_keeps_a_conversation_that_activity_only_covered() {
+    // Back from Activity: the conversation (and its thread pane) stays.
+    assert_eq!(
+        messages_return(MainMessageView::Conversation, Some("C1")),
+        MessagesReturn::Keep
+    );
+    // Back from a view that replaced the conversation: reopen it.
+    for main_view in [
+        MainMessageView::Threads,
+        MainMessageView::Files,
+        MainMessageView::Saved,
+        MainMessageView::Search,
+        MainMessageView::Placeholder,
+    ] {
+        assert_eq!(
+            messages_return(main_view, Some("C1")),
+            MessagesReturn::Reopen("C1".to_string())
+        );
+    }
+    assert_eq!(
+        messages_return(MainMessageView::Conversation, None),
+        MessagesReturn::Placeholder
+    );
+}
+
+#[test]
 fn the_activity_sidebar_owns_the_rail_selection_whatever_the_main_view() {
     for main_view in [
         MainMessageView::Conversation,

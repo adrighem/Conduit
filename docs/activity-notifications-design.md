@@ -16,6 +16,10 @@ user takes part in. Desktop notification policy is separate; see
   `WorkspaceViewState`. Selecting Messages, Threads, Files or Later returns the sidebar to
   Conversations; one rail toggle is active at a time and `sync_workspace_chrome` gives the
   Activity toggle precedence while the mode is Activity.
+- Back to Messages while the main pane still shows a conversation (`messages_return` is
+  `Keep`), the conversation and its thread pane stay as they are; the sidebar re-renders its
+  highlight from workspace state and scrolls the highlighted row into view once. Coming from
+  Threads, Files or Later reopens the last conversation instead.
 - The header has two toggles that are exclusive or both off, and a switch:
   - **@ N** shows mentions only; N is the number of unread mentions.
   - **thread icon N** shows followed threads only; N is the number of unread threads.
