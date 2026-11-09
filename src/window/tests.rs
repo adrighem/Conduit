@@ -288,6 +288,45 @@ fn perf_guard_full_sidebar_renders_only_come_from_the_frame_flush() {
 }
 
 #[test]
+fn perf_guard_external_opens_never_wait_on_a_launcher_process() {
+    // `open::that` blocks until the launcher process exits (hundreds of
+    // milliseconds with xdg-open). Links, permalinks and downloads go through
+    // the asynchronous GtkUriLauncher / GtkFileLauncher instead.
+    let source = include_str!("../window.rs");
+    assert!(!source.contains(concat!("open::", "that(")));
+    assert_eq!(source.matches("gtk::UriLauncher::new(").count(), 1);
+    assert_eq!(source.matches("gtk::FileLauncher::new(").count(), 1);
+}
+
+#[test]
+fn external_launch_outcome_reports_failures_but_not_a_dismissed_chooser() {
+    assert_eq!(external_launch_outcome(Ok(())), Some(Ok(())));
+    let failure = glib::Error::new(gio::IOErrorEnum::NotFound, "no handler");
+    assert_eq!(
+        external_launch_outcome(Err(failure)),
+        Some(Err("no handler".to_string()))
+    );
+    let dismissed = glib::Error::new(gtk::DialogError::Dismissed, "dismissed");
+    assert_eq!(external_launch_outcome(Err(dismissed)), None);
+    let cancelled = glib::Error::new(gio::IOErrorEnum::Cancelled, "cancelled");
+    assert_eq!(external_launch_outcome(Err(cancelled)), None);
+}
+
+#[test]
+fn perf_guard_pasted_screenshots_encode_off_the_gtk_thread() {
+    // PNG-encoding a large screenshot takes tens of milliseconds. The
+    // encode and write run inside `gio::spawn_blocking`; only
+    // `write_screenshot_png` (called from the worker) may encode.
+    let source = include_str!("../window.rs");
+    assert!(!source.contains(concat!(".save_to_", "png(")));
+    assert_eq!(
+        source.matches(concat!(".save_to_", "png_bytes(")).count(),
+        1
+    );
+    assert!(source.contains("move || write_screenshot_png(&texture, &directory, &path)"));
+}
+
+#[test]
 fn perf_guard_timeline_renders_register_no_message_control_handles() {
     // Fresh per-render handle tokens made every render context differ, so
     // every re-render rebound every timeline row. Handles are registered on
@@ -3591,6 +3630,28 @@ mod graphical {
         window.set_child(Some(&image.picture));
         window.present();
         window
+    }
+
+    #[test]
+    fn screenshot_png_is_written_from_a_worker_thread() {
+        run_gtk_test(|| {
+            let dir = TempTestDir::new("screenshot");
+            let directory = dir.path().join("staging");
+            let path = directory.join("shot.png");
+            let pixels = glib::Bytes::from_owned(vec![0xffu8; 4 * 4 * 4]);
+            let texture: gtk::gdk::Texture =
+                gtk::gdk::MemoryTexture::new(4, 4, gtk::gdk::MemoryFormat::R8g8b8a8, &pixels, 16)
+                    .upcast();
+            let written = std::thread::spawn({
+                let path = path.clone();
+                move || write_screenshot_png(&texture, &directory, &path)
+            })
+            .join()
+            .expect("worker thread");
+            assert!(written.is_ok());
+            let bytes = std::fs::read(&path).expect("screenshot file");
+            assert!(bytes.starts_with(b"\x89PNG"));
+        });
     }
 
     #[test]

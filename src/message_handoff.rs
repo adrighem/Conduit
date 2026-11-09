@@ -781,15 +781,21 @@ impl fmt::Display for ExternalOpenError {
 
 impl std::error::Error for ExternalOpenError {}
 
+/// Runs once an external open finishes, possibly after `open` returned.
+pub(crate) type ExternalOpenCompletion = Box<dyn FnOnce(Result<(), ExternalOpenError>)>;
+
 pub(crate) trait ExternalOpener {
-    fn open(&self, permalink: &SafeSlackPermalink) -> Result<(), ExternalOpenError>;
+    /// Starts opening `permalink`. Launching can be asynchronous (a desktop
+    /// portal round trip), so the outcome is reported through `done`.
+    fn open(&self, permalink: &SafeSlackPermalink, done: ExternalOpenCompletion);
 }
 
 pub(crate) fn open_resolved_handoff(
     opener: &impl ExternalOpener,
     handoff: &ResolvedMessageHandoff,
-) -> Result<(), ExternalOpenError> {
-    opener.open(&handoff.permalink)
+    done: ExternalOpenCompletion,
+) {
+    opener.open(&handoff.permalink, done);
 }
 
 #[cfg(test)]
@@ -1354,15 +1360,30 @@ mod tests {
     }
 
     impl ExternalOpener for RecordingOpener {
-        fn open(&self, permalink: &SafeSlackPermalink) -> Result<(), ExternalOpenError> {
+        fn open(&self, permalink: &SafeSlackPermalink, done: ExternalOpenCompletion) {
             if self.fail {
-                return Err(ExternalOpenError::new("synthetic open failure"));
+                done(Err(ExternalOpenError::new("synthetic open failure")));
+                return;
             }
             self.opened
                 .borrow_mut()
                 .push(permalink.as_str().to_string());
-            Ok(())
+            done(Ok(()));
         }
+    }
+
+    fn open_and_capture(
+        opener: &RecordingOpener,
+        handoff: &ResolvedMessageHandoff,
+    ) -> Option<Result<(), ExternalOpenError>> {
+        let outcome = std::rc::Rc::new(RefCell::new(None));
+        let sink = outcome.clone();
+        open_resolved_handoff(
+            opener,
+            handoff,
+            Box::new(move |result| *sink.borrow_mut() = Some(result)),
+        );
+        outcome.take()
     }
 
     #[test]
@@ -1376,7 +1397,9 @@ mod tests {
             provenance: HandoffProvenance::Authoritative,
         };
         let opener = RecordingOpener::default();
-        open_resolved_handoff(&opener, &handoff).unwrap();
+        open_and_capture(&opener, &handoff)
+            .expect("completion runs")
+            .unwrap();
 
         assert_eq!(opener.opened.borrow().len(), 1);
     }
@@ -1395,7 +1418,9 @@ mod tests {
             ..RecordingOpener::default()
         };
 
-        assert!(open_resolved_handoff(&opener, &handoff).is_err());
+        assert!(open_and_capture(&opener, &handoff)
+            .expect("completion runs")
+            .is_err());
         assert!(opener.opened.borrow().is_empty());
     }
 }
