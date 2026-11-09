@@ -3892,3 +3892,21 @@ mod graphical {
         });
     }
 }
+
+#[test]
+fn perf_guard_sidebar_bind_keeps_child_for_invisible_changes() {
+    let item = keyed_sidebar_row("C1", "Channel 1", false);
+    let mut moved = item.clone();
+    let SidebarItemModel::Conversation(row) = &mut moved.model else {
+        panic!("expected conversation row");
+    };
+    row.latest_ts = Some("1700000000.000100".to_string());
+    assert!(sidebar_bind_keeps_child(Some(&item), &moved));
+    assert!(!sidebar_bind_keeps_child(None, &item));
+
+    let SidebarItemModel::Conversation(row) = &mut moved.model else {
+        panic!("expected conversation row");
+    };
+    row.mention_count = 1;
+    assert!(!sidebar_bind_keeps_child(Some(&item), &moved));
+}

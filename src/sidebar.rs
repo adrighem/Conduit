@@ -118,6 +118,25 @@ pub struct ConversationPickerSections {
 }
 
 impl SidebarRowModel {
+    /// True when both rows draw identically in a sidebar row widget. Fields
+    /// that are only ordering or lookup inputs (`latest_ts`, `avatar_url`,
+    /// `search_aliases`, `private`, `has_draft`, `user_deleted`,
+    /// `starred_member`) are ignored: a message arriving in a conversation
+    /// changes `latest_ts` on every event and must not rebuild its row.
+    pub fn renders_same(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.title == other.title
+            && self.kind == other.kind
+            && self.unread == other.unread
+            && self.mention_count == other.mention_count
+            && self.selected == other.selected
+            && self.starred == other.starred
+            && self.muted == other.muted
+            && self.external == other.external
+            && self.huddle_active == other.huddle_active
+            && self.status == other.status
+    }
+
     /// Listed in the Priority section: starred, or a group DM with a starred
     /// member.
     pub fn in_priority(&self) -> bool {
@@ -240,6 +259,18 @@ pub enum SidebarItemModel {
     },
 }
 
+impl SidebarItemModel {
+    /// True when both models draw identically, so a bound row widget can be
+    /// kept. Differs from `==` only for conversation rows, see
+    /// `SidebarRowModel::renders_same`.
+    pub fn renders_same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Conversation(left), Self::Conversation(right)) => left.renders_same(right),
+            _ => self == other,
+        }
+    }
+}
+
 /// Precomputed unread-thread entry for a conversation's sidebar sub-row.
 /// Decoupled from `ThreadRecord` so `sidebar.rs` doesn't need to depend on
 /// `thread_catalog`'s internals; the caller (`window.rs`) filters the real
@@ -324,7 +355,7 @@ impl SidebarProjection {
                 .iter()
                 .zip(next)
                 .enumerate()
-                .filter(|(_, (previous, next))| previous.model != next.model)
+                .filter(|(_, (previous, next))| !previous.model.renders_same(&next.model))
                 .map(|(position, _)| SidebarProjectionOperation::Update { position })
                 .collect()
         } else {
@@ -363,15 +394,19 @@ impl SidebarProjection {
                     return None;
                 }
                 if previous != next {
-                    updates.push((position, next));
+                    updates.push((position, next, !previous.renders_same(next)));
                 }
             }
         }
 
         let mut operations = Vec::with_capacity(updates.len());
-        for (position, next) in updates {
+        for (position, next, redraw) in updates {
+            // Always keep the projection current; only a drawn change asks
+            // the list to rebuild the row.
             self.items[position].model = SidebarItemModel::Conversation(next.clone());
-            operations.push(SidebarProjectionOperation::Update { position });
+            if redraw {
+                operations.push(SidebarProjectionOperation::Update { position });
+            }
         }
         Some(operations)
     }
@@ -435,7 +470,7 @@ fn sidebar_projection_structural_operations(
             .iter()
             .zip(&next[..prefix])
             .enumerate()
-            .filter(|(_, (previous, next))| previous.model != next.model)
+            .filter(|(_, (previous, next))| !previous.model.renders_same(&next.model))
             .map(|(position, _)| SidebarProjectionOperation::Update { position }),
     );
 
@@ -446,7 +481,7 @@ fn sidebar_projection_structural_operations(
             .iter()
             .zip(&next[next_suffix_start..])
             .enumerate()
-            .filter(|(_, (previous, next))| previous.model != next.model)
+            .filter(|(_, (previous, next))| !previous.model.renders_same(&next.model))
             .map(|(offset, _)| SidebarProjectionOperation::Update {
                 position: next_suffix_start + offset,
             }),
@@ -4102,6 +4137,47 @@ mod tests {
         assert_eq!(
             projection.reconcile(&next),
             vec![SidebarProjectionOperation::Update { position: 713 }]
+        );
+    }
+
+    #[test]
+    fn perf_guard_sidebar_incoming_message_rebuilds_no_row() {
+        let rows = (0..200)
+            .map(|index| row(&format!("C{index}"), false))
+            .collect::<Vec<_>>();
+        let initial = SidebarListModel::Rows(rows).keyed_items();
+        let mut projection = SidebarProjection::default();
+        projection.reconcile(&initial);
+
+        // A message arriving only moves `latest_ts`; the row draws the same.
+        let mut next = initial.clone();
+        let SidebarItemModel::Conversation(changed) = &mut next[42].model else {
+            panic!("expected conversation row");
+        };
+        changed.latest_ts = Some("1700000000.000100".to_string());
+        changed.avatar_url = Some("https://example.com/a.png".to_string());
+        assert!(projection.reconcile(&next).is_empty());
+        assert_eq!(projection.items(), next);
+
+        let mut in_place = row("C42", false);
+        in_place.latest_ts = Some("1700000000.000200".to_string());
+        assert_eq!(
+            projection.update_conversation_rows(&[in_place.clone()]),
+            Some(Vec::new())
+        );
+        assert!(matches!(
+            &projection.items()[42].model,
+            SidebarItemModel::Conversation(stored) if stored.latest_ts == in_place.latest_ts
+        ));
+
+        // A drawn change still rebuilds exactly that row.
+        let SidebarItemModel::Conversation(changed) = &mut next[42].model else {
+            panic!("expected conversation row");
+        };
+        changed.unread = true;
+        assert_eq!(
+            projection.reconcile(&next),
+            vec![SidebarProjectionOperation::Update { position: 42 }]
         );
     }
 
