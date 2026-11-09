@@ -555,3 +555,11 @@
 - Closed ISSUE:44: first closed as not planned claiming no matching alert, which was wrong (missed alert 6 by truncating the alert list). Corrected 2026-11-08 with ISSUE:44 comment, reclosed as completed: alert 6 (GHSA-h2v8-394m-p7vv) fixed by `49a3243`. Its cited CVE-2024-45491 is unrelated.
 - PR:26 (release 0.9.0): mergeable, metadata-only diff, exact-head CI `42191032345` pass. On hold by maintainer; uncommitted Activity work not included.
 - Worktree: uncommitted Activity feature (19 files, +1150/-107, new `src/activity.rs` 765 lines, `src/secondary_views/activity.rs` 570 lines). `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` pass (1431 passed, 3 ignored). Graphical tests not run.
+
+## 2026-11-09 Maintainer Pass
+
+- Scope: manual pass via `gh-helper`.
+- GitHub: 0 open issues, 0 open PRs, 0 unread Conduit notifications, 0 open Dependabot alerts, 0 open code scanning alerts.
+- PR:26 (release 0.9.0) merged; v0.9.0 published 2026-11-08 with the Activity feature (`69c3bb2`, `f0f652a`). Release and main CI pass.
+- Worktree clean, main in sync with origin.
+- No public GitHub action taken.
