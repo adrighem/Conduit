@@ -110,6 +110,7 @@ pub fn clear_timeline_view_caches() {
     REACTION_TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
     crate::animated_image::clear_caches();
     crate::image_metadata::clear();
+    forget_asset_misses();
     crate::timeline_document_widget::clear_document_accent_cache();
 }
 
@@ -374,9 +375,15 @@ fn remember_asset_miss(cache_root: &Path, url: &str) {
 
 /// A file for `url` was just written: the next lookup probes the disk
 /// again instead of trusting a remembered miss. Covers custom emoji too.
+/// Call it on the GTK thread: asset misses are remembered per thread.
 pub(crate) fn forget_asset_miss(url: &str) {
     ASSET_MISSES.with(|misses| misses.borrow_mut().remove(url));
     crate::emoji_picker_window::forget_custom_emoji_miss(url);
+}
+
+/// Forgets every remembered asset miss, e.g. on workspace sign-out.
+fn forget_asset_misses() {
+    ASSET_MISSES.with(|misses| misses.borrow_mut().clear());
 }
 
 /// Maps a Slack-provided URL to a file inside the image asset cache: the
