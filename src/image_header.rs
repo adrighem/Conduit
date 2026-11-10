@@ -138,6 +138,7 @@ fn webp(reader: &mut impl Read) -> Option<(u32, u32)> {
 /// decoder and decode once. A GIF stops counting at 2. `None` for other
 /// formats and for files too short or malformed to say; callers should then
 /// assume the file may be animated.
+#[cfg(test)]
 pub(crate) fn declared_frame_count(path: &Path) -> Option<u32> {
     frame_count(&mut BufReader::new(File::open(path).ok()?))
 }
@@ -147,7 +148,7 @@ pub(crate) fn frame_count(reader: &mut (impl Read + Seek)) -> Option<u32> {
     let (format, _, _) = header(reader)?;
     reader.rewind().ok()?;
     match format {
-        ImageFormat::Gif => gif_frame_count(reader),
+        ImageFormat::Gif => gif_frame_count(reader, 2),
         ImageFormat::Webp => {
             webp_frame_count(reader).map(|frames| u32::try_from(frames).unwrap_or(u32::MAX))
         }
@@ -155,14 +156,27 @@ pub(crate) fn frame_count(reader: &mut (impl Read + Seek)) -> Option<u32> {
     }
 }
 
+/// Every frame of the GIF or WebP in `reader`, counted from block and chunk
+/// headers without decoding, so an animation player knows where its loop
+/// ends. Walks the whole stream: call it off the GTK thread, on bytes
+/// already in memory. `None` as for [`frame_count`].
+pub(crate) fn loop_frame_count(reader: &mut (impl Read + Seek)) -> Option<u32> {
+    let (format, _, _) = header(reader)?;
+    reader.rewind().ok()?;
+    match format {
+        ImageFormat::Gif => gif_frame_count(reader, u32::MAX),
+        _ => frame_count(reader),
+    }
+}
+
 /// Most blocks and sub-blocks [`gif_frame_count`] walks before giving up:
 /// twice what an 8 MiB file of 255-byte sub-blocks needs.
 const MAX_GIF_BLOCKS: u32 = 1 << 16;
 
-/// Number of image descriptors in a GIF, counting up to 2. Skips extension
-/// and image data sub-blocks without decoding them. `None` when the stream
-/// is not a GIF, is truncated before its trailer, or has no image.
-fn gif_frame_count(reader: &mut (impl Read + Seek)) -> Option<u32> {
+/// Number of image descriptors in a GIF, counting up to `limit`. Skips
+/// extension and image data sub-blocks without decoding them. `None` when
+/// the stream is not a GIF, is truncated before its trailer, or has no image.
+fn gif_frame_count(reader: &mut (impl Read + Seek), limit: u32) -> Option<u32> {
     let mut screen = [0u8; 13];
     reader.read_exact(&mut screen).ok()?;
     if &screen[..3] != b"GIF" {
@@ -183,7 +197,7 @@ fn gif_frame_count(reader: &mut (impl Read + Seek)) -> Option<u32> {
             // then data sub-blocks.
             0x2c => {
                 frames += 1;
-                if frames == 2 {
+                if frames == limit {
                     return Some(frames);
                 }
                 let mut descriptor = [0u8; 9];
@@ -336,7 +350,20 @@ mod tests {
         !\xfe\x03a\x3b\x3b\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\x02\x02L\x01\x00;";
 
     fn gif_frames(bytes: &[u8]) -> Option<u32> {
-        gif_frame_count(&mut std::io::Cursor::new(bytes))
+        gif_frame_count(&mut std::io::Cursor::new(bytes), 2)
+    }
+
+    #[test]
+    fn loop_frame_count_counts_every_gif_frame() {
+        // Three frames: the still's one frame, three times.
+        let frame_at = STILL_GIF.windows(2).position(|w| w == b"!\xf9").unwrap();
+        let (screen, frame) = STILL_GIF[..STILL_GIF.len() - 1].split_at(frame_at);
+        let bytes = [screen, frame, frame, frame, b";"].concat();
+        let count = |bytes: &[u8]| loop_frame_count(&mut std::io::Cursor::new(bytes));
+        assert_eq!(gif_frames(&bytes), Some(2), "the still check stops at 2");
+        assert_eq!(count(&bytes), Some(3));
+        assert_eq!(count(STILL_GIF), Some(1));
+        assert_eq!(count(b"not an image"), None);
     }
 
     #[test]

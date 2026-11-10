@@ -54,7 +54,7 @@ fn declared_size(image: &MessageImage) -> Option<(u32, u32)> {
 /// declared size, then [`PLACEHOLDER_SIZE`]: gdk-pixbuf's probe would block
 /// the GTK thread on a glycin subprocess.
 fn file_size(path: &Path) -> Option<(u32, u32)> {
-    crate::image_header::declared_dimensions(path)
+    crate::image_metadata::metadata(path).map(|declared| (declared.width, declared.height))
 }
 
 /// The image URL (the cache key, not the network URL) when the window will

@@ -215,6 +215,7 @@ impl NativeTimelineView {
         let current_popover_for_bind = current_popover.clone();
         let bar_motion_for_bind = bar_motion.clone();
         let quick_bar_for_bind = quick_bar.clone();
+        let quick_bar_cache = Rc::new(QuickBarCache::default());
         let overlay_for_bind = overlay.clone();
         let read_mark_target_for_bind = read_mark_target.clone();
         let bind_row: Rc<dyn Fn(&gtk::ListItem)> = Rc::new(move |item| {
@@ -286,6 +287,7 @@ impl NativeTimelineView {
                     let current_popover = current_popover_for_bind.clone();
                     let bar_motion = bar_motion_for_bind.clone();
                     let quick_bar = quick_bar_for_bind.clone();
+                    let quick_bar_cache = quick_bar_cache.clone();
                     let overlay = overlay_for_bind.clone();
                     let context_for_hover = context_clone.clone();
                     let on_action_for_hover = on_action_clone.clone();
@@ -320,11 +322,12 @@ impl NativeTimelineView {
                             }
                             if let Some(ctx) = context_for_hover.borrow().as_ref() {
                                 // Read on hover, not at bind: reacting
-                                // changes them without rebuilding rows.
-                                rebuild_quick_bar(
+                                // changes them without rebuilding rows. The
+                                // buttons are rebuilt only when they change.
+                                show_quick_bar_for(
                                     &quick_bar,
+                                    &quick_bar_cache,
                                     &ts,
-                                    &crate::message_markup::recent_reactions(ctx),
                                     ctx,
                                     &QuickBarState {
                                         on_action: &on_action_for_hover,

@@ -5,7 +5,9 @@
 //! paintable that all pictures showing it share. A single timer per paintable
 //! advances frames at the image's own delay and stops once no widget holds the
 //! paintable, so N copies of a GIF cost one decoder, one texture per frame and
-//! no per-widget frame-clock ticks.
+//! no per-widget frame-clock ticks. A player scales each frame once: it keeps
+//! the textures of its first loop and replays them, so a looping animation
+//! costs no pixel work on the GTK thread after one pass.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -29,6 +31,9 @@ const MAX_STATIC_FILES: usize = 4096;
 /// still, 256 MiB as RGBA. Files are capped at 8 MiB on download, but a tiny
 /// GIF or PNG header can still declare a canvas that decodes to gigabytes.
 const MAX_DECODED_PIXELS: u64 = 8192 * 8192;
+/// Most bytes the frames kept for replay may take, over all players. A player
+/// that would pass it scales every frame as it comes instead.
+const MAX_LOOP_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 thread_local! {
     static PLAYERS: RefCell<HashMap<(PathBuf, i32), glib::WeakRef<AnimatedImage>>> =
@@ -36,6 +41,14 @@ thread_local! {
     /// GIF/WebP files known to hold a single frame, so they are not decoded
     /// again on every row build.
     static STATIC_FILES: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
+    /// Bytes held by every player's replayed frames.
+    static LOOP_CACHE_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Frames scaled and turned into a texture on this thread.
+    pub(crate) static FRAME_RENDERS: Cell<usize> = const { Cell::new(0) };
 }
 
 mod imp {
@@ -47,6 +60,17 @@ mod imp {
         pub(super) frame: RefCell<Option<gdk::Texture>>,
         pub(super) max_side: Cell<i32>,
         pub(super) timer: RefCell<Option<glib::SourceId>>,
+        /// The time `iter` started at, and how far it has been advanced.
+        /// Each step moves it by exactly the current frame's delay, so the
+        /// step count names the frame shown however late a timer fires.
+        pub(super) start: Cell<Option<SystemTime>>,
+        pub(super) elapsed: Cell<Duration>,
+        pub(super) step: Cell<usize>,
+        /// Frames in one loop, 0 when unknown or not replayed.
+        pub(super) loop_frames: Cell<usize>,
+        /// The textures of the first loop, in order, and their bytes.
+        pub(super) loop_cache: RefCell<Vec<gdk::Texture>>,
+        pub(super) loop_bytes: Cell<usize>,
     }
 
     #[glib::object_subclass]
@@ -61,6 +85,7 @@ mod imp {
             if let Some(timer) = self.timer.take() {
                 timer.remove();
             }
+            self.obj().forget_loop();
         }
     }
 
@@ -93,10 +118,23 @@ glib::wrapper! {
 }
 
 impl AnimatedImage {
-    fn new(iter: gdk_pixbuf::PixbufAnimationIter, max_side: i32) -> Self {
+    fn new(
+        animation: &gdk_pixbuf::PixbufAnimation,
+        max_side: i32,
+        loop_frames: Option<u32>,
+    ) -> Self {
         let player: Self = glib::Object::new();
-        player.imp().max_side.set(max_side);
-        player.imp().iter.replace(Some(iter));
+        let imp = player.imp();
+        let start = SystemTime::now();
+        imp.start.set(Some(start));
+        imp.max_side.set(max_side);
+        imp.loop_frames.set(
+            loop_frames
+                .filter(|&frames| frames > 1)
+                .and_then(|frames| usize::try_from(frames).ok())
+                .unwrap_or(0),
+        );
+        imp.iter.replace(Some(animation.iter(Some(start))));
         player.show_current_frame();
         player.schedule_next_frame();
         player
@@ -104,12 +142,66 @@ impl AnimatedImage {
 
     fn show_current_frame(&self) {
         let imp = self.imp();
-        let Some(pixbuf) = imp.iter.borrow().as_ref().map(|iter| iter.pixbuf()) else {
-            return;
+        let index = match imp.loop_frames.get() {
+            0 => None,
+            frames => Some(imp.step.get() % frames),
         };
-        let pixbuf = scale_to_fit(&pixbuf, imp.max_side.get());
-        imp.frame.replace(Some(gdk::Texture::for_pixbuf(&pixbuf)));
+        let replayed = index.and_then(|index| imp.loop_cache.borrow().get(index).cloned());
+        let texture = match replayed {
+            Some(texture) => texture,
+            None => {
+                let Some(texture) = self.render_current_frame() else {
+                    // A gap in the kept loop could never be filled.
+                    self.forget_loop();
+                    return;
+                };
+                if index.is_some() {
+                    self.keep_for_loop(&texture);
+                }
+                texture
+            }
+        };
+        imp.frame.replace(Some(texture));
         self.invalidate_contents();
+    }
+
+    /// The iterator's current frame, scaled to fit, as a texture of its own:
+    /// the decoder may composite the next frame into the same pixels.
+    fn render_current_frame(&self) -> Option<gdk::Texture> {
+        let imp = self.imp();
+        let pixbuf = imp.iter.borrow().as_ref().map(|iter| iter.pixbuf())?;
+        let mut frame = scale_to_fit(&pixbuf, imp.max_side.get());
+        if frame == pixbuf {
+            frame = pixbuf.copy().unwrap_or(pixbuf);
+        }
+        #[cfg(test)]
+        FRAME_RENDERS.with(|renders| renders.set(renders.get() + 1));
+        Some(gdk::Texture::for_pixbuf(&frame))
+    }
+
+    /// Keeps `texture` as the next frame of the replayed loop, or gives up
+    /// replaying when all players' frames would pass the budget.
+    fn keep_for_loop(&self, texture: &gdk::Texture) {
+        let imp = self.imp();
+        let bytes = texture_bytes(texture);
+        let total = LOOP_CACHE_BYTES.with(Cell::get);
+        if total.saturating_add(bytes) > MAX_LOOP_CACHE_BYTES {
+            self.forget_loop();
+            return;
+        }
+        LOOP_CACHE_BYTES.with(|cached| cached.set(total + bytes));
+        imp.loop_bytes.set(imp.loop_bytes.get() + bytes);
+        imp.loop_cache.borrow_mut().push(texture.clone());
+    }
+
+    /// Stops replaying and frees the kept frames: from then on every frame
+    /// is scaled as it comes.
+    fn forget_loop(&self) {
+        let imp = self.imp();
+        imp.loop_frames.set(0);
+        imp.loop_cache.borrow_mut().clear();
+        let bytes = imp.loop_bytes.replace(0);
+        LOOP_CACHE_BYTES.with(|cached| cached.set(cached.get().saturating_sub(bytes)));
     }
 
     fn schedule_next_frame(&self) {
@@ -149,17 +241,49 @@ impl AnimatedImage {
             self.schedule(PAUSED_POLL);
             return;
         }
-        let changed = self
-            .imp()
+        self.step_frame();
+        self.schedule_next_frame();
+    }
+
+    /// Moves to the next frame: the iterator is advanced by the current
+    /// frame's own delay, not to the wall clock, so no frame is skipped and
+    /// step `n` always shows frame `n` modulo the loop.
+    fn step_frame(&self) {
+        let imp = self.imp();
+        let Some(start) = imp.start.get() else {
+            return;
+        };
+        let Some(delay) = imp
             .iter
             .borrow()
             .as_ref()
-            .is_some_and(|iter| iter.advance(SystemTime::now()));
+            .and_then(|iter| iter.delay_time())
+        else {
+            return;
+        };
+        let elapsed = imp.elapsed.get() + delay.max(Duration::from_millis(1));
+        imp.elapsed.set(elapsed);
+        let changed = imp
+            .iter
+            .borrow()
+            .as_ref()
+            .is_some_and(|iter| iter.advance(start + elapsed));
+        imp.step.set(imp.step.get().wrapping_add(1));
         if changed {
             self.show_current_frame();
+        } else {
+            // A zero-length frame: the step count no longer names the frame.
+            self.forget_loop();
         }
-        self.schedule_next_frame();
     }
+}
+
+/// Bytes of a texture's pixels, as RGBA.
+fn texture_bytes(texture: &gdk::Texture) -> usize {
+    let side = |side: i32| usize::try_from(side).unwrap_or(0);
+    side(texture.width())
+        .saturating_mul(side(texture.height()))
+        .saturating_mul(4)
 }
 
 /// The live shared player of `path` for `display_size`, if any widget still
@@ -173,18 +297,22 @@ pub(crate) fn existing_player(path: &Path, display_size: i32) -> Option<gdk::Pai
 
 /// The shared paintable playing `animation`, loaded from `path`, sized for a
 /// widget of at most `display_size` logical pixels per side. Reuses the live
-/// player for that size, so N copies cost one decoder and one timer.
+/// player for that size, so N copies cost one decoder and one timer. With
+/// `loop_frames`, the frames in one loop, it replays its first loop's
+/// textures instead of scaling every frame again.
 pub(crate) fn player(
     path: &Path,
     display_size: i32,
     animation: &gdk_pixbuf::PixbufAnimation,
+    loop_frames: Option<u32>,
 ) -> gdk::Paintable {
     if let Some(player) = existing_player(path, display_size) {
         return player;
     }
     let player = AnimatedImage::new(
-        animation.iter(Some(SystemTime::now())),
+        animation,
         display_size.saturating_mul(OVERSAMPLE),
+        loop_frames,
     );
     PLAYERS.with(|players| {
         let mut players = players.borrow_mut();
@@ -197,12 +325,14 @@ pub(crate) fn player(
 /// Whether `path` should load as an animation, judged from its headers on
 /// the GTK thread without decoding: a GIF or WebP not known to be static.
 /// Headers that declare one frame are remembered as static, so the still
-/// path decodes the file once instead of twice.
+/// path decodes the file once instead of twice. The headers come from
+/// [`crate::image_metadata`], so a file is read once, not per row build.
 pub(crate) fn may_animate(path: &Path) -> bool {
     if is_known_static(path) || !may_be_animated(path) {
         return false;
     }
-    if crate::image_header::declared_frame_count(path) == Some(1) {
+    let frames = crate::image_metadata::metadata(path).and_then(|declared| declared.frames);
+    if frames == Some(1) {
         remember_static(path);
         return false;
     }
@@ -268,10 +398,10 @@ fn fit_down(width: i32, height: i32, max_side: i32) -> (i32, i32) {
 /// header, so static images skip a full animation decode. Our own parser
 /// knows GIF and WebP, the only animated formats gdk-pixbuf plays, so any
 /// other file is static: it never reaches gdk-pixbuf's glycin probe here, on
-/// the GTK thread, but in the worker that judges its decode budget.
+/// the GTK thread, but in the worker that judges its decode budget. Read
+/// through [`crate::image_metadata`], so once per file.
 pub(crate) fn may_be_animated(path: &Path) -> bool {
-    crate::image_header::declared_header(path)
-        .is_some_and(|(format, _, _)| format.may_be_animated())
+    crate::image_metadata::metadata(path).is_some_and(|declared| declared.format.may_be_animated())
 }
 
 /// Whether `path` decodes to at most [`MAX_DECODED_PIXELS`], judged from its
@@ -552,13 +682,82 @@ pub(crate) mod tests {
                 assert!(may_animate(&path));
                 let animation =
                     gdk_pixbuf::PixbufAnimation::from_file(&path).expect("animation loads");
-                let first = player(&path, 18, &animation);
-                let second = player(&path, 18, &animation);
-                let other_size = player(&path, 32, &animation);
+                let first = player(&path, 18, &animation, Some(2));
+                let second = player(&path, 18, &animation, Some(2));
+                let other_size = player(&path, 32, &animation, Some(2));
                 assert_eq!(first, second);
                 assert_eq!(existing_player(&path, 18), Some(first.clone()));
                 assert_ne!(first, other_size);
                 assert_eq!(first.intrinsic_width(), 1);
+                std::fs::remove_file(path).ok();
+            });
+        }
+
+        fn frame_renders_during(probe: impl FnOnce()) -> usize {
+            let before = FRAME_RENDERS.with(Cell::get);
+            probe();
+            FRAME_RENDERS.with(Cell::get) - before
+        }
+
+        fn shown(player: &AnimatedImage) -> gdk::Texture {
+            player
+                .imp()
+                .frame
+                .borrow()
+                .clone()
+                .expect("a frame is shown")
+        }
+
+        #[test]
+        fn perf_guard_looping_animation_renders_each_frame_once() {
+            crate::timeline_message_widget::tests::run_gtk_test(|| {
+                let path = write_temp("loop.gif", ANIMATED_GIF);
+                let animation =
+                    gdk_pixbuf::PixbufAnimation::from_file(&path).expect("animation loads");
+                let mut first_frame = None;
+                let renders = frame_renders_during(|| {
+                    let player = AnimatedImage::new(&animation, 64, Some(2));
+                    first_frame = Some(shown(&player));
+                    for _ in 0..10 {
+                        player.step_frame();
+                    }
+                    // Ten steps of a two-frame loop: back on frame 0.
+                    assert_eq!(Some(shown(&player)), first_frame);
+                });
+                std::fs::remove_file(path).ok();
+                assert_eq!(renders, 2, "each frame of the loop is scaled once");
+            });
+        }
+
+        #[test]
+        fn animation_without_a_frame_count_renders_every_step() {
+            crate::timeline_message_widget::tests::run_gtk_test(|| {
+                let path = write_temp("noloop.gif", ANIMATED_GIF);
+                let animation =
+                    gdk_pixbuf::PixbufAnimation::from_file(&path).expect("animation loads");
+                let renders = frame_renders_during(|| {
+                    let player = AnimatedImage::new(&animation, 64, None);
+                    for _ in 0..4 {
+                        player.step_frame();
+                    }
+                });
+                std::fs::remove_file(path).ok();
+                assert_eq!(renders, 5, "the fallback scales every frame shown");
+            });
+        }
+
+        #[test]
+        fn dropped_players_release_their_loop_budget() {
+            crate::timeline_message_widget::tests::run_gtk_test(|| {
+                let path = write_temp("budget-loop.gif", ANIMATED_GIF);
+                let animation =
+                    gdk_pixbuf::PixbufAnimation::from_file(&path).expect("animation loads");
+                let before = LOOP_CACHE_BYTES.with(Cell::get);
+                let player = AnimatedImage::new(&animation, 64, Some(2));
+                player.step_frame();
+                assert_eq!(LOOP_CACHE_BYTES.with(Cell::get), before + 2 * 4);
+                drop(player);
+                assert_eq!(LOOP_CACHE_BYTES.with(Cell::get), before);
                 std::fs::remove_file(path).ok();
             });
         }

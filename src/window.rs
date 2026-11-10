@@ -8144,6 +8144,7 @@ impl ConduitWindow {
                     self.mark_image_asset_failed(&key);
                     return;
                 };
+                crate::timeline::cache::forget_asset_miss(&key);
                 for evicted_key in evicted {
                     self.patch_image_asset(&evicted_key);
                 }
