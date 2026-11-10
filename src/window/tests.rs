@@ -3473,12 +3473,7 @@ fn perf_guard_image_arrivals_are_batched_into_one_frame_flush() {
     assert!(!patch.contains("message_html_context"));
     assert!(patch.contains("UiInvalidations::IMAGES"));
     let apply = window_method_source("apply_arrived_images");
-    assert_eq!(
-        apply
-            .matches("message_html_context_with_image_keys(None, Some(keys))")
-            .count(),
-        1
-    );
+    assert_eq!(apply.matches("self.image_asset_context(keys)").count(), 1);
     assert!(!apply.contains("self.message_html_context(None)"));
     assert!(!window_method_source("show_arrived_avatar").contains("message_html_context"));
 }

@@ -3276,11 +3276,10 @@ fn messages_showing_image_asset(
         .iter()
         .filter(|message| {
             message_uses_image_asset_matching(message, &catalog, &is_key)
-                || (!avatar_user_ids.is_empty() && {
-                    let mut user_ids = HashSet::new();
-                    collect_message_user_ids(std::slice::from_ref(message), &mut user_ids);
-                    !user_ids.is_disjoint(avatar_user_ids)
-                })
+                || (!avatar_user_ids.is_empty()
+                    && rendering::extract_user_ids(message)
+                        .iter()
+                        .any(|user_id| avatar_user_ids.contains(user_id)))
         })
         .map(|message| message.ts.clone())
         .collect()
@@ -11053,6 +11052,10 @@ impl ConduitWindow {
         profile_user: Option<&String>,
         context: &MessageRenderContext,
     ) {
+        let profile_user = profile_user.filter(|user_id| {
+            avatar_user_ids.contains(user_id)
+                || self.user_avatar_url(user_id).as_deref() == Some(key)
+        });
         if avatar_user_ids.is_empty() && profile_user.is_none() {
             return;
         }
@@ -11064,11 +11067,39 @@ impl ConduitWindow {
             crate::channel_details_dialog::set_member_avatar_path(user_id, &path);
         }
         if let Some(user_id) = profile_user {
-            if avatar_user_ids.contains(user_id)
-                || self.user_avatar_url(user_id).as_deref() == Some(key)
-            {
-                self.refresh_profile_dialog(user_id);
-            }
+            self.refresh_profile_dialog(user_id);
+        }
+    }
+
+    /// A render context carrying only the image state of `keys` (and the
+    /// shared avatar map), for merging arrived images into bound timelines
+    /// (`update_image_assets`). Looks up just those keys: no titles, no
+    /// settings read, no copy of the whole image map.
+    fn image_asset_context(&self, keys: &HashSet<String>) -> MessageRenderContext {
+        let imp = self.imp();
+        let image_assets = imp.image_assets.borrow();
+        let failed = imp.failed_image_assets.borrow();
+        MessageRenderContext {
+            user_avatar_urls: imp
+                .workspace
+                .user_directory
+                .user_avatar_urls
+                .borrow()
+                .clone(),
+            image_assets: keys
+                .iter()
+                .filter_map(|key| {
+                    image_assets
+                        .path(key)
+                        .map(|path| (key.clone(), path.to_path_buf()))
+                })
+                .collect(),
+            failed_image_urls: keys
+                .iter()
+                .filter(|key| failed.contains(key))
+                .cloned()
+                .collect(),
+            ..MessageRenderContext::default()
         }
     }
 
@@ -11108,19 +11139,19 @@ impl ConduitWindow {
             let users_by_url = index.users_by_url(&avatar_urls);
             keys.iter()
                 .filter_map(|key| users_by_url.get(key).map(|users| (key, users.clone())))
-                .collect::<Vec<_>>()
+                .collect::<HashMap<_, _>>()
         };
         let avatar_user_ids = avatar_users_by_key
-            .iter()
-            .flat_map(|(_, users)| users.iter().cloned())
+            .values()
+            .flatten()
+            .cloned()
             .collect::<HashSet<_>>();
-        let context = self.message_html_context_with_image_keys(None, Some(keys));
+        let context = self.image_asset_context(keys);
         let profile_user = crate::profile_dialog::open_user_id();
         for key in keys {
             let users = avatar_users_by_key
-                .iter()
-                .find(|(candidate, _)| *candidate == key)
-                .map(|(_, users)| users.as_slice())
+                .get(key)
+                .map(Vec::as_slice)
                 .unwrap_or_default();
             self.show_arrived_avatar(key, users, profile_user.as_ref(), &context);
         }
@@ -15187,10 +15218,6 @@ impl ConduitWindow {
         }
     }
 
-    fn message_html_context(&self, thread_ts: Option<&str>) -> MessageRenderContext {
-        self.message_html_context_with_image_keys(thread_ts, None)
-    }
-
     /// Forgets the action handles of messages no longer on `surface`.
     /// Handles are minted on demand when a control is clicked, never per
     /// render: fresh tokens would make every render look changed.
@@ -15260,11 +15287,7 @@ impl ConduitWindow {
         }
     }
 
-    fn message_html_context_with_image_keys(
-        &self,
-        thread_ts: Option<&str>,
-        image_keys: Option<&HashSet<String>>,
-    ) -> MessageRenderContext {
+    fn message_html_context(&self, thread_ts: Option<&str>) -> MessageRenderContext {
         let imp = self.imp();
         let user_names = imp.workspace.user_directory.user_names.borrow().clone();
         let current_user_id = imp.current_user_id.borrow().clone();
@@ -15285,7 +15308,6 @@ impl ConduitWindow {
             .image_assets
             .borrow()
             .iter()
-            .filter(|(key, _)| image_keys.is_none_or(|keys| keys.contains(*key)))
             .map(|(key, path)| (key.clone(), path.to_path_buf()))
             .collect();
         let last_read = self.visible_channel_id().and_then(|channel_id| {
@@ -15331,13 +15353,7 @@ impl ConduitWindow {
             last_read,
             unread_separator_ts: None,
             image_assets,
-            failed_image_urls: imp
-                .failed_image_assets
-                .borrow()
-                .iter()
-                .filter(|key| image_keys.is_none_or(|keys| keys.contains(*key)))
-                .cloned()
-                .collect(),
+            failed_image_urls: imp.failed_image_assets.borrow().iter().cloned().collect(),
             recent_reactions,
             custom_emojis: imp.custom_emojis.borrow().clone(),
         }
