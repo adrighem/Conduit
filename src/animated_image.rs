@@ -253,21 +253,22 @@ impl AnimatedImage {
         let Some(start) = imp.start.get() else {
             return;
         };
-        let Some(delay) = imp
-            .iter
-            .borrow()
-            .as_ref()
-            .and_then(|iter| iter.delay_time())
-        else {
-            return;
+        let changed = {
+            let iter = imp.iter.borrow();
+            let Some(iter) = iter.as_ref() else {
+                return;
+            };
+            let Some(delay) = iter.delay_time() else {
+                return;
+            };
+            let elapsed = imp.elapsed.get() + delay.max(Duration::from_millis(1));
+            imp.elapsed.set(elapsed);
+            let before = iter.pixbuf();
+            // gdk-pixbuf 2.44.5 reports no change when a GIF wraps to its
+            // first frame, though it hands out that frame's own pixbuf; a
+            // new pixbuf means a new frame whatever `advance` says.
+            iter.advance(start + elapsed) || iter.pixbuf() != before
         };
-        let elapsed = imp.elapsed.get() + delay.max(Duration::from_millis(1));
-        imp.elapsed.set(elapsed);
-        let changed = imp
-            .iter
-            .borrow()
-            .as_ref()
-            .is_some_and(|iter| iter.advance(start + elapsed));
         imp.step.set(imp.step.get().wrapping_add(1));
         if changed {
             self.show_current_frame();
