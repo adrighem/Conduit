@@ -803,9 +803,9 @@ pub fn user_search_aliases(users: &[SlackUser]) -> UserSearchAliases {
 }
 
 /// Group DM member ids parsed from the conversation JSON, empty for other
-/// kinds. Cached per conversation while `catalog_stamp` stays the same; the
-/// stamp changes on every catalog mutation, so no change path can leave it
-/// stale.
+/// kinds. With a `catalog_stamp` the ids are cached per conversation and
+/// revalidated against the raw JSON they were parsed from, so a message
+/// arriving elsewhere (which bumps the catalog stamp) reparses nothing.
 fn group_member_ids(conversation: &SlackConversation, catalog_stamp: Option<u64>) -> Arc<[String]> {
     if !conversation.is_mpim.unwrap_or(false) {
         return Arc::from([]);
@@ -813,25 +813,63 @@ fn group_member_ids(conversation: &SlackConversation, catalog_stamp: Option<u64>
     let Some(stamp) = catalog_stamp else {
         return conversation.group_direct_message_user_ids().into();
     };
-    MEMBER_IDS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.stamp != Some(stamp) {
-            cache.stamp = Some(stamp);
-            cache.ids.clear();
-        }
-        Arc::clone(
-            cache
-                .ids
-                .entry(conversation.id.clone())
-                .or_insert_with(|| conversation.group_direct_message_user_ids().into()),
-        )
-    })
+    MEMBER_IDS.with(|cache| cache.borrow_mut().member_ids(conversation, stamp))
+}
+
+struct MemberIdEntry {
+    /// The raw member values `ids` was parsed from.
+    source: Vec<serde_json::Value>,
+    ids: Arc<[String]>,
+    last_seen: u64,
 }
 
 #[derive(Default)]
 struct MemberIdCache {
-    stamp: Option<u64>,
-    ids: HashMap<String, Arc<[String]>>,
+    entries: HashMap<String, MemberIdEntry>,
+    stamp: u64,
+    touched: usize,
+}
+
+impl MemberIdCache {
+    fn member_ids(&mut self, conversation: &SlackConversation, stamp: u64) -> Arc<[String]> {
+        if stamp != self.stamp {
+            // Drop conversations that were not used since the previous
+            // stamp once they outnumber the live ones.
+            if self.entries.len() > 2 * self.touched + 16 {
+                let previous = self.stamp;
+                self.entries.retain(|_, entry| entry.last_seen == previous);
+            }
+            self.stamp = stamp;
+            self.touched = 0;
+        }
+        if let Some(entry) = self.entries.get_mut(&conversation.id) {
+            if entry
+                .source
+                .iter()
+                .eq(conversation.group_direct_message_member_sources())
+            {
+                if entry.last_seen != stamp {
+                    entry.last_seen = stamp;
+                    self.touched += 1;
+                }
+                return Arc::clone(&entry.ids);
+            }
+        }
+        let ids: Arc<[String]> = conversation.group_direct_message_user_ids().into();
+        self.touched += 1;
+        self.entries.insert(
+            conversation.id.clone(),
+            MemberIdEntry {
+                source: conversation
+                    .group_direct_message_member_sources()
+                    .cloned()
+                    .collect(),
+                ids: Arc::clone(&ids),
+                last_seen: stamp,
+            },
+        );
+        ids
+    }
 }
 
 thread_local! {
@@ -4491,13 +4529,33 @@ mod tests {
             "unchanged catalog must not parse member JSON again"
         );
 
-        // Any catalog mutation changes the stamp and reparses.
-        let changed = SidebarBuildOptions {
+        // A message elsewhere bumps the stamp but reparses no other group DM.
+        let bumped = SidebarBuildOptions {
             catalog_stamp: Some(u64::MAX - 6),
             ..options
         };
-        build_sidebar_list(conversations.iter(), &HashMap::new(), changed);
-        assert!(crate::models::MEMBER_ID_PARSES.with(std::cell::Cell::get) >= conversations.len());
+        build_sidebar_list(conversations.iter(), &HashMap::new(), bumped);
+        assert_eq!(
+            crate::models::MEMBER_ID_PARSES.with(std::cell::Cell::get),
+            0,
+            "a stamp bump alone must not reparse member JSON"
+        );
+
+        // Changed member JSON is noticed and reparsed for that conversation only.
+        let mut edited = conversations.clone();
+        edited[3]
+            .extra
+            .insert("members".to_string(), serde_json::json!(["UME", "U9"]));
+        let rebuilt = SidebarBuildOptions {
+            catalog_stamp: Some(u64::MAX - 5),
+            ..options
+        };
+        build_sidebar_list(edited.iter(), &HashMap::new(), rebuilt);
+        let reparsed = crate::models::MEMBER_ID_PARSES.with(std::cell::Cell::get);
+        assert!(
+            (1..=3).contains(&reparsed),
+            "only the edited conversation reparses, got {reparsed}"
+        );
     }
 
     #[test]

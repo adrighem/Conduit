@@ -295,6 +295,14 @@ impl SlackConversation {
         names
     }
 
+    /// The raw JSON values `group_direct_message_user_ids` is parsed from, for
+    /// callers that cache the parsed ids and revalidate them cheaply.
+    pub fn group_direct_message_member_sources(&self) -> impl Iterator<Item = &Value> {
+        CONVERSATION_MEMBER_KEYS
+            .iter()
+            .filter_map(|key| self.extra_value(key))
+    }
+
     pub fn group_direct_message_user_ids(&self) -> Vec<String> {
         #[cfg(test)]
         MEMBER_ID_PARSES.with(|count| count.set(count.get() + 1));
