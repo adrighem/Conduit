@@ -33,6 +33,13 @@
     <color type="primary" scheme_preference="dark">#543b2f</color>
   </branding>
 
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/adrighem/Conduit/v0.9.0/data/screenshots/main-window-profile.png</image>
+      <caption>Main application window with conversations and profile sidebar</caption>
+    </screenshot>
+  </screenshots>
+
   <releases>
     <release version="0.9.0" date="2026-11-08"> <!-- x-release-please-version-date -->
       <url type="details">https://github.com/adrighem/Conduit/releases/tag/v0.9.0</url> <!-- x-release-please-version -->

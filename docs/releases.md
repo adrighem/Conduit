@@ -54,6 +54,22 @@ Reqwest is therefore configured with `rustls-no-provider`, and Conduit selects t
 
 The GitHub Release `.flatpak` is a directly installable bundle, not an update repository. Flatpak repositories or Flathub are needed for automatic updates.
 
-Flathub onboarding is deliberately not automated here. It requires a separate manifest pinned to an immutable tag and commit, screenshots and complete AppStream metadata, domain verification, a human submission and review, and ongoing updates in the generated Flathub repository.
+Flathub onboarding is deliberately not automated here. It requires a separate manifest pinned to an immutable tag and commit, screenshots and complete AppStream metadata, domain verification, a human submission and review, and ongoing updates in the generated Flathub repository. Ready-to-submit Flathub files live in [packaging/flatpak/flathub/](../packaging/flatpak/flathub/).
+
+### Flathub submission steps:
+
+1. Fork `flathub/flathub` on GitHub (uncheck "Copy master branch only").
+2. Clone fork, checkout `new-pr` branch:
+   ```sh
+   git clone --branch=new-pr git@github.com:adrighem/flathub.git && cd flathub
+   git checkout -b add-conduit new-pr
+   ```
+3. Copy `packaging/flatpak/flathub/eu.vanadrighem.conduit.json` and `packaging/flatpak/flathub/cargo-sources.json` to root of branch.
+4. Verify local build:
+   ```sh
+   flatpak-builder --force-clean --user --install-deps-from=flathub build-dir eu.vanadrighem.conduit.json
+   ```
+5. Commit and open PR against `flathub/flathub:new-pr` with title `Add eu.vanadrighem.conduit`.
+6. Disclose AI assistance in submission per Flathub AI policy; human maintainer must own PR.
 
 Flathub's current requirements also prohibit AI-generated or AI-assisted application and submission content except by case-by-case exception. Conduit contains AI-assisted work, so a maintainer must first obtain an explicit Flathub exception and personally own any submission and review discussion. Without that exception, the supported Flatpak route remains GitHub Release bundles; a signed self-hosted Flatpak repository is a possible future alternative.
