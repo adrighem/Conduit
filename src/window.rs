@@ -196,7 +196,7 @@ struct ComposerEntityMark {
 struct MessageEditState {
     target: ComposerTarget,
     channel_id: String,
-    original: SlackMessage,
+    original: std::sync::Arc<SlackMessage>,
     original_draft: RichComposerDraft,
     uses_rich_blocks: bool,
     submitted: bool,
@@ -766,6 +766,10 @@ mod imp {
                         for message in &mut thread_messages {
                             message.refresh_canonical_content();
                         }
+                        let thread_messages = thread_messages
+                            .into_iter()
+                            .map(std::sync::Arc::new)
+                            .collect::<Vec<_>>();
                         obj.imp()
                             .workspace
                             .view
@@ -774,7 +778,7 @@ mod imp {
                         obj.imp().workspace.view.borrow_mut().apply_thread(
                             test_channel_id,
                             "1.0",
-                            thread_messages.clone(),
+                            thread_messages.iter().map(|m| (**m).clone()).collect(),
                             false,
                             None,
                             true,
@@ -1836,7 +1840,7 @@ fn valid_channel_name(name: &str) -> bool {
         })
 }
 
-fn media_gallery_items(messages: &[SlackMessage]) -> Vec<MediaGalleryItem> {
+fn media_gallery_items(messages: &[Arc<SlackMessage>]) -> Vec<MediaGalleryItem> {
     file_media_gallery_items(
         messages
             .iter()
@@ -2279,7 +2283,7 @@ fn message_notification_body(
     user_names: &HashMap<String, String>,
     user_full_names: &HashMap<String, String>,
 ) -> Option<String> {
-    let visible_text = message.map(SlackMessage::visible_text).unwrap_or_default();
+    let visible_text = message.map(|m| m.visible_text()).unwrap_or_default();
     let text = rendering::notification_plain_text(&visible_text, user_names, user_full_names)?;
     if !text.is_empty() {
         Some(text)
@@ -2541,20 +2545,21 @@ fn submitted_draft_matches(
         .is_some_and(|text| text.trim() == submitted)
 }
 
-fn latest_editable_message(
+fn latest_editable_message<T: std::borrow::Borrow<SlackMessage> + Clone>(
     target: ComposerTarget,
-    messages: &[SlackMessage],
+    messages: &[T],
     current_user_id: Option<&str>,
-) -> Option<SlackMessage> {
+) -> Option<T> {
     let current_user_id = current_user_id?;
     messages
         .iter()
         .find(|message| {
-            message.author_user_id() == Some(current_user_id)
-                && (target == ComposerTarget::Thread || !message.is_thread_reply())
-                && matches!(message.subtype.as_deref(), None | Some("me_message"))
-                && !message.ts.trim().is_empty()
-                && !message.body_text().trim().is_empty()
+            let msg = message.borrow();
+            msg.author_user_id() == Some(current_user_id)
+                && (target == ComposerTarget::Thread || !msg.is_thread_reply())
+                && matches!(msg.subtype.as_deref(), None | Some("me_message"))
+                && !msg.ts.trim().is_empty()
+                && !msg.body_text().trim().is_empty()
         })
         .cloned()
 }
@@ -3170,15 +3175,16 @@ fn retain_image_asset_request(
     requests.insert(key, url);
 }
 
-fn message_image_asset_requests<'a>(
-    messages: impl IntoIterator<Item = &'a SlackMessage>,
+fn message_image_asset_requests<'a, T: std::borrow::Borrow<SlackMessage> + 'a>(
+    messages: impl IntoIterator<Item = &'a T>,
     avatar_urls: &HashMap<String, String>,
     custom_emojis: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
     let mut requests = HashMap::new();
     let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
     for message in messages {
-        for request in message
+        let msg = message.borrow();
+        for request in msg
             .files
             .as_ref()
             .into_iter()
@@ -3187,7 +3193,7 @@ fn message_image_asset_requests<'a>(
         {
             retain_image_asset_request(&mut requests, Some(request));
         }
-        for request in message
+        for request in msg
             .attachments
             .as_ref()
             .into_iter()
@@ -3196,14 +3202,14 @@ fn message_image_asset_requests<'a>(
         {
             retain_image_asset_request(&mut requests, Some(request));
         }
-        for request in message
+        for request in msg
             .document
             .image_urls()
             .filter_map(document_image_asset_request)
         {
             retain_image_asset_request(&mut requests, Some(request));
         }
-        for reaction in message.reactions.as_ref().into_iter().flatten() {
+        for reaction in msg.reactions.as_ref().into_iter().flatten() {
             if let Some(name) = reaction.name.as_deref() {
                 let clean_name = name.trim_matches(':');
                 if let Some(crate::emoji::EmojiValue::CustomImage(url)) =
@@ -3213,7 +3219,7 @@ fn message_image_asset_requests<'a>(
                 }
             }
         }
-        if let Some(text) = message.text.as_deref() {
+        if let Some(text) = msg.text.as_deref() {
             let mut rest = text;
             while let Some(start) = rest.find(':') {
                 rest = &rest[start + 1..];
@@ -3240,12 +3246,12 @@ fn message_image_asset_requests<'a>(
                 }
             }
         }
-        if let Some(url) = message
+        if let Some(url) = msg
             .user
             .as_ref()
             .and_then(|user_id| avatar_urls.get(user_id))
             .map(String::as_str)
-            .or_else(|| message.avatar_url())
+            .or_else(|| msg.avatar_url())
         {
             retain_image_asset_request(&mut requests, bounded_image_asset_request(url));
         }
@@ -3255,14 +3261,15 @@ fn message_image_asset_requests<'a>(
     requests
 }
 
-fn messages_use_image_asset(
-    messages: &[SlackMessage],
+fn messages_use_image_asset<T: std::borrow::Borrow<SlackMessage>>(
+    messages: &[T],
     custom_emojis: &HashMap<String, String>,
     is_key: impl Fn(&str) -> bool,
 ) -> bool {
     let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
     messages
         .iter()
+        .map(std::borrow::Borrow::borrow)
         .any(|message| message_uses_image_asset_matching(message, &catalog, &is_key))
 }
 
@@ -3270,8 +3277,8 @@ fn messages_use_image_asset(
 /// accepts, either directly or as the avatar of one of `avatar_user_ids`.
 /// The single source of truth for which timeline rows arriving images must
 /// re-render; one pass serves a whole batch of arrivals.
-fn messages_showing_image_asset(
-    messages: &[SlackMessage],
+fn messages_showing_image_asset<T: std::borrow::Borrow<SlackMessage>>(
+    messages: &[T],
     custom_emojis: &HashMap<String, String>,
     is_key: impl Fn(&str) -> bool,
     avatar_user_ids: &HashSet<String>,
@@ -3279,6 +3286,7 @@ fn messages_showing_image_asset(
     let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
     messages
         .iter()
+        .map(std::borrow::Borrow::borrow)
         .filter(|message| {
             message_uses_image_asset_matching(message, &catalog, &is_key)
                 || (!avatar_user_ids.is_empty()
@@ -3325,15 +3333,18 @@ impl AvatarUserIndex {
 }
 
 /// Collects every user id the rendered messages depend on (author, mentions, reactions).
-fn collect_message_user_ids(messages: &[SlackMessage], out: &mut HashSet<String>) {
+fn collect_message_user_ids<T: std::borrow::Borrow<SlackMessage>>(
+    messages: &[T],
+    out: &mut HashSet<String>,
+) {
     for message in messages {
-        out.extend(rendering::extract_user_ids(message));
+        out.extend(rendering::extract_user_ids(message.borrow()));
     }
 }
 
 /// Collects the user ids a followed-thread root row depends on (reply avatars included).
 fn collect_thread_root_user_ids(message: &SlackMessage, out: &mut HashSet<String>) {
-    collect_message_user_ids(std::slice::from_ref(message), out);
+    collect_message_user_ids(std::slice::from_ref(&message), out);
     out.extend(message.reply_users.iter().flatten().cloned());
 }
 
@@ -3491,10 +3502,14 @@ impl ReadHold {
 /// Finds the earliest message timestamp strictly after `last_read`, i.e. the
 /// unread-separator anchor. `None` if there's no `last_read` or nothing
 /// unread. Pure/order-independent over `messages` (doesn't assume sorted).
-fn earliest_unread_ts(last_read: Option<&str>, messages: &[SlackMessage]) -> Option<String> {
+fn earliest_unread_ts<T: std::borrow::Borrow<SlackMessage>>(
+    last_read: Option<&str>,
+    messages: &[T],
+) -> Option<String> {
     last_read.and_then(|last_read| {
         messages
             .iter()
+            .map(std::borrow::Borrow::borrow)
             .filter(|message| crate::models::slack_timestamp_is_after(&message.ts, last_read))
             .fold(None::<&str>, |earliest, message| match earliest {
                 Some(current) if crate::models::slack_timestamp_is_after(current, &message.ts) => {
@@ -9307,7 +9322,7 @@ impl ConduitWindow {
         }
         self.send_command(RuntimeCommand::UpdateMessage {
             channel_id,
-            original: Box::new(original),
+            original: Box::new((*original).clone()),
             text: payload.fallback_text,
             blocks_json: uses_rich_blocks.then_some(payload.blocks_json),
         });
@@ -10234,7 +10249,7 @@ impl ConduitWindow {
                         source_channel_id: &source_channel_id,
                         target_channel_id: &action.channel_id,
                         message_ts: &message_ts,
-                        source_message: source_message.as_ref(),
+                        source_message: source_message.as_deref(),
                         source_conversation: source_conversation.as_ref(),
                         workspace_url: workspace_url.as_deref(),
                         user_display_name: user_display_name.as_deref(),
@@ -10266,7 +10281,7 @@ impl ConduitWindow {
         self.set_status(status);
     }
 
-    fn find_message(&self, channel_id: &str, ts: &str) -> Option<SlackMessage> {
+    fn find_message(&self, channel_id: &str, ts: &str) -> Option<std::sync::Arc<SlackMessage>> {
         self.imp()
             .workspace
             .view
@@ -10627,7 +10642,7 @@ impl ConduitWindow {
                     .channel_messages(&change.channel_id)
                     .iter()
                     .find(|message| message.ts == change.ts)
-                    .map(SlackMessage::visible_text)
+                    .map(|m| m.visible_text())
                     .unwrap_or_default();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -11440,8 +11455,10 @@ impl ConduitWindow {
             for operation in change.operations() {
                 match operation {
                     TimelineProjectionOperation::Upsert { message, .. } => {
-                        self.request_user_names(std::slice::from_ref(message.as_ref()));
-                        self.request_image_assets(std::iter::once(message.as_ref()));
+                        let m = std::sync::Arc::new(message.as_ref().clone());
+                        self.request_user_names(std::slice::from_ref(&m));
+                        let m = std::sync::Arc::new(message.as_ref().clone());
+                        self.request_image_assets(std::iter::once(&m));
                         if let Ok(target) = MessageRef::new(channel_id, message.ts.clone()) {
                             let _ = self
                                 .imp()
@@ -11757,7 +11774,8 @@ impl ConduitWindow {
                     .iter()
                     .filter_map(|item| item.message.as_ref())
                 {
-                    collect_message_user_ids(std::slice::from_ref(message), &mut user_ids);
+                    let m = std::sync::Arc::new(message.clone());
+                    collect_message_user_ids(std::slice::from_ref(&m), &mut user_ids);
                 }
             }
             MainMessageView::Files => {
@@ -11779,11 +11797,19 @@ impl ConduitWindow {
                 messages_use_image_asset(state.channel_messages(channel_id), custom_emojis, &is_key)
             }),
             MainMessageView::Threads => self.followed_thread_roots().iter().any(|(_, message)| {
-                messages_use_image_asset(std::slice::from_ref(message), custom_emojis, &is_key)
+                messages_use_image_asset(
+                    std::slice::from_ref(&std::sync::Arc::new(message.clone())),
+                    custom_emojis,
+                    &is_key,
+                )
             }),
             MainMessageView::Saved => state.saved_items().iter().any(|item| {
                 item.message.as_ref().is_some_and(|message| {
-                    messages_use_image_asset(std::slice::from_ref(message), custom_emojis, &is_key)
+                    messages_use_image_asset(
+                        std::slice::from_ref(&std::sync::Arc::new(message.clone())),
+                        custom_emojis,
+                        &is_key,
+                    )
                 })
             }),
             MainMessageView::Files => state
@@ -13749,7 +13775,7 @@ impl ConduitWindow {
         let observed = self.followed_thread_roots();
         let roots = observed
             .iter()
-            .map(|(_, message)| message.clone())
+            .map(|(_, message)| std::sync::Arc::new(message.clone()))
             .collect::<Vec<_>>();
         self.request_user_names(&roots);
         self.request_image_assets(roots.iter());
@@ -13885,7 +13911,11 @@ impl ConduitWindow {
         }
         let saved_messages = items
             .iter()
-            .filter_map(|item| item.message.clone())
+            .filter_map(|item| {
+                item.message
+                    .as_ref()
+                    .map(|m| std::sync::Arc::new(m.clone()))
+            })
             .collect::<Vec<_>>();
         self.request_user_names(&saved_messages);
         self.request_image_assets(saved_messages.iter());
@@ -15023,10 +15053,10 @@ impl ConduitWindow {
         }
     }
 
-    fn request_user_names(&self, messages: &[SlackMessage]) {
+    fn request_user_names(&self, messages: &[Arc<SlackMessage>]) {
         let mut ids = messages
             .iter()
-            .flat_map(rendering::extract_user_ids)
+            .flat_map(|m| rendering::extract_user_ids(m.as_ref()))
             .collect::<Vec<_>>();
         ids.sort();
         ids.dedup();
@@ -15037,10 +15067,10 @@ impl ConduitWindow {
 
     /// Asks Slack for the titles of `<#C...>` mentions of channels that are
     /// neither joined nor discovered. See `ChannelNameLookups` for the bounds.
-    fn request_channel_names(&self, messages: &[SlackMessage]) {
+    fn request_channel_names(&self, messages: &[Arc<SlackMessage>]) {
         let ids = messages
             .iter()
-            .flat_map(rendering::extract_channel_ids)
+            .flat_map(|m| rendering::extract_channel_ids(m.as_ref()))
             .collect::<HashSet<_>>();
         if ids.is_empty() {
             return;
@@ -15137,7 +15167,10 @@ impl ConduitWindow {
         }
     }
 
-    fn request_image_assets<'a>(&self, messages: impl IntoIterator<Item = &'a SlackMessage>) {
+    fn request_image_assets<'a>(
+        &self,
+        messages: impl IntoIterator<Item = &'a std::sync::Arc<SlackMessage>>,
+    ) {
         let avatar_urls = self
             .imp()
             .workspace
@@ -15255,7 +15288,7 @@ impl ConduitWindow {
         &self,
         surface: TimelineSurfaceId,
         channel_id: &str,
-        messages: &[SlackMessage],
+        messages: &[Arc<SlackMessage>],
     ) {
         let live = messages
             .iter()

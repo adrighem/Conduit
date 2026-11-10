@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use adw::prelude::*;
@@ -1070,7 +1071,7 @@ impl NativeTimelineView {
     fn update_store_grouping(&self, unread_separator_ts: Option<&str>) -> HashSet<String> {
         let mut changed = HashSet::new();
         let n = self.store.n_items();
-        let mut prev_msg: Option<SlackMessage> = None;
+        let mut prev_msg: Option<std::sync::Arc<SlackMessage>> = None;
         for i in 0..n {
             let Some(obj) = self
                 .store
@@ -1122,16 +1123,17 @@ impl NativeTimelineView {
             if obj.is_day_separator() {
                 return false;
             }
-            let ts = obj.message().ts;
-            changed.contains(&ts)
-                || previous.as_deref() == Some(ts.as_str())
-                || anchor_ts.as_deref() == Some(ts.as_str())
+            obj.with_message(|msg| {
+                changed.contains(&msg.ts)
+                    || previous.as_deref() == Some(msg.ts.as_str())
+                    || anchor_ts.as_deref() == Some(msg.ts.as_str())
+            })
         });
     }
 
     pub fn set_messages(
         &self,
-        messages: &[SlackMessage],
+        messages: &[Arc<SlackMessage>],
         context: &MessageRenderContext,
         focus_ts: Option<&str>,
     ) {
@@ -1152,8 +1154,8 @@ impl NativeTimelineView {
         {
             let roots: HashSet<&str> = messages
                 .iter()
-                .filter(|msg| is_thread_broadcast(msg))
-                .filter_map(SlackMessage::thread_root_ts)
+                .filter(|msg| is_thread_broadcast(msg.as_ref()))
+                .filter_map(|m| m.thread_root_ts())
                 .collect();
             let mut texts = self.thread_root_texts.borrow_mut();
             texts.clear();
@@ -1657,7 +1659,15 @@ mod tests {
                 window.set_default_size(400, 500);
                 window.set_child(Some(view.widget()));
                 window.present();
-                view.set_messages(&messages, &ctx, None);
+                view.set_messages(
+                    &messages
+                        .iter()
+                        .cloned()
+                        .map(std::sync::Arc::new)
+                        .collect::<Vec<_>>(),
+                    &ctx,
+                    None,
+                );
                 pump(300);
 
                 // Simulate the target row having fallen out of the store (e.g. an

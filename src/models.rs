@@ -850,7 +850,8 @@ impl SlackAttachment {
     }
 }
 
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(not(test), derive(Clone))]
 pub struct SlackMessage {
     #[serde(rename = "type")]
     pub kind: Option<String>,
@@ -2815,4 +2816,122 @@ mod tests {
         assert!(conversation.extra.contains_key("last_read"));
         assert!(conversation.extra.contains_key("unread_mentions"));
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SLACK_MESSAGE_CLONE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_slack_message_clones<R>(f: impl FnOnce() -> R) -> (usize, R) {
+    let start = SLACK_MESSAGE_CLONE_COUNT.with(|c| c.get());
+    let r = f();
+    let end = SLACK_MESSAGE_CLONE_COUNT.with(|c| c.get());
+    (end - start, r)
+}
+
+#[cfg(test)]
+impl Clone for SlackMessage {
+    fn clone(&self) -> Self {
+        SLACK_MESSAGE_CLONE_COUNT.with(|c| c.set(c.get() + 1));
+        Self {
+            kind: self.kind.clone(),
+            subtype: self.subtype.clone(),
+            user: self.user.clone(),
+            username: self.username.clone(),
+            text: self.text.clone(),
+            ts: self.ts.clone(),
+            client_msg_id: self.client_msg_id.clone(),
+            thread_ts: self.thread_ts.clone(),
+            reply_count: self.reply_count,
+            reply_users: self.reply_users.clone(),
+            latest_reply: self.latest_reply.clone(),
+            subscribed: self.subscribed,
+            last_read: self.last_read.clone(),
+            is_starred: self.is_starred,
+            is_thread_broadcast: self.is_thread_broadcast,
+            edited: self.edited.clone(),
+            reactions: self.reactions.clone(),
+            files: self.files.clone(),
+            blocks: self.blocks.clone(),
+            attachments: self.attachments.clone(),
+            bot_id: self.bot_id.clone(),
+            app_id: self.app_id.clone(),
+            bot_profile: self.bot_profile.clone(),
+            icons: self.icons.clone(),
+            is_ephemeral: self.is_ephemeral,
+            author: self.author.clone(),
+            document: self.document.clone(),
+            content_version: self.content_version,
+            no_notifications: self.no_notifications,
+            room: self.room.clone(),
+            call: self.call.clone(),
+            call_id: self.call_id.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn slack_message_clone_preserves_all_fields() {
+    let msg = SlackMessage {
+        kind: Some("message".to_string()),
+        subtype: Some("bot_message".to_string()),
+        user: Some("U123".to_string()),
+        username: Some("bot".to_string()),
+        text: Some("text".to_string()),
+        ts: "123.456".to_string(),
+        client_msg_id: Some("UUID".to_string()),
+        thread_ts: Some("123.000".to_string()),
+        reply_count: Some(1),
+        reply_users: Some(vec!["U123".to_string()]),
+        latest_reply: Some("123.456".to_string()),
+        subscribed: Some(false),
+        last_read: Some("123.000".to_string()),
+        is_starred: Some(true),
+        is_thread_broadcast: Some(false),
+        edited: Some(crate::models::SlackMessageEdit {
+            user: Some("U1".to_string()),
+            ts: Some("1.0".to_string()),
+        }),
+        reactions: Some(vec![]),
+        files: Some(vec![]),
+        blocks: Some(serde_json::Value::Null),
+        attachments: Some(vec![]),
+        bot_id: Some("B123".to_string()),
+        app_id: Some("A123".to_string()),
+        bot_profile: Some(crate::models::SlackBotProfile {
+            id: Some("B123".to_string()),
+            name: Some("bot".to_string()),
+            app_id: Some("A123".to_string()),
+            icons: Some(crate::models::SlackIcons {
+                image_36: Some("url".to_string()),
+                image_48: None,
+                image_72: None,
+                emoji: None,
+            }),
+            updated: Some(123),
+            deleted: Some(false),
+            team_id: Some("T123".to_string()),
+            user_id: Some("U123".to_string()),
+        }),
+        icons: Some(crate::models::SlackIcons {
+            image_36: Some("url".to_string()),
+            image_48: None,
+            image_72: None,
+            emoji: None,
+        }),
+        is_ephemeral: Some(true),
+        author: crate::models::MessageAuthor::User {
+            user_id: "U123".to_string(),
+        },
+        document: Default::default(),
+        content_version: 1,
+        no_notifications: Some(true),
+        room: None,
+        call: None,
+        call_id: None,
+    };
+    assert_eq!(msg.clone(), msg);
 }

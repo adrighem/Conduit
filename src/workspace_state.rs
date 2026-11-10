@@ -978,7 +978,7 @@ pub(crate) enum ThreadApplyOutcome {
 /// A timeline's message list, shared with renders so handing it to the
 /// timeline is a refcount bump, not a deep copy. Mutate through
 /// `Arc::make_mut` or replace it only when the list changed.
-pub(crate) type SharedMessages = Arc<Vec<SlackMessage>>;
+pub(crate) type SharedMessages = Arc<Vec<Arc<SlackMessage>>>;
 
 #[derive(Debug, Clone, Default)]
 struct ChannelHistoryState {
@@ -1149,7 +1149,7 @@ impl ConversationOpenCoordinator {
         &mut self,
         generation: ConversationOpenGeneration,
         channel_id: &str,
-        messages: &[SlackMessage],
+        messages: &[std::sync::Arc<SlackMessage>],
     ) -> Option<ConversationOpenPosition> {
         let session = self.active.as_mut().filter(|session| {
             session.generation == generation
@@ -1276,7 +1276,7 @@ impl WorkspaceViewState {
             .map(|thread| (thread.channel_id.as_str(), thread.ts.as_str()))
     }
 
-    pub(crate) fn channel_messages(&self, channel_id: &str) -> &[SlackMessage] {
+    pub(crate) fn channel_messages(&self, channel_id: &str) -> &[std::sync::Arc<SlackMessage>] {
         self.channels
             .get(channel_id)
             .map(|history| {
@@ -1318,14 +1318,17 @@ impl WorkspaceViewState {
             .unwrap_or_default()
     }
 
-    pub(crate) fn channel_tail_messages(&self, channel_id: &str) -> &[SlackMessage] {
+    pub(crate) fn channel_tail_messages(
+        &self,
+        channel_id: &str,
+    ) -> &[std::sync::Arc<SlackMessage>] {
         self.channels
             .get(channel_id)
             .map(|history| history.messages.as_slice())
             .unwrap_or_default()
     }
 
-    pub(crate) fn current_thread_messages(&self) -> &[SlackMessage] {
+    pub(crate) fn current_thread_messages(&self) -> &[std::sync::Arc<SlackMessage>] {
         self.thread
             .as_ref()
             .map(|thread| {
@@ -1472,7 +1475,7 @@ impl WorkspaceViewState {
         channel_id: &str,
         message_ts: &str,
         saved: bool,
-        message: Option<SlackMessage>,
+        message: Option<std::sync::Arc<SlackMessage>>,
     ) -> bool {
         self.saved_items.retain(|item| {
             let item_channel = item.channel.as_deref().or(item.group.as_deref());
@@ -1484,7 +1487,7 @@ impl WorkspaceViewState {
                 self.saved_items.push(SavedItem {
                     kind: Some("message".to_string()),
                     channel: Some(channel_id.to_string()),
-                    message: Some(message),
+                    message: Some((*message).clone()),
                     ..Default::default()
                 });
                 self.saved_items.sort_by(|left, right| {
@@ -1590,9 +1593,9 @@ impl WorkspaceViewState {
         let was_loaded = history.loaded;
         let had_context = history.context_messages.is_some();
         let merged = if append_older {
-            merge_channel_message_pages(&history.messages, &messages)
+            merge_channel_message_pages(&history.messages, messages)
         } else {
-            merge_channel_message_refresh(&history.messages, &messages)
+            merge_channel_message_refresh(&history.messages, messages)
         };
         let messages_changed = replace_if_changed(&mut history.messages, merged);
         history.loaded = true;
@@ -1748,7 +1751,7 @@ impl WorkspaceViewState {
     pub(crate) fn apply_message_context(
         &mut self,
         location: &SearchMessageLocation,
-        messages: Vec<SlackMessage>,
+        messages: Vec<std::sync::Arc<SlackMessage>>,
     ) -> bool {
         if !messages
             .iter()
@@ -1789,7 +1792,7 @@ impl WorkspaceViewState {
     pub(crate) fn take_channel_focus_for_render(
         &mut self,
         channel_id: &str,
-        messages: &[SlackMessage],
+        messages: &[std::sync::Arc<SlackMessage>],
     ) -> Option<String> {
         if self.visible_channel_id() != Some(channel_id) {
             return None;
@@ -1807,7 +1810,7 @@ impl WorkspaceViewState {
         &mut self,
         channel_id: &str,
         thread_ts: &str,
-        messages: &[SlackMessage],
+        messages: &[std::sync::Arc<SlackMessage>],
     ) -> Option<String> {
         let thread = self.thread.as_mut()?;
         if thread.channel_id != channel_id || thread.ts != thread_ts {
@@ -1917,9 +1920,9 @@ impl WorkspaceViewState {
         let was_ready = thread.status == ThreadLoadStatus::Ready;
         let had_context = thread.context_messages.is_some();
         let merged = if append_older {
-            merge_message_pages(&thread.messages, &messages)
+            merge_message_pages(&thread.messages, messages)
         } else {
-            merge_message_refresh(&thread.messages, &messages)
+            merge_message_refresh(&thread.messages, messages)
         };
         let messages_changed = replace_if_changed(&mut thread.messages, merged);
         thread.status = ThreadLoadStatus::Ready;
@@ -2096,7 +2099,7 @@ impl WorkspaceViewState {
         })
     }
 
-    pub(crate) fn find_message(&self, channel_id: &str, ts: &str) -> Option<SlackMessage> {
+    pub(crate) fn find_message(&self, channel_id: &str, ts: &str) -> Option<Arc<SlackMessage>> {
         self.channels
             .get(channel_id)
             .and_then(|history| {
@@ -2106,6 +2109,7 @@ impl WorkspaceViewState {
                     .unwrap_or(&history.messages)
                     .iter()
                     .find(|message| message.ts == ts)
+                    .cloned()
             })
             .or_else(|| {
                 self.thread
@@ -2118,6 +2122,7 @@ impl WorkspaceViewState {
                             .unwrap_or(&thread.messages)
                             .iter()
                             .find(|message| message.ts == ts)
+                            .cloned()
                     })
             })
             .or_else(|| {
@@ -2126,8 +2131,8 @@ impl WorkspaceViewState {
                     .filter(|item| item.channel.as_deref() == Some(channel_id))
                     .filter_map(|item| item.message.as_ref())
                     .find(|message| message.ts == ts)
+                    .map(|m| std::sync::Arc::new(m.clone()))
             })
-            .cloned()
     }
 
     fn navigate_to(&mut self, view: MainMessageView) {
@@ -2248,7 +2253,7 @@ fn usable_cursor(has_more: bool, cursor: Option<String>) -> Option<String> {
 }
 
 fn apply_projection_message_changes(
-    messages: &mut Vec<SlackMessage>,
+    messages: &mut Vec<std::sync::Arc<SlackMessage>>,
     changes: &[MessageChange],
     accepts: impl Fn(&SlackMessage) -> bool,
 ) -> bool {
@@ -2257,19 +2262,19 @@ fn apply_projection_message_changes(
         match change {
             MessageChange::Upsert(message) if accepts(message) => {
                 if let Some(pos) = messages.iter().position(|known| known.ts == message.ts) {
-                    if &messages[pos] != message.as_ref() {
-                        messages[pos].clone_from(message);
+                    if *messages[pos] != **message {
+                        messages[pos] = std::sync::Arc::new((**message).clone());
                         changed = true;
                     }
                 } else {
                     // messages is sorted descending by ts (newest first).
                     if messages.first().is_none_or(|newest| message.ts > newest.ts) {
-                        messages.insert(0, (**message).clone());
+                        messages.insert(0, std::sync::Arc::new((**message).clone()));
                     } else if messages.last().is_some_and(|oldest| message.ts < oldest.ts) {
-                        messages.push((**message).clone());
+                        messages.push(std::sync::Arc::new((**message).clone()));
                     } else {
                         let idx = messages.partition_point(|known| known.ts > message.ts);
-                        messages.insert(idx, (**message).clone());
+                        messages.insert(idx, std::sync::Arc::new((**message).clone()));
                     }
                     changed = true;
                 }
@@ -2287,13 +2292,13 @@ fn apply_projection_message_changes(
 }
 
 fn timeline_projection_operations(
-    messages: &[SlackMessage],
+    messages: &[std::sync::Arc<SlackMessage>],
     changes: &[MessageChange],
     accepts: impl Fn(&SlackMessage) -> bool,
 ) -> Vec<TimelineProjectionOperation> {
-    let mut known: HashMap<&str, &SlackMessage> = messages
+    let mut known: std::collections::HashMap<&str, &SlackMessage> = messages
         .iter()
-        .map(|message| (message.ts.as_str(), message))
+        .map(|message| (message.ts.as_str(), message.as_ref()))
         .collect();
     let mut newly_inserted: HashMap<String, Box<SlackMessage>> = HashMap::new();
     let mut operations = Vec::new();
@@ -2341,7 +2346,7 @@ fn timeline_projection_operations(
 }
 
 fn apply_context_message_changes(
-    messages: &mut Vec<SlackMessage>,
+    messages: &mut Vec<std::sync::Arc<SlackMessage>>,
     changes: &[MessageChange],
 ) -> bool {
     let mut changed = false;
@@ -2352,8 +2357,8 @@ fn apply_context_message_changes(
                 else {
                     continue;
                 };
-                if existing != message.as_ref() {
-                    existing.clone_from(message);
+                if **existing != **message {
+                    *existing = std::sync::Arc::new((**message).clone());
                     changed = true;
                 }
             }
@@ -2367,69 +2372,173 @@ fn apply_context_message_changes(
     changed
 }
 
+enum MergedItem {
+    Shared(Arc<SlackMessage>),
+    Incoming(usize),
+}
+
+struct MergedBatch {
+    incoming: Vec<Option<SlackMessage>>,
+    items: Vec<MergedItem>,
+}
+
+impl MergedBatch {
+    fn from_incoming_and_shared(
+        incoming: Vec<SlackMessage>,
+        shared: impl IntoIterator<Item = Arc<SlackMessage>>,
+        incoming_first: bool,
+        channel_only: bool,
+    ) -> Self {
+        let slots: Vec<Option<SlackMessage>> = incoming.into_iter().map(Some).collect();
+        let shared_vec: Vec<Arc<SlackMessage>> = shared.into_iter().collect();
+        let mut items = Vec::with_capacity(slots.len() + shared_vec.len());
+
+        let push_incoming = |items: &mut Vec<MergedItem>, slots: &[Option<SlackMessage>]| {
+            for (idx, slot) in slots.iter().enumerate() {
+                if let Some(msg) = slot {
+                    if !channel_only || msg.belongs_in_channel_timeline() {
+                        items.push(MergedItem::Incoming(idx));
+                    }
+                }
+            }
+        };
+        let push_shared = |items: &mut Vec<MergedItem>, shared_vec: Vec<Arc<SlackMessage>>| {
+            for msg in shared_vec {
+                if !channel_only || msg.belongs_in_channel_timeline() {
+                    items.push(MergedItem::Shared(msg));
+                }
+            }
+        };
+
+        if incoming_first {
+            push_incoming(&mut items, &slots);
+            push_shared(&mut items, shared_vec);
+        } else {
+            push_shared(&mut items, shared_vec);
+            push_incoming(&mut items, &slots);
+        }
+
+        fn ts_of<'a>(item: &'a MergedItem, slots: &'a [Option<SlackMessage>]) -> &'a str {
+            match item {
+                MergedItem::Shared(msg) => msg.ts.as_str(),
+                MergedItem::Incoming(idx) => slots[*idx].as_ref().map_or("", |msg| msg.ts.as_str()),
+            }
+        }
+        items.sort_by(|left, right| ts_of(right, &slots).cmp(ts_of(left, &slots)));
+        items.dedup_by(|left, right| {
+            let left_ts = ts_of(left, &slots);
+            !left_ts.is_empty() && left_ts == ts_of(right, &slots)
+        });
+
+        Self {
+            incoming: slots,
+            items,
+        }
+    }
+
+    fn message_at<'a>(slots: &'a [Option<SlackMessage>], item: &'a MergedItem) -> &'a SlackMessage {
+        match item {
+            MergedItem::Shared(msg) => msg,
+            MergedItem::Incoming(idx) => slots[*idx]
+                .as_ref()
+                .expect("incoming slot populated while inspecting batch"),
+        }
+    }
+
+    fn matches_arc(
+        slots: &[Option<SlackMessage>],
+        item: &MergedItem,
+        existing: &Arc<SlackMessage>,
+    ) -> bool {
+        match item {
+            MergedItem::Shared(msg) => Arc::ptr_eq(existing, msg) || **existing == **msg,
+            MergedItem::Incoming(idx) => {
+                let msg = slots[*idx]
+                    .as_ref()
+                    .expect("incoming slot populated while comparing batch");
+                **existing == *msg
+            }
+        }
+    }
+}
+
 /// Stores `merged` only when it differs, so an unchanged reload keeps the
 /// shared list (and renders holding it) and reports no change without
-/// cloning the previous list to compare.
-fn replace_if_changed(messages: &mut SharedMessages, merged: Vec<SlackMessage>) -> bool {
-    if **messages == merged {
+/// cloning existing messages or allocating new `Arc`s for unchanged entries.
+fn replace_if_changed(messages: &mut SharedMessages, mut merged: MergedBatch) -> bool {
+    if messages.len() == merged.items.len()
+        && messages
+            .iter()
+            .zip(merged.items.iter())
+            .all(|(old, new)| MergedBatch::matches_arc(&merged.incoming, new, old))
+    {
         return false;
     }
-    *messages = Arc::new(merged);
+    let old_by_ts: std::collections::HashMap<&str, &Arc<SlackMessage>> =
+        messages.iter().map(|m| (m.ts.as_str(), m)).collect();
+    let mut new_messages = Vec::with_capacity(merged.items.len());
+    let items = std::mem::take(&mut merged.items);
+    for item in items {
+        let matched_old = {
+            let ts = MergedBatch::message_at(&merged.incoming, &item).ts.as_str();
+            old_by_ts
+                .get(ts)
+                .copied()
+                .filter(|old| MergedBatch::matches_arc(&merged.incoming, &item, old))
+        };
+        if let Some(old) = matched_old {
+            new_messages.push(Arc::clone(old));
+            continue;
+        }
+        let shared = match item {
+            MergedItem::Shared(msg) => msg,
+            MergedItem::Incoming(idx) => Arc::new(
+                merged.incoming[idx]
+                    .take()
+                    .expect("each incoming message index appears at most once"),
+            ),
+        };
+        new_messages.push(shared);
+    }
+    *messages = Arc::new(new_messages);
     true
 }
 
-fn normalize_messages(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
+fn normalize_messages(mut messages: Vec<Arc<SlackMessage>>) -> Vec<Arc<SlackMessage>> {
     messages.sort_by(|left, right| right.ts.cmp(&left.ts));
     messages.dedup_by(|left, right| !left.ts.is_empty() && left.ts == right.ts);
     messages
 }
 
-fn normalize_channel_messages(messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
-    normalize_messages(
-        messages
-            .into_iter()
-            .filter(SlackMessage::belongs_in_channel_timeline)
-            .collect(),
-    )
-}
-
-fn merge_message_pages(existing: &[SlackMessage], page: &[SlackMessage]) -> Vec<SlackMessage> {
-    let mut messages = existing.to_vec();
-    messages.extend(page.iter().cloned());
-    normalize_messages(messages)
+fn merge_message_pages(existing: &[Arc<SlackMessage>], page: Vec<SlackMessage>) -> MergedBatch {
+    MergedBatch::from_incoming_and_shared(page, existing.iter().cloned(), false, false)
 }
 
 fn merge_message_refresh(
-    existing: &[SlackMessage],
-    snapshot: &[SlackMessage],
-) -> Vec<SlackMessage> {
-    // A send response or realtime event can arrive while the request that
-    // produced this snapshot is still in flight. Snapshot entries are
-    // authoritative for duplicates, while newer locally observed entries must
-    // not disappear until a later response includes them.
-    let mut messages = snapshot.to_vec();
-    messages.extend(existing.iter().cloned());
-    normalize_messages(messages)
+    existing: &[Arc<SlackMessage>],
+    snapshot: Vec<SlackMessage>,
+) -> MergedBatch {
+    MergedBatch::from_incoming_and_shared(snapshot, existing.iter().cloned(), true, false)
 }
 
 fn merge_channel_message_pages(
-    existing: &[SlackMessage],
-    page: &[SlackMessage],
-) -> Vec<SlackMessage> {
-    normalize_channel_messages(page.iter().chain(existing).cloned().collect::<Vec<_>>())
+    existing: &[Arc<SlackMessage>],
+    page: Vec<SlackMessage>,
+) -> MergedBatch {
+    MergedBatch::from_incoming_and_shared(page, existing.iter().cloned(), true, true)
 }
 
 /// The server page replaces the list, except ephemeral messages (a /giphy
 /// preview): history never returns them, so they live only in memory.
 fn merge_channel_message_refresh(
-    existing: &[SlackMessage],
-    snapshot: &[SlackMessage],
-) -> Vec<SlackMessage> {
+    existing: &[Arc<SlackMessage>],
+    snapshot: Vec<SlackMessage>,
+) -> MergedBatch {
     let ephemerals = existing
         .iter()
         .filter(|message| message.is_ephemeral == Some(true))
         .cloned();
-    normalize_channel_messages(snapshot.iter().cloned().chain(ephemerals).collect())
+    MergedBatch::from_incoming_and_shared(snapshot, ephemerals, true, true)
 }
 
 #[cfg(test)]
@@ -3194,7 +3303,7 @@ mod tests {
         assert!(second > first);
         assert!(!coordinator.commit_position(first));
         assert_eq!(
-            coordinator.resolve_position(second, "C2", &[message("1", "one")]),
+            coordinator.resolve_position(second, "C2", &[message("1", "one").into()]),
             Some(ConversationOpenPosition::Latest)
         );
         assert!(coordinator.commit_position(second));
@@ -3229,7 +3338,7 @@ mod tests {
             coordinator.resolve_position(
                 generation,
                 "C1",
-                &[message("4", "four"), message("3", "three")],
+                &[message("4", "four").into(), message("3", "three").into()],
             ),
             Some(ConversationOpenPosition::Message("3".to_string()))
         );
@@ -3239,7 +3348,10 @@ mod tests {
             coordinator.resolve_position(
                 generation,
                 "C1",
-                &[message("4", "four"), message("2.5", "earlier")],
+                &[
+                    message("4", "four").into(),
+                    message("2.5", "earlier").into()
+                ],
             ),
             Some(ConversationOpenPosition::Message("3".to_string()))
         );
@@ -3250,13 +3362,13 @@ mod tests {
         let mut coordinator = ConversationOpenCoordinator::default();
         let generation = coordinator.begin("C1", ConversationOpenIntent::Latest);
         assert_eq!(
-            coordinator.resolve_position(generation, "C1", &[message("1", "one")]),
+            coordinator.resolve_position(generation, "C1", &[message("1", "one").into()]),
             Some(ConversationOpenPosition::Latest)
         );
 
         assert!(coordinator.note_user_interaction(generation));
         assert_eq!(
-            coordinator.resolve_position(generation, "C1", &[message("2", "two")]),
+            coordinator.resolve_position(generation, "C1", &[message("2", "two").into()]),
             None
         );
         assert!(!coordinator.commit_position(generation));
@@ -3267,7 +3379,7 @@ mod tests {
         let mut coordinator = ConversationOpenCoordinator::default();
         let generation = coordinator.begin("C1", ConversationOpenIntent::Latest);
         assert_eq!(
-            coordinator.resolve_position(generation, "C1", &[message("1", "one")]),
+            coordinator.resolve_position(generation, "C1", &[message("1", "one").into()]),
             Some(ConversationOpenPosition::Latest)
         );
 
@@ -3295,15 +3407,15 @@ mod tests {
             coordinator.begin("C1", ConversationOpenIntent::Message("target".to_string()));
 
         assert_eq!(
-            coordinator.resolve_position(generation, "C2", &[message("target", "wrong")]),
+            coordinator.resolve_position(generation, "C2", &[message("target", "wrong").into()]),
             None
         );
         assert_eq!(
-            coordinator.resolve_position(generation, "C1", &[message("other", "cached")]),
+            coordinator.resolve_position(generation, "C1", &[message("other", "cached").into()]),
             None
         );
         assert_eq!(
-            coordinator.resolve_position(generation, "C1", &[message("target", "context")]),
+            coordinator.resolve_position(generation, "C1", &[message("target", "context").into()]),
             Some(ConversationOpenPosition::Message("target".to_string()))
         );
     }
@@ -3910,12 +4022,12 @@ mod tests {
         assert!(state.focus_message(&location));
         assert_eq!(state.channel_focus_ts("C1"), Some("2"));
         assert_eq!(
-            state.take_channel_focus_for_render("C1", &[message("1", "other")]),
+            state.take_channel_focus_for_render("C1", &[message("1", "other").into()]),
             None
         );
         assert_eq!(state.channel_focus_ts("C1"), Some("2"));
         assert_eq!(
-            state.take_channel_focus_for_render("C1", &[message("2", "target")]),
+            state.take_channel_focus_for_render("C1", &[message("2", "target").into()]),
             Some("2".into())
         );
         assert_eq!(state.channel_focus_ts("C1"), None);
@@ -3946,7 +4058,7 @@ mod tests {
         assert!(!state.focus_message(&stale));
         assert_eq!(state.thread_focus_ts(), Some("2"));
         assert_eq!(
-            state.take_thread_focus_for_render("C1", "1", &[message("2", "reply")]),
+            state.take_thread_focus_for_render("C1", "1", &[message("2", "reply").into()]),
             Some("2".into())
         );
         assert_eq!(state.thread_focus_ts(), None);
@@ -3965,7 +4077,7 @@ mod tests {
         assert!(state.focus_message(&location));
         assert!(state.apply_message_context(
             &location,
-            vec![message("2", "target"), message("1", "older")],
+            vec![message("2", "target").into(), message("1", "older").into()],
         ));
         assert!(state.has_channel_context("C1"));
         assert_eq!(state.channel_messages("C1")[0].body_text(), "target");
@@ -3989,7 +4101,7 @@ mod tests {
         assert!(state.focus_message(&location));
         state.select_conversation("C2");
 
-        assert!(!state.apply_message_context(&location, vec![message("2", "stale")]));
+        assert!(!state.apply_message_context(&location, vec![message("2", "stale").into()]));
         assert_eq!(state.visible_channel_id(), Some("C2"));
         assert_eq!(state.channels["C1"].messages[0].body_text(), "latest");
     }
@@ -4011,7 +4123,7 @@ mod tests {
         assert!(!apply_fresh(&mut state, "C1", page).render);
         assert!(Arc::ptr_eq(&rendered, &state.channel_messages_shared("C1")));
 
-        let same = MessageChange::Upsert(Box::new(rendered[0].clone()));
+        let same = MessageChange::Upsert(Box::new((*rendered[0]).clone()));
         assert!(state
             .apply_timeline_changes(&TimelineTarget::Channel("C1".into()), &[same])
             .is_none());
@@ -4385,5 +4497,114 @@ mod tests {
         assert!(!gate.should_request(now));
         gate.reset();
         assert!(gate.should_request(now));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn perf_guard_replace_if_changed_preserves_pointers() {
+    use crate::models::{count_slack_message_clones, SlackMessage};
+    use std::sync::Arc;
+
+    let msg1 = SlackMessage {
+        ts: "2".to_string(),
+        text: Some("first".to_string()),
+        ..Default::default()
+    };
+    let msg2 = SlackMessage {
+        ts: "1".to_string(),
+        text: Some("second".to_string()),
+        ..Default::default()
+    };
+
+    let mut messages = Arc::new(vec![Arc::new(msg1.clone()), Arc::new(msg2.clone())]);
+    let ptr1 = Arc::as_ptr(&messages[0]);
+    let ptr2 = Arc::as_ptr(&messages[1]);
+    let outer_ptr = Arc::as_ptr(&messages);
+
+    // 0 messages changed
+    let merged = merge_message_refresh(&[], vec![msg1.clone(), msg2.clone()]);
+    let (clones, changed) =
+        count_slack_message_clones(|| replace_if_changed(&mut messages, merged));
+    assert!(!changed);
+    assert_eq!(clones, 0);
+    assert!(std::ptr::eq(Arc::as_ptr(&messages), outer_ptr));
+    assert!(std::ptr::eq(Arc::as_ptr(&messages[0]), ptr1));
+
+    // 1 message changed
+    let msg2_edit = SlackMessage {
+        text: Some("edited".to_string()),
+        ..msg2.clone()
+    };
+    let merged = merge_message_refresh(&[], vec![msg1.clone(), msg2_edit.clone()]);
+    let changed = replace_if_changed(&mut messages, merged);
+    assert!(changed);
+    // msg1 should still point to the same Arc
+    assert!(std::ptr::eq(Arc::as_ptr(&messages[0]), ptr1));
+    // msg2 should be a new pointer
+    assert!(!std::ptr::eq(Arc::as_ptr(&messages[1]), ptr2));
+}
+
+#[cfg(test)]
+#[test]
+fn perf_guard_apply_history_pagination_and_refresh_clone_zero_messages() {
+    let mut state = WorkspaceViewState::default();
+    let channel_id = "C1";
+    fn message(ts: &str, text: &str) -> crate::models::SlackMessage {
+        crate::models::SlackMessage {
+            ts: ts.to_string(),
+            text: Some(text.to_string()),
+            ..crate::models::SlackMessage::default()
+        }
+    }
+
+    let initial_messages: Vec<crate::models::SlackMessage> = (0..100)
+        .map(|i| message(&format!("{i}.000"), "test"))
+        .collect();
+    state.apply_history(channel_id, initial_messages, true, None, false, false);
+
+    let original_arcs = state.channels[channel_id].messages.clone();
+    assert_eq!(original_arcs.len(), 100);
+
+    // Older page
+    let page_messages: Vec<crate::models::SlackMessage> = (100..120)
+        .map(|i| message(&format!("{i}.000"), "test"))
+        .collect();
+
+    let (clones, _) = crate::models::count_slack_message_clones(|| {
+        state.apply_history(channel_id, page_messages, true, None, true, false);
+    });
+
+    assert_eq!(clones, 0);
+    let new_arcs = &state.channels[channel_id].messages;
+    assert_eq!(new_arcs.len(), 120);
+
+    // Assert Arc::ptr_eq holds for all 100 original messages
+    for old_arc in original_arcs.iter() {
+        let found = new_arcs.iter().find(|m| m.ts == old_arc.ts).unwrap();
+        assert!(std::sync::Arc::ptr_eq(old_arc, found));
+    }
+
+    let after_older_arcs = state.channels[channel_id].messages.clone();
+
+    // Refresh with an identical 20-message latest snapshot
+    let snapshot_messages: Vec<crate::models::SlackMessage> = (0..20)
+        .map(|i| message(&format!("{i}.000"), "test"))
+        .collect();
+
+    let (clones, _) = crate::models::count_slack_message_clones(|| {
+        state.apply_history(channel_id, snapshot_messages, true, None, false, false);
+    });
+
+    assert_eq!(clones, 0);
+    let final_arcs = &state.channels[channel_id].messages;
+    assert_eq!(final_arcs.len(), 20);
+
+    for final_arc in final_arcs.iter() {
+        let found = after_older_arcs
+            .iter()
+            .find(|m| m.ts == final_arc.ts)
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(final_arc, found));
     }
 }

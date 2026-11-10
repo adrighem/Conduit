@@ -1409,7 +1409,11 @@ fn read_hold_ends_on_explicit_mark_read_of_that_conversation_only() {
 
 #[test]
 fn earliest_unread_ts_is_none_for_empty_messages() {
-    assert_eq!(earliest_unread_ts(Some("1710000000.000100"), &[]), None);
+    let empty: &[SlackMessage] = &[];
+    assert_eq!(
+        earliest_unread_ts::<SlackMessage>(Some("1710000000.000100"), empty),
+        None
+    );
 }
 
 #[test]
@@ -3174,7 +3178,7 @@ fn message_image_requests_include_bot_and_attachment_images() {
     }];
 
     assert_eq!(
-        message_image_asset_requests(&messages, &HashMap::new(), &HashMap::new()),
+        message_image_asset_requests::<SlackMessage>(&messages, &HashMap::new(), &HashMap::new()),
         vec![
             (bot_avatar.clone(), bot_avatar),
             (attachment_image.clone(), attachment_image),
@@ -3192,8 +3196,11 @@ fn external_attachment_images_are_requested_through_the_image_proxy() {
         ..Default::default()
     };
     let external = "https://images.example.test/card.png";
-    let requests =
-        message_image_asset_requests(&[attachment(external)], &HashMap::new(), &HashMap::new());
+    let requests = message_image_asset_requests::<SlackMessage>(
+        &[attachment(external)],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].0, external);
     assert!(
@@ -3209,8 +3216,12 @@ fn external_attachment_images_are_requested_through_the_image_proxy() {
         "http://192.168.1.2/a.png",
     ] {
         assert!(
-            message_image_asset_requests(&[attachment(private)], &HashMap::new(), &HashMap::new())
-                .is_empty(),
+            message_image_asset_requests::<SlackMessage>(
+                &[attachment(private)],
+                &HashMap::new(),
+                &HashMap::new()
+            )
+            .is_empty(),
             "{private}"
         );
     }
@@ -3232,7 +3243,7 @@ fn canonical_link_unfurl_images_remain_native_asset_requests() {
 
     assert!(message.attachments.is_none());
     assert_eq!(
-        message_image_asset_requests(&[message], &HashMap::new(), &HashMap::new()),
+        message_image_asset_requests::<SlackMessage>(&[message], &HashMap::new(), &HashMap::new()),
         vec![(image_url.clone(), image_url)]
     );
 }
@@ -3320,7 +3331,7 @@ fn gif_file_requests_animated_thumbnail_instead_of_static_preview() {
     .unwrap();
 
     assert_eq!(
-        message_image_asset_requests(&[message], &HashMap::new(), &HashMap::new()),
+        message_image_asset_requests::<SlackMessage>(&[message], &HashMap::new(), &HashMap::new()),
         vec![(animated_url.to_string(), animated_url.to_string())]
     );
 }
@@ -3340,7 +3351,7 @@ fn custom_emoji_reactions_are_requested() {
     };
 
     assert_eq!(
-        message_image_asset_requests(&[message], &HashMap::new(), &custom_emojis),
+        message_image_asset_requests::<SlackMessage>(&[message], &HashMap::new(), &custom_emojis),
         vec![(emoji_url.clone(), emoji_url)]
     );
 }
@@ -3382,7 +3393,7 @@ fn message_user_ids_cover_author_mentions_and_reactions() {
         ..Default::default()
     };
     let mut ids = HashSet::new();
-    collect_message_user_ids(&[message], &mut ids);
+    collect_message_user_ids::<SlackMessage>(&[message], &mut ids);
     let expected = ["U1", "U2", "U3"].map(String::from).into_iter().collect();
     assert_eq!(ids, expected);
 }
@@ -3433,7 +3444,12 @@ fn messages_showing_image_asset_lists_only_rows_using_the_key() {
             .iter()
             .map(ToString::to_string)
             .collect::<HashSet<_>>();
-        messages_showing_image_asset(&messages, &custom_emojis, |c| c == key, &users)
+        messages_showing_image_asset::<SlackMessage>(
+            &messages,
+            &custom_emojis,
+            |c| c == key,
+            &users,
+        )
     };
 
     assert_eq!(showing(&emoji_url, &[]), HashSet::from(["2.0".to_string()]));
@@ -3447,7 +3463,12 @@ fn messages_showing_image_asset_lists_only_rows_using_the_key() {
     let batch = HashSet::from([emoji_url.clone(), "https://avatars.example/u1.png".into()]);
     let users = HashSet::from(["U1".to_string()]);
     assert_eq!(
-        messages_showing_image_asset(&messages, &custom_emojis, |c| batch.contains(c), &users),
+        messages_showing_image_asset::<SlackMessage>(
+            &messages,
+            &custom_emojis,
+            |c| batch.contains(c),
+            &users
+        ),
         HashSet::from(["1.0".to_string(), "2.0".to_string()])
     );
 }

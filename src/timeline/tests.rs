@@ -512,7 +512,7 @@ fn bound_row_widgets(view: &NativeTimelineView) -> Vec<(String, Widget)> {
         .filter_map(|item| {
             let obj = item.item().and_downcast::<TimelineMessageObject>()?;
             let child = item.child()?;
-            (!obj.is_day_separator()).then(|| (obj.message().ts, child))
+            (!obj.is_day_separator()).then(|| (obj.message().ts.clone(), child))
         })
         .collect()
 }
@@ -845,7 +845,7 @@ fn store_splices_replace_only_changed_rows() {
         messages
             .iter()
             .cloned()
-            .map(TimelineMessageObject::new)
+            .map(|m| TimelineMessageObject::new(std::sync::Arc::new(m)))
             .collect::<Vec<_>>()
     };
     let old = items(&[
@@ -1521,7 +1521,11 @@ mod graphical {
 
             // 11. Native timeline view & update_image_asset
             let timeline_view = NativeTimelineView::new();
-            timeline_view.set_messages(&[msg1, msg2], &ctx, None);
+            timeline_view.set_messages(
+                &[std::sync::Arc::new(msg1), std::sync::Arc::new(msg2)],
+                &ctx,
+                None,
+            );
             // Two same-day messages: one leading day separator plus both rows.
             assert_eq!(timeline_view.store.n_items(), 3);
             timeline_view.update_image_asset(&ctx, HashSet::new());
@@ -1540,7 +1544,8 @@ mod graphical {
                 .and_downcast::<TimelineMessageObject>()
                 .expect("message row")
                 .message()
-                .ts;
+                .ts
+                .clone();
             timeline_view.set_unread_separator(Some(second_ts.clone()));
             assert_eq!(separator_ts(&timeline_view), Some(second_ts));
             assert_eq!(timeline_view.store.n_items(), 3);
@@ -1631,7 +1636,12 @@ mod graphical {
             window.set_default_size(400, 500);
             window.set_child(Some(view.widget()));
             window.present();
-            view.set_messages(&messages, &ctx, Some(&target));
+            let messages_arc = messages
+                .iter()
+                .cloned()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>();
+            view.set_messages(&messages_arc, &ctx, Some(&target));
             pump(400);
 
             let highlighted = view
@@ -1644,7 +1654,7 @@ mod graphical {
                         .is_some_and(|child| child.has_css_class(FOCUS_TARGET_CLASS))
                 })
                 .filter_map(|item| item.item().and_downcast::<TimelineMessageObject>())
-                .map(|obj| obj.message().ts)
+                .map(|obj| obj.message().ts.clone())
                 .collect::<Vec<_>>();
             assert_eq!(highlighted, vec![target.clone()]);
 
@@ -1701,7 +1711,12 @@ mod graphical {
             window.set_child(Some(view.widget()));
             window.present();
             view.set_read_mark_target("C1", None);
-            view.set_messages(&messages, &ctx, None);
+            let messages_arc = messages
+                .iter()
+                .cloned()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>();
+            view.set_messages(&messages_arc, &ctx, None);
             pump(500);
             let newest = messages[0].ts.clone();
             assert_eq!(*marks.borrow(), vec![newest.clone()]);
@@ -1740,7 +1755,12 @@ mod graphical {
             window.set_child(Some(view.widget()));
             window.present();
             view.set_read_mark_target("C1", None);
-            view.set_messages(&messages, &ctx, None);
+            let messages_arc = messages
+                .iter()
+                .cloned()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>();
+            view.set_messages(&messages_arc, &ctx, None);
             pump_until(5000, || !marks.borrow().is_empty());
             assert_eq!(marks.borrow().len(), 1);
 
@@ -1774,7 +1794,12 @@ mod graphical {
             window.set_child(Some(&stack));
             window.present();
             view.set_read_mark_target("C1", None);
-            view.set_messages(&messages, &ctx, None);
+            let messages_arc = messages
+                .iter()
+                .cloned()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>();
+            view.set_messages(&messages_arc, &ctx, None);
             pump_until(5000, || !marks.borrow().is_empty());
             assert_eq!(marks.borrow().len(), 1);
 
@@ -1813,7 +1838,12 @@ mod graphical {
             window.set_default_size(400, 500);
             window.set_child(Some(view.widget()));
             present_and_wait_for_layout(&window);
-            view.set_messages(&messages, &ctx, None);
+            let messages_arc = messages
+                .iter()
+                .cloned()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>();
+            view.set_messages(&messages_arc, &ctx, None);
             wait_until_at_bottom(&view);
             pump(300);
 
@@ -1871,7 +1901,12 @@ mod graphical {
             window.set_default_size(400, 500);
             window.set_child(Some(view.widget()));
             window.present();
-            view.set_messages(&messages, &ctx, None);
+            let messages_arc = messages
+                .iter()
+                .cloned()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>();
+            view.set_messages(&messages_arc, &ctx, None);
             pump(300);
             let before = bound_row_widgets(&view);
             let (first, second) = (before[0].0.clone(), before[1].0.clone());
@@ -1913,12 +1948,25 @@ mod graphical {
             window.set_default_size(400, 500);
             window.set_child(Some(view.widget()));
             window.present();
-            view.set_messages(&messages, &ctx, None);
+            let messages_arc = messages
+                .iter()
+                .cloned()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>();
+            view.set_messages(&messages_arc, &ctx, None);
             pump(300);
             let before = bound_row_widgets(&view);
             assert!(!before.is_empty(), "rows are bound");
 
-            view.set_messages(&messages, &ctx.clone(), None);
+            view.set_messages(
+                &messages
+                    .iter()
+                    .cloned()
+                    .map(std::sync::Arc::new)
+                    .collect::<Vec<_>>(),
+                &ctx.clone(),
+                None,
+            );
             pump(50);
             assert_eq!(rebound_rows(&view, &before), Vec::<String>::new());
 
@@ -1932,7 +1980,15 @@ mod graphical {
                 .insert("https://example.com/b.png".into());
             images.last_read = Some(messages[5].ts.clone());
             images.timeline_scroll = crate::message_markup::TimelineScrollBehavior::Bottom;
-            view.set_messages(&messages, &images, None);
+            view.set_messages(
+                &messages
+                    .iter()
+                    .cloned()
+                    .map(std::sync::Arc::new)
+                    .collect::<Vec<_>>(),
+                &images,
+                None,
+            );
             pump(50);
             assert_eq!(rebound_rows(&view, &before), Vec::<String>::new());
 
@@ -1940,7 +1996,15 @@ mod graphical {
             let anchor = before[before.len() / 2].0.clone();
             let mut unread = images.clone();
             unread.unread_separator_ts = Some(anchor.clone());
-            view.set_messages(&messages, &unread, None);
+            view.set_messages(
+                &messages
+                    .iter()
+                    .cloned()
+                    .map(std::sync::Arc::new)
+                    .collect::<Vec<_>>(),
+                &unread,
+                None,
+            );
             pump(50);
             assert_eq!(rebound_rows(&view, &before), vec![anchor]);
 
@@ -1948,7 +2012,15 @@ mod graphical {
             let before = bound_row_widgets(&view);
             let mut renamed = unread.clone();
             renamed.user_names = Arc::new(HashMap::from([("U123".to_string(), "Bob".to_string())]));
-            view.set_messages(&messages, &renamed, None);
+            view.set_messages(
+                &messages
+                    .iter()
+                    .cloned()
+                    .map(std::sync::Arc::new)
+                    .collect::<Vec<_>>(),
+                &renamed,
+                None,
+            );
             pump(50);
             assert_eq!(rebound_rows(&view, &before).len(), before.len());
             window.destroy();
@@ -1974,10 +2046,13 @@ mod graphical {
             let cached = cached_roundtrip(fresh.clone());
             assert!(cached.blocks.is_none() && fresh.blocks.is_some());
 
+            let cached_arc = std::sync::Arc::new(cached);
+            let fresh_arc = std::sync::Arc::new(fresh);
+
             let view = NativeTimelineView::new();
-            view.set_messages(std::slice::from_ref(&cached), &ctx, None);
+            view.set_messages(std::slice::from_ref(&cached_arc), &ctx, None);
             let row = view.store.item(1);
-            view.set_messages(std::slice::from_ref(&fresh), &ctx, None);
+            view.set_messages(std::slice::from_ref(&fresh_arc), &ctx, None);
 
             assert_eq!(view.store.item(1), row, "row is kept");
             let row = row
@@ -2004,7 +2079,12 @@ mod graphical {
             window.set_default_size(400, 500);
             window.set_child(Some(view.widget()));
             window.present();
-            view.set_messages(&messages, &ctx, None);
+            let messages_arc = messages
+                .iter()
+                .cloned()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>();
+            view.set_messages(&messages_arc, &ctx, None);
             pump(300);
             let before = bound_row_widgets(&view);
             assert_eq!(before.len(), 2);
@@ -2012,13 +2092,29 @@ mod graphical {
             // A user no row shows: nothing to rebuild.
             let mut unrelated = ctx.clone();
             Arc::make_mut(&mut unrelated.user_names).insert("U999".to_string(), "Zed".to_string());
-            view.set_messages(&messages, &unrelated, None);
+            view.set_messages(
+                &messages
+                    .iter()
+                    .cloned()
+                    .map(std::sync::Arc::new)
+                    .collect::<Vec<_>>(),
+                &unrelated,
+                None,
+            );
             pump(50);
             assert_eq!(rebound_rows(&view, &before), Vec::<String>::new());
 
             let mut renamed = unrelated.clone();
             Arc::make_mut(&mut renamed.user_names).insert("U456".to_string(), "Bea".to_string());
-            view.set_messages(&messages, &renamed, None);
+            view.set_messages(
+                &messages
+                    .iter()
+                    .cloned()
+                    .map(std::sync::Arc::new)
+                    .collect::<Vec<_>>(),
+                &renamed,
+                None,
+            );
             pump(50);
             assert_eq!(
                 rebound_rows(&view, &before),
@@ -2074,7 +2170,12 @@ mod graphical {
             window.present();
 
             let before = crate::debug::IMAGE_DECODES.get();
-            view.set_messages(&messages, &ctx, None);
+            let messages_arc = messages
+                .iter()
+                .cloned()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>();
+            view.set_messages(&messages_arc, &ctx, None);
             pump(300);
             assert_eq!(
                 crate::debug::IMAGE_DECODES.get() - before,
@@ -2481,9 +2582,9 @@ mod graphical {
             };
 
             // Messages passed to timeline are newest-first (Slack API order).
+            let msgs = vec![Arc::new(msg3), Arc::new(msg2), Arc::new(msg1)];
             // Without unread separator: msg1 has header, msg2 and msg3 hide header
-            let (items, _) =
-                build_store_items(&[msg3.clone(), msg2.clone(), msg1.clone()], None, None);
+            let (items, _) = build_store_items(&msgs, None, None);
             let msg_objs: Vec<TimelineMessageObject> = items
                 .into_iter()
                 .filter_map(|item| item.downcast::<TimelineMessageObject>().ok())
@@ -2498,11 +2599,7 @@ mod graphical {
             assert!(msg_objs[2].hide_header());
 
             // With unread separator on msg2: msg2 must NOT hide header
-            let (items, _) = build_store_items(
-                &[msg3.clone(), msg2.clone(), msg1.clone()],
-                None,
-                Some("1700000010.000100"),
-            );
+            let (items, _) = build_store_items(&msgs, None, Some("1700000010.000100"));
             let msg_objs: Vec<TimelineMessageObject> = items
                 .into_iter()
                 .filter_map(|item| item.downcast::<TimelineMessageObject>().ok())
@@ -3360,7 +3457,15 @@ mod graphical {
             window.set_child(Some(view.widget()));
             present_and_wait_for_layout(&window);
             view.set_read_mark_target("C1", None);
-            view.set_messages(&page(100..200), &ctx, None);
+            view.set_messages(
+                &page(100..200)
+                    .iter()
+                    .cloned()
+                    .map(std::sync::Arc::new)
+                    .collect::<Vec<_>>(),
+                &ctx,
+                None,
+            );
             wait_until_at_bottom(&view);
             // Past the 150ms settle, whose paging check must find the bottom.
             pump(300);
@@ -3383,7 +3488,15 @@ mod graphical {
             let mut prepend = ctx.clone();
             prepend.timeline_scroll =
                 crate::message_markup::TimelineScrollBehavior::PreservePrepend;
-            view.set_messages(&page(0..200), &prepend, None);
+            view.set_messages(
+                &page(0..200)
+                    .iter()
+                    .cloned()
+                    .map(std::sync::Arc::new)
+                    .collect::<Vec<_>>(),
+                &prepend,
+                None,
+            );
             view.finish_loading_older("C1", None);
             pump_until(2000, || vadj.upper() > upper_before);
             // Past the settle, whose paging check must see the anchored offset.
@@ -3436,7 +3549,12 @@ mod graphical {
             window.set_child(Some(view.widget()));
             present_and_wait_for_layout(&window);
             view.set_read_mark_target("C1", None);
-            view.set_messages(&messages, &ctx, None);
+            let messages_arc = messages
+                .iter()
+                .cloned()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>();
+            view.set_messages(&messages_arc, &ctx, None);
             wait_until_at_bottom(&view);
             // Past the 150ms settle, whose paging check must find the bottom.
             pump(300);
@@ -3674,4 +3792,61 @@ mod graphical {
             window.destroy();
         });
     }
+}
+
+#[test]
+fn perf_guard_build_store_items_clones_zero_messages() {
+    use crate::models::{count_slack_message_clones, SlackMessage};
+    use crate::timeline::model::{build_store_items, store_splices};
+    use std::sync::Arc;
+
+    let msg1 = Arc::new(SlackMessage {
+        ts: "123.456".to_string(),
+        text: Some("first".to_string()),
+        user: Some("U1".to_string()),
+        ..Default::default()
+    });
+    let msg2 = Arc::new(SlackMessage {
+        ts: "123.457".to_string(),
+        text: Some("second".to_string()),
+        user: Some("U1".to_string()),
+        ..Default::default()
+    });
+    let msg3 = Arc::new(SlackMessage {
+        ts: "86400000.000".to_string(), // next day
+        text: Some("next day".to_string()),
+        user: Some("U1".to_string()),
+        ..Default::default()
+    });
+
+    let messages = vec![msg3.clone(), msg2.clone(), msg1.clone()]; // newest first
+
+    let (clones, (items, _focus_index)) =
+        count_slack_message_clones(|| build_store_items(&messages, None, None));
+    assert_eq!(
+        clones, 0,
+        "build_store_items should perform 0 SlackMessage clones"
+    );
+
+    // test store_splices and adopt_message
+    let msg2_edited = Arc::new(SlackMessage {
+        ts: "123.457".to_string(),
+        text: Some("second edited".to_string()),
+        user: Some("U1".to_string()),
+        ..Default::default()
+    });
+    let new_messages = vec![msg3.clone(), msg2_edited.clone(), msg1.clone()];
+
+    let (clones, (new_items, _)) =
+        count_slack_message_clones(|| build_store_items(&new_messages, None, None));
+    assert_eq!(
+        clones, 0,
+        "build_store_items should perform 0 SlackMessage clones on rebuild"
+    );
+
+    let (clones, _) = count_slack_message_clones(|| store_splices(&items, &new_items));
+    assert_eq!(
+        clones, 0,
+        "store_splices should perform 0 SlackMessage clones"
+    );
 }

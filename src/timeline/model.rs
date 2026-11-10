@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 use gtk::glib;
 use gtk::glib::subclass::prelude::*;
@@ -8,13 +9,25 @@ use crate::models::SlackMessage;
 mod imp {
     use super::*;
 
-    #[derive(Default)]
     pub struct TimelineMessageObject {
-        pub message: RefCell<SlackMessage>,
+        pub message: RefCell<Arc<SlackMessage>>,
         /// True for a day-separator row; `message` is then the first message
         /// of the day it introduces (only its `ts` is used).
         pub day_separator: Cell<bool>,
         pub hide_header: Cell<bool>,
+    }
+
+    static EMPTY_MESSAGE: std::sync::LazyLock<Arc<SlackMessage>> =
+        std::sync::LazyLock::new(|| Arc::new(SlackMessage::default()));
+
+    impl Default for TimelineMessageObject {
+        fn default() -> Self {
+            Self {
+                message: RefCell::new(Arc::clone(&EMPTY_MESSAGE)),
+                day_separator: Cell::new(false),
+                hide_header: Cell::new(false),
+            }
+        }
     }
 
     #[glib::object_subclass]
@@ -32,14 +45,14 @@ glib::wrapper! {
 }
 
 impl TimelineMessageObject {
-    pub fn new(message: SlackMessage) -> Self {
+    pub fn new(message: std::sync::Arc<SlackMessage>) -> Self {
         let obj: Self = glib::Object::builder().build();
         *obj.imp().message.borrow_mut() = message;
         obj
     }
 
     /// Separator row introducing the day of `first_message_of_day`.
-    pub fn day_separator(first_message_of_day: SlackMessage) -> Self {
+    pub fn day_separator(first_message_of_day: std::sync::Arc<SlackMessage>) -> Self {
         let obj = Self::new(first_message_of_day);
         obj.imp().day_separator.set(true);
         obj
@@ -57,8 +70,8 @@ impl TimelineMessageObject {
         self.imp().hide_header.set(hide);
     }
 
-    pub fn message(&self) -> SlackMessage {
-        self.imp().message.borrow().clone()
+    pub fn message(&self) -> std::sync::Arc<SlackMessage> {
+        std::sync::Arc::clone(&self.imp().message.borrow())
     }
 
     /// Runs `f` on the message without cloning it.
@@ -69,16 +82,13 @@ impl TimelineMessageObject {
     /// Whether both objects render the same row (kind, header, message).
     /// A day separator only shows its day, so its message's `ts` is enough.
     pub(crate) fn same_row(&self, other: &Self) -> bool {
+        let a = self.imp().message.borrow();
+        let b = other.imp().message.borrow();
         if self.is_day_separator() || other.is_day_separator() {
             return self.is_day_separator() == other.is_day_separator()
-                && self.imp().message.borrow().ts == other.imp().message.borrow().ts;
+                && (Arc::ptr_eq(&a, &b) || a.ts == b.ts);
         }
-        self.hide_header() == other.hide_header()
-            && self
-                .imp()
-                .message
-                .borrow()
-                .renders_same(&other.imp().message.borrow())
+        self.hide_header() == other.hide_header() && (Arc::ptr_eq(&a, &b) || a.renders_same(&b))
     }
 
     /// Store order: chronological, a day separator before its first message.
@@ -92,9 +102,10 @@ impl TimelineMessageObject {
     /// Takes `other`'s message without rebuilding the row, so a kept row
     /// still holds the freshest copy (e.g. wire fields a cached copy lacks).
     pub(crate) fn adopt_message(&self, other: &Self) {
-        let message = other.imp().message.borrow();
-        if *self.imp().message.borrow() != *message {
-            *self.imp().message.borrow_mut() = message.clone();
+        let next = Arc::clone(&other.imp().message.borrow());
+        let same_ptr = Arc::ptr_eq(&self.imp().message.borrow(), &next);
+        if !same_ptr {
+            *self.imp().message.borrow_mut() = next;
         }
     }
 }
@@ -244,7 +255,7 @@ fn span_splice(old: &[TimelineMessageObject], new: &[TimelineMessageObject]) -> 
 /// here once and can never drift out of sync with inserts or prepends.
 /// Also returns the index of `focus_ts` within the resulting items.
 pub(crate) fn build_store_items(
-    messages: &[SlackMessage],
+    messages: &[std::sync::Arc<SlackMessage>],
     focus_ts: Option<&str>,
     unread_separator_ts: Option<&str>,
 ) -> (Vec<TimelineMessageObject>, Option<u32>) {
