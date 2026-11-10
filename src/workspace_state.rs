@@ -569,8 +569,7 @@ pub(crate) struct WorkspacePatchApplication {
     conversation_structure_changed: bool,
     changed_conversation_ids: Vec<String>,
     thread_catalog_changed: bool,
-    thread_catalog_replaced: bool,
-    changed_thread_keys: Vec<crate::thread_catalog::ThreadKey>,
+    selected_thread_record_changed: bool,
     read_state_changed_ids: Vec<String>,
     users_reset: bool,
     changed_user_ids: Vec<String>,
@@ -644,13 +643,9 @@ impl WorkspacePatchApplication {
     }
 
     /// Whether this patch replaced the thread catalog or changed the record
-    /// of the thread rooted at `root_ts` in `channel_id`.
-    pub(crate) fn thread_record_changed(&self, channel_id: &str, root_ts: &str) -> bool {
-        self.thread_catalog_replaced
-            || self
-                .changed_thread_keys
-                .iter()
-                .any(|key| key.channel_id == channel_id && key.root_ts == root_ts)
+    /// of the thread open in the thread pane.
+    pub(crate) fn selected_thread_record_changed(&self) -> bool {
+        self.selected_thread_record_changed
     }
 
     /// Conversations whose read state changed without a conversation reset.
@@ -750,7 +745,7 @@ impl WorkspaceSessionState {
                     );
                     *threads = ThreadCatalog::from_records(data.threads.clone());
                     application.thread_catalog_changed = true;
-                    application.thread_catalog_replaced = true;
+                    application.selected_thread_record_changed = true;
                     *read_states = data.read_states.clone();
                     replace_patch_users(&mut users, &data.users, &mut application);
                 }
@@ -780,13 +775,16 @@ impl WorkspaceSessionState {
                     application.record_conversation_structure_change(channel_id);
                 }
                 WorkspaceChange::ThreadCatalogChanged(records) => {
+                    let selected = view.selected_thread_target();
+                    application.selected_thread_record_changed |= records.is_empty()
+                        || selected.is_some_and(|(channel_id, root_ts)| {
+                            records.iter().any(|record| {
+                                record.key.channel_id == channel_id && record.key.root_ts == root_ts
+                            })
+                        });
                     if records.is_empty() {
                         *threads = ThreadCatalog::default();
-                        application.thread_catalog_replaced = true;
                     } else {
-                        application
-                            .changed_thread_keys
-                            .extend(records.iter().map(|record| record.key.clone()));
                         threads.upsert_records(records.iter().cloned());
                     }
                     application.thread_catalog_changed = true;
@@ -2790,29 +2788,37 @@ mod tests {
             .unwrap();
 
         assert!(replaced.thread_catalog_changed());
-        assert!(replaced.thread_record_changed("C9", "9"));
+        assert!(replaced.selected_thread_record_changed());
         assert!(session.threads.borrow().clone().into_records().is_empty());
     }
 
     #[test]
-    fn thread_catalog_upsert_reports_only_its_own_threads() {
-        let session = WorkspaceSessionState::default();
+    fn thread_catalog_upsert_flags_only_the_open_thread() {
         let mut catalog = ThreadCatalog::default();
         let mut root = message("1", "thread root");
         root.reply_count = Some(1);
         catalog.observe_history("C1", &[root]);
+        let records = catalog.into_records();
+        let upsert_with_open_thread = |open: Option<(&str, &str)>| {
+            let session = WorkspaceSessionState::default();
+            if let Some((channel_id, thread_ts)) = open {
+                let mut view = session.view.borrow_mut();
+                view.select_conversation(channel_id);
+                view.open_thread(channel_id, thread_ts);
+            }
+            session
+                .apply_workspace_patch(&conversation_patch(
+                    WorkspaceRevision::INITIAL.successor(),
+                    WorkspaceChange::ThreadCatalogChanged(records.clone()),
+                ))
+                .unwrap()
+        };
 
-        let upserted = session
-            .apply_workspace_patch(&conversation_patch(
-                WorkspaceRevision::INITIAL.successor(),
-                WorkspaceChange::ThreadCatalogChanged(catalog.into_records()),
-            ))
-            .unwrap();
-
-        assert!(upserted.thread_catalog_changed());
-        assert!(upserted.thread_record_changed("C1", "1"));
-        assert!(!upserted.thread_record_changed("C1", "2"));
-        assert!(!upserted.thread_record_changed("C2", "1"));
+        let open = upsert_with_open_thread(Some(("C1", "1")));
+        assert!(open.thread_catalog_changed());
+        assert!(open.selected_thread_record_changed());
+        assert!(!upsert_with_open_thread(Some(("C1", "2"))).selected_thread_record_changed());
+        assert!(!upsert_with_open_thread(None).selected_thread_record_changed());
     }
 
     fn projected_user(id: &str, name: &str) -> SlackUser {

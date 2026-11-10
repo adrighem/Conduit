@@ -120,15 +120,13 @@ impl UiInvalidations {
     pub const PEOPLE_PICKER: Self = Self(1 << 5);
     pub const COMPLETION: Self = Self(1 << 6);
     pub const ACTIVITY: Self = Self(1 << 7);
-    /// The Threads main view list (rebuilt only while it is shown).
-    pub const THREADS: Self = Self(1 << 8);
     /// The main timeline's "New" separator and dwell-read recheck.
-    pub const MAIN_READ_MARKS: Self = Self(1 << 9);
+    pub const MAIN_READ_MARKS: Self = Self(1 << 8);
     /// The open thread's "New" separator and dwell-read recheck.
-    pub const THREAD_READ_MARKS: Self = Self(1 << 10);
+    pub const THREAD_READ_MARKS: Self = Self(1 << 9);
     /// Image assets that arrived since the last flush
     /// (`imp::ConduitWindow::arrived_image_keys`).
-    pub const IMAGES: Self = Self(1 << 11);
+    pub const IMAGES: Self = Self(1 << 10);
 
     pub fn contains(self, invalidation: Self) -> bool {
         self.0 & invalidation.0 != 0
@@ -8555,12 +8553,10 @@ impl ConduitWindow {
             self.refresh_workspace_title_status();
             self.refresh_current_conversation_title();
         }
+        let main_rendered = invalidations.contains(UiInvalidations::MAIN)
+            && self.current_main_view() == MainMessageView::Conversation;
         if invalidations.contains(UiInvalidations::MAIN) {
             self.rerender_current_main_messages();
-        } else if invalidations.contains(UiInvalidations::THREADS)
-            && self.current_main_view() == MainMessageView::Threads
-        {
-            self.populate_threads();
         }
         if invalidations.contains(UiInvalidations::THREAD) {
             self.rerender_current_thread();
@@ -8568,7 +8564,11 @@ impl ConduitWindow {
         let main_marks = invalidations.contains(UiInvalidations::MAIN_READ_MARKS);
         let thread_marks = invalidations.contains(UiInvalidations::THREAD_READ_MARKS);
         if main_marks || thread_marks {
-            self.refresh_unread_separator_surfaces(main_marks, thread_marks);
+            // A timeline rendered in this flush already placed its separator.
+            self.refresh_unread_separator_surfaces(
+                main_marks && !main_rendered,
+                thread_marks && !invalidations.contains(UiInvalidations::THREAD),
+            );
             self.recheck_visible_reads(main_marks, thread_marks);
         }
 
@@ -11269,17 +11269,11 @@ impl ConduitWindow {
             // Sidebar thread sub-rows ("Thread (N responses) (M unread)")
             // are derived from the thread catalog independently of which
             // main view is active, so they need their own invalidation here.
-            let mut invalidations = UiInvalidations::SIDEBAR | UiInvalidations::THREADS;
-            let selected_thread_changed = self
-                .imp()
-                .workspace
-                .view
-                .borrow()
-                .selected_thread_target()
-                .is_some_and(|(channel_id, thread_ts)| {
-                    application.thread_record_changed(channel_id, thread_ts)
-                });
-            if selected_thread_changed {
+            let mut invalidations = UiInvalidations::SIDEBAR;
+            if self.current_main_view() == MainMessageView::Threads {
+                invalidations.insert(UiInvalidations::MAIN);
+            }
+            if application.selected_thread_record_changed() {
                 invalidations.insert(UiInvalidations::THREAD_READ_MARKS);
             }
             self.queue_ui_invalidations(invalidations);

@@ -376,14 +376,14 @@ fn perf_guard_burst_of_thread_patches_schedules_one_threads_rebuild() {
         .filter(|_| {
             pending.insert(
                 UiInvalidations::SIDEBAR
-                    | UiInvalidations::THREADS
+                    | UiInvalidations::MAIN
                     | UiInvalidations::THREAD_READ_MARKS,
             )
         })
         .count();
     assert_eq!(schedules, 1);
     let flushed = pending.take();
-    assert!(flushed.contains(UiInvalidations::THREADS));
+    assert!(flushed.contains(UiInvalidations::MAIN));
     assert!(flushed.contains(UiInvalidations::THREAD_READ_MARKS));
     assert!(!flushed.contains(UiInvalidations::MAIN_READ_MARKS));
     assert!(pending.is_empty());
