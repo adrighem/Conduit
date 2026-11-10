@@ -11367,6 +11367,7 @@ impl ConduitWindow {
                 user_statuses: Some(&user_statuses),
                 user_avatar_urls: Some(&user_avatar_urls),
                 starred_user_ids: starred_user_ids.as_ref(),
+                catalog_stamp: Some(conversations.content_stamp()),
             };
             let mut rows = Vec::with_capacity(changed_channel_ids.len());
             for channel_id in changed_channel_ids {
@@ -11653,6 +11654,7 @@ impl ConduitWindow {
                     user_statuses: Some(&imp.workspace.user_directory.user_statuses.borrow()),
                     user_avatar_urls: Some(&imp.workspace.user_directory.user_avatar_urls.borrow()),
                     starred_user_ids: None,
+                    catalog_stamp: Some(conversations.content_stamp()),
                 },
             );
             (model, conversations.len())
@@ -11997,7 +11999,7 @@ impl ConduitWindow {
             .and_downcast::<gio::ListStore>()
             .expect("sidebar selection should own a list store");
         let mut projection = imp.sidebar_projection.borrow_mut();
-        let operations = projection.reconcile(&next_items);
+        let operations = projection.reconcile(next_items);
         apply_sidebar_store_operations(&store, projection.items(), &operations);
         let selected_position = sidebar_selected_position(projection.items());
         drop(projection);

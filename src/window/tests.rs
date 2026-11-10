@@ -455,7 +455,7 @@ fn sidebar_list_store_replaces_only_updated_projection_items() {
             )
         })
         .collect::<Vec<_>>();
-    let operations = projection.reconcile(&initial);
+    let operations = projection.reconcile(initial.clone());
     apply_sidebar_store_operations(&store, projection.items(), &operations);
     let retained_before = store.item(699).unwrap();
     let updated_before = store.item(700).unwrap();
@@ -503,7 +503,7 @@ fn sidebar_list_store_splice_preserves_selection_by_model_identity() {
         keyed_sidebar_row("C2", "Two", true),
         keyed_sidebar_row("C3", "Three", false),
     ];
-    let operations = projection.reconcile(&initial);
+    let operations = projection.reconcile(initial.clone());
     apply_sidebar_store_operations(&store, projection.items(), &operations);
     let selected_before = store.item(1).unwrap();
     let suffix_before = store.item(2).unwrap();
@@ -514,7 +514,7 @@ fn sidebar_list_store_splice_preserves_selection_by_model_identity() {
         keyed_sidebar_row("C2", "Two", true),
         keyed_sidebar_row("C3", "Three", false),
     ];
-    let operations = projection.reconcile(&next);
+    let operations = projection.reconcile(next.clone());
     apply_sidebar_store_operations(&store, projection.items(), &operations);
 
     assert_eq!(store.n_items(), 4);

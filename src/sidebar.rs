@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::models::{SlackConversation, SlackUser, SlackUserStatus};
 use crate::search::{
@@ -331,39 +332,42 @@ impl SidebarProjection {
         &self.items
     }
 
-    pub fn reconcile(&mut self, next: &[KeyedSidebarItem]) -> Vec<SidebarProjectionOperation> {
+    pub fn reconcile(&mut self, next: Vec<KeyedSidebarItem>) -> Vec<SidebarProjectionOperation> {
         if self.items == next {
             return Vec::new();
         }
 
+        let same_keys = self.items.len() == next.len()
+            && self
+                .items
+                .iter()
+                .zip(&next)
+                .all(|(previous, next)| previous.key == next.key);
         let operations = if self.items.is_empty()
             || !keyed_sidebar_items_are_unique(&self.items)
-            || !keyed_sidebar_items_are_unique(next)
+            || !keyed_sidebar_items_are_unique(&next)
         {
             (!next.is_empty())
                 .then_some(SidebarProjectionOperation::Reset)
                 .into_iter()
                 .collect()
-        } else if self.items.len() == next.len()
-            && self
-                .items
-                .iter()
-                .zip(next)
-                .all(|(previous, next)| previous.key == next.key)
-        {
+        } else if same_keys {
             self.items
                 .iter()
-                .zip(next)
+                .zip(&next)
                 .enumerate()
                 .filter(|(_, (previous, next))| !previous.model.renders_same(&next.model))
                 .map(|(position, _)| SidebarProjectionOperation::Update { position })
                 .collect()
         } else {
-            sidebar_projection_structural_operations(&self.items, next)
+            sidebar_projection_structural_operations(&self.items, &next)
         };
 
-        self.items = next.to_vec();
-        self.rebuild_conversation_positions();
+        self.items = next;
+        // Keys in the same order keep every position, so the map stays valid.
+        if !same_keys {
+            self.rebuild_conversation_positions();
+        }
         operations
     }
 
@@ -604,10 +608,15 @@ pub struct SidebarBuildOptions<'a> {
     /// Users whose 1:1 DM is starred (`starred_user_ids`). `build_sidebar_list`
     /// computes it when absent; row patches must pass it for group DMs.
     pub starred_user_ids: Option<&'a HashSet<String>>,
+    /// `ConversationCatalog::content_stamp` of the conversations being built.
+    /// With it, group DM member ids are parsed once per catalog change
+    /// instead of several times per row on every render.
+    pub catalog_stamp: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SidebarRowOptions<'a> {
+    catalog_stamp: Option<u64>,
     selected_channel: Option<&'a str>,
     read_state: Option<&'a ConversationReadState>,
     has_draft: bool,
@@ -646,9 +655,12 @@ impl SidebarRowModel {
         let kind = conversation_kind(conversation);
         let empty_full_names = HashMap::new();
         let user_full_names = options.user_full_names.unwrap_or(&empty_full_names);
-        let search_aliases = conversation_user_ids(conversation, options.current_user_id)
-            .into_iter()
-            .filter_map(|user_id| options.user_search_aliases?.get(&user_id))
+        // Parsed once per row (and once per catalog change when stamped).
+        let members = group_member_ids(conversation, options.catalog_stamp);
+        let participants = conversation_user_ids(conversation, &members, options.current_user_id);
+        let search_aliases = participants
+            .iter()
+            .filter_map(|user_id| options.user_search_aliases?.get(user_id))
             .flatten()
             .cloned()
             .collect();
@@ -662,7 +674,8 @@ impl SidebarRowModel {
             .map_or(0, ConversationReadState::badge_count);
         Self {
             id: conversation.id.clone(),
-            title: conversation.navigation_name_with_users(
+            title: conversation.navigation_name_with_members(
+                &members,
                 user_names,
                 user_full_names,
                 options.current_user_id,
@@ -673,7 +686,10 @@ impl SidebarRowModel {
             selected: options.selected_channel == Some(conversation.id.as_str()),
             starred: conversation.is_starred(),
             starred_member: options.starred_user_ids.is_some_and(|starred_user_ids| {
-                has_starred_member(conversation, starred_user_ids, options.current_user_id)
+                kind == ConversationKind::GroupDirectMessage
+                    && participants
+                        .iter()
+                        .any(|user_id| starred_user_ids.contains(user_id))
             }),
             private: conversation.is_private.unwrap_or(false)
                 || conversation.is_group.unwrap_or(false)
@@ -725,6 +741,7 @@ pub(crate) fn sidebar_row_for_conversation(
         conversation,
         user_names,
         SidebarRowOptions {
+            catalog_stamp: options.catalog_stamp,
             selected_channel: options.selected_channel,
             read_state: options
                 .read_states
@@ -763,16 +780,19 @@ pub fn starred_user_ids<'a>(
 }
 
 /// A group DM with at least one member from `starred_user_ids`.
-pub fn has_starred_member(
+fn has_starred_member(
     conversation: &SlackConversation,
     starred_user_ids: &HashSet<String>,
     current_user_id: Option<&str>,
+    catalog_stamp: Option<u64>,
 ) -> bool {
     !starred_user_ids.is_empty()
         && conversation_kind(conversation) == ConversationKind::GroupDirectMessage
-        && conversation_user_ids(conversation, current_user_id)
+        && group_member_ids(conversation, catalog_stamp)
             .iter()
-            .any(|user_id| starred_user_ids.contains(user_id))
+            .any(|user_id| {
+                Some(user_id.as_str()) != current_user_id && starred_user_ids.contains(user_id)
+            })
 }
 
 pub fn user_search_aliases(users: &[SlackUser]) -> UserSearchAliases {
@@ -782,18 +802,57 @@ pub fn user_search_aliases(users: &[SlackUser]) -> UserSearchAliases {
         .collect()
 }
 
+/// Group DM member ids parsed from the conversation JSON, empty for other
+/// kinds. Cached per conversation while `catalog_stamp` stays the same; the
+/// stamp changes on every catalog mutation, so no change path can leave it
+/// stale.
+fn group_member_ids(conversation: &SlackConversation, catalog_stamp: Option<u64>) -> Arc<[String]> {
+    if !conversation.is_mpim.unwrap_or(false) {
+        return Arc::from([]);
+    }
+    let Some(stamp) = catalog_stamp else {
+        return conversation.group_direct_message_user_ids().into();
+    };
+    MEMBER_IDS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.stamp != Some(stamp) {
+            cache.stamp = Some(stamp);
+            cache.ids.clear();
+        }
+        Arc::clone(
+            cache
+                .ids
+                .entry(conversation.id.clone())
+                .or_insert_with(|| conversation.group_direct_message_user_ids().into()),
+        )
+    })
+}
+
+#[derive(Default)]
+struct MemberIdCache {
+    stamp: Option<u64>,
+    ids: HashMap<String, Arc<[String]>>,
+}
+
+thread_local! {
+    static MEMBER_IDS: std::cell::RefCell<MemberIdCache> = std::cell::RefCell::default();
+}
+
+/// People a conversation shows: the other side of a 1:1 DM, or the group DM
+/// members without the current user. `members` comes from [`group_member_ids`].
 fn conversation_user_ids(
     conversation: &SlackConversation,
+    members: &[String],
     current_user_id: Option<&str>,
 ) -> Vec<String> {
     if conversation.is_im.unwrap_or(false) {
         return conversation.user.iter().cloned().collect();
     }
     if conversation.is_mpim.unwrap_or(false) {
-        return conversation
-            .group_direct_message_user_ids()
-            .into_iter()
+        return members
+            .iter()
             .filter(|user_id| Some(user_id.as_str()) != current_user_id)
+            .cloned()
             .collect();
     }
     Vec::new()
@@ -858,9 +917,10 @@ where
             options.selected_channel,
             starred_user_ids,
             options.current_user_id,
+            options.catalog_stamp,
         )
     };
-    let mut rows = conversations
+    let mut scored = conversations
         .clone()
         .filter(|conversation| !conversation.is_archived.unwrap_or(false))
         .filter(|conversation| {
@@ -872,8 +932,12 @@ where
                 conversation_visible_in_unread_sidebar(conversation, options)
             } else {
                 // Starred-member group DMs join Priority only while recent.
-                (has_starred_member(conversation, starred_user_ids, options.current_user_id)
-                    && group_direct_message_is_recent(conversation))
+                (has_starred_member(
+                    conversation,
+                    starred_user_ids,
+                    options.current_user_id,
+                    options.catalog_stamp,
+                ) && group_direct_message_is_recent(conversation))
                     || conversation_visible_in_default_sidebar(
                         conversation,
                         options.selected_channel,
@@ -883,26 +947,40 @@ where
             }
         })
         .map(|conversation| sidebar_row_for_conversation(conversation, user_names, options))
-        .filter(|row| row.match_score(&query).is_some())
+        // Scored once: the score feeds the filter and the search sort.
+        .filter_map(|row| {
+            let score = row.match_score(&query)?;
+            Some((row, score))
+        })
         .collect::<Vec<_>>();
 
-    if rows.is_empty() {
+    if scored.is_empty() {
         return SidebarListModel::Placeholder(SidebarPlaceholder::NoMatches);
     }
 
     if !query.is_empty() {
+        // Coverage only matters for rows that matched; archived and
+        // non-matching conversations are skipped.
+        let matched_ids = scored
+            .iter()
+            .map(|(row, _)| row.id.as_str())
+            .collect::<HashSet<_>>();
         let participant_coverage = conversation_participant_coverage(
-            conversations,
+            conversations.filter(|conversation| matched_ids.contains(conversation.id.as_str())),
+            options.catalog_stamp,
             user_names,
             options.current_user_id,
             &query,
             options.user_search_aliases,
         );
-        sort_search_rows(&mut rows, &query, &participant_coverage);
-        return SidebarListModel::Rows(rows);
+        sort_search_rows(&mut scored, &participant_coverage);
+        return SidebarListModel::Rows(scored.into_iter().map(|(row, _)| row).collect());
     }
 
-    SidebarListModel::Sections(build_sidebar_sections_from_rows(rows, None))
+    SidebarListModel::Sections(build_sidebar_sections_from_rows(
+        scored.into_iter().map(|(row, _)| row),
+        None,
+    ))
 }
 
 #[cfg(test)]
@@ -1040,6 +1118,7 @@ pub(crate) fn filter_conversation_switcher_rows(
             conversations
                 .iter()
                 .filter(|conversation| matching_ids.contains(conversation.id.as_str())),
+            None,
             user_names,
             current_user_id,
             &query,
@@ -1147,6 +1226,7 @@ pub fn conversation_picker_sections_with_statuses(
     } else {
         conversation_participant_coverage(
             conversations,
+            None,
             user_names,
             current_user_id,
             &search_query,
@@ -1304,15 +1384,28 @@ fn sort_by_relevance_then_title<T>(
     rank: impl Fn(&SidebarRowModel, &SidebarRowModel) -> std::cmp::Ordering,
 ) {
     let query = query.filter(|query| !query.is_empty());
+    sort_by_band_then_title(
+        items,
+        &row,
+        |item| {
+            query
+                .and_then(|query| row(item).match_score(query))
+                .map_or(0, MatchScore::band)
+        },
+        rank,
+    );
+}
+
+/// [`sort_by_relevance_then_title`] with the band supplied by the caller.
+fn sort_by_band_then_title<T>(
+    items: &mut Vec<T>,
+    row: impl Fn(&T) -> &SidebarRowModel,
+    band: impl Fn(&T) -> u8,
+    rank: impl Fn(&SidebarRowModel, &SidebarRowModel) -> std::cmp::Ordering,
+) {
     let mut keyed = std::mem::take(items)
         .into_iter()
-        .map(|item| {
-            let item_row = row(&item);
-            let band = query
-                .and_then(|query| item_row.match_score(query))
-                .map_or(0, MatchScore::band);
-            (band, title_sort_key(&item_row.title), item)
-        })
+        .map(|item| (band(&item), title_sort_key(&row(&item).title), item))
         .collect::<Vec<_>>();
     keyed.sort_by(
         |(left_band, left_title, left), (right_band, right_title, right)| {
@@ -1477,6 +1570,7 @@ fn recent_history_direct_message_ids<'a>(
     selected_channel: Option<&str>,
     starred_user_ids: &HashSet<String>,
     current_user_id: Option<&str>,
+    catalog_stamp: Option<u64>,
 ) -> HashSet<String> {
     let mut candidates = conversations
         .into_iter()
@@ -1484,7 +1578,14 @@ fn recent_history_direct_message_ids<'a>(
         .filter(|conversation| conversation_kind(conversation) == ConversationKind::DirectMessage)
         .filter(|conversation| selected_channel != Some(conversation.id.as_str()))
         .filter(|conversation| !conversation.is_starred())
-        .filter(|conversation| !has_starred_member(conversation, starred_user_ids, current_user_id))
+        .filter(|conversation| {
+            !has_starred_member(
+                conversation,
+                starred_user_ids,
+                current_user_id,
+                catalog_stamp,
+            )
+        })
         .filter(|conversation| !conversation.has_active_direct_message_hint())
         .filter(|conversation| !conversation.is_user_deleted() && !conversation.is_dormant())
         .filter_map(|conversation| {
@@ -1566,6 +1667,7 @@ struct ParticipantCoverage {
 
 fn conversation_participant_coverage<'a>(
     conversations: impl IntoIterator<Item = &'a SlackConversation>,
+    catalog_stamp: Option<u64>,
     user_names: &HashMap<String, String>,
     current_user_id: Option<&str>,
     query: &SearchQuery,
@@ -1592,7 +1694,8 @@ fn conversation_participant_coverage<'a>(
             if !conversation.is_mpim.unwrap_or(false) {
                 return None;
             }
-            let user_ids = conversation_user_ids(conversation, current_user_id);
+            let members = group_member_ids(conversation, catalog_stamp);
+            let user_ids = conversation_user_ids(conversation, &members, current_user_id);
             let total = user_ids.len();
             (total > 0).then(|| {
                 let matched = user_ids
@@ -1625,15 +1728,15 @@ fn user_matches_query(
             .is_some_and(|aliases| aliases.iter().any(|name| query.matches_any_term(name)))
 }
 
+/// Sorts rows by their already computed match score, then ranking and title.
 fn sort_search_rows(
-    rows: &mut Vec<SidebarRowModel>,
-    query: &SearchQuery,
+    rows: &mut Vec<(SidebarRowModel, MatchScore)>,
     participant_coverage: &HashMap<String, ParticipantCoverage>,
 ) {
-    sort_by_relevance_then_title(
+    sort_by_band_then_title(
         rows,
-        |row| row,
-        Some(query),
+        |(row, _)| row,
+        |(_, score)| score.band(),
         |left, right| compare_ranking(left, right, Some(participant_coverage)),
     );
 }
@@ -2218,15 +2321,20 @@ mod tests {
         let conversations = [starred_dm("D1", "U1"), group];
         let starred = starred_user_ids(&conversations, Some("UME"));
 
-        assert!(
-            recent_history_direct_message_ids(&conversations, None, &starred, Some("UME"))
-                .is_empty()
-        );
+        assert!(recent_history_direct_message_ids(
+            &conversations,
+            None,
+            &starred,
+            Some("UME"),
+            None
+        )
+        .is_empty());
         assert!(recent_history_direct_message_ids(
             &conversations,
             None,
             &HashSet::new(),
-            Some("UME")
+            Some("UME"),
+            None
         )
         .is_empty());
     }
@@ -2240,7 +2348,7 @@ mod tests {
         let mut member_dm = starred_dm("D1", "U1");
         let model = build_sidebar_list([&member_dm, &group], &HashMap::new(), me());
         let mut projection = SidebarProjection::default();
-        projection.reconcile(&model.keyed_items());
+        projection.reconcile(model.keyed_items());
 
         member_dm.set_starred(false);
         let starred = starred_user_ids([&member_dm], Some("UME"));
@@ -2282,7 +2390,7 @@ mod tests {
             unopened_group_dm.clone(),
         ];
         let recent_history_direct_messages =
-            recent_history_direct_message_ids(&conversations, None, &HashSet::new(), None);
+            recent_history_direct_message_ids(&conversations, None, &HashSet::new(), None, None);
 
         assert!(conversation_visible_in_default_sidebar(
             &active_channel,
@@ -4110,11 +4218,11 @@ mod tests {
         let mut projection = SidebarProjection::default();
 
         assert_eq!(
-            projection.reconcile(&items),
+            projection.reconcile(items.clone()),
             vec![SidebarProjectionOperation::Reset]
         );
         assert_eq!(projection.items(), items);
-        assert!(projection.reconcile(&items).is_empty());
+        assert!(projection.reconcile(items.clone()).is_empty());
     }
 
     #[test]
@@ -4125,7 +4233,7 @@ mod tests {
         let mut next = SidebarListModel::Rows(rows).keyed_items();
         let mut projection = SidebarProjection::default();
         assert_eq!(
-            projection.reconcile(&next),
+            projection.reconcile(next.clone()),
             vec![SidebarProjectionOperation::Reset]
         );
 
@@ -4135,7 +4243,7 @@ mod tests {
         changed.muted = true;
 
         assert_eq!(
-            projection.reconcile(&next),
+            projection.reconcile(next.clone()),
             vec![SidebarProjectionOperation::Update { position: 713 }]
         );
     }
@@ -4147,7 +4255,7 @@ mod tests {
             .collect::<Vec<_>>();
         let initial = SidebarListModel::Rows(rows).keyed_items();
         let mut projection = SidebarProjection::default();
-        projection.reconcile(&initial);
+        projection.reconcile(initial.clone());
 
         // A message arriving only moves `latest_ts`; the row draws the same.
         let mut next = initial.clone();
@@ -4156,7 +4264,7 @@ mod tests {
         };
         changed.latest_ts = Some("1700000000.000100".to_string());
         changed.avatar_url = Some("https://example.com/a.png".to_string());
-        assert!(projection.reconcile(&next).is_empty());
+        assert!(projection.reconcile(next.clone()).is_empty());
         assert_eq!(projection.items(), next);
 
         let mut in_place = row("C42", false);
@@ -4176,7 +4284,7 @@ mod tests {
         };
         changed.unread = true;
         assert_eq!(
-            projection.reconcile(&next),
+            projection.reconcile(next.clone()),
             vec![SidebarProjectionOperation::Update { position: 42 }]
         );
     }
@@ -4188,7 +4296,7 @@ mod tests {
             .collect::<Vec<_>>();
         let initial = SidebarListModel::Rows(rows).keyed_items();
         let mut projection = SidebarProjection::default();
-        projection.reconcile(&initial);
+        projection.reconcile(initial.clone());
         let mut changed = row("C713", false);
         changed.muted = true;
 
@@ -4216,7 +4324,7 @@ mod tests {
         ])
         .keyed_items();
         let mut projection = SidebarProjection::default();
-        projection.reconcile(&items);
+        projection.reconcile(items.clone());
         duplicated.muted = true;
 
         assert_eq!(
@@ -4238,7 +4346,7 @@ mod tests {
         }])
         .keyed_items();
         let mut projection = SidebarProjection::default();
-        projection.reconcile(&items);
+        projection.reconcile(items.clone());
 
         let mut reordered = starred.clone();
         reordered.title = "#renamed".to_string();
@@ -4265,7 +4373,7 @@ mod tests {
         let mut second = row("C2", false);
         let items = SidebarListModel::Rows(vec![first.clone(), second.clone()]).keyed_items();
         let mut projection = SidebarProjection::default();
-        projection.reconcile(&items);
+        projection.reconcile(items.clone());
 
         first.muted = true;
         second.starred = true;
@@ -4303,7 +4411,7 @@ mod tests {
             &[],
         );
         let mut projection = SidebarProjection::default();
-        projection.reconcile(&items);
+        projection.reconcile(items.clone());
         starred.muted = true;
 
         assert_eq!(
@@ -4319,8 +4427,8 @@ mod tests {
         let reordered =
             SidebarListModel::Rows(vec![row("C2", false), row("C1", false)]).keyed_items();
         let mut projection = SidebarProjection::default();
-        projection.reconcile(&initial);
-        projection.reconcile(&reordered);
+        projection.reconcile(initial.clone());
+        projection.reconcile(reordered.clone());
         let mut changed = row("C1", false);
         changed.muted = true;
 
@@ -4343,15 +4451,79 @@ mod tests {
             .unwrap();
         next.insert(713, inserted);
         let mut projection = SidebarProjection::default();
-        projection.reconcile(&initial);
+        projection.reconcile(initial.clone());
 
         assert_eq!(
-            projection.reconcile(&next),
+            projection.reconcile(next.clone()),
             vec![SidebarProjectionOperation::Splice {
                 position: 713,
                 removed: 0,
                 inserted: 1,
             }]
+        );
+    }
+
+    #[test]
+    fn perf_guard_unchanged_catalog_parses_group_member_ids_once() {
+        let conversations = (0..50)
+            .map(|index| {
+                latest_ago(
+                    mpim_with_members(&format!("G{index}"), "mpdm", &["UME", "U1", "U2"]),
+                    60,
+                )
+            })
+            .collect::<Vec<_>>();
+        let options = SidebarBuildOptions {
+            catalog_stamp: Some(u64::MAX - 7),
+            ..me()
+        };
+        let render = || build_sidebar_list(conversations.iter(), &HashMap::new(), options);
+
+        let first = render();
+        let first_parses = crate::models::MEMBER_ID_PARSES.with(|count| count.replace(0));
+        assert!(first_parses >= conversations.len());
+        for _ in 0..5 {
+            assert_eq!(render(), first);
+        }
+        assert_eq!(
+            crate::models::MEMBER_ID_PARSES.with(std::cell::Cell::get),
+            0,
+            "unchanged catalog must not parse member JSON again"
+        );
+
+        // Any catalog mutation changes the stamp and reparses.
+        let changed = SidebarBuildOptions {
+            catalog_stamp: Some(u64::MAX - 6),
+            ..options
+        };
+        build_sidebar_list(conversations.iter(), &HashMap::new(), changed);
+        assert!(crate::models::MEMBER_ID_PARSES.with(std::cell::Cell::get) >= conversations.len());
+    }
+
+    #[test]
+    fn perf_guard_search_keystroke_normalizes_each_row_field_once() {
+        let channels = (0..300)
+            .map(|index| channel(&format!("C{index:04}"), &format!("team-{index}")))
+            .collect::<Vec<_>>();
+        crate::search::take_normalizations();
+
+        let model = build_sidebar_list(
+            channels.iter(),
+            &HashMap::new(),
+            SidebarBuildOptions {
+                query: "team",
+                ..Default::default()
+            },
+        );
+        let normalizations = crate::search::take_normalizations();
+
+        assert!(matches!(model, SidebarListModel::Rows(rows) if rows.len() == 300));
+        // Title and id once each (plus the query): scoring is not repeated
+        // for the sort.
+        assert!(
+            normalizations <= 2 * channels.len() + 4,
+            "{normalizations} normalizations for {} rows",
+            channels.len()
         );
     }
 
