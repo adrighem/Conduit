@@ -319,9 +319,6 @@ fn decode_sidebar_image(
                 &stream,
                 gtk::gio::Cancellable::NONE,
                 move |animation| {
-                    let Some(picture) = weak_picture.upgrade() else {
-                        return;
-                    };
                     let Ok(animation) = animation else { return };
                     let frame = animation.iter(Some(std::time::SystemTime::now()));
                     let pixbuf = frame.pixbuf();
@@ -339,7 +336,10 @@ fn decode_sidebar_image(
                     if let Some(key) = cache_key {
                         store_sidebar_texture(key, &texture);
                     }
-                    picture.set_paintable(Some(&texture));
+                    // Cache even when the row scrolled away during the decode.
+                    if let Some(picture) = weak_picture.upgrade() {
+                        picture.set_paintable(Some(&texture));
+                    }
                 },
             );
         },
