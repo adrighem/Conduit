@@ -1712,6 +1712,12 @@ fn sidebar_list_store() -> gio::ListStore {
     gio::ListStore::new::<glib::BoxedAnyObject>()
 }
 
+/// A recycled list item keeps its widget tree when it is rebound to an item
+/// with the same key that draws identically.
+fn sidebar_bind_keeps_child(shown: Option<&KeyedSidebarItem>, next: &KeyedSidebarItem) -> bool {
+    shown.is_some_and(|shown| shown.key == next.key && shown.model.renders_same(&next.model))
+}
+
 fn boxed_sidebar_item(item: &KeyedSidebarItem) -> glib::BoxedAnyObject {
     glib::BoxedAnyObject::new(item.clone())
 }
@@ -4631,7 +4637,12 @@ impl ConduitWindow {
     fn setup_sidebar_list(&self) {
         self.ensure_composer_format_control_css();
         let factory = gtk::SignalListItemFactory::new();
+        // What each recycled `ListItem` currently shows, by object pointer. A
+        // rebind to an item that draws the same keeps the existing widget
+        // tree (a row is 6-10 widgets plus two controllers).
+        let rendered: Rc<RefCell<HashMap<usize, KeyedSidebarItem>>> = Rc::default();
         let weak_window = self.downgrade();
+        let rendered_for_bind = Rc::clone(&rendered);
         factory.connect_bind(move |_, object| {
             let Some(window) = weak_window.upgrade() else {
                 return;
@@ -4651,10 +4662,24 @@ impl ConduitWindow {
             };
             list_item.set_selectable(selectable);
             list_item.set_activatable(activatable);
+            let pointer = list_item.as_ptr() as usize;
+            let mut rendered = rendered_for_bind.borrow_mut();
+            if list_item.child().is_some()
+                && sidebar_bind_keeps_child(rendered.get(&pointer), &item)
+            {
+                return;
+            }
             list_item.set_child(Some(&window.sidebar_item_widget(&item)));
+            rendered.insert(pointer, item.clone());
         });
-        factory.connect_unbind(|_, object| {
+        // Unbind keeps the child: GTK recycles list items and rebinding the
+        // same row (scrolling back, an invisible model change) reuses it.
+        let rendered_for_teardown = Rc::clone(&rendered);
+        factory.connect_teardown(move |_, object| {
             if let Some(list_item) = object.downcast_ref::<gtk::ListItem>() {
+                rendered_for_teardown
+                    .borrow_mut()
+                    .remove(&(list_item.as_ptr() as usize));
                 list_item.set_child(None::<&gtk::Widget>);
             }
         });
@@ -11343,6 +11368,7 @@ impl ConduitWindow {
                 user_statuses: Some(&user_statuses),
                 user_avatar_urls: Some(&user_avatar_urls),
                 starred_user_ids: starred_user_ids.as_ref(),
+                catalog_stamp: Some(conversations.content_stamp()),
             };
             let mut rows = Vec::with_capacity(changed_channel_ids.len());
             for channel_id in changed_channel_ids {
@@ -11629,6 +11655,7 @@ impl ConduitWindow {
                     user_statuses: Some(&imp.workspace.user_directory.user_statuses.borrow()),
                     user_avatar_urls: Some(&imp.workspace.user_directory.user_avatar_urls.borrow()),
                     starred_user_ids: None,
+                    catalog_stamp: Some(conversations.content_stamp()),
                 },
             );
             (model, conversations.len())
@@ -11973,7 +12000,7 @@ impl ConduitWindow {
             .and_downcast::<gio::ListStore>()
             .expect("sidebar selection should own a list store");
         let mut projection = imp.sidebar_projection.borrow_mut();
-        let operations = projection.reconcile(&next_items);
+        let operations = projection.reconcile(next_items);
         apply_sidebar_store_operations(&store, projection.items(), &operations);
         let selected_position = sidebar_selected_position(projection.items());
         drop(projection);

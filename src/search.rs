@@ -163,6 +163,8 @@ impl SearchQuery {
 }
 
 pub fn normalize_for_search(value: &str) -> String {
+    #[cfg(test)]
+    NORMALIZATIONS.with(|count| count.set(count.get() + 1));
     value
         .nfkd()
         .filter(|character| !is_combining_mark(*character))
@@ -205,6 +207,18 @@ fn weighted_percentage(score: u8, weight: u8) -> u8 {
 }
 
 static NEXT_COMPLETION_INDEX_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+thread_local! {
+    static NORMALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `normalize_for_search` calls on this thread since the last call, for
+/// guards that bound the work of a search keystroke.
+#[cfg(test)]
+pub fn take_normalizations() -> usize {
+    NORMALIZATIONS.with(|count| count.replace(0))
+}
 
 #[cfg(test)]
 thread_local! {

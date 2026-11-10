@@ -246,12 +246,20 @@ fn sidebar_status_emoji_picture(url: &str, label: &str, size: i32) -> gtk::Pictu
 /// non-https and private hosts and caps the download size, and the decode
 /// budget rejects files that would inflate to gigabytes of pixels.
 fn load_sidebar_image(picture: &gtk::Picture, url: &str, size: i32) {
+    let cache_key = (url.to_string(), size);
+    let use_cache = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_FILE").is_none();
+    if use_cache {
+        if let Some(texture) = cached_sidebar_texture(&cache_key) {
+            picture.set_paintable(Some(&texture));
+            return;
+        }
+    }
     let weak_picture = picture.downgrade();
     if let Some(path) = std::env::var_os("CONDUIT_TEST_STATUS_EMOJI_FILE")
         .map(std::path::PathBuf::from)
         .or_else(|| crate::emoji_picker_window::resolve_custom_emoji_cached_file(url))
     {
-        decode_sidebar_image(weak_picture, &path, size);
+        decode_sidebar_image(weak_picture, &path, size, use_cache.then_some(cache_key));
         return;
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
@@ -260,8 +268,36 @@ fn load_sidebar_image(picture: &gtk::Picture, url: &str, size: i32) {
     });
     gtk::glib::spawn_future_local(async move {
         if let Some(path) = rx.recv().await {
-            decode_sidebar_image(weak_picture, &path, size);
+            decode_sidebar_image(weak_picture, &path, size, use_cache.then_some(cache_key));
         }
+    });
+}
+
+/// Most distinct custom status emoji (per size) kept decoded. Past this the
+/// cache starts over, which only costs one decode per visible emoji.
+const SIDEBAR_TEXTURE_CACHE_LIMIT: usize = 64;
+
+type SidebarTextureKey = (String, i32);
+
+thread_local! {
+    /// Decoded status emoji by URL and size, so a rebuilt row does not stat,
+    /// probe and decode the same file again.
+    static SIDEBAR_TEXTURES: std::cell::RefCell<
+        std::collections::HashMap<SidebarTextureKey, gtk::gdk::Texture>,
+    > = std::cell::RefCell::default();
+}
+
+fn cached_sidebar_texture(key: &SidebarTextureKey) -> Option<gtk::gdk::Texture> {
+    SIDEBAR_TEXTURES.with(|cache| cache.borrow().get(key).cloned())
+}
+
+fn store_sidebar_texture(key: SidebarTextureKey, texture: &gtk::gdk::Texture) {
+    SIDEBAR_TEXTURES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= SIDEBAR_TEXTURE_CACHE_LIMIT && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, texture.clone());
     });
 }
 
@@ -269,6 +305,7 @@ fn decode_sidebar_image(
     weak_picture: gtk::glib::WeakRef<gtk::Picture>,
     path: &std::path::Path,
     size: i32,
+    cache_key: Option<(String, i32)>,
 ) {
     if weak_picture.upgrade().is_none() || !crate::animated_image::within_decode_budget(path) {
         return;
@@ -282,9 +319,6 @@ fn decode_sidebar_image(
                 &stream,
                 gtk::gio::Cancellable::NONE,
                 move |animation| {
-                    let Some(picture) = weak_picture.upgrade() else {
-                        return;
-                    };
                     let Ok(animation) = animation else { return };
                     let frame = animation.iter(Some(std::time::SystemTime::now()));
                     let pixbuf = frame.pixbuf();
@@ -298,7 +332,14 @@ fn decode_sidebar_image(
                     let scaled = pixbuf
                         .scale_simple(target_w, target_h, gdk_pixbuf::InterpType::Bilinear)
                         .unwrap_or(pixbuf);
-                    picture.set_paintable(Some(&gtk::gdk::Texture::for_pixbuf(&scaled)));
+                    let texture = gtk::gdk::Texture::for_pixbuf(&scaled);
+                    if let Some(key) = cache_key {
+                        store_sidebar_texture(key, &texture);
+                    }
+                    // Cache even when the row scrolled away during the decode.
+                    if let Some(picture) = weak_picture.upgrade() {
+                        picture.set_paintable(Some(&texture));
+                    }
                 },
             );
         },
