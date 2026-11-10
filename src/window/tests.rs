@@ -299,17 +299,23 @@ fn perf_guard_external_opens_never_wait_on_a_launcher_process() {
 }
 
 #[test]
-fn external_launch_outcome_reports_failures_but_not_a_dismissed_chooser() {
-    assert_eq!(external_launch_outcome(Ok(())), Some(Ok(())));
+fn external_launch_distinguishes_failures_from_a_dismissed_chooser() {
+    assert_eq!(ExternalLaunch::from(Ok(())), ExternalLaunch::Opened);
     let failure = glib::Error::new(gio::IOErrorEnum::NotFound, "no handler");
     assert_eq!(
-        external_launch_outcome(Err(failure)),
-        Some(Err("no handler".to_string()))
+        ExternalLaunch::from(Err(failure)),
+        ExternalLaunch::Failed("no handler".to_string())
     );
     let dismissed = glib::Error::new(gtk::DialogError::Dismissed, "dismissed");
-    assert_eq!(external_launch_outcome(Err(dismissed)), None);
+    assert_eq!(
+        ExternalLaunch::from(Err(dismissed)),
+        ExternalLaunch::Dismissed
+    );
     let cancelled = glib::Error::new(gio::IOErrorEnum::Cancelled, "cancelled");
-    assert_eq!(external_launch_outcome(Err(cancelled)), None);
+    assert_eq!(
+        ExternalLaunch::from(Err(cancelled)),
+        ExternalLaunch::Dismissed
+    );
 }
 
 #[test]
@@ -323,7 +329,8 @@ fn perf_guard_pasted_screenshots_encode_off_the_gtk_thread() {
         source.matches(concat!(".save_to_", "png_bytes(")).count(),
         1
     );
-    assert!(source.contains("move || write_screenshot_png(&texture, &directory, &path)"));
+    assert!(source.contains("gio::spawn_blocking({"));
+    assert_eq!(source.matches("write_screenshot_png(&texture").count(), 1);
 }
 
 #[test]

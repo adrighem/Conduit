@@ -201,24 +201,35 @@ struct SystemExternalOpener<'a>(&'a ConduitWindow);
 impl ExternalOpener for SystemExternalOpener<'_> {
     fn open(&self, permalink: &SafeSlackPermalink, done: ExternalOpenCompletion) {
         self.0
-            .launch_external_uri(permalink.as_str(), move |_, result| {
-                done(result.map_err(ExternalOpenError::new))
+            .launch_external_uri(permalink.as_str(), move |_, outcome| match outcome {
+                ExternalLaunch::Opened => done(Ok(())),
+                ExternalLaunch::Dismissed => {}
+                ExternalLaunch::Failed(error) => done(Err(ExternalOpenError::new(error))),
             });
     }
 }
 
-/// Maps a launcher outcome to the status-message error, or `None` when the
-/// user dismissed the portal's application chooser (nothing to report).
-fn external_launch_outcome(result: Result<(), glib::Error>) -> Option<Result<(), String>> {
-    match result {
-        Ok(()) => Some(Ok(())),
-        Err(error)
-            if error.matches(gtk::DialogError::Dismissed)
-                || error.matches(gio::IOErrorEnum::Cancelled) =>
-        {
-            None
+/// How an asynchronous external launch ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExternalLaunch {
+    Opened,
+    /// The user dismissed the portal's application chooser.
+    Dismissed,
+    Failed(String),
+}
+
+impl From<Result<(), glib::Error>> for ExternalLaunch {
+    fn from(result: Result<(), glib::Error>) -> Self {
+        match result {
+            Ok(()) => Self::Opened,
+            Err(error)
+                if error.matches(gtk::DialogError::Dismissed)
+                    || error.matches(gio::IOErrorEnum::Cancelled) =>
+            {
+                Self::Dismissed
+            }
+            Err(error) => Self::Failed(error.message().to_string()),
         }
-        Err(error) => Some(Err(error.message().to_string())),
     }
 }
 
@@ -2599,6 +2610,7 @@ fn screenshot_filename() -> String {
 enum ScreenshotWriteError {
     Prepare(std::io::Error),
     Encode(String),
+    Write(std::io::Error),
 }
 
 impl std::fmt::Display for ScreenshotWriteError {
@@ -2608,6 +2620,7 @@ impl std::fmt::Display for ScreenshotWriteError {
                 write!(formatter, "Could not prepare screenshot upload: {error}")
             }
             Self::Encode(error) => write!(formatter, "Could not encode clipboard image: {error}"),
+            Self::Write(error) => write!(formatter, "Could not save clipboard image: {error}"),
         }
     }
 }
@@ -2621,7 +2634,27 @@ fn write_screenshot_png(
 ) -> Result<(), ScreenshotWriteError> {
     std::fs::create_dir_all(directory).map_err(ScreenshotWriteError::Prepare)?;
     let bytes = texture.save_to_png_bytes();
-    std::fs::write(path, &bytes).map_err(|error| ScreenshotWriteError::Encode(error.to_string()))
+    if bytes.is_empty() {
+        return Err(ScreenshotWriteError::Encode(
+            "the encoder produced no data".to_string(),
+        ));
+    }
+    std::fs::write(path, &bytes).map_err(ScreenshotWriteError::Write)
+}
+
+/// A CPU-memory copy of `texture`, safe to download from a worker thread.
+/// Clipboard textures are decoded image data and already memory-backed; a
+/// GL or dmabuf texture is downloaded here, on the GTK thread that owns its
+/// context (a plain pixel copy, the expensive PNG encode stays off-thread).
+fn memory_backed_texture(texture: gtk::gdk::Texture) -> gtk::gdk::Texture {
+    if texture.is::<gtk::gdk::MemoryTexture>() {
+        return texture;
+    }
+    let format = gtk::gdk::MemoryFormat::R8g8b8a8Premultiplied;
+    let mut downloader = gtk::gdk::TextureDownloader::new(&texture);
+    downloader.set_format(format);
+    let (bytes, stride) = downloader.download_bytes();
+    gtk::gdk::MemoryTexture::new(texture.width(), texture.height(), format, &bytes, stride).upcast()
 }
 
 fn referenced_staged_uploads(drafts: &Drafts, directory: &Path) -> HashSet<PathBuf> {
@@ -8225,9 +8258,12 @@ impl ConduitWindow {
                 self.set_status(&format!("{label} ({:.0}%)", fraction * 100.0));
             }
             RuntimeEventKind::AttachmentDownloaded { url: _, name, path } => {
-                self.launch_external_file(&path, move |window, result| match result {
-                    Ok(()) => window.set_status(&format!("Opened {name}")),
-                    Err(error) => window.set_status(&format!("Could not open {name}: {error}")),
+                self.launch_external_file(&path, move |window, outcome| match outcome {
+                    ExternalLaunch::Opened => window.set_status(&format!("Opened {name}")),
+                    ExternalLaunch::Dismissed => {}
+                    ExternalLaunch::Failed(error) => {
+                        window.set_status(&format!("Could not open {name}: {error}"))
+                    }
                 });
             }
             RuntimeEventKind::MessagePermalinkResolved { handoff } => {
@@ -9465,11 +9501,13 @@ impl ConduitWindow {
     }
 
     /// Encodes a pasted clipboard image to PNG and stages it as an upload.
-    /// The encode and the file write run on a blocking worker (`GdkTexture`
-    /// is immutable and thread-safe), so a large screenshot never stalls the
-    /// GTK thread. The file is staged only if the composer still points at
-    /// the conversation it was pasted into; otherwise it is discarded.
+    /// The encode and the file write run on a blocking worker (a memory
+    /// texture is immutable and thread-safe), so a large screenshot never
+    /// stalls the GTK thread. The file is staged only if the composer still
+    /// points at the conversation it was pasted into; otherwise it is
+    /// discarded.
     fn stage_clipboard_screenshot(&self, texture: gtk::gdk::Texture, target: ComposerTarget) {
+        let texture = memory_backed_texture(texture);
         let scope = self.composer_draft_key(target);
         let directory = config::upload_staging_dir();
         let path = directory.join(screenshot_filename());
@@ -10003,8 +10041,8 @@ impl ConduitWindow {
     }
 
     fn open_external_link(&self, uri: &str) {
-        self.launch_external_uri(uri, |window, result| {
-            if let Err(error) = result {
+        self.launch_external_uri(uri, |window, outcome| {
+            if let ExternalLaunch::Failed(error) = outcome {
                 window.set_status(&format!("Failed to open link: {error}"));
             }
         });
@@ -10012,20 +10050,13 @@ impl ConduitWindow {
 
     /// Hands `uri` to the desktop through `GtkUriLauncher` (the OpenURI
     /// portal when sandboxed). The launch is asynchronous, so the GTK thread
-    /// never waits on a launcher process; `done` runs on the main loop with
-    /// the outcome while the window is alive, and not at all when the user
-    /// dismissed the chooser.
-    fn launch_external_uri(
-        &self,
-        uri: &str,
-        done: impl FnOnce(&Self, Result<(), String>) + 'static,
-    ) {
+    /// never waits on a launcher process; `done` runs once on the main loop
+    /// with the outcome, unless the window is gone by then.
+    fn launch_external_uri(&self, uri: &str, done: impl FnOnce(&Self, ExternalLaunch) + 'static) {
         let weak_window = self.downgrade();
         gtk::UriLauncher::new(uri).launch(Some(self), gio::Cancellable::NONE, move |result| {
-            if let (Some(window), Some(result)) =
-                (weak_window.upgrade(), external_launch_outcome(result))
-            {
-                done(&window, result);
+            if let Some(window) = weak_window.upgrade() {
+                done(&window, result.into());
             }
         });
     }
@@ -10034,7 +10065,7 @@ impl ConduitWindow {
     fn launch_external_file(
         &self,
         path: &Path,
-        done: impl FnOnce(&Self, Result<(), String>) + 'static,
+        done: impl FnOnce(&Self, ExternalLaunch) + 'static,
     ) {
         let weak_window = self.downgrade();
         let file = gio::File::for_path(path);
@@ -10042,10 +10073,8 @@ impl ConduitWindow {
             Some(self),
             gio::Cancellable::NONE,
             move |result| {
-                if let (Some(window), Some(result)) =
-                    (weak_window.upgrade(), external_launch_outcome(result))
-                {
-                    done(&window, result);
+                if let Some(window) = weak_window.upgrade() {
+                    done(&window, result.into());
                 }
             },
         );
