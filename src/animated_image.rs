@@ -151,9 +151,11 @@ impl AnimatedImage {
             Some(texture) => texture,
             None => {
                 let Some(texture) = self.render_current_frame() else {
+                    // A gap in the kept loop could never be filled.
+                    self.forget_loop();
                     return;
                 };
-                if index.is_some_and(|index| index == imp.loop_cache.borrow().len()) {
+                if index.is_some() {
                     self.keep_for_loop(&texture);
                 }
                 texture
