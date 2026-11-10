@@ -42,6 +42,7 @@ mod gnome_search_provider;
 mod http_client;
 mod huddles;
 mod image_header;
+mod image_metadata;
 mod image_proxy;
 mod message_handoff;
 mod message_markup;

@@ -323,12 +323,14 @@ pub(crate) fn player(
 /// Whether `path` should load as an animation, judged from its headers on
 /// the GTK thread without decoding: a GIF or WebP not known to be static.
 /// Headers that declare one frame are remembered as static, so the still
-/// path decodes the file once instead of twice.
+/// path decodes the file once instead of twice. The headers come from
+/// [`crate::image_metadata`], so a file is read once, not per row build.
 pub(crate) fn may_animate(path: &Path) -> bool {
     if is_known_static(path) || !may_be_animated(path) {
         return false;
     }
-    if crate::image_header::declared_frame_count(path) == Some(1) {
+    let frames = crate::image_metadata::metadata(path).and_then(|declared| declared.frames);
+    if frames == Some(1) {
         remember_static(path);
         return false;
     }
@@ -394,10 +396,10 @@ fn fit_down(width: i32, height: i32, max_side: i32) -> (i32, i32) {
 /// header, so static images skip a full animation decode. Our own parser
 /// knows GIF and WebP, the only animated formats gdk-pixbuf plays, so any
 /// other file is static: it never reaches gdk-pixbuf's glycin probe here, on
-/// the GTK thread, but in the worker that judges its decode budget.
+/// the GTK thread, but in the worker that judges its decode budget. Read
+/// through [`crate::image_metadata`], so once per file.
 pub(crate) fn may_be_animated(path: &Path) -> bool {
-    crate::image_header::declared_header(path)
-        .is_some_and(|(format, _, _)| format.may_be_animated())
+    crate::image_metadata::metadata(path).is_some_and(|declared| declared.format.may_be_animated())
 }
 
 /// Whether `path` decodes to at most [`MAX_DECODED_PIXELS`], judged from its

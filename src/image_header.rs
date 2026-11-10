@@ -138,6 +138,7 @@ fn webp(reader: &mut impl Read) -> Option<(u32, u32)> {
 /// decoder and decode once. A GIF stops counting at 2. `None` for other
 /// formats and for files too short or malformed to say; callers should then
 /// assume the file may be animated.
+#[cfg(test)]
 pub(crate) fn declared_frame_count(path: &Path) -> Option<u32> {
     frame_count(&mut BufReader::new(File::open(path).ok()?))
 }
