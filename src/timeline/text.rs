@@ -1,4 +1,8 @@
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::{glib, pango, Box, Button, Label, Orientation, TextView, Widget};
@@ -210,7 +214,7 @@ pub(crate) fn attach_label_links(
 /// Underlines link ranges in a TextView buffer and opens them on click.
 fn attach_text_view_links(
     view: &TextView,
-    links: Vec<MarkupLink>,
+    links: &[MarkupLink],
     context: &MessageRenderContext,
     on_action: Option<&ActionHandler>,
 ) {
@@ -219,7 +223,7 @@ fn attach_text_view_links(
     }
     let buffer = view.buffer();
     let mut hrefs = Vec::with_capacity(links.len());
-    for (index, link) in links.into_iter().enumerate() {
+    for (index, link) in links.iter().enumerate() {
         let name = format!("conduit-link-{index}");
         let tag = gtk::TextTag::builder()
             .name(name.as_str())
@@ -231,7 +235,7 @@ fn attach_text_view_links(
             &buffer.iter_at_offset(link.start),
             &buffer.iter_at_offset(link.end),
         );
-        hrefs.push((name, link.href));
+        hrefs.push((name, link.href.clone()));
     }
     let click = gtk::GestureClick::new();
     let context = context.clone();
@@ -287,12 +291,56 @@ fn attach_text_view_links(
     view.add_controller(click);
 }
 
+/// Pango markup ready to show, with what a `TextView` needs prepared up
+/// front when it holds inline custom emoji. Pure, so it is cached per text.
+#[derive(Debug)]
+pub(crate) struct TextMarkup {
+    pango: String,
+    inline: Option<InlineMarkup>,
+}
+
+/// Markup with the custom emoji replaced by U+FFFC and the links taken out,
+/// the emoji in order and the link ranges.
+#[derive(Debug)]
+struct InlineMarkup {
+    markup: String,
+    emojis: Vec<InlineCustomEmoji>,
+    links: Vec<MarkupLink>,
+}
+
+impl TextMarkup {
+    pub(crate) fn new(pango: String) -> Self {
+        let inline = pango.contains("<conduit-custom-emoji ").then(|| {
+            let (markup, emojis) = extract_custom_emojis_and_prepare_markup(&pango);
+            let (markup, links) = strip_anchor_tags(&markup);
+            InlineMarkup {
+                markup,
+                emojis,
+                links,
+            }
+        });
+        Self { pango, inline }
+    }
+}
+
 pub(crate) fn create_message_text_widget(
     pango: &str,
     context: &MessageRenderContext,
     on_action: Option<&ActionHandler>,
 ) -> Widget {
-    if !pango.contains("<conduit-custom-emoji ") {
+    text_markup_widget(&TextMarkup::new(pango.to_string()), context, on_action)
+}
+
+/// The widget showing `markup`: a selectable label, or a `TextView` when it
+/// holds inline custom emoji. A label cannot host the emoji pictures, and a
+/// row of labels and pictures would break wrapping and selection across
+/// them, so emoji keep the `TextView`.
+fn text_markup_widget(
+    markup: &TextMarkup,
+    context: &MessageRenderContext,
+    on_action: Option<&ActionHandler>,
+) -> Widget {
+    let Some(inline) = markup.inline.as_ref() else {
         let label = Label::new(None);
         label.set_wrap(true);
         label.set_wrap_mode(pango::WrapMode::WordChar);
@@ -301,13 +349,11 @@ pub(crate) fn create_message_text_widget(
         label.set_xalign(0.0);
         // libadwaita's document font (family, size, line height) for reading content.
         label.add_css_class("document");
-        label.set_markup(pango);
+        label.set_markup(&markup.pango);
         attach_label_links(&label, context, on_action);
         return label.upcast::<Widget>();
-    }
+    };
 
-    let (markup_clean, emojis) = extract_custom_emojis_and_prepare_markup(pango);
-    let (markup_clean, links) = strip_anchor_tags(&markup_clean);
     let view = TextView::new();
     view.set_editable(false);
     view.set_cursor_visible(false);
@@ -318,11 +364,11 @@ pub(crate) fn create_message_text_widget(
 
     let buffer = view.buffer();
     let mut iter = buffer.start_iter();
-    buffer.insert_markup(&mut iter, &markup_clean);
-    attach_text_view_links(&view, links, context, on_action);
+    buffer.insert_markup(&mut iter, &inline.markup);
+    attach_text_view_links(&view, &inline.links, context, on_action);
 
     let mut search_iter = buffer.start_iter();
-    for emoji in &emojis {
+    for emoji in &inline.emojis {
         if let Some((start_match, end_match)) =
             search_iter.forward_search("\u{FFFC}", gtk::TextSearchFlags::empty(), None)
         {
@@ -665,40 +711,239 @@ fn build_jumbo_emoji_row(names: &[String], context: &MessageRenderContext) -> Wi
     row.upcast()
 }
 
+/// One block of a message text, parsed and turned into markup: everything a
+/// row bind needs before it builds widgets.
+#[derive(Debug)]
+pub(crate) enum TextBlock {
+    /// An emoji-only message, shown large.
+    Jumbo(Vec<String>),
+    Code {
+        lang: Option<String>,
+        code: String,
+    },
+    Quote(TextMarkup),
+    Normal(TextMarkup),
+}
+
+/// Parses `text` into blocks and converts each to markup. Pure in `text`
+/// and the context fields [`MarkupStamp`] holds.
+fn text_blocks(text: &str, context: &MessageRenderContext) -> Vec<TextBlock> {
+    #[cfg(test)]
+    TEXT_BLOCK_BUILDS.with(|builds| builds.set(builds.get() + 1));
+    if let Some(names) = emoji_only_names(text, context) {
+        return vec![TextBlock::Jumbo(names)];
+    }
+    parse_text_segments(text)
+        .into_iter()
+        .filter_map(|segment| match segment {
+            TextSegment::CodeBlock { lang, code } => Some(TextBlock::Code { lang, code }),
+            TextSegment::Quote(quote_text) => {
+                let pango = crate::message_markup::mrkdwn_to_pango(&quote_text, context);
+                Some(TextBlock::Quote(TextMarkup::new(format!("<i>{pango}</i>"))))
+            }
+            TextSegment::Normal(normal_text) => (!normal_text.trim().is_empty()).then(|| {
+                TextBlock::Normal(TextMarkup::new(crate::message_markup::mrkdwn_to_pango(
+                    &normal_text,
+                    context,
+                )))
+            }),
+        })
+        .collect()
+}
+
+/// The context message markup reads: names, groups, channels, statuses and
+/// custom emoji. The window reuses each `Arc` until its source changes, so
+/// comparing pointers tells whether cached markup is still current.
+struct MarkupStamp {
+    user_names: Arc<HashMap<String, String>>,
+    user_full_names: Arc<HashMap<String, String>>,
+    user_avatar_urls: Arc<HashMap<String, String>>,
+    bot_user_ids: Arc<HashSet<String>>,
+    conversation_titles: Arc<HashMap<String, String>>,
+    private_conversation_ids: Arc<HashSet<String>>,
+    user_statuses: Arc<HashMap<String, crate::models::SlackUserStatus>>,
+    user_group_names: Arc<HashMap<String, String>>,
+    user_group_members: Arc<HashMap<String, Vec<String>>>,
+    custom_emojis: Arc<HashMap<String, String>>,
+    current_user_id: Option<String>,
+}
+
+impl MarkupStamp {
+    fn of(context: &MessageRenderContext) -> Self {
+        Self {
+            user_names: context.user_names.clone(),
+            user_full_names: context.user_full_names.clone(),
+            user_avatar_urls: context.user_avatar_urls.clone(),
+            bot_user_ids: context.bot_user_ids.clone(),
+            conversation_titles: context.conversation_titles.clone(),
+            private_conversation_ids: context.private_conversation_ids.clone(),
+            user_statuses: context.user_statuses.clone(),
+            user_group_names: context.user_group_names.clone(),
+            user_group_members: context.user_group_members.clone(),
+            custom_emojis: context.custom_emojis.clone(),
+            current_user_id: context.current_user_id.clone(),
+        }
+    }
+
+    fn matches(&self, context: &MessageRenderContext) -> bool {
+        Arc::ptr_eq(&self.user_names, &context.user_names)
+            && Arc::ptr_eq(&self.user_full_names, &context.user_full_names)
+            && Arc::ptr_eq(&self.user_avatar_urls, &context.user_avatar_urls)
+            && Arc::ptr_eq(&self.bot_user_ids, &context.bot_user_ids)
+            && Arc::ptr_eq(&self.conversation_titles, &context.conversation_titles)
+            && Arc::ptr_eq(
+                &self.private_conversation_ids,
+                &context.private_conversation_ids,
+            )
+            && Arc::ptr_eq(&self.user_statuses, &context.user_statuses)
+            && Arc::ptr_eq(&self.user_group_names, &context.user_group_names)
+            && Arc::ptr_eq(&self.user_group_members, &context.user_group_members)
+            && Arc::ptr_eq(&self.custom_emojis, &context.custom_emojis)
+            && self.current_user_id == context.current_user_id
+    }
+}
+
+/// Texts whose blocks are kept: a few screens of rows in both panes.
+const MAX_TEXT_MODELS: usize = 512;
+
+/// Recently rendered texts' blocks, for the context in `stamp`.
+#[derive(Default)]
+struct TextModelCache {
+    stamp: Option<MarkupStamp>,
+    /// Blocks and when each text was last used.
+    entries: HashMap<String, (Rc<[TextBlock]>, u64)>,
+    clock: u64,
+}
+
+impl TextModelCache {
+    fn blocks(&mut self, text: &str, context: &MessageRenderContext) -> Rc<[TextBlock]> {
+        if !self
+            .stamp
+            .as_ref()
+            .is_some_and(|stamp| stamp.matches(context))
+        {
+            self.entries.clear();
+            self.stamp = Some(MarkupStamp::of(context));
+        }
+        self.clock += 1;
+        if let Some((blocks, used)) = self.entries.get_mut(text) {
+            *used = self.clock;
+            return blocks.clone();
+        }
+        if self.entries.len() >= MAX_TEXT_MODELS {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(text, _)| text.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        let blocks: Rc<[TextBlock]> = text_blocks(text, context).into();
+        self.entries
+            .insert(text.to_string(), (blocks.clone(), self.clock));
+        blocks
+    }
+}
+
+thread_local! {
+    static TEXT_MODELS: RefCell<TextModelCache> = RefCell::default();
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Texts parsed into blocks on this thread.
+    pub(crate) static TEXT_BLOCK_BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The blocks of `text` under `context`, parsed once and reused while the
+/// context's markup inputs stay the same.
+pub(crate) fn cached_text_blocks(text: &str, context: &MessageRenderContext) -> Rc<[TextBlock]> {
+    TEXT_MODELS.with(|models| models.borrow_mut().blocks(text, context))
+}
+
 pub(crate) fn render_text_content(
     text: &str,
     target_box: &Box,
     context: &MessageRenderContext,
     on_action: Option<&ActionHandler>,
 ) {
-    if let Some(names) = emoji_only_names(text, context) {
-        target_box.append(&build_jumbo_emoji_row(&names, context));
-        return;
-    }
-    let segments = parse_text_segments(text);
-    for seg in segments {
-        match seg {
-            TextSegment::CodeBlock { lang, code } => {
-                let widget = build_code_block_widget(&code, lang.as_deref());
-                target_box.append(&widget);
+    for block in cached_text_blocks(text, context).iter() {
+        match block {
+            TextBlock::Jumbo(names) => target_box.append(&build_jumbo_emoji_row(names, context)),
+            TextBlock::Code { lang, code } => {
+                target_box.append(&build_code_block_widget(code, lang.as_deref()));
             }
-            TextSegment::Quote(quote_text) => {
+            TextBlock::Quote(markup) => {
                 register_timeline_css();
                 let quote_box = Box::new(Orientation::Vertical, 0);
                 quote_box.add_css_class("blockquote");
-                let pango = crate::message_markup::mrkdwn_to_pango(&quote_text, context);
-                let text_widget =
-                    create_message_text_widget(&format!("<i>{}</i>", pango), context, on_action);
-                quote_box.append(&text_widget);
+                quote_box.append(&text_markup_widget(markup, context, on_action));
                 target_box.append(&quote_box);
             }
-            TextSegment::Normal(normal_text) => {
-                if !normal_text.trim().is_empty() {
-                    let pango = crate::message_markup::mrkdwn_to_pango(&normal_text, context);
-                    let text_widget = create_message_text_widget(&pango, context, on_action);
-                    target_box.append(&text_widget);
-                }
+            TextBlock::Normal(markup) => {
+                target_box.append(&text_markup_widget(markup, context, on_action));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    fn builds() -> usize {
+        TEXT_BLOCK_BUILDS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn perf_guard_rebinding_a_message_parses_its_markup_once() {
+        let context = crate::timeline::tests::test_context();
+        let text = "hello *world* <https://example.com|link>\n> quoted\n```code```";
+        let before = builds();
+        let first = cached_text_blocks(text, &context);
+        for _ in 0..5 {
+            let again = cached_text_blocks(text, &context);
+            assert!(Rc::ptr_eq(&first, &again));
+        }
+        assert_eq!(builds() - before, 1, "only the first bind parses");
+        assert_eq!(first.len(), 3);
+    }
+
+    #[test]
+    fn markup_inputs_changing_parses_again() {
+        let mut context = crate::timeline::tests::test_context();
+        let text = "hi <@U1>";
+        let before = builds();
+        cached_text_blocks(text, &context);
+        // A per-render field is not a markup input.
+        context.last_read = Some("1.0".into());
+        cached_text_blocks(text, &context);
+        assert_eq!(builds() - before, 1);
+        let mut names = HashMap::new();
+        names.insert("U1".to_string(), "Ada".to_string());
+        context.user_names = Arc::new(names);
+        let blocks = cached_text_blocks(text, &context);
+        assert_eq!(builds() - before, 2, "new user names render again");
+        let TextBlock::Normal(markup) = &blocks[0] else {
+            panic!("a text block");
+        };
+        assert!(markup.pango.contains("Ada"));
+    }
+
+    #[test]
+    fn least_recently_used_texts_are_evicted() {
+        let context = crate::timeline::tests::test_context();
+        let mut cache = TextModelCache::default();
+        for index in 0..=MAX_TEXT_MODELS {
+            cache.blocks(&format!("text {index}"), &context);
+            // Keep the first text in use.
+            cache.blocks("text 0", &context);
+        }
+        assert_eq!(cache.entries.len(), MAX_TEXT_MODELS);
+        assert!(cache.entries.contains_key("text 0"));
+        assert!(!cache.entries.contains_key("text 1"));
     }
 }

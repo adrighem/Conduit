@@ -2689,6 +2689,92 @@ mod graphical {
     }
 
     #[test]
+    fn perf_guard_rebinding_a_row_parses_its_text_once() {
+        run_gtk_test(|| {
+            let mut message = SlackMessage {
+                ts: "1700000000.000200".to_string(),
+                text: Some("rebind *me* <https://example.com|please>".to_string()),
+                ..Default::default()
+            };
+            message.refresh_canonical_content();
+            let context = test_context();
+            let builds = || crate::timeline::text::TEXT_BLOCK_BUILDS.with(Cell::get);
+            let before = builds();
+            for _ in 0..3 {
+                build_timeline_message_widget(
+                    &message, &context, None, None, None, None, None, true,
+                );
+            }
+            assert_eq!(builds() - before, 1, "only the first bind parses the text");
+        });
+    }
+
+    #[test]
+    fn perf_guard_hovering_rows_retargets_the_quick_bar_without_rebuilding_it() {
+        run_gtk_test(|| {
+            use crate::timeline::quick_actions::{
+                show_quick_bar_for, QuickBarCache, QuickBarState, QUICK_BAR_BUILDS,
+            };
+            let quick_bar = Box::new(Orientation::Horizontal, 2);
+            let opened: Rc<RefCell<Vec<String>>> = Rc::default();
+            let on_action: ActionSlot = Rc::new(RefCell::new(None));
+            {
+                let opened = opened.clone();
+                *on_action.borrow_mut() = Some(Rc::new(move |action| {
+                    if let TimelineAction::OpenThread(ts) = action {
+                        opened.borrow_mut().push(ts);
+                    }
+                }));
+            }
+            let popover = Rc::new(RefCell::new(None));
+            let state = QuickBarState {
+                on_action: &on_action,
+                hover_generation: &Rc::new(Cell::new(0)),
+                hovered: &Rc::new(RefCell::new(None)),
+                current_popover: &popover,
+                bar_motion: &gtk::EventControllerMotion::new(),
+                can_mark_unread: true,
+            };
+            let mut context = test_context();
+            context.recent_reactions = vec!["tada".to_string()];
+            let cache = QuickBarCache::default();
+            let builds = || QUICK_BAR_BUILDS.with(Cell::get);
+            let before = builds();
+            for ts in ["1.000001", "1.000002", "1.000003"] {
+                show_quick_bar_for(&quick_bar, &cache, ts, &context, &state);
+            }
+            assert_eq!(builds() - before, 1, "hovering rows only retargets the bar");
+
+            let reply = quick_bar
+                .observe_children()
+                .into_iter()
+                .filter_map(|w| w.ok()?.downcast::<Button>().ok())
+                .find(|b| b.tooltip_text().as_deref() == Some("Reply in thread"))
+                .expect("reply button");
+            reply.emit_clicked();
+            assert_eq!(
+                *opened.borrow(),
+                ["1.000003"],
+                "buttons act on the hovered row"
+            );
+
+            context.recent_reactions = vec!["eyes".to_string()];
+            show_quick_bar_for(&quick_bar, &cache, "1.000001", &context, &state);
+            assert_eq!(builds() - before, 2, "new recent reactions rebuild the bar");
+            let with_unread = QuickBarState {
+                can_mark_unread: false,
+                ..state
+            };
+            show_quick_bar_for(&quick_bar, &cache, "1.000001", &context, &with_unread);
+            assert_eq!(
+                builds() - before,
+                3,
+                "the overflow menu's offer rebuilds it"
+            );
+        });
+    }
+
+    #[test]
     fn quick_bar_offers_mark_unread_in_overflow_menu_on_conversation_surfaces_only() {
         run_gtk_test(|| {
             let overflow_labels = |can_mark_unread: bool| {
