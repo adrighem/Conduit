@@ -563,3 +563,15 @@
 - PR:26 (release 0.9.0) merged; v0.9.0 published 2026-11-08 with the Activity feature (`69c3bb2`, `f0f652a`). Release and main CI pass.
 - Worktree clean, main in sync with origin.
 - No public GitHub action taken.
+
+## 2026-11-10 Maintainer Pass
+
+- Scope: main-thread responsiveness review and fixes, PR:46 merge, backlog shaping.
+- Review: four read-only reviewers over window, runtime and pipeline, store and sidebar, and timeline and images found no SQLite, network or JSON work on the GTK thread. The cost was per-event UI work that scaled with users, messages and rows.
+- PR:46 (squash merged as `c5751ac`): 11 fixes with `perf_guard_*` tests, `AGENTS.md` Performance rules and an agy architect review per feature. Async link launch and screenshot encode, compare-first user maps, shared message lists, per-frame patch and image batching, image header and miss memo (`src/image_metadata.rs`), looping animation replay, cached message text and quick bar, sidebar row reuse and cached member parsing, and the search highlight accent fix.
+- CI caught a real bug on the first push: gdk-pixbuf 2.44.5 (Ubuntu 26.04) reports no change when a GIF wraps to its first frame, so the player stuttered and dropped its replay cache. Reproduced in an `ubuntu:26.04` podman container and fixed in `animated_image.rs` (a new pixbuf after `advance` counts as a frame change). Lesson: GTK and gdk-pixbuf behaviour differs between the dev machine and CI, so reproduce in the CI image before changing tests.
+- Approved: new file `src/image_metadata.rs`, and two updated tests for the asset miss memo (`resolve_finds_asset_written_after_a_miss_without_waiting_for_ttl`, `resolve_custom_emoji_finds_a_file_written_after_a_miss`).
+- Backlog: ISSUE:47 (files of forwarded messages, from the dropped `wip/non-topic15` prototype, low priority), ISSUE:48 (reuse timeline row widgets across binds), ISSUE:49 (build sidebar row widgets once in setup), ISSUE:50 (share messages with rows instead of cloning in `build_store_items`), ISSUE:51 (merge queued workspace patches per frame).
+- Not measured: the gains are estimates. Compare `cargo run -- --debug` `scope="performance"` lines on the old and new builds.
+- GitHub status: 0 unread inbox notifications, 5 open issues (ISSUE:47 to ISSUE:51), PR:45 (release 0.10.0) open and not reviewed, main CI green.
+- Housekeeping: agent worktrees and branches, two stashes and scratch files removed; the WIP stash became `wip/non-topic15` and was then deleted after the issue was written (its commit was `5e1875e`).
