@@ -390,6 +390,23 @@ fn perf_guard_burst_of_thread_patches_schedules_one_threads_rebuild() {
 }
 
 #[test]
+fn perf_guard_timeline_renders_share_message_lists() {
+    // Renders take the shared list (`*_messages_shared`) instead of a deep
+    // copy of every message on each main or thread re-render.
+    let squashed = include_str!("../window.rs")
+        .split_whitespace()
+        .collect::<String>();
+    for copy in [
+        concat!("current_thread_messages()", ".to_vec()"),
+        concat!("channel_messages(channel_id)", ".to_vec()"),
+        concat!("channel_messages(&channel_id)", ".to_vec()"),
+        concat!("channel_messages(location.channel_id())", ".to_vec()"),
+    ] {
+        assert!(!squashed.contains(copy), "{copy} deep-copies a timeline");
+    }
+}
+
+#[test]
 fn perf_guard_timeline_renders_register_no_message_control_handles() {
     // Fresh per-render handle tokens made every render context differ, so
     // every re-render rebound every timeline row. Handles are registered on

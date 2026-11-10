@@ -102,10 +102,10 @@ use crate::workspace_pipeline::{TimelineTarget, WorkspaceRevision};
 use crate::workspace_state::{
     ChannelLookupOutcome, ConversationOpenCoordinator, ConversationOpenIntent,
     ConversationOpenPosition, ConversationOpenRenderAction, ConversationPatchRemoval,
-    ConversationSelectionDecision, MainMessageView, SidebarMode, ThreadApplyOutcome,
-    ThreadOpenOutcome, TimelineProjectionApplication, TimelineProjectionOperation,
-    WorkspaceLifecycle, WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState,
-    DISCOVERY_STARTUP_DELAY,
+    ConversationSelectionDecision, MainMessageView, SharedMessages, SidebarMode,
+    ThreadApplyOutcome, ThreadOpenOutcome, TimelineProjectionApplication,
+    TimelineProjectionOperation, WorkspaceLifecycle, WorkspaceLifecycleEvent,
+    WorkspaceScrollBehavior, WorkspaceSessionState, DISCOVERY_STARTUP_DELAY,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -738,8 +738,7 @@ mod imp {
                         .workspace
                         .view
                         .borrow()
-                        .channel_messages(test_channel_id)
-                        .to_vec();
+                        .channel_messages_shared(test_channel_id);
                     obj.populate_history(test_channel_id, messages);
                     if std::env::var_os("CONDUIT_TEST_THREAD_COMPOSER").is_some() {
                         let mut thread_messages = vec![
@@ -783,7 +782,7 @@ mod imp {
                         obj.populate_thread(
                             test_channel_id,
                             "1.0",
-                            thread_messages,
+                            Arc::new(thread_messages),
                             TimelineScrollBehavior::Preserve,
                         );
                     }
@@ -8046,8 +8045,7 @@ impl ConduitWindow {
                             .workspace
                             .view
                             .borrow()
-                            .channel_messages(&channel_id)
-                            .to_vec();
+                            .channel_messages_shared(&channel_id);
                         self.populate_history_with_scroll(
                             &channel_id,
                             rendered_messages,
@@ -8087,8 +8085,7 @@ impl ConduitWindow {
                             .workspace
                             .view
                             .borrow()
-                            .current_thread_messages()
-                            .to_vec();
+                            .current_thread_messages_shared();
                         self.request_user_names(&rendered_messages);
                         self.populate_thread(
                             &channel_id,
@@ -8131,8 +8128,7 @@ impl ConduitWindow {
                             .workspace
                             .view
                             .borrow()
-                            .current_thread_messages()
-                            .to_vec();
+                            .current_thread_messages_shared();
                         self.populate_thread(
                             location.channel_id(),
                             thread_ts,
@@ -8145,8 +8141,7 @@ impl ConduitWindow {
                             .workspace
                             .view
                             .borrow()
-                            .channel_messages(location.channel_id())
-                            .to_vec();
+                            .channel_messages_shared(location.channel_id());
                         self.populate_history_with_scroll(
                             location.channel_id(),
                             messages,
@@ -9646,8 +9641,7 @@ impl ConduitWindow {
                     .workspace
                     .view
                     .borrow()
-                    .current_thread_messages()
-                    .to_vec();
+                    .current_thread_messages_shared();
                 self.populate_thread(
                     channel_id,
                     ts,
@@ -9661,8 +9655,7 @@ impl ConduitWindow {
                     .workspace
                     .view
                     .borrow()
-                    .current_thread_messages()
-                    .to_vec();
+                    .current_thread_messages_shared();
                 self.populate_thread(
                     channel_id,
                     ts,
@@ -13448,8 +13441,7 @@ impl ConduitWindow {
             .workspace
             .view
             .borrow()
-            .channel_messages(channel_id)
-            .to_vec();
+            .channel_messages_shared(channel_id);
         let open_intent = ConversationOpenIntent::choose(explicit_message_ts);
         imp.conversation_opening
             .borrow_mut()
@@ -13512,7 +13504,7 @@ impl ConduitWindow {
         true
     }
 
-    fn populate_history(&self, channel_id: &str, messages: Vec<SlackMessage>) {
+    fn populate_history(&self, channel_id: &str, messages: SharedMessages) {
         self.populate_history_with_scroll(
             channel_id,
             messages,
@@ -13523,7 +13515,7 @@ impl ConduitWindow {
     fn populate_history_with_scroll(
         &self,
         channel_id: &str,
-        messages: Vec<SlackMessage>,
+        messages: SharedMessages,
         scroll_behavior: TimelineScrollBehavior,
     ) {
         let imp = self.imp();
@@ -13633,7 +13625,7 @@ impl ConduitWindow {
                 view.last_channel_id().map(|channel_id| {
                     (
                         channel_id.to_string(),
-                        view.channel_messages(channel_id).to_vec(),
+                        view.channel_messages_shared(channel_id),
                     )
                 })
             }
@@ -13650,7 +13642,7 @@ impl ConduitWindow {
         }
     }
 
-    fn queue_history_asset_followups(&self, channel_id: &str, messages: Vec<SlackMessage>) {
+    fn queue_history_asset_followups(&self, channel_id: &str, messages: SharedMessages) {
         let weak_window = self.downgrade();
         let channel_id = channel_id.to_string();
         glib::idle_add_local_once(move || {
@@ -13667,7 +13659,7 @@ impl ConduitWindow {
         &self,
         channel_id: &str,
         ts: &str,
-        messages: Vec<SlackMessage>,
+        messages: SharedMessages,
         scroll_behavior: TimelineScrollBehavior,
     ) {
         let imp = self.imp();
@@ -13985,7 +13977,7 @@ impl ConduitWindow {
             let messages = {
                 let view = self.imp().workspace.view.borrow();
                 (view.selected_thread_target() == Some((channel_id, thread_ts)))
-                    .then(|| view.current_thread_messages().to_vec())
+                    .then(|| view.current_thread_messages_shared())
             };
             if let Some(messages) = messages {
                 self.populate_thread(
@@ -15169,7 +15161,7 @@ impl ConduitWindow {
                     view.last_channel_id().map(|channel_id| {
                         (
                             channel_id.to_string(),
-                            view.channel_messages(channel_id).to_vec(),
+                            view.channel_messages_shared(channel_id),
                         )
                     })
                 };
@@ -15204,7 +15196,7 @@ impl ConduitWindow {
                     (
                         channel_id.to_string(),
                         thread_ts.to_string(),
-                        view.current_thread_messages().to_vec(),
+                        view.current_thread_messages_shared(),
                     )
                 })
         };

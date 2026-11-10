@@ -975,10 +975,15 @@ pub(crate) enum ThreadApplyOutcome {
     },
 }
 
+/// A timeline's message list, shared with renders so handing it to the
+/// timeline is a refcount bump, not a deep copy. Mutate through
+/// `Arc::make_mut` or replace it only when the list changed.
+pub(crate) type SharedMessages = Arc<Vec<SlackMessage>>;
+
 #[derive(Debug, Clone, Default)]
 struct ChannelHistoryState {
-    messages: Vec<SlackMessage>,
-    context_messages: Option<Vec<SlackMessage>>,
+    messages: SharedMessages,
+    context_messages: Option<SharedMessages>,
     next_cursor: Option<String>,
     loading: bool,
     loaded: bool,
@@ -1203,8 +1208,8 @@ impl ConversationOpenCoordinator {
 struct ThreadViewState {
     channel_id: String,
     ts: String,
-    messages: Vec<SlackMessage>,
-    context_messages: Option<Vec<SlackMessage>>,
+    messages: SharedMessages,
+    context_messages: Option<SharedMessages>,
     next_cursor: Option<String>,
     status: ThreadLoadStatus,
     focus_ts: Option<String>,
@@ -1223,7 +1228,7 @@ pub(crate) struct WorkspaceViewState {
     sidebar_mode: SidebarMode,
     last_channel_id: Option<String>,
     channels: HashMap<String, ChannelHistoryState>,
-    thread_timelines: HashMap<(String, String), Vec<SlackMessage>>,
+    thread_timelines: HashMap<(String, String), SharedMessages>,
     thread: Option<ThreadViewState>,
     search_results: Vec<SearchMatch>,
     files: Vec<SlackFile>,
@@ -1279,6 +1284,36 @@ impl WorkspaceViewState {
                     .context_messages
                     .as_deref()
                     .unwrap_or(&history.messages)
+                    .as_slice()
+            })
+            .unwrap_or_default()
+    }
+
+    /// [`Self::channel_messages`] as a shared handle, for a render that
+    /// must not hold the view borrow.
+    pub(crate) fn channel_messages_shared(&self, channel_id: &str) -> SharedMessages {
+        self.channels
+            .get(channel_id)
+            .map(|history| {
+                history
+                    .context_messages
+                    .as_ref()
+                    .unwrap_or(&history.messages)
+                    .clone()
+            })
+            .unwrap_or_default()
+    }
+
+    /// [`Self::current_thread_messages`] as a shared handle.
+    pub(crate) fn current_thread_messages_shared(&self) -> SharedMessages {
+        self.thread
+            .as_ref()
+            .map(|thread| {
+                thread
+                    .context_messages
+                    .as_ref()
+                    .unwrap_or(&thread.messages)
+                    .clone()
             })
             .unwrap_or_default()
     }
@@ -1298,6 +1333,7 @@ impl WorkspaceViewState {
                     .context_messages
                     .as_deref()
                     .unwrap_or(&thread.messages)
+                    .as_slice()
             })
             .unwrap_or_default()
     }
@@ -1552,13 +1588,13 @@ impl WorkspaceViewState {
         let visible = self.visible_channel_id() == Some(channel_id);
         let history = self.channels.entry(channel_id.to_string()).or_default();
         let was_loaded = history.loaded;
-        let previous_messages = history.messages.clone();
         let had_context = history.context_messages.is_some();
-        history.messages = if append_older {
+        let merged = if append_older {
             merge_channel_message_pages(&history.messages, &messages)
         } else {
             merge_channel_message_refresh(&history.messages, &messages)
         };
+        let messages_changed = replace_if_changed(&mut history.messages, merged);
         history.loaded = true;
         if !cached {
             history.next_cursor = usable_cursor(has_more, next_cursor);
@@ -1567,9 +1603,7 @@ impl WorkspaceViewState {
         }
 
         let render = visible
-            && (!was_loaded
-                || history.messages != previous_messages
-                || (had_context && !cached && !append_older));
+            && (!was_loaded || messages_changed || (had_context && !cached && !append_older));
         let notify_new_messages = visible && !cached && !append_older;
         let scroll = visible.then(|| self.take_channel_scroll(channel_id, append_older));
         HistoryApplyOutcome {
@@ -1733,7 +1767,7 @@ impl WorkspaceViewState {
             {
                 return false;
             }
-            thread.context_messages = Some(normalize_messages(messages));
+            thread.context_messages = Some(Arc::new(normalize_messages(messages)));
             thread.status = ThreadLoadStatus::Ready;
             return true;
         }
@@ -1747,7 +1781,7 @@ impl WorkspaceViewState {
         if history.focus_ts.as_deref() != Some(location.message_ts()) {
             return false;
         }
-        history.context_messages = Some(normalize_messages(messages));
+        history.context_messages = Some(Arc::new(normalize_messages(messages)));
         history.loading = false;
         true
     }
@@ -1881,13 +1915,13 @@ impl WorkspaceViewState {
         }
 
         let was_ready = thread.status == ThreadLoadStatus::Ready;
-        let previous_messages = thread.messages.clone();
         let had_context = thread.context_messages.is_some();
-        thread.messages = if append_older {
+        let merged = if append_older {
             merge_message_pages(&thread.messages, &messages)
         } else {
             merge_message_refresh(&thread.messages, &messages)
         };
+        let messages_changed = replace_if_changed(&mut thread.messages, merged);
         thread.status = ThreadLoadStatus::Ready;
         thread.context_messages = None;
         thread.next_cursor = usable_cursor(has_more, next_cursor);
@@ -1901,7 +1935,7 @@ impl WorkspaceViewState {
             } else {
                 WorkspaceScrollBehavior::StickToBottom
             },
-            render: !was_ready || had_context || thread.messages != previous_messages,
+            render: !was_ready || had_context || messages_changed,
         }
     }
 
@@ -1981,15 +2015,17 @@ impl WorkspaceViewState {
                     changes,
                     SlackMessage::belongs_in_channel_timeline,
                 );
-                let base_changed = apply_projection_message_changes(
-                    &mut history.messages,
-                    changes,
-                    SlackMessage::belongs_in_channel_timeline,
-                );
-                let context_changed = history
-                    .context_messages
-                    .as_mut()
-                    .is_some_and(|messages| apply_context_message_changes(messages, changes));
+                // `operations` lists every effective change, so an empty list
+                // leaves the shared list untouched (no copy-on-write).
+                let base_changed = !operations.is_empty()
+                    && apply_projection_message_changes(
+                        Arc::make_mut(&mut history.messages),
+                        changes,
+                        SlackMessage::belongs_in_channel_timeline,
+                    );
+                let context_changed = history.context_messages.as_mut().is_some_and(|messages| {
+                    apply_context_message_changes(Arc::make_mut(messages), changes)
+                });
                 if base_changed {
                     history.loaded = true;
                 }
@@ -2006,9 +2042,12 @@ impl WorkspaceViewState {
                     let operations = timeline_projection_operations(messages, changes, |message| {
                         message.belongs_to_thread(thread_ts)
                     });
-                    let changed = apply_projection_message_changes(messages, changes, |message| {
-                        message.belongs_to_thread(thread_ts)
-                    });
+                    let changed = !operations.is_empty()
+                        && apply_projection_message_changes(
+                            Arc::make_mut(messages),
+                            changes,
+                            |message| message.belongs_to_thread(thread_ts),
+                        );
                     (changed, changed.then(|| messages.clone()), operations)
                 };
                 let active_changed = self
@@ -2016,13 +2055,13 @@ impl WorkspaceViewState {
                     .as_mut()
                     .filter(|thread| thread.channel_id == *channel_id && thread.ts == *thread_ts)
                     .is_some_and(|thread| {
-                        if let Some(messages) = projected_messages.as_ref() {
-                            thread.messages.clone_from(messages);
+                        if let Some(messages) = projected_messages {
+                            thread.messages = messages;
                         }
-                        let context_changed = thread
-                            .context_messages
-                            .as_mut()
-                            .is_some_and(|context| apply_context_message_changes(context, changes));
+                        let context_changed =
+                            thread.context_messages.as_mut().is_some_and(|context| {
+                                apply_context_message_changes(Arc::make_mut(context), changes)
+                            });
                         base_changed || context_changed
                     });
                 (base_changed || active_changed, active_changed, operations)
@@ -2308,6 +2347,17 @@ fn apply_context_message_changes(
         }
     }
     changed
+}
+
+/// Stores `merged` only when it differs, so an unchanged reload keeps the
+/// shared list (and renders holding it) and reports no change without
+/// cloning the previous list to compare.
+fn replace_if_changed(messages: &mut SharedMessages, merged: Vec<SlackMessage>) -> bool {
+    if **messages == merged {
+        return false;
+    }
+    *messages = Arc::new(merged);
+    true
 }
 
 fn normalize_messages(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
@@ -3924,6 +3974,43 @@ mod tests {
         assert!(!state.apply_message_context(&location, vec![message("2", "stale")]));
         assert_eq!(state.visible_channel_id(), Some("C2"));
         assert_eq!(state.channels["C1"].messages[0].body_text(), "latest");
+    }
+
+    #[test]
+    fn perf_guard_message_lists_are_shared_not_deep_copied() {
+        // Every timeline render deep-copied the channel or thread list to
+        // release the view borrow, and every history or thread reload cloned
+        // the previous list just to compare it after the merge. Lists are
+        // shared `Arc`s now: renders bump a refcount and an unchanged reload
+        // or no-op realtime change keeps the very same list.
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        let page = vec![message("2", "two"), message("1", "one")];
+        assert!(apply_fresh(&mut state, "C1", page.clone()).render);
+        let rendered = state.channel_messages_shared("C1");
+        assert!(Arc::ptr_eq(&rendered, &state.channel_messages_shared("C1")));
+
+        assert!(!apply_fresh(&mut state, "C1", page).render);
+        assert!(Arc::ptr_eq(&rendered, &state.channel_messages_shared("C1")));
+
+        let same = MessageChange::Upsert(Box::new(rendered[0].clone()));
+        assert!(state
+            .apply_timeline_changes(&TimelineTarget::Channel("C1".into()), &[same])
+            .is_none());
+        assert!(Arc::ptr_eq(&rendered, &state.channel_messages_shared("C1")));
+
+        state.open_thread("C1", "1");
+        let replies = vec![message("1", "root"), message("1.5", "reply")];
+        state.apply_thread("C1", "1", replies.clone(), false, None, false);
+        let thread = state.current_thread_messages_shared();
+        assert!(matches!(
+            state.apply_thread("C1", "1", replies, false, None, false),
+            ThreadApplyOutcome::Applied { render: false, .. }
+        ));
+        assert!(Arc::ptr_eq(
+            &thread,
+            &state.current_thread_messages_shared()
+        ));
     }
 
     #[test]
