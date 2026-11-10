@@ -287,6 +287,87 @@ impl UserDirectoryState {
         self.pending_user_ids.borrow_mut().clear();
     }
 
+    /// Projects `users` into the shared name, avatar, bot, alias and status
+    /// maps and returns the ids whose projected values changed.
+    ///
+    /// `reset` treats `users` as the whole directory, dropping users absent
+    /// from it; otherwise it merges them. A shared map is replaced or
+    /// copy-on-write mutated only when a value differs, so a no-op update
+    /// keeps every `Arc` (and every cache keyed on its pointer) intact.
+    pub(crate) fn apply_user_projection<'a>(
+        &self,
+        users: impl IntoIterator<Item = &'a SlackUser>,
+        reset: bool,
+    ) -> HashSet<String> {
+        let mut edits = UserProjectionEdits::default();
+        for user in users {
+            edits.add(user);
+        }
+        let mut changed = HashSet::new();
+        if reset {
+            replace_shared_map(&self.user_names, edits.names, &mut changed);
+            replace_shared_map(&self.user_full_names, edits.full_names, &mut changed);
+            replace_shared_map(&self.user_avatar_urls, edits.avatar_urls, &mut changed);
+            replace_shared_map(&self.user_statuses, edits.statuses, &mut changed);
+            let bots = edits
+                .bot_flags
+                .into_iter()
+                .filter_map(|(user_id, is_bot)| is_bot.then_some(user_id))
+                .collect::<HashSet<_>>();
+            if *self.bot_user_ids.borrow().as_ref() != bots {
+                changed.extend(
+                    self.bot_user_ids
+                        .borrow()
+                        .symmetric_difference(&bots)
+                        .cloned(),
+                );
+                *self.bot_user_ids.borrow_mut() = Arc::new(bots);
+            }
+            let mut aliases = self.user_search_aliases.borrow_mut();
+            changed.extend(changed_keys(&aliases, &edits.aliases));
+            *aliases = edits.aliases;
+        } else {
+            merge_shared_map(&self.user_names, edits.names, &mut changed);
+            merge_shared_map(&self.user_full_names, edits.full_names, &mut changed);
+            merge_shared_map(&self.user_avatar_urls, edits.avatar_urls, &mut changed);
+            let mut statuses = edits
+                .statuses
+                .into_iter()
+                .map(|(user_id, status)| (user_id, Some(status)))
+                .collect::<Vec<_>>();
+            statuses.extend(edits.cleared_statuses.into_iter().map(|id| (id, None)));
+            edit_shared_map(&self.user_statuses, statuses, &mut changed);
+            let bot_edits = {
+                let bots = self.bot_user_ids.borrow();
+                edits
+                    .bot_flags
+                    .into_iter()
+                    .filter(|(user_id, is_bot)| bots.contains(user_id) != *is_bot)
+                    .collect::<Vec<_>>()
+            };
+            if !bot_edits.is_empty() {
+                let mut bots = self.bot_user_ids.borrow_mut();
+                let bots = Arc::make_mut(&mut bots);
+                for (user_id, is_bot) in bot_edits {
+                    if is_bot {
+                        bots.insert(user_id.clone());
+                    } else {
+                        bots.remove(&user_id);
+                    }
+                    changed.insert(user_id);
+                }
+            }
+            let mut aliases = self.user_search_aliases.borrow_mut();
+            for (user_id, user_aliases) in edits.aliases {
+                if aliases.get(&user_id) != Some(&user_aliases) {
+                    changed.insert(user_id.clone());
+                    aliases.insert(user_id, user_aliases);
+                }
+            }
+        }
+        changed
+    }
+
     /// Replaces the user-group directory and the label and member
     /// projections that message rendering derives from it.
     pub(crate) fn apply_user_groups(&self, groups: Vec<SlackUserGroup>) {
@@ -319,6 +400,123 @@ impl UserDirectoryState {
         self.user_search_aliases.borrow_mut().clear();
         *self.user_statuses.borrow_mut() = Arc::default();
         affected_user_ids
+    }
+}
+
+/// The directory values projected from a batch of users, before they are
+/// compared against the shared maps.
+#[derive(Default)]
+struct UserProjectionEdits {
+    names: HashMap<String, String>,
+    full_names: HashMap<String, String>,
+    avatar_urls: HashMap<String, String>,
+    bot_flags: Vec<(String, bool)>,
+    aliases: UserSearchAliases,
+    statuses: UserStatuses,
+    cleared_statuses: Vec<String>,
+}
+
+impl UserProjectionEdits {
+    fn add(&mut self, user: &SlackUser) {
+        let Some(user_id) = user.id.clone() else {
+            return;
+        };
+        self.bot_flags
+            .push((user_id.clone(), user.is_bot.unwrap_or(false)));
+        if let Some(name) = user.display_name() {
+            self.names.insert(user_id.clone(), name);
+        }
+        if let Some(full_name) = user.full_name() {
+            self.full_names.insert(user_id.clone(), full_name);
+        }
+        if let Some(avatar_url) = user.avatar_url() {
+            self.avatar_urls.insert(user_id.clone(), avatar_url);
+        }
+        let user_aliases = user.search_aliases();
+        if !user_aliases.is_empty() {
+            self.aliases.insert(user_id.clone(), user_aliases);
+        }
+        if let Some(status) = user.status() {
+            self.statuses.insert(user_id, status);
+        } else if user
+            .profile
+            .as_ref()
+            .is_some_and(|profile| profile.contains_status_fields())
+        {
+            self.cleared_statuses.push(user_id);
+        }
+    }
+}
+
+/// Keys present in only one of the maps or mapped to different values.
+fn changed_keys<V: PartialEq>(
+    current: &HashMap<String, V>,
+    next: &HashMap<String, V>,
+) -> Vec<String> {
+    let mut changed = next
+        .iter()
+        .filter(|(key, value)| current.get(*key) != Some(*value))
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    changed.extend(
+        current
+            .keys()
+            .filter(|key| !next.contains_key(*key))
+            .cloned(),
+    );
+    changed
+}
+
+/// Swaps in `next` only when it differs from the shared map.
+fn replace_shared_map<V: PartialEq>(
+    shared: &RefCell<Arc<HashMap<String, V>>>,
+    next: HashMap<String, V>,
+    changed: &mut HashSet<String>,
+) {
+    let differing = changed_keys(&shared.borrow(), &next);
+    if !differing.is_empty() {
+        changed.extend(differing);
+        *shared.borrow_mut() = Arc::new(next);
+    }
+}
+
+fn merge_shared_map<V: PartialEq + Clone>(
+    shared: &RefCell<Arc<HashMap<String, V>>>,
+    updates: HashMap<String, V>,
+    changed: &mut HashSet<String>,
+) {
+    let edits = updates
+        .into_iter()
+        .map(|(key, value)| (key, Some(value)))
+        .collect();
+    edit_shared_map(shared, edits, changed);
+}
+
+/// Applies inserts (`Some`) and removals (`None`), copy-on-write mutating
+/// the shared map only when at least one edit changes it.
+fn edit_shared_map<V: PartialEq + Clone>(
+    shared: &RefCell<Arc<HashMap<String, V>>>,
+    edits: Vec<(String, Option<V>)>,
+    changed: &mut HashSet<String>,
+) {
+    let edits = {
+        let current = shared.borrow();
+        edits
+            .into_iter()
+            .filter(|(key, value)| current.get(key) != value.as_ref())
+            .collect::<Vec<_>>()
+    };
+    if edits.is_empty() {
+        return;
+    }
+    let mut shared = shared.borrow_mut();
+    let map = Arc::make_mut(&mut shared);
+    for (key, value) in edits {
+        match value {
+            Some(value) => map.insert(key.clone(), value),
+            None => map.remove(&key),
+        };
+        changed.insert(key);
     }
 }
 
@@ -627,11 +825,11 @@ impl WorkspaceSessionState {
 }
 
 fn replace_patch_users(
-    users: &mut HashMap<String, SlackUser>,
+    users: &mut crate::search::StampedRefMut<'_, HashMap<String, SlackUser>>,
     updated: &[SlackUser],
     application: &mut WorkspacePatchApplication,
 ) {
-    users.clear();
+    let mut next = HashMap::with_capacity(updated.len());
     for user in updated {
         let Some(user_id) = user
             .id
@@ -641,11 +839,18 @@ fn replace_patch_users(
         else {
             continue;
         };
-        users.insert(user_id.to_string(), user.clone());
+        next.insert(user_id.to_string(), user.clone());
     }
+    // Report only users that were added, removed or changed: a reconnect
+    // that re-sends the same directory must not invalidate every user.
+    let mut changed = changed_keys(&**users, &next);
+    if changed.is_empty() {
+        return;
+    }
+    **users = next;
+    changed.sort();
     application.users_reset = true;
-    application.changed_user_ids = users.keys().cloned().collect();
-    application.changed_user_ids.sort();
+    application.changed_user_ids = changed;
 }
 
 fn replace_patch_conversations(
@@ -2572,6 +2777,122 @@ mod tests {
         assert!(session.threads.borrow().clone().into_records().is_empty());
     }
 
+    fn projected_user(id: &str, name: &str) -> SlackUser {
+        SlackUser {
+            id: Some(id.into()),
+            name: Some(name.into()),
+            profile: Some(crate::models::SlackUserProfile {
+                image_72: Some(format!("https://avatars.example/{id}.png")),
+                status_text: Some("Focus".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn identical_users_reset_reports_no_change() {
+        let session = WorkspaceSessionState::default();
+        let users = vec![projected_user("U1", "ada"), projected_user("U2", "bob")];
+        let revision = WorkspaceRevision::INITIAL.successor();
+        let first = session
+            .apply_workspace_patch(&conversation_patch(
+                revision,
+                WorkspaceChange::UsersReset(users.clone()),
+            ))
+            .unwrap();
+        assert_eq!(first.changed_user_ids(), &["U1", "U2"]);
+        let stamp = session.users.stamp();
+
+        let mut renamed = users.clone();
+        renamed[1].name = Some("robert".into());
+        let again = session
+            .apply_workspace_patch(&conversation_patch(
+                revision.successor(),
+                WorkspaceChange::UsersReset(users),
+            ))
+            .unwrap();
+        assert!(!again.users_reset());
+        assert!(again.changed_user_ids().is_empty());
+        assert_eq!(
+            session.users.stamp(),
+            stamp,
+            "a no-op reset must not restamp"
+        );
+
+        let changed = session
+            .apply_workspace_patch(&conversation_patch(
+                revision.successor().successor(),
+                WorkspaceChange::UsersReset(renamed),
+            ))
+            .unwrap();
+        assert!(changed.users_reset());
+        assert_eq!(changed.changed_user_ids(), &["U2"]);
+    }
+
+    #[test]
+    fn user_projection_reports_only_changed_users_and_drops_removed_ones() {
+        let directory = UserDirectoryState::default();
+        let ada = projected_user("U1", "ada");
+        let bob = projected_user("U2", "bob");
+        let mut changed = directory.apply_user_projection([&ada, &bob], true);
+        let mut changed_ids = changed.drain().collect::<Vec<_>>();
+        changed_ids.sort();
+        assert_eq!(changed_ids, ["U1", "U2"]);
+        assert_eq!(
+            directory.user_names.borrow().get("U1").map(String::as_str),
+            Some("ada")
+        );
+        assert!(directory.user_statuses.borrow().contains_key("U2"));
+
+        let mut cleared = bob.clone();
+        cleared.profile.as_mut().unwrap().status_text = Some(String::new());
+        assert_eq!(
+            directory.apply_user_projection([&cleared], false),
+            HashSet::from(["U2".to_string()])
+        );
+        assert!(!directory.user_statuses.borrow().contains_key("U2"));
+
+        assert_eq!(
+            directory.apply_user_projection([&ada], true),
+            HashSet::from(["U2".to_string()])
+        );
+        assert!(!directory.user_names.borrow().contains_key("U2"));
+        assert!(!directory.user_search_aliases.borrow().contains_key("U2"));
+    }
+
+    #[test]
+    fn perf_guard_no_op_user_updates_copy_no_shared_user_maps() {
+        // Timeline render contexts and the conversation titles cache hold
+        // clones of these `Arc`s, so an unconditional `Arc::make_mut` deep
+        // copied every map and invalidated every pointer-keyed cache.
+        let directory = UserDirectoryState::default();
+        let users = (0..50)
+            .map(|index| projected_user(&format!("U{index}"), &format!("user{index}")))
+            .collect::<Vec<_>>();
+        directory.apply_user_projection(&users, true);
+        let held = (
+            directory.user_names.borrow().clone(),
+            directory.user_full_names.borrow().clone(),
+            directory.user_avatar_urls.borrow().clone(),
+            directory.bot_user_ids.borrow().clone(),
+            directory.user_statuses.borrow().clone(),
+        );
+
+        for _ in 0..20 {
+            assert!(directory
+                .apply_user_projection(&users[..3], false)
+                .is_empty());
+        }
+        assert!(directory.apply_user_projection(&users, true).is_empty());
+
+        assert!(Arc::ptr_eq(&held.0, &directory.user_names.borrow()));
+        assert!(Arc::ptr_eq(&held.1, &directory.user_full_names.borrow()));
+        assert!(Arc::ptr_eq(&held.2, &directory.user_avatar_urls.borrow()));
+        assert!(Arc::ptr_eq(&held.3, &directory.bot_user_ids.borrow()));
+        assert!(Arc::ptr_eq(&held.4, &directory.user_statuses.borrow()));
+    }
+
     #[test]
     fn workspace_patch_alone_hydrates_updates_and_clears_users() {
         let session = WorkspaceSessionState::default();
@@ -2622,7 +2943,7 @@ mod tests {
             ))
             .unwrap();
         assert!(cleared.users_reset());
-        assert!(cleared.changed_user_ids().is_empty());
+        assert_eq!(cleared.changed_user_ids(), &["U1"]);
         assert!(session.users.borrow().is_empty());
     }
 

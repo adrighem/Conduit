@@ -11177,92 +11177,26 @@ impl ConduitWindow {
     }
 
     fn sync_workspace_user_projection(&self, reset: bool, changed_user_ids: &[String]) {
-        let users = self.imp().workspace.users.borrow();
-        let selected = if reset {
-            users.values().cloned().collect::<Vec<_>>()
-        } else {
-            changed_user_ids
-                .iter()
-                .filter_map(|user_id| users.get(user_id).cloned())
-                .collect::<Vec<_>>()
-        };
-        drop(users);
-
+        let imp = self.imp();
+        let directory = &imp.workspace.user_directory;
         let mut affected_user_ids = changed_user_ids.iter().cloned().collect::<HashSet<_>>();
-        if reset {
-            affected_user_ids.extend(self.imp().workspace.user_directory.reset_projections());
-        }
-
-        let mut names = HashMap::new();
-        let mut full_names = HashMap::new();
-        let mut avatar_urls = HashMap::new();
-        let mut bot_flags = Vec::new();
-        let mut aliases = HashMap::new();
-        let mut statuses = HashMap::new();
-        let mut cleared_statuses = Vec::new();
-        for user in selected {
-            let Some(user_id) = user.id.clone() else {
-                continue;
-            };
-            affected_user_ids.insert(user_id.clone());
-            bot_flags.push((user_id.clone(), user.is_bot.unwrap_or(false)));
-            if let Some(name) = user.display_name() {
-                names.insert(user_id.clone(), name);
-            }
-            if let Some(full_name) = user.full_name() {
-                full_names.insert(user_id.clone(), full_name);
-            }
-            if let Some(avatar_url) = user.avatar_url() {
-                avatar_urls.insert(user_id.clone(), avatar_url);
-            }
-            let user_aliases = user.search_aliases();
-            if !user_aliases.is_empty() {
-                aliases.insert(user_id.clone(), user_aliases);
-            }
-            if let Some(status) = user.status() {
-                statuses.insert(user_id, status);
-            } else if user
-                .profile
-                .as_ref()
-                .is_some_and(|profile| profile.contains_status_fields())
-            {
-                cleared_statuses.push(user_id);
-            }
-        }
-
         {
-            let imp = self.imp();
-            Arc::make_mut(&mut imp.workspace.user_directory.user_names.borrow_mut()).extend(names);
-            Arc::make_mut(&mut imp.workspace.user_directory.user_full_names.borrow_mut())
-                .extend(full_names);
-            Arc::make_mut(&mut imp.workspace.user_directory.user_avatar_urls.borrow_mut())
-                .extend(avatar_urls);
-            {
-                let mut bot_user_ids = imp.workspace.user_directory.bot_user_ids.borrow_mut();
-                let bot_user_ids = Arc::make_mut(&mut bot_user_ids);
-                for (user_id, is_bot) in bot_flags {
-                    if is_bot {
-                        bot_user_ids.insert(user_id);
-                    } else {
-                        bot_user_ids.remove(&user_id);
-                    }
-                }
-            }
-            imp.workspace
-                .user_directory
-                .user_search_aliases
-                .borrow_mut()
-                .extend(aliases);
-            let mut known_statuses = imp.workspace.user_directory.user_statuses.borrow_mut();
-            let known_statuses = Arc::make_mut(&mut known_statuses);
-            known_statuses.extend(statuses);
-            for user_id in cleared_statuses {
-                known_statuses.remove(&user_id);
-            }
-            let mut pending = imp.workspace.user_directory.pending_user_ids.borrow_mut();
-            for user_id in &affected_user_ids {
-                pending.remove(user_id);
-            }
+            let users = imp.workspace.users.borrow();
+            let projected = if reset {
+                directory.apply_user_projection(users.values(), true)
+            } else {
+                directory.apply_user_projection(
+                    changed_user_ids
+                        .iter()
+                        .filter_map(|user_id| users.get(user_id)),
+                    false,
+                )
+            };
+            affected_user_ids.extend(projected);
+            let mut pending = directory.pending_user_ids.borrow_mut();
+            pending.retain(|user_id| {
+                !affected_user_ids.contains(user_id) && !(reset && users.contains_key(user_id))
+            });
         }
         // Expiry scheduling reads the status map, so all projection borrows must be released first.
         self.schedule_status_expiry();
