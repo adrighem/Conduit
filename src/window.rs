@@ -11289,37 +11289,41 @@ impl ConduitWindow {
     fn sync_workspace_user_projection(&self, reset: bool, changed_user_ids: &[String]) {
         let imp = self.imp();
         let directory = &imp.workspace.user_directory;
-        let mut affected_user_ids = changed_user_ids.iter().cloned().collect::<HashSet<_>>();
-        {
+        // `changed_user_ids` are exactly the added, changed or (on a reset)
+        // removed users, so the projection work scales with the change, not
+        // with the directory. A reset replaces values a user lacks.
+        let affected_user_ids = {
             let users = imp.workspace.users.borrow();
-            let projected = if reset {
-                directory.apply_user_projection(users.values(), true)
-            } else {
-                directory.apply_user_projection(
-                    changed_user_ids
-                        .iter()
-                        .filter_map(|user_id| users.get(user_id)),
-                    false,
-                )
-            };
-            affected_user_ids.extend(projected);
+            let (present, removed): (Vec<_>, Vec<_>) = changed_user_ids
+                .iter()
+                .partition(|user_id| users.contains_key(*user_id));
+            let mut affected =
+                directory.project_users(present.iter().filter_map(|id| users.get(*id)), reset);
+            if reset {
+                let removed = removed.into_iter().cloned().collect::<Vec<_>>();
+                affected.extend(directory.remove_users(&removed));
+            }
             let mut pending = directory.pending_user_ids.borrow_mut();
-            pending.retain(|user_id| {
-                !affected_user_ids.contains(user_id) && !(reset && users.contains_key(user_id))
-            });
-        }
+            for user_id in changed_user_ids {
+                pending.remove(user_id);
+            }
+            affected
+        };
         // Expiry scheduling reads the status map, so all projection borrows must be released first.
         self.schedule_status_expiry();
-
-        for target in COMPOSER_TARGETS {
-            self.refresh_composer_mention_names(target);
-        }
-        self.invalidate_composer_completions();
-        let mut affected_user_ids = affected_user_ids.into_iter().collect::<Vec<_>>();
-        affected_user_ids.sort();
-        self.patch_users_on_timelines(&affected_user_ids);
         self.update_huddle_surface();
-        self.queue_user_projection_invalidations(&affected_user_ids);
+        if !affected_user_ids.is_empty() {
+            // Only projected values (names, avatars, statuses, bots) reach
+            // the composer and the timelines; other profile changes do not.
+            for target in COMPOSER_TARGETS {
+                self.refresh_composer_mention_names(target);
+            }
+            self.invalidate_composer_completions();
+            let mut affected_user_ids = affected_user_ids.into_iter().collect::<Vec<_>>();
+            affected_user_ids.sort();
+            self.patch_users_on_timelines(&affected_user_ids);
+            self.queue_user_projection_invalidations(&affected_user_ids);
+        }
         self.flush_pending_message_notifications();
     }
 
@@ -11604,23 +11608,24 @@ impl ConduitWindow {
         }
 
         let changed_user_ids = {
-            let imp = self.imp();
-            let mut known_user_names = imp.workspace.user_directory.user_names.borrow_mut();
-            let known_user_names = Arc::make_mut(&mut known_user_names);
-            let mut pending_user_ids = imp.workspace.user_directory.pending_user_ids.borrow_mut();
-            let mut changed_user_ids = Vec::new();
-
-            for (user_id, display_name) in user_names {
-                if user_id.trim().is_empty() || display_name.trim().is_empty() {
-                    continue;
-                }
-                pending_user_ids.remove(&user_id);
-                if known_user_names.get(&user_id) != Some(&display_name) {
-                    known_user_names.insert(user_id.clone(), display_name);
-                    changed_user_ids.push(user_id);
+            let directory = &self.imp().workspace.user_directory;
+            let user_names = user_names
+                .into_iter()
+                .filter(|(user_id, display_name)| {
+                    !user_id.trim().is_empty() && !display_name.trim().is_empty()
+                })
+                .collect::<Vec<_>>();
+            {
+                let mut pending_user_ids = directory.pending_user_ids.borrow_mut();
+                for (user_id, _) in &user_names {
+                    pending_user_ids.remove(user_id);
                 }
             }
-
+            let mut changed_user_ids = directory
+                .merge_user_names(user_names)
+                .into_iter()
+                .collect::<Vec<_>>();
+            changed_user_ids.sort();
             changed_user_ids
         };
 

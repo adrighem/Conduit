@@ -290,81 +290,82 @@ impl UserDirectoryState {
     /// Projects `users` into the shared name, avatar, bot, alias and status
     /// maps and returns the ids whose projected values changed.
     ///
-    /// `reset` treats `users` as the whole directory, dropping users absent
-    /// from it; otherwise it merges them. A shared map is replaced or
-    /// copy-on-write mutated only when a value differs, so a no-op update
-    /// keeps every `Arc` (and every cache keyed on its pointer) intact.
-    pub(crate) fn apply_user_projection<'a>(
+    /// With `replace`, a value a user lacks (no name, avatar, aliases or
+    /// status) removes the stored one, as a directory reload should;
+    /// without it, a partial update keeps what is stored. A shared map is
+    /// copy-on-write mutated only when a value differs, so unchanged users
+    /// never copy a map and keep every `Arc` (and every cache keyed on its
+    /// pointer) intact. The cost is proportional to `users`, not to the
+    /// directory.
+    pub(crate) fn project_users<'a>(
         &self,
         users: impl IntoIterator<Item = &'a SlackUser>,
-        reset: bool,
+        replace: bool,
     ) -> HashSet<String> {
         let mut edits = UserProjectionEdits::default();
         for user in users {
-            edits.add(user);
+            edits.add(user, replace);
         }
+        self.apply_projection_edits(edits)
+    }
+
+    /// Drops `user_ids` from every projection and returns those that had a
+    /// projected value.
+    pub(crate) fn remove_users(&self, user_ids: &[String]) -> HashSet<String> {
+        let mut edits = UserProjectionEdits::default();
+        for user_id in user_ids {
+            edits.remove(user_id);
+        }
+        self.apply_projection_edits(edits)
+    }
+
+    /// Records `user_names` (from a lookup) without copying the shared name
+    /// map when every name is already known; returns the changed ids.
+    pub(crate) fn merge_user_names(
+        &self,
+        user_names: impl IntoIterator<Item = (String, String)>,
+    ) -> HashSet<String> {
         let mut changed = HashSet::new();
-        if reset {
-            replace_shared_map(&self.user_names, edits.names, &mut changed);
-            replace_shared_map(&self.user_full_names, edits.full_names, &mut changed);
-            replace_shared_map(&self.user_avatar_urls, edits.avatar_urls, &mut changed);
-            replace_shared_map(&self.user_statuses, edits.statuses, &mut changed);
-            let bots = edits
-                .bot_flags
+        let edits = user_names
+            .into_iter()
+            .map(|(user_id, name)| (user_id, Some(name)))
+            .collect();
+        edit_shared_map(&self.user_names, edits, &mut changed);
+        changed
+    }
+
+    fn apply_projection_edits(&self, edits: UserProjectionEdits) -> HashSet<String> {
+        let mut changed = HashSet::new();
+        edit_shared_map(&self.user_names, edits.names, &mut changed);
+        edit_shared_map(&self.user_full_names, edits.full_names, &mut changed);
+        edit_shared_map(&self.user_avatar_urls, edits.avatar_urls, &mut changed);
+        edit_shared_map(&self.user_statuses, edits.statuses, &mut changed);
+        let bot_edits = {
+            let bots = self.bot_user_ids.borrow();
+            edits
+                .bots
                 .into_iter()
-                .filter_map(|(user_id, is_bot)| is_bot.then_some(user_id))
-                .collect::<HashSet<_>>();
-            if *self.bot_user_ids.borrow().as_ref() != bots {
-                changed.extend(
-                    self.bot_user_ids
-                        .borrow()
-                        .symmetric_difference(&bots)
-                        .cloned(),
-                );
-                *self.bot_user_ids.borrow_mut() = Arc::new(bots);
-            }
-            let mut aliases = self.user_search_aliases.borrow_mut();
-            changed.extend(changed_keys(&aliases, &edits.aliases));
-            *aliases = edits.aliases;
-        } else {
-            merge_shared_map(&self.user_names, edits.names, &mut changed);
-            merge_shared_map(&self.user_full_names, edits.full_names, &mut changed);
-            merge_shared_map(&self.user_avatar_urls, edits.avatar_urls, &mut changed);
-            let mut statuses = edits
-                .statuses
-                .into_iter()
-                .map(|(user_id, status)| (user_id, Some(status)))
-                .collect::<Vec<_>>();
-            statuses.extend(edits.cleared_statuses.into_iter().map(|id| (id, None)));
-            edit_shared_map(&self.user_statuses, statuses, &mut changed);
-            let bot_edits = {
-                let bots = self.bot_user_ids.borrow();
-                edits
-                    .bot_flags
-                    .into_iter()
-                    .filter(|(user_id, is_bot)| bots.contains(user_id) != *is_bot)
-                    .collect::<Vec<_>>()
-            };
-            if !bot_edits.is_empty() {
-                let mut bots = self.bot_user_ids.borrow_mut();
-                let bots = Arc::make_mut(&mut bots);
-                for (user_id, is_bot) in bot_edits {
-                    if is_bot {
-                        bots.insert(user_id.clone());
-                    } else {
-                        bots.remove(&user_id);
-                    }
-                    changed.insert(user_id);
+                .filter(|(user_id, is_bot)| bots.contains(user_id) != *is_bot)
+                .collect::<Vec<_>>()
+        };
+        if !bot_edits.is_empty() {
+            let mut bots = self.bot_user_ids.borrow_mut();
+            let bots = Arc::make_mut(&mut bots);
+            for (user_id, is_bot) in bot_edits {
+                if is_bot {
+                    bots.insert(user_id.clone());
+                } else {
+                    bots.remove(&user_id);
                 }
-            }
-            let mut aliases = self.user_search_aliases.borrow_mut();
-            for (user_id, user_aliases) in edits.aliases {
-                if aliases.get(&user_id) != Some(&user_aliases) {
-                    changed.insert(user_id.clone());
-                    aliases.insert(user_id, user_aliases);
-                }
+                changed.insert(user_id);
             }
         }
+        let aliases = differing_edits(&self.user_search_aliases.borrow(), edits.aliases);
+        apply_edits(
+            &mut self.user_search_aliases.borrow_mut(),
+            aliases,
+            &mut changed,
+        );
         changed
     }
 
@@ -403,48 +404,61 @@ impl UserDirectoryState {
     }
 }
 
-/// The directory values projected from a batch of users, before they are
-/// compared against the shared maps.
+/// Per-map edits projected from a batch of users, before they are compared
+/// against the shared maps: `Some` stores a value, `None` removes it.
 #[derive(Default)]
 struct UserProjectionEdits {
-    names: HashMap<String, String>,
-    full_names: HashMap<String, String>,
-    avatar_urls: HashMap<String, String>,
-    bot_flags: Vec<(String, bool)>,
-    aliases: UserSearchAliases,
-    statuses: UserStatuses,
-    cleared_statuses: Vec<String>,
+    names: Vec<(String, Option<String>)>,
+    full_names: Vec<(String, Option<String>)>,
+    avatar_urls: Vec<(String, Option<String>)>,
+    bots: Vec<(String, bool)>,
+    aliases: Vec<(String, Option<Vec<String>>)>,
+    statuses: Vec<(String, Option<crate::models::SlackUserStatus>)>,
 }
 
 impl UserProjectionEdits {
-    fn add(&mut self, user: &SlackUser) {
-        let Some(user_id) = user.id.clone() else {
+    fn add(&mut self, user: &SlackUser, replace: bool) {
+        let Some(user_id) = user.id.as_deref() else {
             return;
         };
-        self.bot_flags
-            .push((user_id.clone(), user.is_bot.unwrap_or(false)));
-        if let Some(name) = user.display_name() {
-            self.names.insert(user_id.clone(), name);
+        fn push<V>(
+            edits: &mut Vec<(String, Option<V>)>,
+            id: &str,
+            value: Option<V>,
+            replace: bool,
+        ) {
+            if value.is_some() || replace {
+                edits.push((id.to_string(), value));
+            }
         }
-        if let Some(full_name) = user.full_name() {
-            self.full_names.insert(user_id.clone(), full_name);
-        }
-        if let Some(avatar_url) = user.avatar_url() {
-            self.avatar_urls.insert(user_id.clone(), avatar_url);
-        }
-        let user_aliases = user.search_aliases();
-        if !user_aliases.is_empty() {
-            self.aliases.insert(user_id.clone(), user_aliases);
-        }
-        if let Some(status) = user.status() {
-            self.statuses.insert(user_id, status);
-        } else if user
+        push(&mut self.names, user_id, user.display_name(), replace);
+        push(&mut self.full_names, user_id, user.full_name(), replace);
+        push(&mut self.avatar_urls, user_id, user.avatar_url(), replace);
+        let aliases = Some(user.search_aliases()).filter(|aliases| !aliases.is_empty());
+        push(&mut self.aliases, user_id, aliases, replace);
+        // A profile carrying empty status fields clears the status even in a
+        // partial update.
+        let clears_status = user
             .profile
             .as_ref()
-            .is_some_and(|profile| profile.contains_status_fields())
-        {
-            self.cleared_statuses.push(user_id);
-        }
+            .is_some_and(|profile| profile.contains_status_fields());
+        push(
+            &mut self.statuses,
+            user_id,
+            user.status(),
+            replace || clears_status,
+        );
+        self.bots
+            .push((user_id.to_string(), user.is_bot.unwrap_or(false)));
+    }
+
+    fn remove(&mut self, user_id: &str) {
+        self.names.push((user_id.to_string(), None));
+        self.full_names.push((user_id.to_string(), None));
+        self.avatar_urls.push((user_id.to_string(), None));
+        self.aliases.push((user_id.to_string(), None));
+        self.statuses.push((user_id.to_string(), None));
+        self.bots.push((user_id.to_string(), false));
     }
 }
 
@@ -467,56 +481,41 @@ fn changed_keys<V: PartialEq>(
     changed
 }
 
-/// Swaps in `next` only when it differs from the shared map.
-fn replace_shared_map<V: PartialEq>(
-    shared: &RefCell<Arc<HashMap<String, V>>>,
-    next: HashMap<String, V>,
-    changed: &mut HashSet<String>,
-) {
-    let differing = changed_keys(&shared.borrow(), &next);
-    if !differing.is_empty() {
-        changed.extend(differing);
-        *shared.borrow_mut() = Arc::new(next);
-    }
-}
-
-fn merge_shared_map<V: PartialEq + Clone>(
-    shared: &RefCell<Arc<HashMap<String, V>>>,
-    updates: HashMap<String, V>,
-    changed: &mut HashSet<String>,
-) {
-    let edits = updates
+/// The edits that would change `current`.
+fn differing_edits<V: PartialEq>(
+    current: &HashMap<String, V>,
+    edits: Vec<(String, Option<V>)>,
+) -> Vec<(String, Option<V>)> {
+    edits
         .into_iter()
-        .map(|(key, value)| (key, Some(value)))
-        .collect();
-    edit_shared_map(shared, edits, changed);
+        .filter(|(key, value)| current.get(key) != value.as_ref())
+        .collect()
 }
 
-/// Applies inserts (`Some`) and removals (`None`), copy-on-write mutating
-/// the shared map only when at least one edit changes it.
-fn edit_shared_map<V: PartialEq + Clone>(
-    shared: &RefCell<Arc<HashMap<String, V>>>,
+fn apply_edits<V>(
+    map: &mut HashMap<String, V>,
     edits: Vec<(String, Option<V>)>,
     changed: &mut HashSet<String>,
 ) {
-    let edits = {
-        let current = shared.borrow();
-        edits
-            .into_iter()
-            .filter(|(key, value)| current.get(key) != value.as_ref())
-            .collect::<Vec<_>>()
-    };
-    if edits.is_empty() {
-        return;
-    }
-    let mut shared = shared.borrow_mut();
-    let map = Arc::make_mut(&mut shared);
     for (key, value) in edits {
         match value {
             Some(value) => map.insert(key.clone(), value),
             None => map.remove(&key),
         };
         changed.insert(key);
+    }
+}
+
+/// Applies `edits`, copy-on-write mutating the shared map only when at
+/// least one edit changes it.
+fn edit_shared_map<V: PartialEq + Clone>(
+    shared: &RefCell<Arc<HashMap<String, V>>>,
+    edits: Vec<(String, Option<V>)>,
+    changed: &mut HashSet<String>,
+) {
+    let edits = differing_edits(&shared.borrow(), edits);
+    if !edits.is_empty() {
+        apply_edits(Arc::make_mut(&mut shared.borrow_mut()), edits, changed);
     }
 }
 
@@ -2874,7 +2873,7 @@ mod tests {
         let directory = UserDirectoryState::default();
         let ada = projected_user("U1", "ada");
         let bob = projected_user("U2", "bob");
-        let mut changed = directory.apply_user_projection([&ada, &bob], true);
+        let mut changed = directory.project_users([&ada, &bob], true);
         let mut changed_ids = changed.drain().collect::<Vec<_>>();
         changed_ids.sort();
         assert_eq!(changed_ids, ["U1", "U2"]);
@@ -2887,17 +2886,29 @@ mod tests {
         let mut cleared = bob.clone();
         cleared.profile.as_mut().unwrap().status_text = Some(String::new());
         assert_eq!(
-            directory.apply_user_projection([&cleared], false),
+            directory.project_users([&cleared], false),
             HashSet::from(["U2".to_string()])
         );
         assert!(!directory.user_statuses.borrow().contains_key("U2"));
 
+        // A reload replaces values the user lacks; a partial update keeps them.
+        let mut renamed = ada.clone();
+        renamed.profile.as_mut().unwrap().image_72 = None;
+        assert!(directory.project_users([&renamed], false).is_empty());
+        assert!(directory.user_avatar_urls.borrow().contains_key("U1"));
         assert_eq!(
-            directory.apply_user_projection([&ada], true),
+            directory.project_users([&renamed], true),
+            HashSet::from(["U1".to_string()])
+        );
+        assert!(!directory.user_avatar_urls.borrow().contains_key("U1"));
+
+        assert_eq!(
+            directory.remove_users(&["U2".to_string()]),
             HashSet::from(["U2".to_string()])
         );
         assert!(!directory.user_names.borrow().contains_key("U2"));
         assert!(!directory.user_search_aliases.borrow().contains_key("U2"));
+        assert!(directory.remove_users(&["U2".to_string()]).is_empty());
     }
 
     #[test]
@@ -2909,7 +2920,7 @@ mod tests {
         let users = (0..50)
             .map(|index| projected_user(&format!("U{index}"), &format!("user{index}")))
             .collect::<Vec<_>>();
-        directory.apply_user_projection(&users, true);
+        directory.project_users(&users, true);
         let held = (
             directory.user_names.borrow().clone(),
             directory.user_full_names.borrow().clone(),
@@ -2919,11 +2930,12 @@ mod tests {
         );
 
         for _ in 0..20 {
-            assert!(directory
-                .apply_user_projection(&users[..3], false)
-                .is_empty());
+            assert!(directory.project_users(&users[..3], false).is_empty());
         }
-        assert!(directory.apply_user_projection(&users, true).is_empty());
+        assert!(directory.project_users(&users, true).is_empty());
+        assert!(directory
+            .merge_user_names(vec![("U1".to_string(), "user1".to_string())])
+            .is_empty());
 
         assert!(Arc::ptr_eq(&held.0, &directory.user_names.borrow()));
         assert!(Arc::ptr_eq(&held.1, &directory.user_full_names.borrow()));
