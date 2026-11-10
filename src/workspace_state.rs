@@ -2037,8 +2037,22 @@ impl WorkspaceViewState {
                 thread_ts,
             } => {
                 let key = (channel_id.clone(), thread_ts.clone());
+                let is_open = |thread: &ThreadViewState| {
+                    thread.channel_id == *channel_id && thread.ts == *thread_ts
+                };
+                // The open thread shares this list with the cache; drop its
+                // handle so the update below mutates in place instead of
+                // copying the whole list on every reply. It gets the cache's
+                // list back below.
+                let cached = self.thread_timelines.entry(key.clone()).or_default();
+                let released = self
+                    .thread
+                    .as_mut()
+                    .filter(|thread| is_open(thread) && Arc::ptr_eq(&thread.messages, cached))
+                    .map(|thread| thread.messages = SharedMessages::default())
+                    .is_some();
                 let (base_changed, projected_messages, operations) = {
-                    let messages = self.thread_timelines.entry(key).or_default();
+                    let messages = self.thread_timelines.entry(key.clone()).or_default();
                     let operations = timeline_projection_operations(messages, changes, |message| {
                         message.belongs_to_thread(thread_ts)
                     });
@@ -2048,12 +2062,16 @@ impl WorkspaceViewState {
                             changes,
                             |message| message.belongs_to_thread(thread_ts),
                         );
-                    (changed, changed.then(|| messages.clone()), operations)
+                    (
+                        changed,
+                        (changed || released).then(|| messages.clone()),
+                        operations,
+                    )
                 };
                 let active_changed = self
                     .thread
                     .as_mut()
-                    .filter(|thread| thread.channel_id == *channel_id && thread.ts == *thread_ts)
+                    .filter(|thread| is_open(thread))
                     .is_some_and(|thread| {
                         if let Some(messages) = projected_messages {
                             thread.messages = messages;
@@ -4011,6 +4029,24 @@ mod tests {
             &thread,
             &state.current_thread_messages_shared()
         ));
+
+        // A realtime reply to the open thread updates the shared list in
+        // place: the thread view's own handle must not force a full copy.
+        let before = Arc::as_ptr(&thread);
+        drop(thread);
+        let mut reply = message("1.7", "new reply");
+        reply.thread_ts = Some("1".into());
+        let target = TimelineTarget::Thread {
+            channel_id: "C1".into(),
+            thread_ts: "1".into(),
+        };
+        let applied = state
+            .apply_timeline_changes(&target, &[MessageChange::Upsert(Box::new(reply))])
+            .expect("reply applies");
+        assert!(applied.render);
+        let after = state.current_thread_messages_shared();
+        assert_eq!(after.len(), 3);
+        assert_eq!(Arc::as_ptr(&after), before);
     }
 
     #[test]

@@ -13613,7 +13613,8 @@ impl ConduitWindow {
             }
         }
         self.show_timeline_surface();
-        self.queue_history_asset_followups(channel_id, messages);
+        drop(messages);
+        self.queue_history_asset_followups(channel_id);
     }
 
     fn reconcile_current_conversation_snapshot(&self) {
@@ -13642,12 +13643,21 @@ impl ConduitWindow {
         }
     }
 
-    fn queue_history_asset_followups(&self, channel_id: &str, messages: SharedMessages) {
+    /// Requests names and images for the rendered channel once idle. The
+    /// list is read then, not captured: a held handle would make the next
+    /// realtime change copy the whole shared list.
+    fn queue_history_asset_followups(&self, channel_id: &str) {
         let weak_window = self.downgrade();
         let channel_id = channel_id.to_string();
         glib::idle_add_local_once(move || {
             if let Some(window) = weak_window.upgrade() {
                 if window.visible_channel_id().as_deref() == Some(channel_id.as_str()) {
+                    let messages = window
+                        .imp()
+                        .workspace
+                        .view
+                        .borrow()
+                        .channel_messages_shared(&channel_id);
                     window.request_user_names(&messages);
                     window.request_image_assets(messages.iter());
                 }
