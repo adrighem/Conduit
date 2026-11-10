@@ -74,7 +74,7 @@ use crate::models::{
 use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
 use crate::rendering::{
     self, attachment_image_asset_request, bounded_image_asset_request,
-    document_image_asset_request, image_asset_request, message_uses_image_asset,
+    document_image_asset_request, image_asset_request, message_uses_image_asset_matching,
 };
 use crate::runtime::{
     preview_workspace_cache_key, preview_workspace_scope, AppRuntime, ChannelInfoResult,
@@ -126,6 +126,9 @@ impl UiInvalidations {
     pub const MAIN_READ_MARKS: Self = Self(1 << 9);
     /// The open thread's "New" separator and dwell-read recheck.
     pub const THREAD_READ_MARKS: Self = Self(1 << 10);
+    /// Image assets that arrived since the last flush
+    /// (`imp::ConduitWindow::arrived_image_keys`).
+    pub const IMAGES: Self = Self(1 << 11);
 
     pub fn contains(self, invalidation: Self) -> bool {
         self.0 & invalidation.0 != 0
@@ -487,6 +490,10 @@ mod imp {
         pub(super) pending_image_assets: RefCell<BoundedImageAssetKeys>,
         pub(super) failed_image_assets: RefCell<BoundedImageAssetKeys>,
         pub(super) recovering_image_assets: RefCell<BoundedImageAssetKeys>,
+        /// Image assets that arrived, failed or were evicted since the last
+        /// frame flush (`UiInvalidations::IMAGES`).
+        pub(super) arrived_image_keys: RefCell<HashSet<String>>,
+        pub(super) avatar_user_index: RefCell<AvatarUserIndex>,
         pub custom_emojis: StampedCell<Arc<HashMap<String, String>>>,
         pub realtime_status: Cell<RealtimeStatus>,
         pub(super) message_composer_completion: RefCell<Option<ComposerCompletion>>,
@@ -3248,38 +3255,71 @@ fn message_image_asset_requests<'a>(
 fn messages_use_image_asset(
     messages: &[SlackMessage],
     custom_emojis: &HashMap<String, String>,
-    key: &str,
+    is_key: impl Fn(&str) -> bool,
 ) -> bool {
     let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
     messages
         .iter()
-        .any(|message| message_uses_image_asset(message, &catalog, key))
+        .any(|message| message_uses_image_asset_matching(message, &catalog, &is_key))
 }
 
-/// Timestamps of the messages whose rows show image asset `key`, either
-/// directly or as the avatar of one of `avatar_user_ids`. The single source
-/// of truth for which timeline rows an arriving image must re-render.
+/// Timestamps of the messages whose rows show an image asset `is_key`
+/// accepts, either directly or as the avatar of one of `avatar_user_ids`.
+/// The single source of truth for which timeline rows arriving images must
+/// re-render; one pass serves a whole batch of arrivals.
 fn messages_showing_image_asset(
     messages: &[SlackMessage],
     custom_emojis: &HashMap<String, String>,
-    key: &str,
-    avatar_user_ids: &[String],
+    is_key: impl Fn(&str) -> bool,
+    avatar_user_ids: &HashSet<String>,
 ) -> HashSet<String> {
     let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
     messages
         .iter()
         .filter(|message| {
-            message_uses_image_asset(message, &catalog, key)
+            message_uses_image_asset_matching(message, &catalog, &is_key)
                 || (!avatar_user_ids.is_empty() && {
                     let mut user_ids = HashSet::new();
                     collect_message_user_ids(std::slice::from_ref(message), &mut user_ids);
-                    avatar_user_ids
-                        .iter()
-                        .any(|user_id| user_ids.contains(user_id))
+                    !user_ids.is_disjoint(avatar_user_ids)
                 })
         })
         .map(|message| message.ts.clone())
         .collect()
+}
+
+/// Reverse index of the shared avatar map (avatar URL to user ids), rebuilt
+/// only when the map's `Arc` changes, so an arriving image finds its users
+/// without scanning every user.
+#[derive(Debug, Default)]
+struct AvatarUserIndex {
+    source: Option<Arc<HashMap<String, String>>>,
+    users_by_url: HashMap<String, Vec<String>>,
+    builds: usize,
+}
+
+impl AvatarUserIndex {
+    fn users_by_url(
+        &mut self,
+        avatar_urls: &Arc<HashMap<String, String>>,
+    ) -> &HashMap<String, Vec<String>> {
+        if !self
+            .source
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, avatar_urls))
+        {
+            self.users_by_url.clear();
+            for (user_id, url) in avatar_urls.iter() {
+                self.users_by_url
+                    .entry(url.clone())
+                    .or_default()
+                    .push(user_id.clone());
+            }
+            self.source = Some(avatar_urls.clone());
+            self.builds += 1;
+        }
+        &self.users_by_url
+    }
 }
 
 /// Collects every user id the rendered messages depend on (author, mentions, reactions).
@@ -8483,9 +8523,14 @@ impl ConduitWindow {
 
     fn flush_ui_invalidations(&self) {
         let mut pending = self.imp().pending_ui_invalidations.get();
-        let invalidations = pending.take();
+        let mut invalidations = pending.take();
         self.imp().pending_ui_invalidations.set(pending);
         let started = Instant::now();
+
+        if invalidations.contains(UiInvalidations::IMAGES) {
+            let keys = std::mem::take(&mut *self.imp().arrived_image_keys.borrow_mut());
+            invalidations.insert(self.apply_arrived_images(&keys));
+        }
 
         if invalidations.contains(UiInvalidations::SIDEBAR) {
             self.render_conversations();
@@ -10999,18 +11044,19 @@ impl ConduitWindow {
         self.patch_image_asset(key);
     }
 
-    /// Refreshes the surfaces that show image asset `key` (an avatar, custom
-    /// emoji or preview). Timelines re-render the affected rows in place, so
-    /// scroll position and focus are kept; assets nothing shows are ignored.
     /// Shows the arrived avatar image `key` in the open profile dialog and
     /// member list, which are not timeline rows and rebind on their own.
-    fn show_arrived_avatar(&self, key: &str, avatar_user_ids: &[String]) {
-        let profile_user = crate::profile_dialog::open_user_id();
+    fn show_arrived_avatar(
+        &self,
+        key: &str,
+        avatar_user_ids: &[String],
+        profile_user: Option<&String>,
+        context: &MessageRenderContext,
+    ) {
         if avatar_user_ids.is_empty() && profile_user.is_none() {
             return;
         }
-        let context = self.message_html_context(None);
-        let Some(path) = crate::timeline_message_widget::resolve_cached_asset_path(key, &context)
+        let Some(path) = crate::timeline_message_widget::resolve_cached_asset_path(key, context)
         else {
             return;
         };
@@ -11018,35 +11064,72 @@ impl ConduitWindow {
             crate::channel_details_dialog::set_member_avatar_path(user_id, &path);
         }
         if let Some(user_id) = profile_user {
-            if avatar_user_ids.contains(&user_id)
-                || self.user_avatar_url(&user_id).as_deref() == Some(key)
+            if avatar_user_ids.contains(user_id)
+                || self.user_avatar_url(user_id).as_deref() == Some(key)
             {
-                self.refresh_profile_dialog(&user_id);
+                self.refresh_profile_dialog(user_id);
             }
         }
     }
 
+    /// Records that image asset `key` (an avatar, custom emoji or preview)
+    /// arrived, failed or was evicted. The surfaces showing it refresh in the
+    /// next frame flush, once for every asset that changed in that frame.
     fn patch_image_asset(&self, key: &str) {
-        self.sync_workspace_icon(key);
-        let avatar_user_ids = self
-            .imp()
-            .workspace
-            .user_directory
-            .user_avatar_urls
-            .borrow()
+        self.imp()
+            .arrived_image_keys
+            .borrow_mut()
+            .insert(key.to_string());
+        self.queue_ui_invalidations(UiInvalidations::IMAGES);
+    }
+
+    /// Refreshes the surfaces that show any of `keys`. Timelines re-render
+    /// the affected rows in place, so scroll position and focus are kept;
+    /// assets nothing shows are ignored. One render context (holding only
+    /// these keys' image state) and one pass over the messages serve the
+    /// whole batch. Returns the surfaces that need a full re-render.
+    fn apply_arrived_images(&self, keys: &HashSet<String>) -> UiInvalidations {
+        let mut invalidations = UiInvalidations::default();
+        if keys.is_empty() {
+            return invalidations;
+        }
+        for key in keys {
+            self.sync_workspace_icon(key);
+        }
+        let avatar_users_by_key = {
+            let imp = self.imp();
+            let avatar_urls = imp
+                .workspace
+                .user_directory
+                .user_avatar_urls
+                .borrow()
+                .clone();
+            let mut index = imp.avatar_user_index.borrow_mut();
+            let users_by_url = index.users_by_url(&avatar_urls);
+            keys.iter()
+                .filter_map(|key| users_by_url.get(key).map(|users| (key, users.clone())))
+                .collect::<Vec<_>>()
+        };
+        let avatar_user_ids = avatar_users_by_key
             .iter()
-            .filter_map(|(user_id, url)| (url == key).then_some(user_id.clone()))
-            .collect::<Vec<_>>();
-        self.show_arrived_avatar(key, &avatar_user_ids);
+            .flat_map(|(_, users)| users.iter().cloned())
+            .collect::<HashSet<_>>();
+        let context = self.message_html_context_with_image_keys(None, Some(keys));
+        let profile_user = crate::profile_dialog::open_user_id();
+        for key in keys {
+            let users = avatar_users_by_key
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+                .map(|(_, users)| users.as_slice())
+                .unwrap_or_default();
+            self.show_arrived_avatar(key, users, profile_user.as_ref(), &context);
+        }
+        let is_key = |candidate: &str| keys.contains(candidate);
         let (main_uses_asset, timeline_rows, thread_rows, main_view) = {
             let custom_emojis = self.imp().custom_emojis.borrow();
-            let main_uses = self.main_view_uses_image_asset(&custom_emojis, key)
-                || (!avatar_user_ids.is_empty() && {
-                    let main_user_ids = self.main_view_user_ids();
-                    avatar_user_ids
-                        .iter()
-                        .any(|user_id| main_user_ids.contains(user_id))
-                });
+            let main_uses = self.main_view_uses_image_asset(&custom_emojis, is_key)
+                || (!avatar_user_ids.is_empty()
+                    && !self.main_view_user_ids().is_disjoint(&avatar_user_ids));
             let state = self.imp().workspace.view.borrow();
             // The conversation timeline keeps its rows while another main
             // view shows, and its re-renders leave image changes to this path.
@@ -11056,7 +11139,7 @@ impl ConduitWindow {
                     messages_showing_image_asset(
                         state.channel_messages(channel_id),
                         &custom_emojis,
-                        key,
+                        is_key,
                         &avatar_user_ids,
                     )
                 })
@@ -11065,7 +11148,7 @@ impl ConduitWindow {
                 messages_showing_image_asset(
                     state.current_thread_messages(),
                     &custom_emojis,
-                    key,
+                    is_key,
                     &avatar_user_ids,
                 )
             } else {
@@ -11080,22 +11163,23 @@ impl ConduitWindow {
             .as_ref()
             .filter(|_| !timeline_rows.is_empty())
         {
-            timeline.update_image_asset(&self.message_html_context(None), timeline_rows);
+            timeline.update_image_assets(&context, Some(keys), timeline_rows);
         }
         if main_uses_asset
             && (main_view != MainMessageView::Conversation || native_timeline.is_none())
         {
-            self.queue_ui_invalidations(UiInvalidations::MAIN);
+            invalidations.insert(UiInvalidations::MAIN);
         }
         if thread_uses_asset {
             let native_timeline = self.thread_pane().native_timeline_view.borrow().clone();
             match native_timeline {
-                Some(timeline) => {
-                    timeline.update_image_asset(&self.message_html_context(None), thread_rows)
+                Some(timeline) => timeline.update_image_assets(&context, Some(keys), thread_rows),
+                None => {
+                    invalidations.insert(UiInvalidations::THREAD);
                 }
-                None => self.queue_ui_invalidations(UiInvalidations::THREAD),
             }
         }
+        invalidations
     }
 
     fn show_conversation_load_error(&self, error: &str) {
@@ -11637,26 +11721,26 @@ impl ConduitWindow {
     fn main_view_uses_image_asset(
         &self,
         custom_emojis: &HashMap<String, String>,
-        key: &str,
+        is_key: impl Fn(&str) -> bool,
     ) -> bool {
         let state = self.imp().workspace.view.borrow();
         match state.main_view() {
             MainMessageView::Conversation => state.visible_channel_id().is_some_and(|channel_id| {
-                messages_use_image_asset(state.channel_messages(channel_id), custom_emojis, key)
+                messages_use_image_asset(state.channel_messages(channel_id), custom_emojis, &is_key)
             }),
             MainMessageView::Threads => self.followed_thread_roots().iter().any(|(_, message)| {
-                messages_use_image_asset(std::slice::from_ref(message), custom_emojis, key)
+                messages_use_image_asset(std::slice::from_ref(message), custom_emojis, &is_key)
             }),
             MainMessageView::Saved => state.saved_items().iter().any(|item| {
                 item.message.as_ref().is_some_and(|message| {
-                    messages_use_image_asset(std::slice::from_ref(message), custom_emojis, key)
+                    messages_use_image_asset(std::slice::from_ref(message), custom_emojis, &is_key)
                 })
             }),
             MainMessageView::Files => state
                 .files()
                 .iter()
                 .filter_map(image_asset_request)
-                .any(|(candidate, _)| candidate == key),
+                .any(|(candidate, _)| is_key(&candidate)),
             MainMessageView::Search | MainMessageView::Placeholder => false,
         }
     }

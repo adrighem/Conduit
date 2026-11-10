@@ -3347,7 +3347,7 @@ fn cached_canonical_image_remains_eligible_for_dom_asset_patch() {
     assert!(messages_use_image_asset(
         &[message],
         &HashMap::new(),
-        image_url
+        |candidate| candidate == image_url
     ));
 }
 
@@ -3412,8 +3412,11 @@ fn messages_showing_image_asset_lists_only_rows_using_the_key() {
         message("3.0", "U3", "plain"),
     ];
     let showing = |key: &str, users: &[&str]| {
-        let users = users.iter().map(ToString::to_string).collect::<Vec<_>>();
-        messages_showing_image_asset(&messages, &custom_emojis, key, &users)
+        let users = users
+            .iter()
+            .map(ToString::to_string)
+            .collect::<HashSet<_>>();
+        messages_showing_image_asset(&messages, &custom_emojis, |c| c == key, &users)
     };
 
     assert_eq!(showing(&emoji_url, &[]), HashSet::from(["2.0".to_string()]));
@@ -3422,6 +3425,62 @@ fn messages_showing_image_asset_lists_only_rows_using_the_key() {
         HashSet::from(["3.0".to_string()])
     );
     assert!(showing("https://example.com/unused.png", &[]).is_empty());
+
+    // One pass serves a batch of arrived keys.
+    let batch = HashSet::from([emoji_url.clone(), "https://avatars.example/u1.png".into()]);
+    let users = HashSet::from(["U1".to_string()]);
+    assert_eq!(
+        messages_showing_image_asset(&messages, &custom_emojis, |c| batch.contains(c), &users),
+        HashSet::from(["1.0".to_string(), "2.0".to_string()])
+    );
+}
+
+#[test]
+fn perf_guard_avatar_user_index_builds_once_per_avatar_map() {
+    // An arriving avatar used to scan every user's avatar URL. The reverse
+    // index is rebuilt only when the shared avatar map's `Arc` changes.
+    let avatars = Arc::new(HashMap::from([
+        ("U1".to_string(), "https://a/1.png".to_string()),
+        ("U2".to_string(), "https://a/shared.png".to_string()),
+        ("U3".to_string(), "https://a/shared.png".to_string()),
+    ]));
+    let mut index = AvatarUserIndex::default();
+    for _ in 0..100 {
+        let users = index.users_by_url(&avatars);
+        assert_eq!(users.get("https://a/1.png"), Some(&vec!["U1".to_string()]));
+        assert_eq!(users.get("https://a/shared.png").map(Vec::len), Some(2));
+    }
+    assert_eq!(index.builds, 1);
+
+    let changed = Arc::new(HashMap::from([(
+        "U1".to_string(),
+        "https://a/new.png".to_string(),
+    )]));
+    assert!(index
+        .users_by_url(&changed)
+        .contains_key("https://a/new.png"));
+    assert!(!index.users_by_url(&changed).contains_key("https://a/1.png"));
+    assert_eq!(index.builds, 2);
+}
+
+#[test]
+fn perf_guard_image_arrivals_are_batched_into_one_frame_flush() {
+    // Each `ImageAssetLoaded` built up to three full render contexts (the
+    // whole image map, the failed set and a GSettings read) and scanned all
+    // avatars and messages. Arrivals now only record their key; the frame
+    // flush handles the batch with one key-limited context.
+    let patch = window_method_source("patch_image_asset");
+    assert!(!patch.contains("message_html_context"));
+    assert!(patch.contains("UiInvalidations::IMAGES"));
+    let apply = window_method_source("apply_arrived_images");
+    assert_eq!(
+        apply
+            .matches("message_html_context_with_image_keys(None, Some(keys))")
+            .count(),
+        1
+    );
+    assert!(!apply.contains("self.message_html_context(None)"));
+    assert!(!window_method_source("show_arrived_avatar").contains("message_html_context"));
 }
 
 #[test]
