@@ -120,6 +120,12 @@ impl UiInvalidations {
     pub const PEOPLE_PICKER: Self = Self(1 << 5);
     pub const COMPLETION: Self = Self(1 << 6);
     pub const ACTIVITY: Self = Self(1 << 7);
+    /// The Threads main view list (rebuilt only while it is shown).
+    pub const THREADS: Self = Self(1 << 8);
+    /// The main timeline's "New" separator and dwell-read recheck.
+    pub const MAIN_READ_MARKS: Self = Self(1 << 9);
+    /// The open thread's "New" separator and dwell-read recheck.
+    pub const THREAD_READ_MARKS: Self = Self(1 << 10);
 
     pub fn contains(self, invalidation: Self) -> bool {
         self.0 & invalidation.0 != 0
@@ -8506,9 +8512,19 @@ impl ConduitWindow {
         }
         if invalidations.contains(UiInvalidations::MAIN) {
             self.rerender_current_main_messages();
+        } else if invalidations.contains(UiInvalidations::THREADS)
+            && self.current_main_view() == MainMessageView::Threads
+        {
+            self.populate_threads();
         }
         if invalidations.contains(UiInvalidations::THREAD) {
             self.rerender_current_thread();
+        }
+        let main_marks = invalidations.contains(UiInvalidations::MAIN_READ_MARKS);
+        let thread_marks = invalidations.contains(UiInvalidations::THREAD_READ_MARKS);
+        if main_marks || thread_marks {
+            self.refresh_unread_separator_surfaces(main_marks, thread_marks);
+            self.recheck_visible_reads(main_marks, thread_marks);
         }
 
         log_performance(started, |elapsed_ms| {
@@ -11155,11 +11171,13 @@ impl ConduitWindow {
             if !self.render_changed_conversations(application.read_state_changed_ids()) {
                 self.queue_sidebar_render();
             }
-            self.refresh_unread_separators();
+            // Only the visible channel's read state moves its "New" line.
             let visible_changed = self
                 .visible_channel_id()
                 .is_some_and(|visible| application.read_state_changed_ids().contains(&visible));
-            self.recheck_visible_reads(visible_changed, false);
+            if visible_changed {
+                self.queue_ui_invalidations(UiInvalidations::MAIN_READ_MARKS);
+            }
         }
         if application.thread_catalog_changed() {
             self.refresh_threads_badge();
@@ -11167,12 +11185,20 @@ impl ConduitWindow {
             // Sidebar thread sub-rows ("Thread (N responses) (M unread)")
             // are derived from the thread catalog independently of which
             // main view is active, so they need their own invalidation here.
-            self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
-            self.refresh_unread_separators();
-            self.recheck_visible_reads(false, true);
-            if self.current_main_view() == MainMessageView::Threads {
-                self.populate_threads();
+            let mut invalidations = UiInvalidations::SIDEBAR | UiInvalidations::THREADS;
+            let selected_thread_changed = self
+                .imp()
+                .workspace
+                .view
+                .borrow()
+                .selected_thread_target()
+                .is_some_and(|(channel_id, thread_ts)| {
+                    application.thread_record_changed(channel_id, thread_ts)
+                });
+            if selected_thread_changed {
+                invalidations.insert(UiInvalidations::THREAD_READ_MARKS);
             }
+            self.queue_ui_invalidations(invalidations);
         }
     }
 
@@ -11312,7 +11338,8 @@ impl ConduitWindow {
             self.queue_ui_invalidations(fallback);
         }
         if refresh_derived_view {
-            self.rerender_current_main_messages();
+            // Search and Saved views re-render once per frame, not per patch.
+            self.queue_ui_invalidations(UiInvalidations::MAIN);
         }
     }
 
@@ -15105,8 +15132,12 @@ impl ConduitWindow {
     /// Moves the "New" separators to the first message after the current
     /// read position, so dwell-based reads move (or clear) the line live.
     fn refresh_unread_separators(&self) {
+        self.refresh_unread_separator_surfaces(true, true);
+    }
+
+    fn refresh_unread_separator_surfaces(&self, main: bool, thread: bool) {
         let imp = self.imp();
-        if let Some(channel_id) = self.visible_channel_id() {
+        if let Some(channel_id) = self.visible_channel_id().filter(|_| main) {
             let last_read = imp
                 .workspace
                 .read_states
@@ -15127,6 +15158,7 @@ impl ConduitWindow {
             .view
             .borrow()
             .selected_thread_target()
+            .filter(|_| thread)
             .map(|(channel_id, ts)| (channel_id.to_string(), ts.to_string()));
         if let Some((channel_id, ts)) = thread_target {
             let last_read = imp

@@ -333,6 +333,62 @@ fn perf_guard_pasted_screenshots_encode_off_the_gtk_thread() {
     assert_eq!(source.matches("write_screenshot_png(&texture").count(), 1);
 }
 
+/// The source of the `ConduitWindow` method `name`, up to the next method.
+fn window_method_source(name: &str) -> &'static str {
+    let source = include_str!("../window.rs");
+    let start = source
+        .find(&format!("    fn {name}("))
+        .unwrap_or_else(|| panic!("window method {name} not found"));
+    let rest = &source[start + 1..];
+    let end = rest.find("\n    fn ").map_or(rest.len(), |end| end + 1);
+    &rest[..end]
+}
+
+#[test]
+fn perf_guard_workspace_patches_only_queue_derived_view_renders() {
+    // Each socket event is its own workspace patch. Rebuilding the Threads
+    // list, re-rendering Search or Saved, or moving unread separators per
+    // patch made a burst of K events cost K rebuilds; the handlers queue
+    // invalidations so the frame flush renders each surface once.
+    for method in [
+        "apply_workspace_patch",
+        "apply_workspace_timeline_projection",
+    ] {
+        let body = window_method_source(method);
+        for direct in [
+            "self.populate_threads()",
+            "self.rerender_current_main_messages()",
+            "self.refresh_unread_separators()",
+            "self.recheck_visible_reads(",
+        ] {
+            assert!(
+                !body.contains(direct),
+                "{method} calls {direct} directly; queue a UiInvalidations flag"
+            );
+        }
+    }
+}
+
+#[test]
+fn perf_guard_burst_of_thread_patches_schedules_one_threads_rebuild() {
+    let mut pending = UiInvalidations::default();
+    let schedules = (0..25)
+        .filter(|_| {
+            pending.insert(
+                UiInvalidations::SIDEBAR
+                    | UiInvalidations::THREADS
+                    | UiInvalidations::THREAD_READ_MARKS,
+            )
+        })
+        .count();
+    assert_eq!(schedules, 1);
+    let flushed = pending.take();
+    assert!(flushed.contains(UiInvalidations::THREADS));
+    assert!(flushed.contains(UiInvalidations::THREAD_READ_MARKS));
+    assert!(!flushed.contains(UiInvalidations::MAIN_READ_MARKS));
+    assert!(pending.is_empty());
+}
+
 #[test]
 fn perf_guard_timeline_renders_register_no_message_control_handles() {
     // Fresh per-render handle tokens made every render context differ, so
