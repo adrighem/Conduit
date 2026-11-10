@@ -63,8 +63,8 @@ use crate::huddles::state::{
     HuddleScreenShareState, HuddleSnapshot,
 };
 use crate::message_handoff::{
-    open_resolved_handoff, ExternalOpenError, ExternalOpener, HandoffProvenance,
-    MessageControlRegistry, MessageRef, SafeSlackPermalink, TimelineSurfaceId,
+    open_resolved_handoff, ExternalOpenCompletion, ExternalOpenError, ExternalOpener,
+    HandoffProvenance, MessageControlRegistry, MessageRef, SafeSlackPermalink, TimelineSurfaceId,
 };
 use crate::message_markup::{MessageRenderContext, TimelineScrollBehavior};
 use crate::models::{
@@ -74,7 +74,7 @@ use crate::models::{
 use crate::realtime::{RealtimePhase, RealtimeStatus, RealtimeTransport};
 use crate::rendering::{
     self, attachment_image_asset_request, bounded_image_asset_request,
-    document_image_asset_request, image_asset_request, message_uses_image_asset,
+    document_image_asset_request, image_asset_request, message_uses_image_asset_matching,
 };
 use crate::runtime::{
     preview_workspace_cache_key, preview_workspace_scope, AppRuntime, ChannelInfoResult,
@@ -102,10 +102,10 @@ use crate::workspace_pipeline::{TimelineTarget, WorkspaceRevision};
 use crate::workspace_state::{
     ChannelLookupOutcome, ConversationOpenCoordinator, ConversationOpenIntent,
     ConversationOpenPosition, ConversationOpenRenderAction, ConversationPatchRemoval,
-    ConversationSelectionDecision, MainMessageView, SidebarMode, ThreadApplyOutcome,
-    ThreadOpenOutcome, TimelineProjectionApplication, TimelineProjectionOperation,
-    WorkspaceLifecycle, WorkspaceLifecycleEvent, WorkspaceScrollBehavior, WorkspaceSessionState,
-    DISCOVERY_STARTUP_DELAY,
+    ConversationSelectionDecision, MainMessageView, SharedMessages, SidebarMode,
+    ThreadApplyOutcome, ThreadOpenOutcome, TimelineProjectionApplication,
+    TimelineProjectionOperation, WorkspaceLifecycle, WorkspaceLifecycleEvent,
+    WorkspaceScrollBehavior, WorkspaceSessionState, DISCOVERY_STARTUP_DELAY,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +120,13 @@ impl UiInvalidations {
     pub const PEOPLE_PICKER: Self = Self(1 << 5);
     pub const COMPLETION: Self = Self(1 << 6);
     pub const ACTIVITY: Self = Self(1 << 7);
+    /// The main timeline's "New" separator and dwell-read recheck.
+    pub const MAIN_READ_MARKS: Self = Self(1 << 8);
+    /// The open thread's "New" separator and dwell-read recheck.
+    pub const THREAD_READ_MARKS: Self = Self(1 << 9);
+    /// Image assets that arrived since the last flush
+    /// (`imp::ConduitWindow::arrived_image_keys`).
+    pub const IMAGES: Self = Self(1 << 10);
 
     pub fn contains(self, invalidation: Self) -> bool {
         self.0 & invalidation.0 != 0
@@ -195,11 +202,41 @@ struct MessageEditState {
     submitted: bool,
 }
 
-struct SystemExternalOpener;
+/// Opens permalinks through the window's asynchronous URI launcher.
+struct SystemExternalOpener<'a>(&'a ConduitWindow);
 
-impl ExternalOpener for SystemExternalOpener {
-    fn open(&self, permalink: &SafeSlackPermalink) -> Result<(), ExternalOpenError> {
-        open::that(permalink.as_str()).map_err(|error| ExternalOpenError::new(error.to_string()))
+impl ExternalOpener for SystemExternalOpener<'_> {
+    fn open(&self, permalink: &SafeSlackPermalink, done: ExternalOpenCompletion) {
+        self.0
+            .launch_external_uri(permalink.as_str(), move |_, outcome| match outcome {
+                ExternalLaunch::Opened => done(Ok(())),
+                ExternalLaunch::Dismissed => {}
+                ExternalLaunch::Failed(error) => done(Err(ExternalOpenError::new(error))),
+            });
+    }
+}
+
+/// How an asynchronous external launch ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExternalLaunch {
+    Opened,
+    /// The user dismissed the portal's application chooser.
+    Dismissed,
+    Failed(String),
+}
+
+impl From<Result<(), glib::Error>> for ExternalLaunch {
+    fn from(result: Result<(), glib::Error>) -> Self {
+        match result {
+            Ok(()) => Self::Opened,
+            Err(error)
+                if error.matches(gtk::DialogError::Dismissed)
+                    || error.matches(gio::IOErrorEnum::Cancelled) =>
+            {
+                Self::Dismissed
+            }
+            Err(error) => Self::Failed(error.message().to_string()),
+        }
     }
 }
 
@@ -451,6 +488,10 @@ mod imp {
         pub(super) pending_image_assets: RefCell<BoundedImageAssetKeys>,
         pub(super) failed_image_assets: RefCell<BoundedImageAssetKeys>,
         pub(super) recovering_image_assets: RefCell<BoundedImageAssetKeys>,
+        /// Image assets that arrived, failed or were evicted since the last
+        /// frame flush (`UiInvalidations::IMAGES`).
+        pub(super) arrived_image_keys: RefCell<HashSet<String>>,
+        pub(super) avatar_user_index: RefCell<AvatarUserIndex>,
         pub custom_emojis: StampedCell<Arc<HashMap<String, String>>>,
         pub realtime_status: Cell<RealtimeStatus>,
         pub(super) message_composer_completion: RefCell<Option<ComposerCompletion>>,
@@ -697,8 +738,7 @@ mod imp {
                         .workspace
                         .view
                         .borrow()
-                        .channel_messages(test_channel_id)
-                        .to_vec();
+                        .channel_messages_shared(test_channel_id);
                     obj.populate_history(test_channel_id, messages);
                     if std::env::var_os("CONDUIT_TEST_THREAD_COMPOSER").is_some() {
                         let mut thread_messages = vec![
@@ -742,7 +782,7 @@ mod imp {
                         obj.populate_thread(
                             test_channel_id,
                             "1.0",
-                            thread_messages,
+                            Arc::new(thread_messages),
                             TimelineScrollBehavior::Preserve,
                         );
                     }
@@ -2582,6 +2622,57 @@ fn screenshot_filename() -> String {
     format!("Screenshot-{timestamp}-{:08x}.png", rand::random::<u32>())
 }
 
+#[derive(Debug)]
+enum ScreenshotWriteError {
+    Prepare(std::io::Error),
+    Encode(String),
+    Write(std::io::Error),
+}
+
+impl std::fmt::Display for ScreenshotWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prepare(error) => {
+                write!(formatter, "Could not prepare screenshot upload: {error}")
+            }
+            Self::Encode(error) => write!(formatter, "Could not encode clipboard image: {error}"),
+            Self::Write(error) => write!(formatter, "Could not save clipboard image: {error}"),
+        }
+    }
+}
+
+/// Encodes `texture` as PNG into `path` under `directory`. Blocking: runs on
+/// a worker thread, never on the GTK thread.
+fn write_screenshot_png(
+    texture: &gtk::gdk::Texture,
+    directory: &Path,
+    path: &Path,
+) -> Result<(), ScreenshotWriteError> {
+    std::fs::create_dir_all(directory).map_err(ScreenshotWriteError::Prepare)?;
+    let bytes = texture.save_to_png_bytes();
+    if bytes.is_empty() {
+        return Err(ScreenshotWriteError::Encode(
+            "the encoder produced no data".to_string(),
+        ));
+    }
+    std::fs::write(path, &bytes).map_err(ScreenshotWriteError::Write)
+}
+
+/// A CPU-memory copy of `texture`, safe to download from a worker thread.
+/// Clipboard textures are decoded image data and already memory-backed; a
+/// GL or dmabuf texture is downloaded here, on the GTK thread that owns its
+/// context (a plain pixel copy, the expensive PNG encode stays off-thread).
+fn memory_backed_texture(texture: gtk::gdk::Texture) -> gtk::gdk::Texture {
+    if texture.is::<gtk::gdk::MemoryTexture>() {
+        return texture;
+    }
+    let format = gtk::gdk::MemoryFormat::R8g8b8a8Premultiplied;
+    let mut downloader = gtk::gdk::TextureDownloader::new(&texture);
+    downloader.set_format(format);
+    let (bytes, stride) = downloader.download_bytes();
+    gtk::gdk::MemoryTexture::new(texture.width(), texture.height(), format, &bytes, stride).upcast()
+}
+
 fn referenced_staged_uploads(drafts: &Drafts, directory: &Path) -> HashSet<PathBuf> {
     drafts
         .to_persisted()
@@ -3167,38 +3258,70 @@ fn message_image_asset_requests<'a>(
 fn messages_use_image_asset(
     messages: &[SlackMessage],
     custom_emojis: &HashMap<String, String>,
-    key: &str,
+    is_key: impl Fn(&str) -> bool,
 ) -> bool {
     let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
     messages
         .iter()
-        .any(|message| message_uses_image_asset(message, &catalog, key))
+        .any(|message| message_uses_image_asset_matching(message, &catalog, &is_key))
 }
 
-/// Timestamps of the messages whose rows show image asset `key`, either
-/// directly or as the avatar of one of `avatar_user_ids`. The single source
-/// of truth for which timeline rows an arriving image must re-render.
+/// Timestamps of the messages whose rows show an image asset `is_key`
+/// accepts, either directly or as the avatar of one of `avatar_user_ids`.
+/// The single source of truth for which timeline rows arriving images must
+/// re-render; one pass serves a whole batch of arrivals.
 fn messages_showing_image_asset(
     messages: &[SlackMessage],
     custom_emojis: &HashMap<String, String>,
-    key: &str,
-    avatar_user_ids: &[String],
+    is_key: impl Fn(&str) -> bool,
+    avatar_user_ids: &HashSet<String>,
 ) -> HashSet<String> {
     let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
     messages
         .iter()
         .filter(|message| {
-            message_uses_image_asset(message, &catalog, key)
-                || (!avatar_user_ids.is_empty() && {
-                    let mut user_ids = HashSet::new();
-                    collect_message_user_ids(std::slice::from_ref(message), &mut user_ids);
-                    avatar_user_ids
+            message_uses_image_asset_matching(message, &catalog, &is_key)
+                || (!avatar_user_ids.is_empty()
+                    && rendering::extract_user_ids(message)
                         .iter()
-                        .any(|user_id| user_ids.contains(user_id))
-                })
+                        .any(|user_id| avatar_user_ids.contains(user_id)))
         })
         .map(|message| message.ts.clone())
         .collect()
+}
+
+/// Reverse index of the shared avatar map (avatar URL to user ids), rebuilt
+/// only when the map's `Arc` changes, so an arriving image finds its users
+/// without scanning every user.
+#[derive(Debug, Default)]
+struct AvatarUserIndex {
+    source: Option<Arc<HashMap<String, String>>>,
+    users_by_url: HashMap<String, Vec<String>>,
+    builds: usize,
+}
+
+impl AvatarUserIndex {
+    fn users_by_url(
+        &mut self,
+        avatar_urls: &Arc<HashMap<String, String>>,
+    ) -> &HashMap<String, Vec<String>> {
+        if !self
+            .source
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, avatar_urls))
+        {
+            self.users_by_url.clear();
+            for (user_id, url) in avatar_urls.iter() {
+                self.users_by_url
+                    .entry(url.clone())
+                    .or_default()
+                    .push(user_id.clone());
+            }
+            self.source = Some(avatar_urls.clone());
+            self.builds += 1;
+        }
+        &self.users_by_url
+    }
 }
 
 /// Collects every user id the rendered messages depend on (author, mentions, reactions).
@@ -7947,8 +8070,7 @@ impl ConduitWindow {
                             .workspace
                             .view
                             .borrow()
-                            .channel_messages(&channel_id)
-                            .to_vec();
+                            .channel_messages_shared(&channel_id);
                         self.populate_history_with_scroll(
                             &channel_id,
                             rendered_messages,
@@ -7988,8 +8110,7 @@ impl ConduitWindow {
                             .workspace
                             .view
                             .borrow()
-                            .current_thread_messages()
-                            .to_vec();
+                            .current_thread_messages_shared();
                         self.request_user_names(&rendered_messages);
                         self.populate_thread(
                             &channel_id,
@@ -8032,8 +8153,7 @@ impl ConduitWindow {
                             .workspace
                             .view
                             .borrow()
-                            .current_thread_messages()
-                            .to_vec();
+                            .current_thread_messages_shared();
                         self.populate_thread(
                             location.channel_id(),
                             thread_ts,
@@ -8046,8 +8166,7 @@ impl ConduitWindow {
                             .workspace
                             .view
                             .borrow()
-                            .channel_messages(location.channel_id())
-                            .to_vec();
+                            .channel_messages_shared(location.channel_id());
                         self.populate_history_with_scroll(
                             location.channel_id(),
                             messages,
@@ -8203,26 +8322,34 @@ impl ConduitWindow {
                 self.set_status(&format!("{label} ({:.0}%)", fraction * 100.0));
             }
             RuntimeEventKind::AttachmentDownloaded { url: _, name, path } => {
-                match open::that(&path) {
-                    Ok(()) => self.set_status(&format!("Opened {name}")),
-                    Err(error) => self.set_status(&format!("Could not open {name}: {error}")),
-                }
+                self.launch_external_file(&path, move |window, outcome| match outcome {
+                    ExternalLaunch::Opened => window.set_status(&format!("Opened {name}")),
+                    ExternalLaunch::Dismissed => {}
+                    ExternalLaunch::Failed(error) => {
+                        window.set_status(&format!("Could not open {name}: {error}"))
+                    }
+                });
             }
             RuntimeEventKind::MessagePermalinkResolved { handoff } => {
-                match open_resolved_handoff(&SystemExternalOpener, &handoff) {
-                    Ok(()) => match handoff.provenance {
-                        HandoffProvenance::Authoritative
-                        | HandoffProvenance::CachedAuthoritative => {
-                            self.set_status("Opened in Slack to complete the action")
+                let weak_window = self.downgrade();
+                let fallback = matches!(
+                    handoff.provenance,
+                    HandoffProvenance::ConstructedFallback(_)
+                );
+                let done: ExternalOpenCompletion =
+                    Box::new(move |result| {
+                        let Some(window) = weak_window.upgrade() else {
+                            return;
+                        };
+                        match result {
+                            Ok(()) if fallback => window
+                                .set_status("Opened a fallback Slack link to complete the action"),
+                            Ok(()) => window.set_status("Opened in Slack to complete the action"),
+                            Err(error) => window
+                                .set_status(&format!("Failed to open message in Slack: {error}")),
                         }
-                        HandoffProvenance::ConstructedFallback(_) => {
-                            self.set_status("Opened a fallback Slack link to complete the action")
-                        }
-                    },
-                    Err(error) => {
-                        self.set_status(&format!("Failed to open message in Slack: {error}"))
-                    }
-                }
+                    });
+                open_resolved_handoff(&SystemExternalOpener(self), &handoff, done);
             }
             RuntimeEventKind::MessageActionCompleted { control_handle } => {
                 self.finish_message_action(&control_handle, true);
@@ -8414,9 +8541,14 @@ impl ConduitWindow {
 
     fn flush_ui_invalidations(&self) {
         let mut pending = self.imp().pending_ui_invalidations.get();
-        let invalidations = pending.take();
+        let mut invalidations = pending.take();
         self.imp().pending_ui_invalidations.set(pending);
         let started = Instant::now();
+
+        if invalidations.contains(UiInvalidations::IMAGES) {
+            let keys = std::mem::take(&mut *self.imp().arrived_image_keys.borrow_mut());
+            invalidations.insert(self.apply_arrived_images(&keys));
+        }
 
         if invalidations.contains(UiInvalidations::SIDEBAR) {
             self.render_conversations();
@@ -8441,11 +8573,23 @@ impl ConduitWindow {
             self.refresh_workspace_title_status();
             self.refresh_current_conversation_title();
         }
+        let main_rendered = invalidations.contains(UiInvalidations::MAIN)
+            && self.current_main_view() == MainMessageView::Conversation;
         if invalidations.contains(UiInvalidations::MAIN) {
             self.rerender_current_main_messages();
         }
         if invalidations.contains(UiInvalidations::THREAD) {
             self.rerender_current_thread();
+        }
+        let main_marks = invalidations.contains(UiInvalidations::MAIN_READ_MARKS);
+        let thread_marks = invalidations.contains(UiInvalidations::THREAD_READ_MARKS);
+        if main_marks || thread_marks {
+            // A timeline rendered in this flush already placed its separator.
+            self.refresh_unread_separator_surfaces(
+                main_marks && !main_rendered,
+                thread_marks && !invalidations.contains(UiInvalidations::THREAD),
+            );
+            self.recheck_visible_reads(main_marks, thread_marks);
         }
 
         log_performance(started, |elapsed_ms| {
@@ -9433,19 +9577,64 @@ impl ConduitWindow {
                 }
             };
 
-            let directory = config::upload_staging_dir();
-            if let Err(error) = std::fs::create_dir_all(&directory) {
-                window.set_status(&format!("Could not prepare screenshot upload: {error}"));
+            window.stage_clipboard_screenshot(texture, target);
+        });
+    }
+
+    /// Encodes a pasted clipboard image to PNG and stages it as an upload.
+    /// The encode and the file write run on a blocking worker (a memory
+    /// texture is immutable and thread-safe), so a large screenshot never
+    /// stalls the GTK thread. The file is staged only if the composer still
+    /// points at the conversation it was pasted into; otherwise it is
+    /// discarded.
+    fn stage_clipboard_screenshot(&self, texture: gtk::gdk::Texture, target: ComposerTarget) {
+        let texture = memory_backed_texture(texture);
+        let scope = self.composer_draft_key(target);
+        let directory = config::upload_staging_dir();
+        let path = directory.join(screenshot_filename());
+        let weak_window = self.downgrade();
+        glib::spawn_future_local(async move {
+            let written = gio::spawn_blocking({
+                let path = path.clone();
+                move || write_screenshot_png(&texture, &directory, &path)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(ScreenshotWriteError::Encode(
+                    "the encoder thread panicked".to_string(),
+                ))
+            });
+            let Some(window) = weak_window.upgrade() else {
+                let _ = std::fs::remove_file(&path);
+                return;
+            };
+            if let Err(error) = written {
+                let _ = std::fs::remove_file(&path);
+                window.set_status(&error.to_string());
                 return;
             }
-            let path = directory.join(screenshot_filename());
-            if let Err(error) = texture.save_to_png(&path) {
+            if window.composer_draft_key(target) != scope {
                 let _ = std::fs::remove_file(&path);
-                window.set_status(&format!("Could not encode clipboard image: {error}"));
+                window.set_status(&gettext(
+                    "The pasted image was discarded because the conversation changed.",
+                ));
                 return;
             }
             window.stage_composer_attachment(target, path, true);
         });
+    }
+
+    /// The draft scope a composer currently writes to: the visible channel,
+    /// plus the open thread for the thread composer.
+    fn composer_draft_key(&self, target: ComposerTarget) -> Option<DraftKey> {
+        let channel_id = self.visible_channel_id()?;
+        match target {
+            ComposerTarget::Message => self.draft_key(&channel_id, None),
+            ComposerTarget::Thread => {
+                let thread_ts = self.selected_thread_ts()?;
+                self.draft_key(&channel_id, Some(&thread_ts))
+            }
+        }
     }
 
     fn close_thread(&self) {
@@ -9478,8 +9667,7 @@ impl ConduitWindow {
                     .workspace
                     .view
                     .borrow()
-                    .current_thread_messages()
-                    .to_vec();
+                    .current_thread_messages_shared();
                 self.populate_thread(
                     channel_id,
                     ts,
@@ -9493,8 +9681,7 @@ impl ConduitWindow {
                     .workspace
                     .view
                     .borrow()
-                    .current_thread_messages()
-                    .to_vec();
+                    .current_thread_messages_shared();
                 self.populate_thread(
                     channel_id,
                     ts,
@@ -9933,9 +10120,43 @@ impl ConduitWindow {
     }
 
     fn open_external_link(&self, uri: &str) {
-        if let Err(error) = open::that(uri) {
-            self.set_status(&format!("Failed to open link: {error}"));
-        }
+        self.launch_external_uri(uri, |window, outcome| {
+            if let ExternalLaunch::Failed(error) = outcome {
+                window.set_status(&format!("Failed to open link: {error}"));
+            }
+        });
+    }
+
+    /// Hands `uri` to the desktop through `GtkUriLauncher` (the OpenURI
+    /// portal when sandboxed). The launch is asynchronous, so the GTK thread
+    /// never waits on a launcher process; `done` runs once on the main loop
+    /// with the outcome, unless the window is gone by then.
+    fn launch_external_uri(&self, uri: &str, done: impl FnOnce(&Self, ExternalLaunch) + 'static) {
+        let weak_window = self.downgrade();
+        gtk::UriLauncher::new(uri).launch(Some(self), gio::Cancellable::NONE, move |result| {
+            if let Some(window) = weak_window.upgrade() {
+                done(&window, result.into());
+            }
+        });
+    }
+
+    /// `launch_external_uri` for a local file, through `GtkFileLauncher`.
+    fn launch_external_file(
+        &self,
+        path: &Path,
+        done: impl FnOnce(&Self, ExternalLaunch) + 'static,
+    ) {
+        let weak_window = self.downgrade();
+        let file = gio::File::for_path(path);
+        gtk::FileLauncher::new(Some(&file)).launch(
+            Some(self),
+            gio::Cancellable::NONE,
+            move |result| {
+                if let Some(window) = weak_window.upgrade() {
+                    done(&window, result.into());
+                }
+            },
+        );
     }
 
     fn copy_message_text(&self, channel_id: &str, ts: &str) {
@@ -10841,18 +11062,23 @@ impl ConduitWindow {
         self.patch_image_asset(key);
     }
 
-    /// Refreshes the surfaces that show image asset `key` (an avatar, custom
-    /// emoji or preview). Timelines re-render the affected rows in place, so
-    /// scroll position and focus are kept; assets nothing shows are ignored.
     /// Shows the arrived avatar image `key` in the open profile dialog and
     /// member list, which are not timeline rows and rebind on their own.
-    fn show_arrived_avatar(&self, key: &str, avatar_user_ids: &[String]) {
-        let profile_user = crate::profile_dialog::open_user_id();
+    fn show_arrived_avatar(
+        &self,
+        key: &str,
+        avatar_user_ids: &[String],
+        profile_user: Option<&String>,
+        context: &MessageRenderContext,
+    ) {
+        let profile_user = profile_user.filter(|user_id| {
+            avatar_user_ids.contains(user_id)
+                || self.user_avatar_url(user_id).as_deref() == Some(key)
+        });
         if avatar_user_ids.is_empty() && profile_user.is_none() {
             return;
         }
-        let context = self.message_html_context(None);
-        let Some(path) = crate::timeline_message_widget::resolve_cached_asset_path(key, &context)
+        let Some(path) = crate::timeline_message_widget::resolve_cached_asset_path(key, context)
         else {
             return;
         };
@@ -10860,35 +11086,100 @@ impl ConduitWindow {
             crate::channel_details_dialog::set_member_avatar_path(user_id, &path);
         }
         if let Some(user_id) = profile_user {
-            if avatar_user_ids.contains(&user_id)
-                || self.user_avatar_url(&user_id).as_deref() == Some(key)
-            {
-                self.refresh_profile_dialog(&user_id);
-            }
+            self.refresh_profile_dialog(user_id);
         }
     }
 
+    /// A render context carrying only the image state of `keys` (and the
+    /// shared avatar map), for merging arrived images into bound timelines
+    /// (`update_image_assets`). Looks up just those keys: no titles, no
+    /// settings read, no copy of the whole image map.
+    fn image_asset_context(&self, keys: &HashSet<String>) -> MessageRenderContext {
+        let imp = self.imp();
+        let image_assets = imp.image_assets.borrow();
+        let failed = imp.failed_image_assets.borrow();
+        MessageRenderContext {
+            user_avatar_urls: imp
+                .workspace
+                .user_directory
+                .user_avatar_urls
+                .borrow()
+                .clone(),
+            image_assets: keys
+                .iter()
+                .filter_map(|key| {
+                    image_assets
+                        .path(key)
+                        .map(|path| (key.clone(), path.to_path_buf()))
+                })
+                .collect(),
+            failed_image_urls: keys
+                .iter()
+                .filter(|key| failed.contains(key))
+                .cloned()
+                .collect(),
+            ..MessageRenderContext::default()
+        }
+    }
+
+    /// Records that image asset `key` (an avatar, custom emoji or preview)
+    /// arrived, failed or was evicted. The surfaces showing it refresh in the
+    /// next frame flush, once for every asset that changed in that frame.
     fn patch_image_asset(&self, key: &str) {
-        self.sync_workspace_icon(key);
-        let avatar_user_ids = self
-            .imp()
-            .workspace
-            .user_directory
-            .user_avatar_urls
-            .borrow()
-            .iter()
-            .filter_map(|(user_id, url)| (url == key).then_some(user_id.clone()))
-            .collect::<Vec<_>>();
-        self.show_arrived_avatar(key, &avatar_user_ids);
+        self.imp()
+            .arrived_image_keys
+            .borrow_mut()
+            .insert(key.to_string());
+        self.queue_ui_invalidations(UiInvalidations::IMAGES);
+    }
+
+    /// Refreshes the surfaces that show any of `keys`. Timelines re-render
+    /// the affected rows in place, so scroll position and focus are kept;
+    /// assets nothing shows are ignored. One render context (holding only
+    /// these keys' image state) and one pass over the messages serve the
+    /// whole batch. Returns the surfaces that need a full re-render.
+    fn apply_arrived_images(&self, keys: &HashSet<String>) -> UiInvalidations {
+        let mut invalidations = UiInvalidations::default();
+        if keys.is_empty() {
+            return invalidations;
+        }
+        for key in keys {
+            self.sync_workspace_icon(key);
+        }
+        let avatar_users_by_key = {
+            let imp = self.imp();
+            let avatar_urls = imp
+                .workspace
+                .user_directory
+                .user_avatar_urls
+                .borrow()
+                .clone();
+            let mut index = imp.avatar_user_index.borrow_mut();
+            let users_by_url = index.users_by_url(&avatar_urls);
+            keys.iter()
+                .filter_map(|key| users_by_url.get(key).map(|users| (key, users.clone())))
+                .collect::<HashMap<_, _>>()
+        };
+        let avatar_user_ids = avatar_users_by_key
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let context = self.image_asset_context(keys);
+        let profile_user = crate::profile_dialog::open_user_id();
+        for key in keys {
+            let users = avatar_users_by_key
+                .get(key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            self.show_arrived_avatar(key, users, profile_user.as_ref(), &context);
+        }
+        let is_key = |candidate: &str| keys.contains(candidate);
         let (main_uses_asset, timeline_rows, thread_rows, main_view) = {
             let custom_emojis = self.imp().custom_emojis.borrow();
-            let main_uses = self.main_view_uses_image_asset(&custom_emojis, key)
-                || (!avatar_user_ids.is_empty() && {
-                    let main_user_ids = self.main_view_user_ids();
-                    avatar_user_ids
-                        .iter()
-                        .any(|user_id| main_user_ids.contains(user_id))
-                });
+            let main_uses = self.main_view_uses_image_asset(&custom_emojis, is_key)
+                || (!avatar_user_ids.is_empty()
+                    && !self.main_view_user_ids().is_disjoint(&avatar_user_ids));
             let state = self.imp().workspace.view.borrow();
             // The conversation timeline keeps its rows while another main
             // view shows, and its re-renders leave image changes to this path.
@@ -10898,7 +11189,7 @@ impl ConduitWindow {
                     messages_showing_image_asset(
                         state.channel_messages(channel_id),
                         &custom_emojis,
-                        key,
+                        is_key,
                         &avatar_user_ids,
                     )
                 })
@@ -10907,7 +11198,7 @@ impl ConduitWindow {
                 messages_showing_image_asset(
                     state.current_thread_messages(),
                     &custom_emojis,
-                    key,
+                    is_key,
                     &avatar_user_ids,
                 )
             } else {
@@ -10922,22 +11213,23 @@ impl ConduitWindow {
             .as_ref()
             .filter(|_| !timeline_rows.is_empty())
         {
-            timeline.update_image_asset(&self.message_html_context(None), timeline_rows);
+            timeline.update_image_assets(&context, Some(keys), timeline_rows);
         }
         if main_uses_asset
             && (main_view != MainMessageView::Conversation || native_timeline.is_none())
         {
-            self.queue_ui_invalidations(UiInvalidations::MAIN);
+            invalidations.insert(UiInvalidations::MAIN);
         }
         if thread_uses_asset {
             let native_timeline = self.thread_pane().native_timeline_view.borrow().clone();
             match native_timeline {
-                Some(timeline) => {
-                    timeline.update_image_asset(&self.message_html_context(None), thread_rows)
+                Some(timeline) => timeline.update_image_assets(&context, Some(keys), thread_rows),
+                None => {
+                    invalidations.insert(UiInvalidations::THREAD);
                 }
-                None => self.queue_ui_invalidations(UiInvalidations::THREAD),
             }
         }
+        invalidations
     }
 
     fn show_conversation_load_error(&self, error: &str) {
@@ -11013,11 +11305,13 @@ impl ConduitWindow {
             if !self.render_changed_conversations(application.read_state_changed_ids()) {
                 self.queue_sidebar_render();
             }
-            self.refresh_unread_separators();
+            // Only the visible channel's read state moves its "New" line.
             let visible_changed = self
                 .visible_channel_id()
                 .is_some_and(|visible| application.read_state_changed_ids().contains(&visible));
-            self.recheck_visible_reads(visible_changed, false);
+            if visible_changed {
+                self.queue_ui_invalidations(UiInvalidations::MAIN_READ_MARKS);
+            }
         }
         if application.thread_catalog_changed() {
             self.refresh_threads_badge();
@@ -11025,115 +11319,55 @@ impl ConduitWindow {
             // Sidebar thread sub-rows ("Thread (N responses) (M unread)")
             // are derived from the thread catalog independently of which
             // main view is active, so they need their own invalidation here.
-            self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
-            self.refresh_unread_separators();
-            self.recheck_visible_reads(false, true);
+            let mut invalidations = UiInvalidations::SIDEBAR;
             if self.current_main_view() == MainMessageView::Threads {
-                self.populate_threads();
+                invalidations.insert(UiInvalidations::MAIN);
             }
+            if application.selected_thread_record_changed() {
+                invalidations.insert(UiInvalidations::THREAD_READ_MARKS);
+            }
+            self.queue_ui_invalidations(invalidations);
         }
     }
 
     fn sync_workspace_user_projection(&self, reset: bool, changed_user_ids: &[String]) {
-        let users = self.imp().workspace.users.borrow();
-        let selected = if reset {
-            users.values().cloned().collect::<Vec<_>>()
-        } else {
-            changed_user_ids
+        let imp = self.imp();
+        let directory = &imp.workspace.user_directory;
+        // `changed_user_ids` are exactly the added, changed or (on a reset)
+        // removed users, so the projection work scales with the change, not
+        // with the directory. A reset replaces values a user lacks.
+        let affected_user_ids = {
+            let users = imp.workspace.users.borrow();
+            let (present, removed): (Vec<_>, Vec<_>) = changed_user_ids
                 .iter()
-                .filter_map(|user_id| users.get(user_id).cloned())
-                .collect::<Vec<_>>()
-        };
-        drop(users);
-
-        let mut affected_user_ids = changed_user_ids.iter().cloned().collect::<HashSet<_>>();
-        if reset {
-            affected_user_ids.extend(self.imp().workspace.user_directory.reset_projections());
-        }
-
-        let mut names = HashMap::new();
-        let mut full_names = HashMap::new();
-        let mut avatar_urls = HashMap::new();
-        let mut bot_flags = Vec::new();
-        let mut aliases = HashMap::new();
-        let mut statuses = HashMap::new();
-        let mut cleared_statuses = Vec::new();
-        for user in selected {
-            let Some(user_id) = user.id.clone() else {
-                continue;
-            };
-            affected_user_ids.insert(user_id.clone());
-            bot_flags.push((user_id.clone(), user.is_bot.unwrap_or(false)));
-            if let Some(name) = user.display_name() {
-                names.insert(user_id.clone(), name);
+                .partition(|user_id| users.contains_key(*user_id));
+            let mut affected =
+                directory.project_users(present.iter().filter_map(|id| users.get(*id)), reset);
+            if reset {
+                let removed = removed.into_iter().cloned().collect::<Vec<_>>();
+                affected.extend(directory.remove_users(&removed));
             }
-            if let Some(full_name) = user.full_name() {
-                full_names.insert(user_id.clone(), full_name);
-            }
-            if let Some(avatar_url) = user.avatar_url() {
-                avatar_urls.insert(user_id.clone(), avatar_url);
-            }
-            let user_aliases = user.search_aliases();
-            if !user_aliases.is_empty() {
-                aliases.insert(user_id.clone(), user_aliases);
-            }
-            if let Some(status) = user.status() {
-                statuses.insert(user_id, status);
-            } else if user
-                .profile
-                .as_ref()
-                .is_some_and(|profile| profile.contains_status_fields())
-            {
-                cleared_statuses.push(user_id);
-            }
-        }
-
-        {
-            let imp = self.imp();
-            Arc::make_mut(&mut imp.workspace.user_directory.user_names.borrow_mut()).extend(names);
-            Arc::make_mut(&mut imp.workspace.user_directory.user_full_names.borrow_mut())
-                .extend(full_names);
-            Arc::make_mut(&mut imp.workspace.user_directory.user_avatar_urls.borrow_mut())
-                .extend(avatar_urls);
-            {
-                let mut bot_user_ids = imp.workspace.user_directory.bot_user_ids.borrow_mut();
-                let bot_user_ids = Arc::make_mut(&mut bot_user_ids);
-                for (user_id, is_bot) in bot_flags {
-                    if is_bot {
-                        bot_user_ids.insert(user_id);
-                    } else {
-                        bot_user_ids.remove(&user_id);
-                    }
-                }
-            }
-            imp.workspace
-                .user_directory
-                .user_search_aliases
-                .borrow_mut()
-                .extend(aliases);
-            let mut known_statuses = imp.workspace.user_directory.user_statuses.borrow_mut();
-            let known_statuses = Arc::make_mut(&mut known_statuses);
-            known_statuses.extend(statuses);
-            for user_id in cleared_statuses {
-                known_statuses.remove(&user_id);
-            }
-            let mut pending = imp.workspace.user_directory.pending_user_ids.borrow_mut();
-            for user_id in &affected_user_ids {
+            let mut pending = directory.pending_user_ids.borrow_mut();
+            for user_id in changed_user_ids {
                 pending.remove(user_id);
             }
-        }
+            affected
+        };
         // Expiry scheduling reads the status map, so all projection borrows must be released first.
         self.schedule_status_expiry();
-
-        for target in COMPOSER_TARGETS {
-            self.refresh_composer_mention_names(target);
-        }
-        self.invalidate_composer_completions();
-        let mut affected_user_ids = affected_user_ids.into_iter().collect::<Vec<_>>();
-        affected_user_ids.sort();
-        self.patch_users_on_timelines(&affected_user_ids);
         self.update_huddle_surface();
-        self.queue_user_projection_invalidations(&affected_user_ids);
+        if !affected_user_ids.is_empty() {
+            // Only projected values (names, avatars, statuses, bots) reach
+            // the composer and the timelines; other profile changes do not.
+            for target in COMPOSER_TARGETS {
+                self.refresh_composer_mention_names(target);
+            }
+            self.invalidate_composer_completions();
+            let mut affected_user_ids = affected_user_ids.into_iter().collect::<Vec<_>>();
+            affected_user_ids.sort();
+            self.patch_users_on_timelines(&affected_user_ids);
+            self.queue_user_projection_invalidations(&affected_user_ids);
+        }
         self.flush_pending_message_notifications();
     }
 
@@ -11236,7 +11470,8 @@ impl ConduitWindow {
             self.queue_ui_invalidations(fallback);
         }
         if refresh_derived_view {
-            self.rerender_current_main_messages();
+            // Search and Saved views re-render once per frame, not per patch.
+            self.queue_ui_invalidations(UiInvalidations::MAIN);
         }
     }
 
@@ -11418,23 +11653,24 @@ impl ConduitWindow {
         }
 
         let changed_user_ids = {
-            let imp = self.imp();
-            let mut known_user_names = imp.workspace.user_directory.user_names.borrow_mut();
-            let known_user_names = Arc::make_mut(&mut known_user_names);
-            let mut pending_user_ids = imp.workspace.user_directory.pending_user_ids.borrow_mut();
-            let mut changed_user_ids = Vec::new();
-
-            for (user_id, display_name) in user_names {
-                if user_id.trim().is_empty() || display_name.trim().is_empty() {
-                    continue;
-                }
-                pending_user_ids.remove(&user_id);
-                if known_user_names.get(&user_id) != Some(&display_name) {
-                    known_user_names.insert(user_id.clone(), display_name);
-                    changed_user_ids.push(user_id);
+            let directory = &self.imp().workspace.user_directory;
+            let user_names = user_names
+                .into_iter()
+                .filter(|(user_id, display_name)| {
+                    !user_id.trim().is_empty() && !display_name.trim().is_empty()
+                })
+                .collect::<Vec<_>>();
+            {
+                let mut pending_user_ids = directory.pending_user_ids.borrow_mut();
+                for (user_id, _) in &user_names {
+                    pending_user_ids.remove(user_id);
                 }
             }
-
+            let mut changed_user_ids = directory
+                .merge_user_names(user_names)
+                .into_iter()
+                .collect::<Vec<_>>();
+            changed_user_ids.sort();
             changed_user_ids
         };
 
@@ -11535,26 +11771,26 @@ impl ConduitWindow {
     fn main_view_uses_image_asset(
         &self,
         custom_emojis: &HashMap<String, String>,
-        key: &str,
+        is_key: impl Fn(&str) -> bool,
     ) -> bool {
         let state = self.imp().workspace.view.borrow();
         match state.main_view() {
             MainMessageView::Conversation => state.visible_channel_id().is_some_and(|channel_id| {
-                messages_use_image_asset(state.channel_messages(channel_id), custom_emojis, key)
+                messages_use_image_asset(state.channel_messages(channel_id), custom_emojis, &is_key)
             }),
             MainMessageView::Threads => self.followed_thread_roots().iter().any(|(_, message)| {
-                messages_use_image_asset(std::slice::from_ref(message), custom_emojis, key)
+                messages_use_image_asset(std::slice::from_ref(message), custom_emojis, &is_key)
             }),
             MainMessageView::Saved => state.saved_items().iter().any(|item| {
                 item.message.as_ref().is_some_and(|message| {
-                    messages_use_image_asset(std::slice::from_ref(message), custom_emojis, key)
+                    messages_use_image_asset(std::slice::from_ref(message), custom_emojis, &is_key)
                 })
             }),
             MainMessageView::Files => state
                 .files()
                 .iter()
                 .filter_map(image_asset_request)
-                .any(|(candidate, _)| candidate == key),
+                .any(|(candidate, _)| is_key(&candidate)),
             MainMessageView::Search | MainMessageView::Placeholder => false,
         }
     }
@@ -13233,8 +13469,7 @@ impl ConduitWindow {
             .workspace
             .view
             .borrow()
-            .channel_messages(channel_id)
-            .to_vec();
+            .channel_messages_shared(channel_id);
         let open_intent = ConversationOpenIntent::choose(explicit_message_ts);
         imp.conversation_opening
             .borrow_mut()
@@ -13297,7 +13532,7 @@ impl ConduitWindow {
         true
     }
 
-    fn populate_history(&self, channel_id: &str, messages: Vec<SlackMessage>) {
+    fn populate_history(&self, channel_id: &str, messages: SharedMessages) {
         self.populate_history_with_scroll(
             channel_id,
             messages,
@@ -13308,7 +13543,7 @@ impl ConduitWindow {
     fn populate_history_with_scroll(
         &self,
         channel_id: &str,
-        messages: Vec<SlackMessage>,
+        messages: SharedMessages,
         scroll_behavior: TimelineScrollBehavior,
     ) {
         let imp = self.imp();
@@ -13406,7 +13641,8 @@ impl ConduitWindow {
             }
         }
         self.show_timeline_surface();
-        self.queue_history_asset_followups(channel_id, messages);
+        drop(messages);
+        self.queue_history_asset_followups(channel_id);
     }
 
     fn reconcile_current_conversation_snapshot(&self) {
@@ -13418,7 +13654,7 @@ impl ConduitWindow {
                 view.last_channel_id().map(|channel_id| {
                     (
                         channel_id.to_string(),
-                        view.channel_messages(channel_id).to_vec(),
+                        view.channel_messages_shared(channel_id),
                     )
                 })
             }
@@ -13435,12 +13671,21 @@ impl ConduitWindow {
         }
     }
 
-    fn queue_history_asset_followups(&self, channel_id: &str, messages: Vec<SlackMessage>) {
+    /// Requests names and images for the rendered channel once idle. The
+    /// list is read then, not captured: a held handle would make the next
+    /// realtime change copy the whole shared list.
+    fn queue_history_asset_followups(&self, channel_id: &str) {
         let weak_window = self.downgrade();
         let channel_id = channel_id.to_string();
         glib::idle_add_local_once(move || {
             if let Some(window) = weak_window.upgrade() {
                 if window.visible_channel_id().as_deref() == Some(channel_id.as_str()) {
+                    let messages = window
+                        .imp()
+                        .workspace
+                        .view
+                        .borrow()
+                        .channel_messages_shared(&channel_id);
                     window.request_user_names(&messages);
                     window.request_image_assets(messages.iter());
                 }
@@ -13452,7 +13697,7 @@ impl ConduitWindow {
         &self,
         channel_id: &str,
         ts: &str,
-        messages: Vec<SlackMessage>,
+        messages: SharedMessages,
         scroll_behavior: TimelineScrollBehavior,
     ) {
         let imp = self.imp();
@@ -13770,7 +14015,7 @@ impl ConduitWindow {
             let messages = {
                 let view = self.imp().workspace.view.borrow();
                 (view.selected_thread_target() == Some((channel_id, thread_ts)))
-                    .then(|| view.current_thread_messages().to_vec())
+                    .then(|| view.current_thread_messages_shared())
             };
             if let Some(messages) = messages {
                 self.populate_thread(
@@ -14954,7 +15199,7 @@ impl ConduitWindow {
                     view.last_channel_id().map(|channel_id| {
                         (
                             channel_id.to_string(),
-                            view.channel_messages(channel_id).to_vec(),
+                            view.channel_messages_shared(channel_id),
                         )
                     })
                 };
@@ -14989,7 +15234,7 @@ impl ConduitWindow {
                     (
                         channel_id.to_string(),
                         thread_ts.to_string(),
-                        view.current_thread_messages().to_vec(),
+                        view.current_thread_messages_shared(),
                     )
                 })
         };
@@ -15001,10 +15246,6 @@ impl ConduitWindow {
                 TimelineScrollBehavior::Preserve,
             );
         }
-    }
-
-    fn message_html_context(&self, thread_ts: Option<&str>) -> MessageRenderContext {
-        self.message_html_context_with_image_keys(thread_ts, None)
     }
 
     /// Forgets the action handles of messages no longer on `surface`.
@@ -15031,8 +15272,12 @@ impl ConduitWindow {
     /// Moves the "New" separators to the first message after the current
     /// read position, so dwell-based reads move (or clear) the line live.
     fn refresh_unread_separators(&self) {
+        self.refresh_unread_separator_surfaces(true, true);
+    }
+
+    fn refresh_unread_separator_surfaces(&self, main: bool, thread: bool) {
         let imp = self.imp();
-        if let Some(channel_id) = self.visible_channel_id() {
+        if let Some(channel_id) = self.visible_channel_id().filter(|_| main) {
             let last_read = imp
                 .workspace
                 .read_states
@@ -15053,6 +15298,7 @@ impl ConduitWindow {
             .view
             .borrow()
             .selected_thread_target()
+            .filter(|_| thread)
             .map(|(channel_id, ts)| (channel_id.to_string(), ts.to_string()));
         if let Some((channel_id, ts)) = thread_target {
             let last_read = imp
@@ -15071,11 +15317,7 @@ impl ConduitWindow {
         }
     }
 
-    fn message_html_context_with_image_keys(
-        &self,
-        thread_ts: Option<&str>,
-        image_keys: Option<&HashSet<String>>,
-    ) -> MessageRenderContext {
+    fn message_html_context(&self, thread_ts: Option<&str>) -> MessageRenderContext {
         let imp = self.imp();
         let user_names = imp.workspace.user_directory.user_names.borrow().clone();
         let current_user_id = imp.current_user_id.borrow().clone();
@@ -15096,7 +15338,6 @@ impl ConduitWindow {
             .image_assets
             .borrow()
             .iter()
-            .filter(|(key, _)| image_keys.is_none_or(|keys| keys.contains(*key)))
             .map(|(key, path)| (key.clone(), path.to_path_buf()))
             .collect();
         let last_read = self.visible_channel_id().and_then(|channel_id| {
@@ -15142,13 +15383,7 @@ impl ConduitWindow {
             last_read,
             unread_separator_ts: None,
             image_assets,
-            failed_image_urls: imp
-                .failed_image_assets
-                .borrow()
-                .iter()
-                .filter(|key| image_keys.is_none_or(|keys| keys.contains(*key)))
-                .cloned()
-                .collect(),
+            failed_image_urls: imp.failed_image_assets.borrow().iter().cloned().collect(),
             recent_reactions,
             custom_emojis: imp.custom_emojis.borrow().clone(),
         }
