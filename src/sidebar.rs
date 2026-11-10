@@ -609,8 +609,8 @@ pub struct SidebarBuildOptions<'a> {
     /// computes it when absent; row patches must pass it for group DMs.
     pub starred_user_ids: Option<&'a HashSet<String>>,
     /// `ConversationCatalog::content_stamp` of the conversations being built.
-    /// With it, group DM member ids are parsed once per catalog change
-    /// instead of several times per row on every render.
+    /// When set, group DM member ids come from a per-conversation cache
+    /// (revalidated against the raw JSON) instead of being parsed again.
     pub catalog_stamp: Option<u64>,
 }
 
@@ -806,57 +806,48 @@ pub fn user_search_aliases(users: &[SlackUser]) -> UserSearchAliases {
 /// kinds. With a `catalog_stamp` the ids are cached per conversation and
 /// revalidated against the raw JSON they were parsed from, so a message
 /// arriving elsewhere (which bumps the catalog stamp) reparses nothing.
+/// The stamp only opts into the cache; it is not a cache key.
 fn group_member_ids(conversation: &SlackConversation, catalog_stamp: Option<u64>) -> Arc<[String]> {
     if !conversation.is_mpim.unwrap_or(false) {
         return Arc::from([]);
     }
-    let Some(stamp) = catalog_stamp else {
+    if catalog_stamp.is_none() {
         return conversation.group_direct_message_user_ids().into();
-    };
-    MEMBER_IDS.with(|cache| cache.borrow_mut().member_ids(conversation, stamp))
+    }
+    MEMBER_IDS.with(|cache| cache.borrow_mut().member_ids(conversation))
 }
 
 struct MemberIdEntry {
     /// The raw member values `ids` was parsed from.
     source: Vec<serde_json::Value>,
     ids: Arc<[String]>,
-    last_seen: u64,
 }
+
+/// Most conversations kept parsed. Entries are revalidated on every use, so
+/// stale ones are harmless; this only bounds memory across long sessions
+/// (a full clear costs one reparse per visible group DM).
+const MEMBER_ID_CACHE_LIMIT: usize = 8192;
 
 #[derive(Default)]
 struct MemberIdCache {
     entries: HashMap<String, MemberIdEntry>,
-    stamp: u64,
-    touched: usize,
 }
 
 impl MemberIdCache {
-    fn member_ids(&mut self, conversation: &SlackConversation, stamp: u64) -> Arc<[String]> {
-        if stamp != self.stamp {
-            // Drop conversations that were not used since the previous
-            // stamp once they outnumber the live ones.
-            if self.entries.len() > 2 * self.touched + 16 {
-                let previous = self.stamp;
-                self.entries.retain(|_, entry| entry.last_seen == previous);
-            }
-            self.stamp = stamp;
-            self.touched = 0;
-        }
-        if let Some(entry) = self.entries.get_mut(&conversation.id) {
+    fn member_ids(&mut self, conversation: &SlackConversation) -> Arc<[String]> {
+        if let Some(entry) = self.entries.get(&conversation.id) {
             if entry
                 .source
                 .iter()
                 .eq(conversation.group_direct_message_member_sources())
             {
-                if entry.last_seen != stamp {
-                    entry.last_seen = stamp;
-                    self.touched += 1;
-                }
                 return Arc::clone(&entry.ids);
             }
         }
+        if self.entries.len() >= MEMBER_ID_CACHE_LIMIT {
+            self.entries.clear();
+        }
         let ids: Arc<[String]> = conversation.group_direct_message_user_ids().into();
-        self.touched += 1;
         self.entries.insert(
             conversation.id.clone(),
             MemberIdEntry {
@@ -865,7 +856,6 @@ impl MemberIdCache {
                     .cloned()
                     .collect(),
                 ids: Arc::clone(&ids),
-                last_seen: stamp,
             },
         );
         ids
