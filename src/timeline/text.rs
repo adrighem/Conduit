@@ -751,55 +751,40 @@ fn text_blocks(text: &str, context: &MessageRenderContext) -> Vec<TextBlock> {
         .collect()
 }
 
-/// The context message markup reads: names, groups, channels, statuses and
-/// custom emoji. The window reuses each `Arc` until its source changes, so
-/// comparing pointers tells whether cached markup is still current.
+/// The context `mrkdwn_to_pango` and `emoji_only_names` read: user names,
+/// channel titles and privacy, user group names and custom emoji. Add a
+/// field here when markup starts reading another one. The window reuses
+/// each `Arc` until its source changes, so comparing pointers tells whether
+/// cached markup is still current; statuses, avatars and the like change
+/// often and do not drop the cache.
 struct MarkupStamp {
     user_names: Arc<HashMap<String, String>>,
-    user_full_names: Arc<HashMap<String, String>>,
-    user_avatar_urls: Arc<HashMap<String, String>>,
-    bot_user_ids: Arc<HashSet<String>>,
     conversation_titles: Arc<HashMap<String, String>>,
     private_conversation_ids: Arc<HashSet<String>>,
-    user_statuses: Arc<HashMap<String, crate::models::SlackUserStatus>>,
     user_group_names: Arc<HashMap<String, String>>,
-    user_group_members: Arc<HashMap<String, Vec<String>>>,
     custom_emojis: Arc<HashMap<String, String>>,
-    current_user_id: Option<String>,
 }
 
 impl MarkupStamp {
     fn of(context: &MessageRenderContext) -> Self {
         Self {
             user_names: context.user_names.clone(),
-            user_full_names: context.user_full_names.clone(),
-            user_avatar_urls: context.user_avatar_urls.clone(),
-            bot_user_ids: context.bot_user_ids.clone(),
             conversation_titles: context.conversation_titles.clone(),
             private_conversation_ids: context.private_conversation_ids.clone(),
-            user_statuses: context.user_statuses.clone(),
             user_group_names: context.user_group_names.clone(),
-            user_group_members: context.user_group_members.clone(),
             custom_emojis: context.custom_emojis.clone(),
-            current_user_id: context.current_user_id.clone(),
         }
     }
 
     fn matches(&self, context: &MessageRenderContext) -> bool {
         Arc::ptr_eq(&self.user_names, &context.user_names)
-            && Arc::ptr_eq(&self.user_full_names, &context.user_full_names)
-            && Arc::ptr_eq(&self.user_avatar_urls, &context.user_avatar_urls)
-            && Arc::ptr_eq(&self.bot_user_ids, &context.bot_user_ids)
             && Arc::ptr_eq(&self.conversation_titles, &context.conversation_titles)
             && Arc::ptr_eq(
                 &self.private_conversation_ids,
                 &context.private_conversation_ids,
             )
-            && Arc::ptr_eq(&self.user_statuses, &context.user_statuses)
             && Arc::ptr_eq(&self.user_group_names, &context.user_group_names)
-            && Arc::ptr_eq(&self.user_group_members, &context.user_group_members)
             && Arc::ptr_eq(&self.custom_emojis, &context.custom_emojis)
-            && self.current_user_id == context.current_user_id
     }
 }
 
@@ -920,6 +905,9 @@ mod model_tests {
         cached_text_blocks(text, &context);
         // A per-render field is not a markup input.
         context.last_read = Some("1.0".into());
+        cached_text_blocks(text, &context);
+        // Nor are statuses, which change often.
+        context.user_statuses = Arc::default();
         cached_text_blocks(text, &context);
         assert_eq!(builds() - before, 1);
         let mut names = HashMap::new();

@@ -56,14 +56,19 @@ pub(crate) fn show_quick_bar_for(
     state: &QuickBarState<'_>,
 ) {
     ts.clone_into(&mut cache.target.borrow_mut());
+    let unchanged = cache.built.borrow().as_ref().is_some_and(|built| {
+        built.recent_reactions == context.recent_reactions
+            && Arc::ptr_eq(&built.custom_emojis, &context.custom_emojis)
+            && built.can_mark_unread == state.can_mark_unread
+    });
+    if unchanged {
+        return;
+    }
     let key = QuickBarKey {
         recent_reactions: context.recent_reactions.clone(),
         custom_emojis: context.custom_emojis.clone(),
         can_mark_unread: state.can_mark_unread,
     };
-    if cache.built.borrow().as_ref() == Some(&key) {
-        return;
-    }
     build_quick_bar(
         quick_bar,
         &cache.target,
@@ -230,12 +235,15 @@ fn build_quick_bar(
 
     let popover = gtk::Popover::new();
     let popover_box = Box::new(Orientation::Vertical, 0);
+    // The message the menu opened for: hovers while it is open must not
+    // retarget its actions.
+    let menu_target = Rc::new(RefCell::new(String::new()));
 
     let copy_link_btn = Button::with_label("Copy link");
     copy_link_btn.set_focus_on_click(false);
     copy_link_btn.add_css_class("flat");
     {
-        let target = target.clone();
+        let target = menu_target.clone();
         let on_action = on_action.clone();
         let popover_weak = popover.downgrade();
         copy_link_btn.connect_clicked(move |_| {
@@ -254,7 +262,7 @@ fn build_quick_bar(
     copy_text_btn.set_focus_on_click(false);
     copy_text_btn.add_css_class("flat");
     {
-        let target = target.clone();
+        let target = menu_target.clone();
         let on_action = on_action.clone();
         let popover_weak = popover.downgrade();
         copy_text_btn.connect_clicked(move |_| {
@@ -273,7 +281,7 @@ fn build_quick_bar(
     copy_details_btn.set_focus_on_click(false);
     copy_details_btn.add_css_class("flat");
     {
-        let target = target.clone();
+        let target = menu_target.clone();
         let on_action = on_action.clone();
         let popover_weak = popover.downgrade();
         copy_details_btn.connect_clicked(move |_| {
@@ -293,7 +301,7 @@ fn build_quick_bar(
         unread_btn.set_focus_on_click(false);
         unread_btn.add_css_class("flat");
         {
-            let target = target.clone();
+            let target = menu_target.clone();
             let on_action = on_action.clone();
             let popover_weak = popover.downgrade();
             unread_btn.connect_clicked(move |_| {
@@ -313,7 +321,9 @@ fn build_quick_bar(
     *current_popover.borrow_mut() = Some(popover.clone());
 
     {
+        let target = target.clone();
         popover.connect_show(move |p| {
+            menu_target.replace(target.borrow().clone());
             crate::debug::log(
                 "quickbar",
                 &format!("popover show is_visible={}", p.is_visible()),
