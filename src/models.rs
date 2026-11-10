@@ -205,6 +205,24 @@ impl SlackConversation {
         user_full_names: &HashMap<String, String>,
         current_user_id: Option<&str>,
     ) -> String {
+        let members = if self.is_mpim.unwrap_or(false) {
+            self.group_direct_message_user_ids()
+        } else {
+            Vec::new()
+        };
+        self.navigation_name_with_members(&members, user_names, user_full_names, current_user_id)
+    }
+
+    /// [`Self::navigation_name_with_users`] for callers that already hold the
+    /// group DM member ids (`group_direct_message_user_ids`), so the member
+    /// JSON is not parsed again. `members` is only read for group DMs.
+    pub fn navigation_name_with_members(
+        &self,
+        members: &[String],
+        user_names: &HashMap<String, String>,
+        user_full_names: &HashMap<String, String>,
+        current_user_id: Option<&str>,
+    ) -> String {
         if self.is_im.unwrap_or(false) {
             if let Some(user_id) = self.user.as_deref() {
                 return direct_message_user_name(
@@ -216,21 +234,20 @@ impl SlackConversation {
         }
 
         if self.is_mpim.unwrap_or(false) {
-            let mut names = self
-                .group_direct_message_user_ids()
-                .into_iter()
+            let mut names = members
+                .iter()
                 .filter(|user_id| Some(user_id.as_str()) != current_user_id)
                 .map(|user_id| {
                     user_full_names
-                        .get(&user_id)
-                        .or_else(|| user_names.get(&user_id))
+                        .get(user_id)
+                        .or_else(|| user_names.get(user_id))
                         .map(|name| name.trim())
                         .filter(|name| !name.is_empty())
                         .unwrap_or(user_id.as_str())
                         .to_string()
                 })
                 .collect::<Vec<_>>();
-            names.sort_by_key(|name| name.to_lowercase());
+            names.sort_by_cached_key(|name| name.to_lowercase());
             if !names.is_empty() {
                 return names.join(", ");
             }
@@ -274,11 +291,21 @@ impl SlackConversation {
             })
             .collect::<Vec<_>>();
 
-        names.sort_by_key(|name| name.to_lowercase());
+        names.sort_by_cached_key(|name| name.to_lowercase());
         names
     }
 
+    /// The raw JSON values `group_direct_message_user_ids` is parsed from, for
+    /// callers that cache the parsed ids and revalidate them cheaply.
+    pub fn group_direct_message_member_sources(&self) -> impl Iterator<Item = &Value> {
+        CONVERSATION_MEMBER_KEYS
+            .iter()
+            .filter_map(|key| self.extra_value(key))
+    }
+
     pub fn group_direct_message_user_ids(&self) -> Vec<String> {
+        #[cfg(test)]
+        MEMBER_ID_PARSES.with(|count| count.set(count.get() + 1));
         let mut user_ids = Vec::new();
 
         for key in CONVERSATION_MEMBER_KEYS {
@@ -299,6 +326,12 @@ impl SlackConversation {
                 .and_then(|properties| properties.get(key))
         })
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Member-id JSON parses on this thread, for the sidebar perf guards.
+    pub(crate) static MEMBER_ID_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn user_ids_from_value(value: &Value) -> Vec<String> {

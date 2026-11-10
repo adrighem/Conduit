@@ -109,6 +109,8 @@ pub fn clear_timeline_view_caches() {
     decode::reset_texture_decodes();
     REACTION_TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
     crate::animated_image::clear_caches();
+    crate::image_metadata::clear();
+    forget_asset_misses();
     crate::timeline_document_widget::clear_document_accent_cache();
 }
 
@@ -309,8 +311,79 @@ fn probe_cache_key(index: &mut ResolvedAssetIndex, dir: &Path, key: &str) -> Opt
 /// Verifies that a cache path the runtime reported still points at a regular
 /// file inside the image asset cache (symlinks followed).
 pub(crate) fn verified_cached_asset_path(path: &Path) -> Option<PathBuf> {
-    let cache_root = crate::config::image_asset_cache_dir().canonicalize().ok()?;
+    let cache_root = canonical_cache_root(&crate::config::image_asset_cache_dir())?;
     contained_cache_file(&cache_root, path)
+}
+
+/// How long a URL with no cache file is answered from memory before the
+/// disk is probed for it again. A download the window hears of ends it at
+/// once ([`forget_asset_miss`]).
+const ASSET_MISS_TTL: Duration = Duration::from_secs(5);
+/// Misses remembered before the memo starts over.
+const MAX_ASSET_MISSES: usize = 4096;
+
+thread_local! {
+    /// Each cache directory's canonical path. The root is fixed for a
+    /// session, so `canonicalize` runs once instead of on every lookup.
+    static CANONICAL_ROOTS: RefCell<HashMap<PathBuf, PathBuf>> = RefCell::new(HashMap::new());
+    /// URLs that resolved to no file: the canonical root asked and when.
+    static ASSET_MISSES: RefCell<HashMap<String, (PathBuf, Instant)>> =
+        RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lookups that probed the disk after missing the index.
+    static ASSET_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn canonical_cache_root(cache_dir: &Path) -> Option<PathBuf> {
+    if let Some(root) = CANONICAL_ROOTS.with(|roots| roots.borrow().get(cache_dir).cloned()) {
+        return Some(root);
+    }
+    // Not remembered until the directory exists.
+    let root = cache_dir.canonicalize().ok()?;
+    CANONICAL_ROOTS.with(|roots| {
+        roots
+            .borrow_mut()
+            .insert(cache_dir.to_path_buf(), root.clone())
+    });
+    Some(root)
+}
+
+fn is_known_asset_miss(cache_root: &Path, url: &str) -> bool {
+    ASSET_MISSES.with(|misses| {
+        misses
+            .borrow()
+            .get(url)
+            .is_some_and(|(root, at)| root.as_path() == cache_root && at.elapsed() < ASSET_MISS_TTL)
+    })
+}
+
+fn remember_asset_miss(cache_root: &Path, url: &str) {
+    ASSET_MISSES.with(|misses| {
+        let mut misses = misses.borrow_mut();
+        if misses.len() >= MAX_ASSET_MISSES {
+            misses.retain(|_, (_, at)| at.elapsed() < ASSET_MISS_TTL);
+            if misses.len() >= MAX_ASSET_MISSES {
+                misses.clear();
+            }
+        }
+        misses.insert(url.to_string(), (cache_root.to_path_buf(), Instant::now()));
+    });
+}
+
+/// A file for `url` was just written: the next lookup probes the disk
+/// again instead of trusting a remembered miss. Covers custom emoji too.
+/// Call it on the GTK thread: asset misses are remembered per thread.
+pub(crate) fn forget_asset_miss(url: &str) {
+    ASSET_MISSES.with(|misses| misses.borrow_mut().remove(url));
+    crate::emoji_picker_window::forget_custom_emoji_miss(url);
+}
+
+/// Forgets every remembered asset miss, e.g. on workspace sign-out.
+fn forget_asset_misses() {
+    ASSET_MISSES.with(|misses| misses.borrow_mut().clear());
 }
 
 /// Maps a Slack-provided URL to a file inside the image asset cache: the
@@ -330,7 +403,7 @@ fn resolve_cached_asset_path_in(
     url: &str,
     context: &MessageRenderContext,
 ) -> Option<PathBuf> {
-    let cache_root = cache_dir.canonicalize().ok()?;
+    let cache_root = canonical_cache_root(cache_dir)?;
     if let Some(path) = context
         .image_assets
         .get(url)
@@ -338,8 +411,11 @@ fn resolve_cached_asset_path_in(
     {
         return Some(path);
     }
+    if is_known_asset_miss(&cache_root, url) {
+        return None;
+    }
 
-    with_resolved_asset_index(&cache_root, |index| {
+    let found = with_resolved_asset_index(&cache_root, |index| {
         // Fast path: answer from the snapshot (one containment check).
         let hit = index
             .workspace_dirs
@@ -352,12 +428,20 @@ fn resolve_cached_asset_path_in(
         // Miss: re-check the disk for just this URL. The root listing is
         // re-read (it holds only workspace dirs) so a workspace directory
         // created after the snapshot is found too.
+        #[cfg(test)]
+        ASSET_PROBES.with(|probes| probes.set(probes.get() + 1));
         cache_workspace_dirs(&cache_root)
             .iter()
             .find_map(|(dir_name, dir)| {
                 probe_cache_key(index, dir, &hashed_cache_key(dir_name, url))
             })
-    })
+    });
+    if found.is_none() {
+        // Row binds ask again on every scroll: probe the disk once per
+        // window, or until a download for `url` lands.
+        remember_asset_miss(&cache_root, url);
+    }
+    found
 }
 
 #[cfg(test)]
@@ -556,6 +640,8 @@ mod path_tests {
 
         let file = hashed_file(&fx, url, ".webp");
         std::fs::write(&file, b"img").unwrap();
+        // The window hears of every download it asked for.
+        forget_asset_miss(url);
         assert_eq!(
             resolve_cached_asset_path_in(&fx.cache, url, &ctx),
             Some(file.canonicalize().unwrap())
@@ -568,11 +654,56 @@ mod path_tests {
         std::fs::create_dir_all(&late_ws).unwrap();
         let hashed = late_ws.join(format!("{}.png", hashed_cache_key("late_ws", url)));
         std::fs::write(&hashed, b"img").unwrap();
+        forget_asset_miss(url);
         assert_eq!(
             resolve_cached_asset_path_in(&fx.cache, url, &ctx),
             Some(hashed.canonicalize().unwrap())
         );
         assert_eq!(resolved_asset_index_builds_for_tests(), builds);
+    }
+
+    fn asset_probes() -> usize {
+        ASSET_PROBES.with(std::cell::Cell::get)
+    }
+
+    /// Row binds ask for URLs that have no file yet on every scroll: a miss
+    /// probes the disk once, until the TTL passes or the download lands.
+    #[test]
+    fn perf_guard_repeated_asset_misses_probe_the_disk_once() {
+        reset_resolved_asset_index_for_tests();
+        let fx = Fixture::new("miss-memo");
+        let ctx = test_context();
+        let url = "https://example.com/not-yet.png";
+
+        let before = asset_probes();
+        for _ in 0..8 {
+            assert_eq!(resolve_cached_asset_path_in(&fx.cache, url, &ctx), None);
+        }
+        assert_eq!(asset_probes() - before, 1, "a miss is remembered");
+
+        let file = hashed_file(&fx, url, ".png");
+        std::fs::write(&file, b"img").unwrap();
+        forget_asset_miss(url);
+        assert_eq!(
+            resolve_cached_asset_path_in(&fx.cache, url, &ctx),
+            Some(file.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_remembered_miss_answers_only_for_its_cache_root() {
+        reset_resolved_asset_index_for_tests();
+        let first = Fixture::new("miss-root-a");
+        let second = Fixture::new("miss-root-b");
+        let ctx = test_context();
+        let url = "https://example.com/per-root.png";
+        assert_eq!(resolve_cached_asset_path_in(&first.cache, url, &ctx), None);
+        let file = hashed_file(&second, url, ".png");
+        std::fs::write(&file, b"img").unwrap();
+        assert_eq!(
+            resolve_cached_asset_path_in(&second.cache, url, &ctx),
+            Some(file.canonicalize().unwrap())
+        );
     }
 
     #[cfg(unix)]
@@ -744,7 +875,9 @@ pub(crate) mod decode {
     #[derive(Debug, Clone)]
     pub(crate) enum Decoded {
         Texture(gdk::Texture),
-        Animation(gdk_pixbuf::PixbufAnimation),
+        /// An animation and the frames in one loop of it, counted from its
+        /// headers in the worker (`None` when they could not say).
+        Animation(gdk_pixbuf::PixbufAnimation, Option<u32>),
         /// An animation request found a single frame: decode it as a still.
         Still,
     }
@@ -767,7 +900,7 @@ pub(crate) mod decode {
             }
             Decoded::Still => crate::animated_image::remember_static(&key.path),
             // Held by its players only: a WebP animation keeps every frame.
-            Decoded::Animation(_) => {}
+            Decoded::Animation(..) => {}
         }
     }
 
@@ -1191,20 +1324,24 @@ pub(crate) mod decode {
         }
     }
 
+    /// An animation's encoded bytes and the frames in one loop of it.
+    pub(crate) type AnimationBytes = (Vec<u8>, Option<u32>);
+
     /// The worker half of an animation load: reads `path` once, judges the
     /// budget on those bytes and counts their frames from the headers.
-    /// `None` for a still, which needs no animation decoder.
-    pub(crate) fn read_animation(path: &Path) -> Result<Option<Vec<u8>>, DecodeError> {
+    /// `None` for a still, which needs no animation decoder; otherwise the
+    /// bytes and the frames in one loop.
+    pub(crate) fn read_animation(path: &Path) -> Result<Option<AnimationBytes>, DecodeError> {
         let bytes = read_within_budget(path)?;
-        let frames = crate::image_header::frame_count(&mut std::io::Cursor::new(&bytes));
-        Ok((frames != Some(1)).then_some(bytes))
+        let frames = crate::image_header::loop_frame_count(&mut std::io::Cursor::new(&bytes));
+        Ok((frames != Some(1)).then_some((bytes, frames)))
     }
 
-    fn animated_or_still(animation: gdk_pixbuf::PixbufAnimation) -> Decoded {
+    fn animated_or_still(animation: gdk_pixbuf::PixbufAnimation, frames: Option<u32>) -> Decoded {
         if animation.is_static_image() {
             Decoded::Still
         } else {
-            Decoded::Animation(animation)
+            Decoded::Animation(animation, frames)
         }
     }
 
@@ -1212,7 +1349,7 @@ pub(crate) mod decode {
     /// worker, then those same bytes are decoded by gdk-pixbuf's task
     /// thread. Completes on the GTK thread.
     async fn load_animation(path: PathBuf) -> Result<Decoded, DecodeError> {
-        let Some(bytes) = gio::spawn_blocking(move || read_animation(&path))
+        let Some((bytes, frames)) = gio::spawn_blocking(move || read_animation(&path))
             .await
             .unwrap_or_else(|_| Err(DecodeError::Permanent("read panicked".into())))?
         else {
@@ -1221,7 +1358,7 @@ pub(crate) mod decode {
         let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_owned(bytes));
         gdk_pixbuf::PixbufAnimation::from_stream_future(&stream)
             .await
-            .map(animated_or_still)
+            .map(|animation| animated_or_still(animation, frames))
             .map_err(|error| classify_glib_error(&error))
     }
 
@@ -1545,14 +1682,16 @@ pub(crate) mod decode {
             // Decoding again would not help.
             return gtk::Picture::new();
         }
-        let declared = crate::image_header::declared_dimensions(path)
-            .and_then(|(width, height)| {
-                let (width, height) = (i32::try_from(width).ok()?, i32::try_from(height).ok()?);
-                Some(match animate_at {
-                    Some(size) => crate::animated_image::frame_size(width, height, size),
-                    None => (width, height),
-                })
-            })
+        let declared = crate::image_metadata::metadata(path)
+            .and_then(
+                |crate::image_metadata::ImageMetadata { width, height, .. }| {
+                    let (width, height) = (i32::try_from(width).ok()?, i32::try_from(height).ok()?);
+                    Some(match animate_at {
+                        Some(size) => crate::animated_image::frame_size(width, height, size),
+                        None => (width, height),
+                    })
+                },
+            )
             .unwrap_or((0, 0));
         let paintable = DeferredPaintable::new(declared, fit);
         let picture = gtk::Picture::for_paintable(&paintable);
@@ -1621,8 +1760,9 @@ pub(crate) mod decode {
                 return;
             };
             match decoded {
-                Decoded::Animation(animation) => {
-                    let player = crate::animated_image::player(&self.path, size, animation);
+                Decoded::Animation(animation, frames) => {
+                    let player =
+                        crate::animated_image::player(&self.path, size, animation, *frames);
                     paintable.set_content(&player);
                 }
                 // One frame after all: decode it as a still.
@@ -1658,12 +1798,12 @@ pub(crate) mod decode {
         if key.spec != TextureSpec::Animation {
             return decode_key(key).map(Decoded::Texture);
         }
-        let Some(bytes) = read_animation(&key.path)? else {
+        let Some((bytes, frames)) = read_animation(&key.path)? else {
             return Ok(Decoded::Still);
         };
         let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_owned(bytes));
         gdk_pixbuf::PixbufAnimation::from_stream(&stream, gio::Cancellable::NONE)
-            .map(animated_or_still)
+            .map(|animation| animated_or_still(animation, frames))
             .map_err(|error| classify_glib_error(&error))
     }
 

@@ -8,7 +8,8 @@ use super::model::{is_http_url, plain_text, DirectoryRow, DirectoryTarget, Searc
 use crate::message_markup::MessageRenderContext;
 use crate::models::SearchMatch;
 use crate::search::{
-    SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT, SECONDARY_FIELD_WEIGHT,
+    normalize_for_search, SearchField, SearchQuery, ID_FIELD_WEIGHT, PRIMARY_FIELD_WEIGHT,
+    SECONDARY_FIELD_WEIGHT,
 };
 use crate::sidebar::{ConversationKind, UserSearchAliases};
 
@@ -239,13 +240,13 @@ pub(crate) fn search_rows(
         .collect()
 }
 
-/// Lowercased content terms of a Slack search query: modifiers such as
+/// Normalized (case and accent folded) content terms of a Slack search query: modifiers such as
 /// `in:#general` or `-excluded` are not highlighted.
 pub(crate) fn highlight_terms(query: &str) -> Vec<String> {
     let mut terms = query
         .split_whitespace()
         .filter(|term| !term.starts_with('-') && !term.contains(':'))
-        .map(|term| term.trim_matches(['"', '*']).to_lowercase())
+        .map(|term| normalize_for_search(term.trim_matches(['"', '*'])))
         .filter(|term| !term.is_empty())
         .collect::<Vec<_>>();
     terms.sort_by_key(|term| std::cmp::Reverse(term.chars().count()));
@@ -253,31 +254,39 @@ pub(crate) fn highlight_terms(query: &str) -> Vec<String> {
     terms
 }
 
-/// Escapes `text` for Pango and wraps case-insensitive term matches in `<b>`.
+/// Escapes `text` for Pango and wraps term matches in `<b>`. Matching goes
+/// through `normalize_for_search`, so case and accents never matter (`a`
+/// highlights `á`); matches map back to the original characters.
 pub(crate) fn highlight_markup(text: &str, terms: &[String]) -> String {
-    let chars = text.char_indices().collect::<Vec<_>>();
+    let chars = text.chars().collect::<Vec<_>>();
+    // Normalized characters, each tagged with the original character it came
+    // from (one original can normalize to several, or to none).
+    let mut normalized = Vec::with_capacity(chars.len());
+    let mut origins = Vec::with_capacity(chars.len());
+    let mut buffer = [0u8; 4];
+    for (index, character) in chars.iter().enumerate() {
+        for folded in normalize_for_search(character.encode_utf8(&mut buffer)).chars() {
+            normalized.push(folded);
+            origins.push(index);
+        }
+    }
     let mut highlighted = vec![false; chars.len()];
     for term in terms {
-        let term_chars = term.chars().collect::<Vec<_>>();
-        if term_chars.is_empty() {
+        let term_chars = normalize_for_search(term).chars().collect::<Vec<_>>();
+        if term_chars.is_empty() || term_chars.len() > normalized.len() {
             continue;
         }
-        for start in 0..chars.len() {
-            let matches = term_chars.len() <= chars.len() - start
-                && term_chars.iter().enumerate().all(|(offset, expected)| {
-                    chars[start + offset]
-                        .1
-                        .to_lowercase()
-                        .eq(expected.to_lowercase())
-                });
-            if matches {
-                highlighted[start..start + term_chars.len()].fill(true);
+        for start in 0..=normalized.len() - term_chars.len() {
+            if normalized[start..start + term_chars.len()] == term_chars[..] {
+                for &origin in &origins[start..start + term_chars.len()] {
+                    highlighted[origin] = true;
+                }
             }
         }
     }
     let mut markup = String::with_capacity(text.len() + 16);
     let mut open = false;
-    for (index, (_, character)) in chars.iter().enumerate() {
+    for (index, character) in chars.iter().enumerate() {
         if highlighted[index] != open {
             markup.push_str(if open { "</b>" } else { "<b>" });
             open = highlighted[index];
@@ -420,6 +429,15 @@ mod tests {
             "&lt;<b>Deploy</b>&gt; &amp; <b>DEPLOY</b>"
         );
         assert_eq!(highlight_markup("no match", &terms), "no match");
+    }
+
+    #[test]
+    fn highlight_markup_ignores_accents_and_maps_back_to_original_text() {
+        let terms = highlight_terms("a CAFE");
+        assert_eq!(
+            highlight_markup("Más Café & más", &terms),
+            "M<b>á</b>s <b>Café</b> &amp; m<b>á</b>s"
+        );
     }
 
     #[test]

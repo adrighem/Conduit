@@ -215,6 +215,7 @@ impl NativeTimelineView {
         let current_popover_for_bind = current_popover.clone();
         let bar_motion_for_bind = bar_motion.clone();
         let quick_bar_for_bind = quick_bar.clone();
+        let quick_bar_cache = Rc::new(QuickBarCache::default());
         let overlay_for_bind = overlay.clone();
         let read_mark_target_for_bind = read_mark_target.clone();
         let bind_row: Rc<dyn Fn(&gtk::ListItem)> = Rc::new(move |item| {
@@ -286,6 +287,7 @@ impl NativeTimelineView {
                     let current_popover = current_popover_for_bind.clone();
                     let bar_motion = bar_motion_for_bind.clone();
                     let quick_bar = quick_bar_for_bind.clone();
+                    let quick_bar_cache = quick_bar_cache.clone();
                     let overlay = overlay_for_bind.clone();
                     let context_for_hover = context_clone.clone();
                     let on_action_for_hover = on_action_clone.clone();
@@ -320,11 +322,12 @@ impl NativeTimelineView {
                             }
                             if let Some(ctx) = context_for_hover.borrow().as_ref() {
                                 // Read on hover, not at bind: reacting
-                                // changes them without rebuilding rows.
-                                rebuild_quick_bar(
+                                // changes them without rebuilding rows. The
+                                // buttons are rebuilt only when they change.
+                                show_quick_bar_for(
                                     &quick_bar,
+                                    &quick_bar_cache,
                                     &ts,
-                                    &crate::message_markup::recent_reactions(ctx),
                                     ctx,
                                     &QuickBarState {
                                         on_action: &on_action_for_hover,
@@ -1005,14 +1008,49 @@ impl NativeTimelineView {
     /// arrived, keeping scroll position and focus. Arrivals within one idle
     /// are coalesced. Only the image fields of `context` are taken; the rest
     /// (unread anchor, thread) belongs to the rendered conversation.
+    #[cfg(test)]
     pub fn update_image_asset(&self, context: &MessageRenderContext, uses_asset: HashSet<String>) {
+        self.update_image_assets(context, None, uses_asset);
+    }
+
+    /// [`Self::update_image_asset`] for a batch of arrivals. With `keys`,
+    /// `context` only needs to carry those keys' image state (cheap to build)
+    /// and only they are merged into the bound context; `None` replaces the
+    /// whole image map.
+    pub fn update_image_assets(
+        &self,
+        context: &MessageRenderContext,
+        keys: Option<&HashSet<String>>,
+        uses_asset: HashSet<String>,
+    ) {
         {
             let mut current = self.context.borrow_mut();
             let Some(current) = current.as_mut() else {
                 return;
             };
-            current.image_assets = context.image_assets.clone();
-            current.failed_image_urls = context.failed_image_urls.clone();
+            match keys {
+                Some(keys) => {
+                    for key in keys {
+                        match context.image_assets.get(key) {
+                            Some(path) => {
+                                current.image_assets.insert(key.clone(), path.clone());
+                            }
+                            None => {
+                                current.image_assets.remove(key);
+                            }
+                        }
+                        if context.failed_image_urls.contains(key) {
+                            current.failed_image_urls.insert(key.clone());
+                        } else {
+                            current.failed_image_urls.remove(key);
+                        }
+                    }
+                }
+                None => {
+                    current.image_assets = context.image_assets.clone();
+                    current.failed_image_urls = context.failed_image_urls.clone();
+                }
+            }
             current.user_avatar_urls = context.user_avatar_urls.clone();
         }
         self.asset_update_rows.borrow_mut().extend(uses_asset);

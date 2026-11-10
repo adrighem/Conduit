@@ -287,6 +287,88 @@ impl UserDirectoryState {
         self.pending_user_ids.borrow_mut().clear();
     }
 
+    /// Projects `users` into the shared name, avatar, bot, alias and status
+    /// maps and returns the ids whose projected values changed.
+    ///
+    /// With `replace`, a value a user lacks (no name, avatar, aliases or
+    /// status) removes the stored one, as a directory reload should;
+    /// without it, a partial update keeps what is stored. A shared map is
+    /// copy-on-write mutated only when a value differs, so unchanged users
+    /// never copy a map and keep every `Arc` (and every cache keyed on its
+    /// pointer) intact. The cost is proportional to `users`, not to the
+    /// directory.
+    pub(crate) fn project_users<'a>(
+        &self,
+        users: impl IntoIterator<Item = &'a SlackUser>,
+        replace: bool,
+    ) -> HashSet<String> {
+        let mut edits = UserProjectionEdits::default();
+        for user in users {
+            edits.add(user, replace);
+        }
+        self.apply_projection_edits(edits)
+    }
+
+    /// Drops `user_ids` from every projection and returns those that had a
+    /// projected value.
+    pub(crate) fn remove_users(&self, user_ids: &[String]) -> HashSet<String> {
+        let mut edits = UserProjectionEdits::default();
+        for user_id in user_ids {
+            edits.remove(user_id);
+        }
+        self.apply_projection_edits(edits)
+    }
+
+    /// Records `user_names` (from a lookup) without copying the shared name
+    /// map when every name is already known; returns the changed ids.
+    pub(crate) fn merge_user_names(
+        &self,
+        user_names: impl IntoIterator<Item = (String, String)>,
+    ) -> HashSet<String> {
+        let mut changed = HashSet::new();
+        let edits = user_names
+            .into_iter()
+            .map(|(user_id, name)| (user_id, Some(name)))
+            .collect();
+        edit_shared_map(&self.user_names, edits, &mut changed);
+        changed
+    }
+
+    fn apply_projection_edits(&self, edits: UserProjectionEdits) -> HashSet<String> {
+        let mut changed = HashSet::new();
+        edit_shared_map(&self.user_names, edits.names, &mut changed);
+        edit_shared_map(&self.user_full_names, edits.full_names, &mut changed);
+        edit_shared_map(&self.user_avatar_urls, edits.avatar_urls, &mut changed);
+        edit_shared_map(&self.user_statuses, edits.statuses, &mut changed);
+        let bot_edits = {
+            let bots = self.bot_user_ids.borrow();
+            edits
+                .bots
+                .into_iter()
+                .filter(|(user_id, is_bot)| bots.contains(user_id) != *is_bot)
+                .collect::<Vec<_>>()
+        };
+        if !bot_edits.is_empty() {
+            let mut bots = self.bot_user_ids.borrow_mut();
+            let bots = Arc::make_mut(&mut bots);
+            for (user_id, is_bot) in bot_edits {
+                if is_bot {
+                    bots.insert(user_id.clone());
+                } else {
+                    bots.remove(&user_id);
+                }
+                changed.insert(user_id);
+            }
+        }
+        let aliases = differing_edits(&self.user_search_aliases.borrow(), edits.aliases);
+        apply_edits(
+            &mut self.user_search_aliases.borrow_mut(),
+            aliases,
+            &mut changed,
+        );
+        changed
+    }
+
     /// Replaces the user-group directory and the label and member
     /// projections that message rendering derives from it.
     pub(crate) fn apply_user_groups(&self, groups: Vec<SlackUserGroup>) {
@@ -319,6 +401,121 @@ impl UserDirectoryState {
         self.user_search_aliases.borrow_mut().clear();
         *self.user_statuses.borrow_mut() = Arc::default();
         affected_user_ids
+    }
+}
+
+/// Per-map edits projected from a batch of users, before they are compared
+/// against the shared maps: `Some` stores a value, `None` removes it.
+#[derive(Default)]
+struct UserProjectionEdits {
+    names: Vec<(String, Option<String>)>,
+    full_names: Vec<(String, Option<String>)>,
+    avatar_urls: Vec<(String, Option<String>)>,
+    bots: Vec<(String, bool)>,
+    aliases: Vec<(String, Option<Vec<String>>)>,
+    statuses: Vec<(String, Option<crate::models::SlackUserStatus>)>,
+}
+
+impl UserProjectionEdits {
+    fn add(&mut self, user: &SlackUser, replace: bool) {
+        let Some(user_id) = user.id.as_deref() else {
+            return;
+        };
+        fn push<V>(
+            edits: &mut Vec<(String, Option<V>)>,
+            id: &str,
+            value: Option<V>,
+            replace: bool,
+        ) {
+            if value.is_some() || replace {
+                edits.push((id.to_string(), value));
+            }
+        }
+        push(&mut self.names, user_id, user.display_name(), replace);
+        push(&mut self.full_names, user_id, user.full_name(), replace);
+        push(&mut self.avatar_urls, user_id, user.avatar_url(), replace);
+        let aliases = Some(user.search_aliases()).filter(|aliases| !aliases.is_empty());
+        push(&mut self.aliases, user_id, aliases, replace);
+        // A profile carrying empty status fields clears the status even in a
+        // partial update.
+        let clears_status = user
+            .profile
+            .as_ref()
+            .is_some_and(|profile| profile.contains_status_fields());
+        push(
+            &mut self.statuses,
+            user_id,
+            user.status(),
+            replace || clears_status,
+        );
+        self.bots
+            .push((user_id.to_string(), user.is_bot.unwrap_or(false)));
+    }
+
+    fn remove(&mut self, user_id: &str) {
+        self.names.push((user_id.to_string(), None));
+        self.full_names.push((user_id.to_string(), None));
+        self.avatar_urls.push((user_id.to_string(), None));
+        self.aliases.push((user_id.to_string(), None));
+        self.statuses.push((user_id.to_string(), None));
+        self.bots.push((user_id.to_string(), false));
+    }
+}
+
+/// Keys present in only one of the maps or mapped to different values.
+fn changed_keys<V: PartialEq>(
+    current: &HashMap<String, V>,
+    next: &HashMap<String, V>,
+) -> Vec<String> {
+    let mut changed = next
+        .iter()
+        .filter(|(key, value)| current.get(*key) != Some(*value))
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    changed.extend(
+        current
+            .keys()
+            .filter(|key| !next.contains_key(*key))
+            .cloned(),
+    );
+    changed
+}
+
+/// The edits that would change `current`.
+fn differing_edits<V: PartialEq>(
+    current: &HashMap<String, V>,
+    edits: Vec<(String, Option<V>)>,
+) -> Vec<(String, Option<V>)> {
+    edits
+        .into_iter()
+        .filter(|(key, value)| current.get(key) != value.as_ref())
+        .collect()
+}
+
+fn apply_edits<V>(
+    map: &mut HashMap<String, V>,
+    edits: Vec<(String, Option<V>)>,
+    changed: &mut HashSet<String>,
+) {
+    for (key, value) in edits {
+        match value {
+            Some(value) => map.insert(key.clone(), value),
+            None => map.remove(&key),
+        };
+        changed.insert(key);
+    }
+}
+
+/// Applies `edits`, copy-on-write mutating the shared map only when at
+/// least one edit changes it.
+fn edit_shared_map<V: PartialEq + Clone>(
+    shared: &RefCell<Arc<HashMap<String, V>>>,
+    edits: Vec<(String, Option<V>)>,
+    changed: &mut HashSet<String>,
+) {
+    let edits = differing_edits(&shared.borrow(), edits);
+    if !edits.is_empty() {
+        apply_edits(Arc::make_mut(&mut shared.borrow_mut()), edits, changed);
     }
 }
 
@@ -372,6 +569,7 @@ pub(crate) struct WorkspacePatchApplication {
     conversation_structure_changed: bool,
     changed_conversation_ids: Vec<String>,
     thread_catalog_changed: bool,
+    selected_thread_record_changed: bool,
     read_state_changed_ids: Vec<String>,
     users_reset: bool,
     changed_user_ids: Vec<String>,
@@ -442,6 +640,12 @@ impl WorkspacePatchApplication {
 
     pub(crate) fn thread_catalog_changed(&self) -> bool {
         self.thread_catalog_changed
+    }
+
+    /// Whether this patch replaced the thread catalog or changed the record
+    /// of the thread open in the thread pane.
+    pub(crate) fn selected_thread_record_changed(&self) -> bool {
+        self.selected_thread_record_changed
     }
 
     /// Conversations whose read state changed without a conversation reset.
@@ -541,6 +745,7 @@ impl WorkspaceSessionState {
                     );
                     *threads = ThreadCatalog::from_records(data.threads.clone());
                     application.thread_catalog_changed = true;
+                    application.selected_thread_record_changed = true;
                     *read_states = data.read_states.clone();
                     replace_patch_users(&mut users, &data.users, &mut application);
                 }
@@ -570,6 +775,13 @@ impl WorkspaceSessionState {
                     application.record_conversation_structure_change(channel_id);
                 }
                 WorkspaceChange::ThreadCatalogChanged(records) => {
+                    let selected = view.selected_thread_target();
+                    application.selected_thread_record_changed |= records.is_empty()
+                        || selected.is_some_and(|(channel_id, root_ts)| {
+                            records.iter().any(|record| {
+                                record.key.channel_id == channel_id && record.key.root_ts == root_ts
+                            })
+                        });
                     if records.is_empty() {
                         *threads = ThreadCatalog::default();
                     } else {
@@ -627,11 +839,11 @@ impl WorkspaceSessionState {
 }
 
 fn replace_patch_users(
-    users: &mut HashMap<String, SlackUser>,
+    users: &mut crate::search::StampedRefMut<'_, HashMap<String, SlackUser>>,
     updated: &[SlackUser],
     application: &mut WorkspacePatchApplication,
 ) {
-    users.clear();
+    let mut next = HashMap::with_capacity(updated.len());
     for user in updated {
         let Some(user_id) = user
             .id
@@ -641,11 +853,18 @@ fn replace_patch_users(
         else {
             continue;
         };
-        users.insert(user_id.to_string(), user.clone());
+        next.insert(user_id.to_string(), user.clone());
     }
+    // Report only users that were added, removed or changed: a reconnect
+    // that re-sends the same directory must not invalidate every user.
+    let mut changed = changed_keys(&**users, &next);
+    if changed.is_empty() {
+        return;
+    }
+    **users = next;
+    changed.sort();
     application.users_reset = true;
-    application.changed_user_ids = users.keys().cloned().collect();
-    application.changed_user_ids.sort();
+    application.changed_user_ids = changed;
 }
 
 fn replace_patch_conversations(
@@ -756,10 +975,15 @@ pub(crate) enum ThreadApplyOutcome {
     },
 }
 
+/// A timeline's message list, shared with renders so handing it to the
+/// timeline is a refcount bump, not a deep copy. Mutate through
+/// `Arc::make_mut` or replace it only when the list changed.
+pub(crate) type SharedMessages = Arc<Vec<SlackMessage>>;
+
 #[derive(Debug, Clone, Default)]
 struct ChannelHistoryState {
-    messages: Vec<SlackMessage>,
-    context_messages: Option<Vec<SlackMessage>>,
+    messages: SharedMessages,
+    context_messages: Option<SharedMessages>,
     next_cursor: Option<String>,
     loading: bool,
     loaded: bool,
@@ -984,8 +1208,8 @@ impl ConversationOpenCoordinator {
 struct ThreadViewState {
     channel_id: String,
     ts: String,
-    messages: Vec<SlackMessage>,
-    context_messages: Option<Vec<SlackMessage>>,
+    messages: SharedMessages,
+    context_messages: Option<SharedMessages>,
     next_cursor: Option<String>,
     status: ThreadLoadStatus,
     focus_ts: Option<String>,
@@ -1004,7 +1228,7 @@ pub(crate) struct WorkspaceViewState {
     sidebar_mode: SidebarMode,
     last_channel_id: Option<String>,
     channels: HashMap<String, ChannelHistoryState>,
-    thread_timelines: HashMap<(String, String), Vec<SlackMessage>>,
+    thread_timelines: HashMap<(String, String), SharedMessages>,
     thread: Option<ThreadViewState>,
     search_results: Vec<SearchMatch>,
     files: Vec<SlackFile>,
@@ -1060,6 +1284,36 @@ impl WorkspaceViewState {
                     .context_messages
                     .as_deref()
                     .unwrap_or(&history.messages)
+                    .as_slice()
+            })
+            .unwrap_or_default()
+    }
+
+    /// [`Self::channel_messages`] as a shared handle, for a render that
+    /// must not hold the view borrow.
+    pub(crate) fn channel_messages_shared(&self, channel_id: &str) -> SharedMessages {
+        self.channels
+            .get(channel_id)
+            .map(|history| {
+                history
+                    .context_messages
+                    .as_ref()
+                    .unwrap_or(&history.messages)
+                    .clone()
+            })
+            .unwrap_or_default()
+    }
+
+    /// [`Self::current_thread_messages`] as a shared handle.
+    pub(crate) fn current_thread_messages_shared(&self) -> SharedMessages {
+        self.thread
+            .as_ref()
+            .map(|thread| {
+                thread
+                    .context_messages
+                    .as_ref()
+                    .unwrap_or(&thread.messages)
+                    .clone()
             })
             .unwrap_or_default()
     }
@@ -1079,6 +1333,7 @@ impl WorkspaceViewState {
                     .context_messages
                     .as_deref()
                     .unwrap_or(&thread.messages)
+                    .as_slice()
             })
             .unwrap_or_default()
     }
@@ -1333,13 +1588,13 @@ impl WorkspaceViewState {
         let visible = self.visible_channel_id() == Some(channel_id);
         let history = self.channels.entry(channel_id.to_string()).or_default();
         let was_loaded = history.loaded;
-        let previous_messages = history.messages.clone();
         let had_context = history.context_messages.is_some();
-        history.messages = if append_older {
+        let merged = if append_older {
             merge_channel_message_pages(&history.messages, &messages)
         } else {
             merge_channel_message_refresh(&history.messages, &messages)
         };
+        let messages_changed = replace_if_changed(&mut history.messages, merged);
         history.loaded = true;
         if !cached {
             history.next_cursor = usable_cursor(has_more, next_cursor);
@@ -1348,9 +1603,7 @@ impl WorkspaceViewState {
         }
 
         let render = visible
-            && (!was_loaded
-                || history.messages != previous_messages
-                || (had_context && !cached && !append_older));
+            && (!was_loaded || messages_changed || (had_context && !cached && !append_older));
         let notify_new_messages = visible && !cached && !append_older;
         let scroll = visible.then(|| self.take_channel_scroll(channel_id, append_older));
         HistoryApplyOutcome {
@@ -1514,7 +1767,7 @@ impl WorkspaceViewState {
             {
                 return false;
             }
-            thread.context_messages = Some(normalize_messages(messages));
+            thread.context_messages = Some(Arc::new(normalize_messages(messages)));
             thread.status = ThreadLoadStatus::Ready;
             return true;
         }
@@ -1528,7 +1781,7 @@ impl WorkspaceViewState {
         if history.focus_ts.as_deref() != Some(location.message_ts()) {
             return false;
         }
-        history.context_messages = Some(normalize_messages(messages));
+        history.context_messages = Some(Arc::new(normalize_messages(messages)));
         history.loading = false;
         true
     }
@@ -1662,13 +1915,13 @@ impl WorkspaceViewState {
         }
 
         let was_ready = thread.status == ThreadLoadStatus::Ready;
-        let previous_messages = thread.messages.clone();
         let had_context = thread.context_messages.is_some();
-        thread.messages = if append_older {
+        let merged = if append_older {
             merge_message_pages(&thread.messages, &messages)
         } else {
             merge_message_refresh(&thread.messages, &messages)
         };
+        let messages_changed = replace_if_changed(&mut thread.messages, merged);
         thread.status = ThreadLoadStatus::Ready;
         thread.context_messages = None;
         thread.next_cursor = usable_cursor(has_more, next_cursor);
@@ -1682,7 +1935,7 @@ impl WorkspaceViewState {
             } else {
                 WorkspaceScrollBehavior::StickToBottom
             },
-            render: !was_ready || had_context || thread.messages != previous_messages,
+            render: !was_ready || had_context || messages_changed,
         }
     }
 
@@ -1762,15 +2015,17 @@ impl WorkspaceViewState {
                     changes,
                     SlackMessage::belongs_in_channel_timeline,
                 );
-                let base_changed = apply_projection_message_changes(
-                    &mut history.messages,
-                    changes,
-                    SlackMessage::belongs_in_channel_timeline,
-                );
-                let context_changed = history
-                    .context_messages
-                    .as_mut()
-                    .is_some_and(|messages| apply_context_message_changes(messages, changes));
+                // `operations` lists every effective change, so an empty list
+                // leaves the shared list untouched (no copy-on-write).
+                let base_changed = !operations.is_empty()
+                    && apply_projection_message_changes(
+                        Arc::make_mut(&mut history.messages),
+                        changes,
+                        SlackMessage::belongs_in_channel_timeline,
+                    );
+                let context_changed = history.context_messages.as_mut().is_some_and(|messages| {
+                    apply_context_message_changes(Arc::make_mut(messages), changes)
+                });
                 if base_changed {
                     history.loaded = true;
                 }
@@ -1782,28 +2037,49 @@ impl WorkspaceViewState {
                 thread_ts,
             } => {
                 let key = (channel_id.clone(), thread_ts.clone());
+                let is_open = |thread: &ThreadViewState| {
+                    thread.channel_id == *channel_id && thread.ts == *thread_ts
+                };
+                // The open thread shares this list with the cache; drop its
+                // handle so the update below mutates in place instead of
+                // copying the whole list on every reply. It gets the cache's
+                // list back below.
+                let cached = self.thread_timelines.entry(key.clone()).or_default();
+                let released = self
+                    .thread
+                    .as_mut()
+                    .filter(|thread| is_open(thread) && Arc::ptr_eq(&thread.messages, cached))
+                    .map(|thread| thread.messages = SharedMessages::default())
+                    .is_some();
                 let (base_changed, projected_messages, operations) = {
-                    let messages = self.thread_timelines.entry(key).or_default();
+                    let messages = self.thread_timelines.entry(key.clone()).or_default();
                     let operations = timeline_projection_operations(messages, changes, |message| {
                         message.belongs_to_thread(thread_ts)
                     });
-                    let changed = apply_projection_message_changes(messages, changes, |message| {
-                        message.belongs_to_thread(thread_ts)
-                    });
-                    (changed, changed.then(|| messages.clone()), operations)
+                    let changed = !operations.is_empty()
+                        && apply_projection_message_changes(
+                            Arc::make_mut(messages),
+                            changes,
+                            |message| message.belongs_to_thread(thread_ts),
+                        );
+                    (
+                        changed,
+                        (changed || released).then(|| messages.clone()),
+                        operations,
+                    )
                 };
                 let active_changed = self
                     .thread
                     .as_mut()
-                    .filter(|thread| thread.channel_id == *channel_id && thread.ts == *thread_ts)
+                    .filter(|thread| is_open(thread))
                     .is_some_and(|thread| {
-                        if let Some(messages) = projected_messages.as_ref() {
-                            thread.messages.clone_from(messages);
+                        if let Some(messages) = projected_messages {
+                            thread.messages = messages;
                         }
-                        let context_changed = thread
-                            .context_messages
-                            .as_mut()
-                            .is_some_and(|context| apply_context_message_changes(context, changes));
+                        let context_changed =
+                            thread.context_messages.as_mut().is_some_and(|context| {
+                                apply_context_message_changes(Arc::make_mut(context), changes)
+                            });
                         base_changed || context_changed
                     });
                 (base_changed || active_changed, active_changed, operations)
@@ -2089,6 +2365,17 @@ fn apply_context_message_changes(
         }
     }
     changed
+}
+
+/// Stores `merged` only when it differs, so an unchanged reload keeps the
+/// shared list (and renders holding it) and reports no change without
+/// cloning the previous list to compare.
+fn replace_if_changed(messages: &mut SharedMessages, merged: Vec<SlackMessage>) -> bool {
+    if **messages == merged {
+        return false;
+    }
+    *messages = Arc::new(merged);
+    true
 }
 
 fn normalize_messages(mut messages: Vec<SlackMessage>) -> Vec<SlackMessage> {
@@ -2569,7 +2856,166 @@ mod tests {
             .unwrap();
 
         assert!(replaced.thread_catalog_changed());
+        assert!(replaced.selected_thread_record_changed());
         assert!(session.threads.borrow().clone().into_records().is_empty());
+    }
+
+    #[test]
+    fn thread_catalog_upsert_flags_only_the_open_thread() {
+        let mut catalog = ThreadCatalog::default();
+        let mut root = message("1", "thread root");
+        root.reply_count = Some(1);
+        catalog.observe_history("C1", &[root]);
+        let records = catalog.into_records();
+        let upsert_with_open_thread = |open: Option<(&str, &str)>| {
+            let session = WorkspaceSessionState::default();
+            if let Some((channel_id, thread_ts)) = open {
+                let mut view = session.view.borrow_mut();
+                view.select_conversation(channel_id);
+                view.open_thread(channel_id, thread_ts);
+            }
+            session
+                .apply_workspace_patch(&conversation_patch(
+                    WorkspaceRevision::INITIAL.successor(),
+                    WorkspaceChange::ThreadCatalogChanged(records.clone()),
+                ))
+                .unwrap()
+        };
+
+        let open = upsert_with_open_thread(Some(("C1", "1")));
+        assert!(open.thread_catalog_changed());
+        assert!(open.selected_thread_record_changed());
+        assert!(!upsert_with_open_thread(Some(("C1", "2"))).selected_thread_record_changed());
+        assert!(!upsert_with_open_thread(None).selected_thread_record_changed());
+    }
+
+    fn projected_user(id: &str, name: &str) -> SlackUser {
+        SlackUser {
+            id: Some(id.into()),
+            name: Some(name.into()),
+            profile: Some(crate::models::SlackUserProfile {
+                image_72: Some(format!("https://avatars.example/{id}.png")),
+                status_text: Some("Focus".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn identical_users_reset_reports_no_change() {
+        let session = WorkspaceSessionState::default();
+        let users = vec![projected_user("U1", "ada"), projected_user("U2", "bob")];
+        let revision = WorkspaceRevision::INITIAL.successor();
+        let first = session
+            .apply_workspace_patch(&conversation_patch(
+                revision,
+                WorkspaceChange::UsersReset(users.clone()),
+            ))
+            .unwrap();
+        assert_eq!(first.changed_user_ids(), &["U1", "U2"]);
+        let stamp = session.users.stamp();
+
+        let mut renamed = users.clone();
+        renamed[1].name = Some("robert".into());
+        let again = session
+            .apply_workspace_patch(&conversation_patch(
+                revision.successor(),
+                WorkspaceChange::UsersReset(users),
+            ))
+            .unwrap();
+        assert!(!again.users_reset());
+        assert!(again.changed_user_ids().is_empty());
+        assert_eq!(
+            session.users.stamp(),
+            stamp,
+            "a no-op reset must not restamp"
+        );
+
+        let changed = session
+            .apply_workspace_patch(&conversation_patch(
+                revision.successor().successor(),
+                WorkspaceChange::UsersReset(renamed),
+            ))
+            .unwrap();
+        assert!(changed.users_reset());
+        assert_eq!(changed.changed_user_ids(), &["U2"]);
+    }
+
+    #[test]
+    fn user_projection_reports_only_changed_users_and_drops_removed_ones() {
+        let directory = UserDirectoryState::default();
+        let ada = projected_user("U1", "ada");
+        let bob = projected_user("U2", "bob");
+        let mut changed = directory.project_users([&ada, &bob], true);
+        let mut changed_ids = changed.drain().collect::<Vec<_>>();
+        changed_ids.sort();
+        assert_eq!(changed_ids, ["U1", "U2"]);
+        assert_eq!(
+            directory.user_names.borrow().get("U1").map(String::as_str),
+            Some("ada")
+        );
+        assert!(directory.user_statuses.borrow().contains_key("U2"));
+
+        let mut cleared = bob.clone();
+        cleared.profile.as_mut().unwrap().status_text = Some(String::new());
+        assert_eq!(
+            directory.project_users([&cleared], false),
+            HashSet::from(["U2".to_string()])
+        );
+        assert!(!directory.user_statuses.borrow().contains_key("U2"));
+
+        // A reload replaces values the user lacks; a partial update keeps them.
+        let mut renamed = ada.clone();
+        renamed.profile.as_mut().unwrap().image_72 = None;
+        assert!(directory.project_users([&renamed], false).is_empty());
+        assert!(directory.user_avatar_urls.borrow().contains_key("U1"));
+        assert_eq!(
+            directory.project_users([&renamed], true),
+            HashSet::from(["U1".to_string()])
+        );
+        assert!(!directory.user_avatar_urls.borrow().contains_key("U1"));
+
+        assert_eq!(
+            directory.remove_users(&["U2".to_string()]),
+            HashSet::from(["U2".to_string()])
+        );
+        assert!(!directory.user_names.borrow().contains_key("U2"));
+        assert!(!directory.user_search_aliases.borrow().contains_key("U2"));
+        assert!(directory.remove_users(&["U2".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn perf_guard_no_op_user_updates_copy_no_shared_user_maps() {
+        // Timeline render contexts and the conversation titles cache hold
+        // clones of these `Arc`s, so an unconditional `Arc::make_mut` deep
+        // copied every map and invalidated every pointer-keyed cache.
+        let directory = UserDirectoryState::default();
+        let users = (0..50)
+            .map(|index| projected_user(&format!("U{index}"), &format!("user{index}")))
+            .collect::<Vec<_>>();
+        directory.project_users(&users, true);
+        let held = (
+            directory.user_names.borrow().clone(),
+            directory.user_full_names.borrow().clone(),
+            directory.user_avatar_urls.borrow().clone(),
+            directory.bot_user_ids.borrow().clone(),
+            directory.user_statuses.borrow().clone(),
+        );
+
+        for _ in 0..20 {
+            assert!(directory.project_users(&users[..3], false).is_empty());
+        }
+        assert!(directory.project_users(&users, true).is_empty());
+        assert!(directory
+            .merge_user_names(vec![("U1".to_string(), "user1".to_string())])
+            .is_empty());
+
+        assert!(Arc::ptr_eq(&held.0, &directory.user_names.borrow()));
+        assert!(Arc::ptr_eq(&held.1, &directory.user_full_names.borrow()));
+        assert!(Arc::ptr_eq(&held.2, &directory.user_avatar_urls.borrow()));
+        assert!(Arc::ptr_eq(&held.3, &directory.bot_user_ids.borrow()));
+        assert!(Arc::ptr_eq(&held.4, &directory.user_statuses.borrow()));
     }
 
     #[test]
@@ -2622,7 +3068,7 @@ mod tests {
             ))
             .unwrap();
         assert!(cleared.users_reset());
-        assert!(cleared.changed_user_ids().is_empty());
+        assert_eq!(cleared.changed_user_ids(), &["U1"]);
         assert!(session.users.borrow().is_empty());
     }
 
@@ -3546,6 +3992,61 @@ mod tests {
         assert!(!state.apply_message_context(&location, vec![message("2", "stale")]));
         assert_eq!(state.visible_channel_id(), Some("C2"));
         assert_eq!(state.channels["C1"].messages[0].body_text(), "latest");
+    }
+
+    #[test]
+    fn perf_guard_message_lists_are_shared_not_deep_copied() {
+        // Every timeline render deep-copied the channel or thread list to
+        // release the view borrow, and every history or thread reload cloned
+        // the previous list just to compare it after the merge. Lists are
+        // shared `Arc`s now: renders bump a refcount and an unchanged reload
+        // or no-op realtime change keeps the very same list.
+        let mut state = WorkspaceViewState::default();
+        state.select_conversation("C1");
+        let page = vec![message("2", "two"), message("1", "one")];
+        assert!(apply_fresh(&mut state, "C1", page.clone()).render);
+        let rendered = state.channel_messages_shared("C1");
+        assert!(Arc::ptr_eq(&rendered, &state.channel_messages_shared("C1")));
+
+        assert!(!apply_fresh(&mut state, "C1", page).render);
+        assert!(Arc::ptr_eq(&rendered, &state.channel_messages_shared("C1")));
+
+        let same = MessageChange::Upsert(Box::new(rendered[0].clone()));
+        assert!(state
+            .apply_timeline_changes(&TimelineTarget::Channel("C1".into()), &[same])
+            .is_none());
+        assert!(Arc::ptr_eq(&rendered, &state.channel_messages_shared("C1")));
+
+        state.open_thread("C1", "1");
+        let replies = vec![message("1", "root"), message("1.5", "reply")];
+        state.apply_thread("C1", "1", replies.clone(), false, None, false);
+        let thread = state.current_thread_messages_shared();
+        assert!(matches!(
+            state.apply_thread("C1", "1", replies, false, None, false),
+            ThreadApplyOutcome::Applied { render: false, .. }
+        ));
+        assert!(Arc::ptr_eq(
+            &thread,
+            &state.current_thread_messages_shared()
+        ));
+
+        // A realtime reply to the open thread updates the shared list in
+        // place: the thread view's own handle must not force a full copy.
+        let before = Arc::as_ptr(&thread);
+        drop(thread);
+        let mut reply = message("1.7", "new reply");
+        reply.thread_ts = Some("1".into());
+        let target = TimelineTarget::Thread {
+            channel_id: "C1".into(),
+            thread_ts: "1".into(),
+        };
+        let applied = state
+            .apply_timeline_changes(&target, &[MessageChange::Upsert(Box::new(reply))])
+            .expect("reply applies");
+        assert!(applied.render);
+        let after = state.current_thread_messages_shared();
+        assert_eq!(after.len(), 3);
+        assert_eq!(Arc::as_ptr(&after), before);
     }
 
     #[test]

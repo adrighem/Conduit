@@ -58,10 +58,59 @@ fn custom_emoji_cache_dir() -> PathBuf {
 }
 
 fn is_non_empty_file(path: &Path) -> bool {
-    path.is_file() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+    path.metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+}
+
+/// How long a custom emoji URL with no file on disk is answered from memory.
+/// Row binds and every `:` completion keystroke ask again; a miss costs a
+/// SHA-256, a dozen stats and a listing of the image cache. A download ends
+/// the window at once (see [`forget_custom_emoji_miss`]).
+const CUSTOM_EMOJI_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Misses remembered before the memo starts over.
+const MAX_CUSTOM_EMOJI_MISSES: usize = 4096;
+
+static CUSTOM_EMOJI_MISSES: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Custom emoji lookups on this thread that searched the disk.
+    static CUSTOM_EMOJI_DISK_RESOLVES: Cell<usize> = const { Cell::new(0) };
+}
+
+fn custom_emoji_misses() -> &'static Mutex<HashMap<String, std::time::Instant>> {
+    CUSTOM_EMOJI_MISSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_known_custom_emoji_miss(url: &str) -> bool {
+    custom_emoji_misses().lock().is_ok_and(|misses| {
+        misses
+            .get(url)
+            .is_some_and(|at| at.elapsed() < CUSTOM_EMOJI_MISS_TTL)
+    })
+}
+
+fn remember_custom_emoji_miss(url: &str) {
+    if let Ok(mut misses) = custom_emoji_misses().lock() {
+        if misses.len() >= MAX_CUSTOM_EMOJI_MISSES {
+            misses.retain(|_, at| at.elapsed() < CUSTOM_EMOJI_MISS_TTL);
+            if misses.len() >= MAX_CUSTOM_EMOJI_MISSES {
+                misses.clear();
+            }
+        }
+        misses.insert(url.to_string(), std::time::Instant::now());
+    }
+}
+
+/// A file for `url` may just have been written: look on disk again.
+pub(crate) fn forget_custom_emoji_miss(url: &str) {
+    if let Ok(mut misses) = custom_emoji_misses().lock() {
+        misses.remove(url);
+    }
 }
 
 pub(crate) fn invalidate_or_set_custom_emoji_cached_file(url: &str, path: PathBuf) {
+    forget_custom_emoji_miss(url);
     if let Ok(mut map) = resolved_cache_map().lock() {
         if is_non_empty_file(&path) {
             map.insert(url.to_string(), path);
@@ -80,12 +129,20 @@ pub(crate) fn resolve_custom_emoji_cached_file(url: &str) -> Option<PathBuf> {
             map.remove(url);
         }
     }
+    if is_known_custom_emoji_miss(url) {
+        return None;
+    }
 
+    #[cfg(test)]
+    CUSTOM_EMOJI_DISK_RESOLVES.with(|resolves| resolves.set(resolves.get() + 1));
     let resolved = resolve_custom_emoji_cached_file_disk(url);
-    if let Some(ref path) = resolved {
-        if let Ok(mut map) = resolved_cache_map().lock() {
-            map.insert(url.to_string(), path.clone());
+    match resolved {
+        Some(ref path) => {
+            if let Ok(mut map) = resolved_cache_map().lock() {
+                map.insert(url.to_string(), path.clone());
+            }
         }
+        None => remember_custom_emoji_miss(url),
     }
     resolved
 }
@@ -631,7 +688,7 @@ impl EmojiSlot {
             return;
         }
         match decoded {
-            Decoded::Animation(animation) => {
+            Decoded::Animation(animation, _) => {
                 let still = gtk::gdk::Texture::for_pixbuf(&animation.iter(None).pixbuf());
                 self.stills
                     .borrow_mut()
@@ -689,7 +746,7 @@ impl EmojiSlot {
         let slot = Rc::downgrade(self);
         // A known still has nothing to play: `Ready` needs no handling.
         let _ = decode::request_animation(&path, &self.hover, move |decoded| {
-            if let (Some(slot), Decoded::Animation(animation)) = (slot.upgrade(), decoded) {
+            if let (Some(slot), Decoded::Animation(animation, _)) = (slot.upgrade(), decoded) {
                 if slot.url() == url {
                     slot.animate(animation);
                 }
@@ -1107,8 +1164,10 @@ mod tests {
         assert!(!is_valid_custom_emoji_url("/etc/passwd"));
     }
 
+    /// A miss is remembered only briefly and never as a path: once a file
+    /// for the URL lands (the download hook forgets the miss), it resolves.
     #[test]
-    fn resolve_custom_emoji_does_not_negative_cache_missing_files() {
+    fn resolve_custom_emoji_finds_a_file_written_after_a_miss() {
         let url = format!(
             "https://emoji.slack-edge.com/T_TEST/non_negative_{}/emoji.gif",
             std::process::id()
@@ -1124,12 +1183,30 @@ mod tests {
         let hash = custom_emoji_url_hash(&url);
         let file_path = dir.join(format!("{hash}.gif"));
         std::fs::write(&file_path, b"GIF89a").unwrap();
+        forget_custom_emoji_miss(&url);
 
         let resolved = resolve_custom_emoji_cached_file(&url);
         assert_eq!(resolved.as_deref(), Some(file_path.as_path()));
 
         std::fs::remove_file(&file_path).unwrap();
         assert!(resolve_custom_emoji_cached_file(&url).is_none());
+    }
+
+    #[test]
+    fn perf_guard_repeated_custom_emoji_misses_resolve_from_disk_once() {
+        let url = format!(
+            "https://emoji.slack-edge.com/T_TEST/miss_memo_{}/emoji.png",
+            std::process::id()
+        );
+        let resolves = || CUSTOM_EMOJI_DISK_RESOLVES.with(Cell::get);
+        let before = resolves();
+        for _ in 0..8 {
+            assert!(resolve_custom_emoji_cached_file(&url).is_none());
+        }
+        assert_eq!(resolves() - before, 1, "a miss is remembered");
+        forget_custom_emoji_miss(&url);
+        assert!(resolve_custom_emoji_cached_file(&url).is_none());
+        assert_eq!(resolves() - before, 2, "a download hook ends the memo");
     }
 
     #[test]

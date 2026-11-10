@@ -84,25 +84,35 @@ pub(crate) fn message_uses_image_asset(
     catalog: &EmojiCatalog,
     key: &str,
 ) -> bool {
-    message.avatar_url() == Some(key)
+    message_uses_image_asset_matching(message, catalog, |candidate| candidate == key)
+}
+
+/// [`message_uses_image_asset`] for any key `is_key` accepts, so a batch of
+/// arrived assets is matched in one pass over the messages.
+pub(crate) fn message_uses_image_asset_matching(
+    message: &SlackMessage,
+    catalog: &EmojiCatalog,
+    is_key: impl Fn(&str) -> bool,
+) -> bool {
+    message.avatar_url().is_some_and(&is_key)
         || message
             .files
             .as_ref()
             .into_iter()
             .flatten()
             .filter_map(image_asset_request)
-            .any(|(candidate, _)| candidate == key)
+            .any(|(candidate, _)| is_key(&candidate))
         || message
             .attachments
             .as_ref()
             .into_iter()
             .flatten()
             .filter_map(attachment_image_asset_request)
-            .any(|(candidate, _)| candidate == key)
+            .any(|(candidate, _)| is_key(&candidate))
         || message
             .document
             .image_urls()
-            .any(|candidate| candidate == key)
+            .any(&is_key)
         || message
             .reactions
             .as_ref()
@@ -111,7 +121,7 @@ pub(crate) fn message_uses_image_asset(
             .any(|r| {
                 r.name.as_deref().is_some_and(|name| {
                     let clean_name = name.trim_matches(':');
-                    matches!(catalog.resolve(clean_name), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if url == key)
+                    matches!(catalog.resolve(clean_name), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if is_key(url))
                 })
             })
         || message.text.as_deref().is_some_and(|text| {
@@ -123,7 +133,7 @@ pub(crate) fn message_uses_image_asset(
                     if !code.is_empty()
                         && code.len() <= 64
                         && code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
-                        && matches!(catalog.resolve(code), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if url == key)
+                        && matches!(catalog.resolve(code), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if is_key(url))
                     {
                         return true;
                     }

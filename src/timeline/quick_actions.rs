@@ -1,5 +1,7 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gtk::prelude::*;
 use gtk::{Box, Button, Orientation};
@@ -21,6 +23,64 @@ pub(crate) struct QuickBarState<'a> {
     pub(crate) can_mark_unread: bool,
 }
 
+/// What the quick bar's buttons were built from.
+#[derive(PartialEq)]
+struct QuickBarKey {
+    recent_reactions: Vec<String>,
+    custom_emojis: Arc<HashMap<String, String>>,
+    can_mark_unread: bool,
+}
+
+/// The quick bar's buttons, built once and pointed at the hovered message.
+/// Hovering another row only swaps the target; the buttons are rebuilt when
+/// the recent reactions, custom emoji or mark-unread offer change.
+#[derive(Default)]
+pub(crate) struct QuickBarCache {
+    target: Rc<RefCell<String>>,
+    built: RefCell<Option<QuickBarKey>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Quick bars built on this thread.
+    pub(crate) static QUICK_BAR_BUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Shows `quick_bar` for the message `ts`, rebuilding its buttons only when
+/// what they show changed since the last hover.
+pub(crate) fn show_quick_bar_for(
+    quick_bar: &Box,
+    cache: &QuickBarCache,
+    ts: &str,
+    context: &MessageRenderContext,
+    state: &QuickBarState<'_>,
+) {
+    ts.clone_into(&mut cache.target.borrow_mut());
+    let unchanged = cache.built.borrow().as_ref().is_some_and(|built| {
+        built.recent_reactions == context.recent_reactions
+            && Arc::ptr_eq(&built.custom_emojis, &context.custom_emojis)
+            && built.can_mark_unread == state.can_mark_unread
+    });
+    if unchanged {
+        return;
+    }
+    let key = QuickBarKey {
+        recent_reactions: context.recent_reactions.clone(),
+        custom_emojis: context.custom_emojis.clone(),
+        can_mark_unread: state.can_mark_unread,
+    };
+    build_quick_bar(
+        quick_bar,
+        &cache.target,
+        &crate::message_markup::recent_reactions(context),
+        context,
+        state,
+    );
+    cache.built.replace(Some(key));
+}
+
+/// Builds `quick_bar`'s buttons for the message `ts`, uncached.
+#[cfg(test)]
 pub(crate) fn rebuild_quick_bar(
     quick_bar: &Box,
     ts: &str,
@@ -28,6 +88,21 @@ pub(crate) fn rebuild_quick_bar(
     context: &MessageRenderContext,
     state: &QuickBarState<'_>,
 ) {
+    let target = Rc::new(RefCell::new(ts.to_string()));
+    build_quick_bar(quick_bar, &target, reactions, context, state);
+}
+
+/// Builds `quick_bar`'s buttons; each acts on the message `target` names
+/// when clicked.
+fn build_quick_bar(
+    quick_bar: &Box,
+    target: &Rc<RefCell<String>>,
+    reactions: &[crate::emoji::EmojiEntry],
+    context: &MessageRenderContext,
+    state: &QuickBarState<'_>,
+) {
+    #[cfg(test)]
+    QUICK_BAR_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let QuickBarState {
         on_action,
         hover_generation,
@@ -56,14 +131,14 @@ pub(crate) fn rebuild_quick_bar(
         btn.add_css_class("flat");
         btn.add_css_class("circular");
         btn.set_tooltip_text(Some(&format!(":{}:", entry.name)));
-        let ts = ts.to_string();
+        let target = target.clone();
         let name = entry.name.clone();
         let on_action = on_action.clone();
         btn.connect_clicked(move |_| {
             dispatch_timeline_action(
                 &on_action,
                 TimelineAction::ToggleReaction {
-                    ts: ts.clone(),
+                    ts: target.borrow().clone(),
                     name: name.clone(),
                     add: true,
                 },
@@ -83,7 +158,7 @@ pub(crate) fn rebuild_quick_bar(
     add_btn.set_tooltip_text(Some("Add reaction..."));
     {
         let custom_emojis = context.custom_emojis.clone();
-        let ts = ts.to_string();
+        let target = target.clone();
         let on_action = on_action.clone();
         let weak_add_btn = add_btn.downgrade();
         add_btn.connect_clicked(move |_| {
@@ -91,7 +166,8 @@ pub(crate) fn rebuild_quick_bar(
                 return;
             };
             let on_action = on_action.clone();
-            let ts = ts.clone();
+            // The picker outlives the hover: react to the message it opened for.
+            let ts = target.borrow().clone();
             let picker = crate::emoji_picker_window::EmojiPickerWindow::new(
                 &btn,
                 &custom_emojis,
@@ -122,10 +198,13 @@ pub(crate) fn rebuild_quick_bar(
     reply_btn.add_css_class("circular");
     reply_btn.set_tooltip_text(Some("Reply in thread"));
     {
-        let ts = ts.to_string();
+        let target = target.clone();
         let on_action = on_action.clone();
         reply_btn.connect_clicked(move |_| {
-            dispatch_timeline_action(&on_action, TimelineAction::OpenThread(ts.clone()));
+            dispatch_timeline_action(
+                &on_action,
+                TimelineAction::OpenThread(target.borrow().clone()),
+            );
         });
     }
     quick_bar.append(&reply_btn);
@@ -136,10 +215,13 @@ pub(crate) fn rebuild_quick_bar(
     forward_btn.add_css_class("circular");
     forward_btn.set_tooltip_text(Some("Forward message..."));
     {
-        let ts = ts.to_string();
+        let target = target.clone();
         let on_action = on_action.clone();
         forward_btn.connect_clicked(move |_| {
-            dispatch_timeline_action(&on_action, TimelineAction::ForwardMessage(ts.clone()));
+            dispatch_timeline_action(
+                &on_action,
+                TimelineAction::ForwardMessage(target.borrow().clone()),
+            );
         });
     }
     quick_bar.append(&forward_btn);
@@ -153,16 +235,22 @@ pub(crate) fn rebuild_quick_bar(
 
     let popover = gtk::Popover::new();
     let popover_box = Box::new(Orientation::Vertical, 0);
+    // The message the menu opened for: hovers while it is open must not
+    // retarget its actions.
+    let menu_target = Rc::new(RefCell::new(String::new()));
 
     let copy_link_btn = Button::with_label("Copy link");
     copy_link_btn.set_focus_on_click(false);
     copy_link_btn.add_css_class("flat");
     {
-        let ts = ts.to_string();
+        let target = menu_target.clone();
         let on_action = on_action.clone();
         let popover_weak = popover.downgrade();
         copy_link_btn.connect_clicked(move |_| {
-            dispatch_timeline_action(&on_action, TimelineAction::CopyMessageLink(ts.clone()));
+            dispatch_timeline_action(
+                &on_action,
+                TimelineAction::CopyMessageLink(target.borrow().clone()),
+            );
             if let Some(p) = popover_weak.upgrade() {
                 p.popdown();
             }
@@ -174,11 +262,14 @@ pub(crate) fn rebuild_quick_bar(
     copy_text_btn.set_focus_on_click(false);
     copy_text_btn.add_css_class("flat");
     {
-        let ts = ts.to_string();
+        let target = menu_target.clone();
         let on_action = on_action.clone();
         let popover_weak = popover.downgrade();
         copy_text_btn.connect_clicked(move |_| {
-            dispatch_timeline_action(&on_action, TimelineAction::CopyMessageText(ts.clone()));
+            dispatch_timeline_action(
+                &on_action,
+                TimelineAction::CopyMessageText(target.borrow().clone()),
+            );
             if let Some(p) = popover_weak.upgrade() {
                 p.popdown();
             }
@@ -190,13 +281,13 @@ pub(crate) fn rebuild_quick_bar(
     copy_details_btn.set_focus_on_click(false);
     copy_details_btn.add_css_class("flat");
     {
-        let ts = ts.to_string();
+        let target = menu_target.clone();
         let on_action = on_action.clone();
         let popover_weak = popover.downgrade();
         copy_details_btn.connect_clicked(move |_| {
             dispatch_timeline_action(
                 &on_action,
-                TimelineAction::CopyMessageWithMetadata(ts.clone()),
+                TimelineAction::CopyMessageWithMetadata(target.borrow().clone()),
             );
             if let Some(p) = popover_weak.upgrade() {
                 p.popdown();
@@ -210,11 +301,14 @@ pub(crate) fn rebuild_quick_bar(
         unread_btn.set_focus_on_click(false);
         unread_btn.add_css_class("flat");
         {
-            let ts = ts.to_string();
+            let target = menu_target.clone();
             let on_action = on_action.clone();
             let popover_weak = popover.downgrade();
             unread_btn.connect_clicked(move |_| {
-                dispatch_timeline_action(&on_action, TimelineAction::MarkUnread(ts.clone()));
+                dispatch_timeline_action(
+                    &on_action,
+                    TimelineAction::MarkUnread(target.borrow().clone()),
+                );
                 if let Some(p) = popover_weak.upgrade() {
                     p.popdown();
                 }
@@ -227,7 +321,9 @@ pub(crate) fn rebuild_quick_bar(
     *current_popover.borrow_mut() = Some(popover.clone());
 
     {
+        let target = target.clone();
         popover.connect_show(move |p| {
+            menu_target.replace(target.borrow().clone());
             crate::debug::log(
                 "quickbar",
                 &format!("popover show is_visible={}", p.is_visible()),
