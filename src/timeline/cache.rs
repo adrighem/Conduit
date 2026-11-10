@@ -744,7 +744,9 @@ pub(crate) mod decode {
     #[derive(Debug, Clone)]
     pub(crate) enum Decoded {
         Texture(gdk::Texture),
-        Animation(gdk_pixbuf::PixbufAnimation),
+        /// An animation and the frames in one loop of it, counted from its
+        /// headers in the worker (`None` when they could not say).
+        Animation(gdk_pixbuf::PixbufAnimation, Option<u32>),
         /// An animation request found a single frame: decode it as a still.
         Still,
     }
@@ -767,7 +769,7 @@ pub(crate) mod decode {
             }
             Decoded::Still => crate::animated_image::remember_static(&key.path),
             // Held by its players only: a WebP animation keeps every frame.
-            Decoded::Animation(_) => {}
+            Decoded::Animation(..) => {}
         }
     }
 
@@ -1191,20 +1193,24 @@ pub(crate) mod decode {
         }
     }
 
+    /// An animation's encoded bytes and the frames in one loop of it.
+    pub(crate) type AnimationBytes = (Vec<u8>, Option<u32>);
+
     /// The worker half of an animation load: reads `path` once, judges the
     /// budget on those bytes and counts their frames from the headers.
-    /// `None` for a still, which needs no animation decoder.
-    pub(crate) fn read_animation(path: &Path) -> Result<Option<Vec<u8>>, DecodeError> {
+    /// `None` for a still, which needs no animation decoder; otherwise the
+    /// bytes and the frames in one loop.
+    pub(crate) fn read_animation(path: &Path) -> Result<Option<AnimationBytes>, DecodeError> {
         let bytes = read_within_budget(path)?;
-        let frames = crate::image_header::frame_count(&mut std::io::Cursor::new(&bytes));
-        Ok((frames != Some(1)).then_some(bytes))
+        let frames = crate::image_header::loop_frame_count(&mut std::io::Cursor::new(&bytes));
+        Ok((frames != Some(1)).then_some((bytes, frames)))
     }
 
-    fn animated_or_still(animation: gdk_pixbuf::PixbufAnimation) -> Decoded {
+    fn animated_or_still(animation: gdk_pixbuf::PixbufAnimation, frames: Option<u32>) -> Decoded {
         if animation.is_static_image() {
             Decoded::Still
         } else {
-            Decoded::Animation(animation)
+            Decoded::Animation(animation, frames)
         }
     }
 
@@ -1212,7 +1218,7 @@ pub(crate) mod decode {
     /// worker, then those same bytes are decoded by gdk-pixbuf's task
     /// thread. Completes on the GTK thread.
     async fn load_animation(path: PathBuf) -> Result<Decoded, DecodeError> {
-        let Some(bytes) = gio::spawn_blocking(move || read_animation(&path))
+        let Some((bytes, frames)) = gio::spawn_blocking(move || read_animation(&path))
             .await
             .unwrap_or_else(|_| Err(DecodeError::Permanent("read panicked".into())))?
         else {
@@ -1221,7 +1227,7 @@ pub(crate) mod decode {
         let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_owned(bytes));
         gdk_pixbuf::PixbufAnimation::from_stream_future(&stream)
             .await
-            .map(animated_or_still)
+            .map(|animation| animated_or_still(animation, frames))
             .map_err(|error| classify_glib_error(&error))
     }
 
@@ -1621,8 +1627,9 @@ pub(crate) mod decode {
                 return;
             };
             match decoded {
-                Decoded::Animation(animation) => {
-                    let player = crate::animated_image::player(&self.path, size, animation);
+                Decoded::Animation(animation, frames) => {
+                    let player =
+                        crate::animated_image::player(&self.path, size, animation, *frames);
                     paintable.set_content(&player);
                 }
                 // One frame after all: decode it as a still.
@@ -1658,12 +1665,12 @@ pub(crate) mod decode {
         if key.spec != TextureSpec::Animation {
             return decode_key(key).map(Decoded::Texture);
         }
-        let Some(bytes) = read_animation(&key.path)? else {
+        let Some((bytes, frames)) = read_animation(&key.path)? else {
             return Ok(Decoded::Still);
         };
         let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_owned(bytes));
         gdk_pixbuf::PixbufAnimation::from_stream(&stream, gio::Cancellable::NONE)
-            .map(animated_or_still)
+            .map(|animation| animated_or_still(animation, frames))
             .map_err(|error| classify_glib_error(&error))
     }
 

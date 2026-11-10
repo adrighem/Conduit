@@ -631,7 +631,7 @@ impl EmojiSlot {
             return;
         }
         match decoded {
-            Decoded::Animation(animation) => {
+            Decoded::Animation(animation, _) => {
                 let still = gtk::gdk::Texture::for_pixbuf(&animation.iter(None).pixbuf());
                 self.stills
                     .borrow_mut()
@@ -689,7 +689,7 @@ impl EmojiSlot {
         let slot = Rc::downgrade(self);
         // A known still has nothing to play: `Ready` needs no handling.
         let _ = decode::request_animation(&path, &self.hover, move |decoded| {
-            if let (Some(slot), Decoded::Animation(animation)) = (slot.upgrade(), decoded) {
+            if let (Some(slot), Decoded::Animation(animation, _)) = (slot.upgrade(), decoded) {
                 if slot.url() == url {
                     slot.animate(animation);
                 }
