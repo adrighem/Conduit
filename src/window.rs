@@ -90,7 +90,6 @@ use crate::sidebar::{
 };
 #[cfg(test)]
 use crate::sidebar::{ConversationPickerItem, ConversationPickerSections, SidebarItemKey};
-use crate::sidebar_widgets::{sidebar_row_widget, SidebarRowLayout};
 use crate::slack_link::{
     resolve_slack_uri, slack_app_web_fallback, SlackFileAction, SlackUri, SlackUriResolution,
     SlackUriTarget,
@@ -1741,7 +1740,7 @@ impl ViewerImage {
     }
 }
 
-fn sidebar_section_accessible_label(title: &str, collapsed: bool) -> String {
+pub(crate) fn sidebar_section_accessible_label(title: &str, collapsed: bool) -> String {
     format!(
         "{} {title}",
         if collapsed {
@@ -1754,12 +1753,6 @@ fn sidebar_section_accessible_label(title: &str, collapsed: bool) -> String {
 
 fn sidebar_list_store() -> gio::ListStore {
     gio::ListStore::new::<glib::BoxedAnyObject>()
-}
-
-/// A recycled list item keeps its widget tree when it is rebound to an item
-/// with the same key that draws identically.
-fn sidebar_bind_keeps_child(shown: Option<&KeyedSidebarItem>, next: &KeyedSidebarItem) -> bool {
-    shown.is_some_and(|shown| shown.key == next.key && shown.model.renders_same(&next.model))
 }
 
 fn boxed_sidebar_item(item: &KeyedSidebarItem) -> glib::BoxedAnyObject {
@@ -2201,7 +2194,7 @@ fn accepts_user_profile_completion(
     profile_visible && pending_user_id == Some(completed_user_id)
 }
 
-fn sidebar_context_menu_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
+pub(crate) fn sidebar_context_menu_key(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
     key == gtk::gdk::Key::Menu
         || (key == gtk::gdk::Key::F10 && state.contains(gtk::gdk::ModifierType::SHIFT_MASK))
 }
@@ -4516,14 +4509,10 @@ impl ConduitWindow {
         }
     }
 
-    fn show_media_context_menu(&self, x: f64, y: f64) {
+    fn show_media_context_menu(&self, x: f64, y: f64) -> Option<gtk::Popover> {
         let viewer_ref = self.imp().media_viewer.borrow();
-        let Some(viewer) = viewer_ref.as_ref() else {
-            return;
-        };
-        if viewer.loaded_path.is_none() {
-            return;
-        }
+        let viewer = viewer_ref.as_ref()?;
+        viewer.loaded_path.as_ref()?;
         let popover = gtk::Popover::new();
         popover.set_parent(&viewer.content_stack);
         popover.set_has_arrow(true);
@@ -4546,6 +4535,7 @@ impl ConduitWindow {
         menu.append(&save);
         popover.set_child(Some(&menu));
         popover.popup();
+        Some(popover)
     }
 
     fn save_current_media(&self) {
@@ -4774,53 +4764,23 @@ impl ConduitWindow {
 
     fn setup_sidebar_list(&self) {
         self.ensure_composer_format_control_css();
-        let factory = gtk::SignalListItemFactory::new();
-        // What each recycled `ListItem` currently shows, by object pointer. A
-        // rebind to an item that draws the same keeps the existing widget
-        // tree (a row is 6-10 widgets plus two controllers).
-        let rendered: Rc<RefCell<HashMap<usize, KeyedSidebarItem>>> = Rc::default();
-        let weak_window = self.downgrade();
-        let rendered_for_bind = Rc::clone(&rendered);
-        factory.connect_bind(move |_, object| {
-            let Some(window) = weak_window.upgrade() else {
-                return;
-            };
-            let Some(list_item) = object.downcast_ref::<gtk::ListItem>() else {
-                return;
-            };
-            let Some(boxed) = list_item.item().and_downcast::<glib::BoxedAnyObject>() else {
-                return;
-            };
-            let item = boxed.borrow::<KeyedSidebarItem>();
-            let (selectable, activatable) = match item.model {
-                SidebarItemModel::Placeholder(_) => (false, false),
-                SidebarItemModel::SectionHeader { .. } => (false, true),
-                SidebarItemModel::Conversation(_) => (true, true),
-                SidebarItemModel::ThreadSummary { .. } => (true, true),
-            };
-            list_item.set_selectable(selectable);
-            list_item.set_activatable(activatable);
-            let pointer = list_item.as_ptr() as usize;
-            let mut rendered = rendered_for_bind.borrow_mut();
-            if list_item.child().is_some()
-                && sidebar_bind_keeps_child(rendered.get(&pointer), &item)
-            {
-                return;
-            }
-            list_item.set_child(Some(&window.sidebar_item_widget(&item)));
-            rendered.insert(pointer, item.clone());
-        });
-        // Unbind keeps the child: GTK recycles list items and rebinding the
-        // same row (scrolling back, an invisible model change) reuses it.
-        let rendered_for_teardown = Rc::clone(&rendered);
-        factory.connect_teardown(move |_, object| {
-            if let Some(list_item) = object.downcast_ref::<gtk::ListItem>() {
-                rendered_for_teardown
-                    .borrow_mut()
-                    .remove(&(list_item.as_ptr() as usize));
-                list_item.set_child(None::<&gtk::Widget>);
-            }
-        });
+        let factory = {
+            let weak_for_emojis = self.downgrade();
+            let weak_for_menu = self.downgrade();
+            crate::sidebar_widgets::build_sidebar_factory(
+                move || {
+                    weak_for_emojis
+                        .upgrade()
+                        .map(|window| std::sync::Arc::clone(&window.imp().custom_emojis.borrow()))
+                        .unwrap_or_default()
+                },
+                move |row, channel_id, pointing_to| {
+                    weak_for_menu.upgrade().and_then(|window| {
+                        window.show_sidebar_context_menu(row, channel_id, pointing_to)
+                    })
+                },
+            )
+        };
 
         let store = sidebar_list_store();
         let selection = gtk::SingleSelection::new(Some(store));
@@ -11937,112 +11897,12 @@ impl ConduitWindow {
         });
     }
 
-    fn sidebar_item_widget(&self, item: &KeyedSidebarItem) -> gtk::Widget {
-        match &item.model {
-            SidebarItemModel::Placeholder(placeholder) => self
-                .placeholder_label(placeholder.label())
-                .upcast::<gtk::Widget>(),
-            SidebarItemModel::SectionHeader {
-                title, collapsed, ..
-            } => self.sidebar_section_widget(title, *collapsed),
-            SidebarItemModel::Conversation(model) => {
-                let row = sidebar_row_widget(
-                    model,
-                    SidebarRowLayout::sidebar(),
-                    &self.imp().custom_emojis.borrow(),
-                );
-                let content = row
-                    .child()
-                    .expect("sidebar conversation row should have content");
-                row.set_child(None::<&gtk::Widget>);
-                let accessible_label = model.accessible_label();
-                content.set_focusable(true);
-                content.set_tooltip_text(Some(&accessible_label));
-                content.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
-                self.attach_sidebar_context_menu(&content, &model.id);
-                content
-            }
-            SidebarItemModel::ThreadSummary {
-                reply_count,
-                unread_count,
-                ..
-            } => {
-                let label = gtk::Label::new(Some(&crate::sidebar::thread_summary_label_text(
-                    *reply_count,
-                    *unread_count,
-                )));
-                label.set_xalign(0.0);
-                label.set_margin_start(24);
-                label.set_margin_end(6);
-                label.set_margin_top(2);
-                label.set_margin_bottom(2);
-                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                label.add_css_class("caption");
-                label.add_css_class("dim-label");
-                label.upcast::<gtk::Widget>()
-            }
-        }
-    }
-
-    fn attach_sidebar_context_menu(&self, row: &gtk::Widget, channel_id: &str) {
-        row.set_focusable(true);
-
-        let gesture = gtk::GestureClick::new();
-        gesture.set_button(3);
-        let weak_window = self.downgrade();
-        let weak_row = row.downgrade();
-        let channel_id_for_pointer = channel_id.to_string();
-        gesture.connect_pressed(move |_, _, x, y| {
-            let Some(window) = weak_window.upgrade() else {
-                return;
-            };
-            let Some(row_for_menu) = weak_row.upgrade() else {
-                return;
-            };
-            window.show_sidebar_context_menu(
-                &row_for_menu,
-                &channel_id_for_pointer,
-                Some(gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)),
-            );
-        });
-        row.add_controller(gesture);
-
-        let keys = gtk::EventControllerKey::new();
-        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let weak_window = self.downgrade();
-        let weak_row = row.downgrade();
-        let channel_id_for_keyboard = channel_id.to_string();
-        keys.connect_key_pressed(move |_, key, _, state| {
-            if !sidebar_context_menu_key(key, state) {
-                return glib::Propagation::Proceed;
-            }
-            let Some(window) = weak_window.upgrade() else {
-                return glib::Propagation::Proceed;
-            };
-            let Some(row_for_menu) = weak_row.upgrade() else {
-                return glib::Propagation::Proceed;
-            };
-            window.show_sidebar_context_menu(
-                &row_for_menu,
-                &channel_id_for_keyboard,
-                Some(gtk::gdk::Rectangle::new(
-                    row_for_menu.width() / 2,
-                    row_for_menu.height() / 2,
-                    1,
-                    1,
-                )),
-            );
-            glib::Propagation::Stop
-        });
-        row.add_controller(keys);
-    }
-
-    fn show_sidebar_context_menu(
+    pub(crate) fn show_sidebar_context_menu(
         &self,
         row: &gtk::Widget,
         channel_id: &str,
         pointing_to: Option<gtk::gdk::Rectangle>,
-    ) {
+    ) -> Option<gtk::Popover> {
         let popover = gtk::Popover::new();
         popover.add_css_class("sidebar-context-menu");
         popover.set_parent(row);
@@ -12191,6 +12051,7 @@ impl ConduitWindow {
 
         popover.set_child(Some(&menu));
         popover.popup();
+        Some(popover)
     }
 
     fn confirm_leave_private_channel(&self, conversation: &SlackConversation) {
@@ -12220,34 +12081,6 @@ impl ConduitWindow {
         self.send_command(RuntimeCommand::LeaveConversation {
             channel_id: channel_id.to_string(),
         });
-    }
-
-    fn sidebar_section_widget(&self, title: &str, collapsed: bool) -> gtk::Widget {
-        let header = gtk::Label::new(Some(title));
-        header.set_xalign(0.0);
-        header.set_hexpand(true);
-        header.set_margin_top(12);
-        header.set_margin_bottom(3);
-        header.set_margin_end(9);
-        header.add_css_class("caption");
-        header.add_css_class("heading");
-
-        let disclosure = gtk::Image::from_icon_name(if collapsed {
-            "pan-end-symbolic"
-        } else {
-            "pan-down-symbolic"
-        });
-        disclosure.set_margin_start(9);
-        disclosure.set_accessible_role(gtk::AccessibleRole::Presentation);
-
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 3);
-        content.set_focusable(true);
-        content.update_property(&[gtk::accessible::Property::Label(
-            &sidebar_section_accessible_label(title, collapsed),
-        )]);
-        content.append(&disclosure);
-        content.append(&header);
-        content.upcast()
     }
 
     fn reconcile_sidebar(&self, next_items: Vec<KeyedSidebarItem>) {
@@ -13183,19 +13016,13 @@ impl ConduitWindow {
                 label.upcast()
             }
             ConversationPickerListEntry::Item(item) => {
-                let row = sidebar_row_widget(
-                    &item.row,
-                    SidebarRowLayout::switcher(),
-                    &self.imp().custom_emojis.borrow(),
+                let widgets = crate::sidebar_widgets::ConversationRowWidgets::new(
+                    crate::sidebar_widgets::SidebarRowLayout::switcher(),
                 );
-                let content = row
-                    .child()
-                    .expect("picker conversation row should have content");
-                row.set_child(None::<&gtk::Widget>);
-                let accessible_label = item.row.accessible_label();
-                content.set_tooltip_text(Some(&accessible_label));
-                content.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
-                content
+                let custom_emojis = std::sync::Arc::clone(&self.imp().custom_emojis.borrow());
+                let generation = std::rc::Rc::new(std::cell::Cell::new(1));
+                widgets.update(&item.row, &custom_emojis, generation, 1);
+                widgets.content.upcast()
             }
             ConversationPickerListEntry::Placeholder(text) => self.placeholder_label(text).upcast(),
         }

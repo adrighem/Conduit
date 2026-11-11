@@ -4107,22 +4107,372 @@ mod graphical {
             assert!(!lock.is_visible());
         });
     }
-}
 
-#[test]
-fn perf_guard_sidebar_bind_keeps_child_for_invisible_changes() {
-    let item = keyed_sidebar_row("C1", "Channel 1", false);
-    let mut moved = item.clone();
-    let SidebarItemModel::Conversation(row) = &mut moved.model else {
-        panic!("expected conversation row");
-    };
-    row.latest_ts = Some("1700000000.000100".to_string());
-    assert!(sidebar_bind_keeps_child(Some(&item), &moved));
-    assert!(!sidebar_bind_keeps_child(None, &item));
+    fn reset_sidebar_widget_counters() {
+        crate::sidebar_widgets::SIDEBAR_SKELETON_BUILDS.with(|c| c.set(0));
+        crate::sidebar_widgets::SIDEBAR_ROW_UPDATES.with(|c| c.set(0));
+        crate::sidebar_widgets::SIDEBAR_WIDGET_CONSTRUCTIONS.with(|c| c.set(0));
+    }
 
-    let SidebarItemModel::Conversation(row) = &mut moved.model else {
-        panic!("expected conversation row");
-    };
-    row.mention_count = 1;
-    assert!(!sidebar_bind_keeps_child(Some(&item), &moved));
+    fn read_sidebar_widget_counters() -> (usize, usize, usize) {
+        (
+            crate::sidebar_widgets::SIDEBAR_SKELETON_BUILDS.with(std::cell::Cell::get),
+            crate::sidebar_widgets::SIDEBAR_ROW_UPDATES.with(std::cell::Cell::get),
+            crate::sidebar_widgets::SIDEBAR_WIDGET_CONSTRUCTIONS.with(std::cell::Cell::get),
+        )
+    }
+
+    #[test]
+    fn perf_guard_sidebar_rebind_and_scroll_construct_zero_widgets() {
+        run_gtk_test(|| {
+            use crate::timeline::tests::{pump, pump_until};
+
+            let _ = adw::init();
+            reset_sidebar_widget_counters();
+
+            let store = sidebar_list_store();
+            let selection = gtk::SingleSelection::new(Some(store.clone()));
+            selection.set_autoselect(false);
+            selection.set_can_unselect(true);
+
+            let factory = crate::sidebar_widgets::build_sidebar_factory(
+                std::sync::Arc::default,
+                |_, _, _| None,
+            );
+            let list = gtk::ListView::new(Some(selection), Some(factory));
+            let scrolled = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .child(&list)
+                .build();
+            let window = gtk::Window::builder()
+                .default_width(280)
+                .default_height(300)
+                .child(&scrolled)
+                .build();
+
+            let mut items = Vec::with_capacity(1_000);
+            items.push(KeyedSidebarItem {
+                key: SidebarItemKey::SectionHeader(SidebarSectionKind::Channels),
+                model: SidebarItemModel::SectionHeader {
+                    kind: SidebarSectionKind::Channels,
+                    title: "Channels".to_string(),
+                    collapsed: false,
+                },
+            });
+            for idx in 1..999 {
+                if idx % 25 == 0 {
+                    items.push(KeyedSidebarItem {
+                        key: SidebarItemKey::ThreadSummary {
+                            channel_id: format!("C{idx}"),
+                            thread_ts: format!("1700000000.{idx:06}"),
+                        },
+                        model: SidebarItemModel::ThreadSummary {
+                            channel_id: format!("C{idx}"),
+                            thread_ts: format!("1700000000.{idx:06}"),
+                            reply_count: 3,
+                            unread_count: 1,
+                        },
+                    });
+                } else {
+                    items.push(keyed_sidebar_row(
+                        &format!("C{idx}"),
+                        &format!("channel-{idx}"),
+                        idx == 1,
+                    ));
+                }
+            }
+            items.push(KeyedSidebarItem {
+                key: SidebarItemKey::SectionHeader(SidebarSectionKind::Other),
+                model: SidebarItemModel::SectionHeader {
+                    kind: SidebarSectionKind::Other,
+                    title: "Other".to_string(),
+                    collapsed: true,
+                },
+            });
+
+            let mut projection = SidebarProjection::default();
+            let ops = projection.reconcile(items.clone());
+            apply_sidebar_store_operations(&store, projection.items(), &ops);
+            window.present();
+            pump_until(5000, || read_sidebar_widget_counters().0 > 0);
+            pump(50);
+
+            let (initial_skeletons, initial_updates, initial_constructions) =
+                read_sidebar_widget_counters();
+            assert!(
+                initial_skeletons > 0 && initial_skeletons < 300,
+                "expected virtualized skeleton count, got {initial_skeletons}"
+            );
+            assert!(initial_updates > 0);
+            assert_eq!(
+                initial_constructions,
+                initial_skeletons * 17,
+                "every widget must be constructed inside setup, never in bind"
+            );
+
+            // Warm GtkListView's tile pool and `build_sidebar_factory`'s spare
+            // skeleton pool once so subsequent splices and scrolls exercise
+            // steady-state recycling.
+            let vadj = scrolled.vadjustment();
+            pump_until(5000, || vadj.upper() > vadj.page_size());
+            vadj.set_value((vadj.upper() - vadj.page_size()).max(0.0));
+            pump(80);
+            vadj.set_value(0.0);
+            pump(80);
+            let mut warmup_items = items.clone();
+            if let SidebarItemModel::Conversation(row) = &mut warmup_items[2].model {
+                row.starred = true;
+            }
+            let ops = projection.reconcile(warmup_items.clone());
+            apply_sidebar_store_operations(&store, projection.items(), &ops);
+            pump(40);
+
+            // Invisible ordering/lookup field update on a visible row: zero widget
+            // constructions and zero row updates via `renders_same`.
+            reset_sidebar_widget_counters();
+            let mut next_items = warmup_items;
+            if let SidebarItemModel::Conversation(row) = &mut next_items[1].model {
+                row.latest_ts = Some("1700000000.000100".to_string());
+            }
+            let ops = projection.reconcile(next_items.clone());
+            apply_sidebar_store_operations(&store, projection.items(), &ops);
+            pump(50);
+            let (skels, updates, constructions) = read_sidebar_widget_counters();
+            assert_eq!(skels, 0);
+            assert_eq!(constructions, 0);
+            assert_eq!(
+                updates, 0,
+                "invisible latest_ts update must skip ConversationRowWidgets::update"
+            );
+
+            // Visible state update on bound rows: updates widgets in place with zero constructions.
+            reset_sidebar_widget_counters();
+            if let SidebarItemModel::Conversation(row) = &mut next_items[1].model {
+                row.unread = true;
+                row.mention_count = 4;
+                row.starred = true;
+                row.muted = true;
+                row.external = true;
+                row.huddle_active = true;
+                row.status = Some(crate::models::SlackUserStatus {
+                    text: "In a meeting".to_string(),
+                    emoji: ":calendar:".to_string(),
+                    expiration: 0,
+                });
+            }
+            let ops = projection.reconcile(next_items);
+            apply_sidebar_store_operations(&store, projection.items(), &ops);
+            pump_until(5000, || read_sidebar_widget_counters().1 > 0);
+            let (skels, updates, constructions) = read_sidebar_widget_counters();
+            assert_eq!(skels, 0);
+            assert_eq!(
+                constructions, 0,
+                "visible row update constructed {constructions} widgets"
+            );
+            assert_eq!(updates, 1);
+
+            reset_sidebar_widget_counters();
+            let max_scroll = (vadj.upper() - vadj.page_size()).max(0.0);
+            for step in 1..=8 {
+                vadj.set_value(max_scroll * (step as f64 / 8.0));
+                pump(30);
+            }
+            for step in (0..8).rev() {
+                vadj.set_value(max_scroll * (step as f64 / 8.0));
+                pump(30);
+            }
+            let (scroll_skels, scroll_updates, scroll_constructions) =
+                read_sidebar_widget_counters();
+            assert_eq!(
+                scroll_skels, 0,
+                "steady-state scroll allocated {scroll_skels} new skeletons"
+            );
+            assert_eq!(
+                scroll_constructions, 0,
+                "steady-state scroll constructed {scroll_constructions} widgets"
+            );
+            assert!(
+                scroll_updates > 20,
+                "expected scroll to recycle and update rows in place, got {scroll_updates}"
+            );
+
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn sidebar_recycled_row_clears_all_state_across_variants_and_conversations() {
+        run_gtk_test(|| {
+            use crate::timeline::tests::{pump, pump_until};
+
+            let _ = adw::init();
+            let store = sidebar_list_store();
+            let selection = gtk::SingleSelection::new(Some(store.clone()));
+            selection.set_autoselect(false);
+            selection.set_can_unselect(true);
+
+            let factory = crate::sidebar_widgets::build_sidebar_factory(
+                std::sync::Arc::default,
+                |_, _, _| None,
+            );
+            let list = gtk::ListView::new(Some(selection), Some(factory));
+            let window = gtk::Window::builder()
+                .default_width(280)
+                .default_height(200)
+                .child(&list)
+                .build();
+
+            let mut rich_row = sidebar_row("C_RICH", "rich-channel");
+            rich_row.selected = true;
+            rich_row.unread = true;
+            rich_row.mention_count = 12;
+            rich_row.starred = true;
+            rich_row.muted = true;
+            rich_row.external = true;
+            rich_row.huddle_active = true;
+            rich_row.status = Some(crate::models::SlackUserStatus {
+                text: "Heads down".to_string(),
+                emoji: ":rocket:".to_string(),
+                expiration: 0,
+            });
+            let rich_item = KeyedSidebarItem {
+                key: SidebarItemKey::Conversation {
+                    section: Some(SidebarSectionKind::Channels),
+                    id: "C_RICH".to_string(),
+                },
+                model: SidebarItemModel::Conversation(rich_row),
+            };
+            store.splice(0, 0, &[boxed_sidebar_item(&rich_item)]);
+            window.present();
+            pump_until(5000, || {
+                list.first_child()
+                    .and_then(|row_wrapper| row_wrapper.first_child())
+                    .is_some()
+            });
+            pump(30);
+
+            let active_child = || {
+                list.first_child()
+                    .and_then(|wrapper| wrapper.first_child())
+                    .expect("bound ListItem child")
+            };
+
+            let conv_box = active_child()
+                .downcast::<gtk::Box>()
+                .expect("conversation content box");
+            assert!(conv_box.has_css_class("active-conversation"));
+
+            // Verify variant transition: Conversation -> SectionHeader.
+            let header_item = KeyedSidebarItem {
+                key: SidebarItemKey::SectionHeader(SidebarSectionKind::Channels),
+                model: SidebarItemModel::SectionHeader {
+                    kind: SidebarSectionKind::Channels,
+                    title: "Channels".to_string(),
+                    collapsed: true,
+                },
+            };
+            store.splice(0, 1, &[boxed_sidebar_item(&header_item)]);
+            pump(40);
+            let header_box = active_child()
+                .downcast::<gtk::Box>()
+                .expect("section header box");
+            let disclosure = header_box
+                .first_child()
+                .and_downcast::<gtk::Image>()
+                .expect("section header disclosure image");
+            let header_label = header_box
+                .last_child()
+                .and_downcast::<gtk::Label>()
+                .expect("section header label");
+            assert_eq!(disclosure.icon_name().as_deref(), Some("pan-end-symbolic"));
+            assert_eq!(header_label.text().as_str(), "Channels");
+
+            // SectionHeader -> ThreadSummary.
+            let thread_item = KeyedSidebarItem {
+                key: SidebarItemKey::ThreadSummary {
+                    channel_id: "C_RICH".to_string(),
+                    thread_ts: "1700000000.000001".to_string(),
+                },
+                model: SidebarItemModel::ThreadSummary {
+                    channel_id: "C_RICH".to_string(),
+                    thread_ts: "1700000000.000001".to_string(),
+                    reply_count: 2,
+                    unread_count: 1,
+                },
+            };
+            store.splice(0, 1, &[boxed_sidebar_item(&thread_item)]);
+            pump(40);
+            let thread_label = active_child()
+                .downcast::<gtk::Label>()
+                .expect("thread summary label");
+            assert_eq!(
+                thread_label.text().as_str(),
+                "Thread (2 responses) (1 unread)"
+            );
+
+            // ThreadSummary -> Placeholder.
+            let placeholder_item = KeyedSidebarItem {
+                key: SidebarItemKey::Placeholder(crate::sidebar::SidebarPlaceholder::NoMatches),
+                model: SidebarItemModel::Placeholder(crate::sidebar::SidebarPlaceholder::NoMatches),
+            };
+            store.splice(0, 1, &[boxed_sidebar_item(&placeholder_item)]);
+            pump(40);
+            let placeholder_label = active_child()
+                .downcast::<gtk::Label>()
+                .expect("placeholder label");
+            assert_eq!(
+                placeholder_label.text().as_str(),
+                crate::sidebar::SidebarPlaceholder::NoMatches.label()
+            );
+
+            // Placeholder -> plain Conversation across GtkListView's 2-item recycle pool:
+            // verify the exact `conv_box` that rendered `C_RICH` is reused with zero
+            // CSS, badge, or status residue.
+            let mut saw_original_conv_box = false;
+            for (channel_id, title) in [("C_PLAIN_A", "plain-a"), ("C_PLAIN_B", "plain-b")] {
+                let plain_item = keyed_sidebar_row(channel_id, title, false);
+                store.splice(0, 1, &[boxed_sidebar_item(&plain_item)]);
+                pump(40);
+                let plain_box = active_child()
+                    .downcast::<gtk::Box>()
+                    .expect("rebound conversation content box");
+                if plain_box == conv_box {
+                    saw_original_conv_box = true;
+                }
+                assert!(!plain_box.has_css_class("active-conversation"));
+
+                let mut children = Vec::new();
+                let mut next = plain_box.first_child();
+                while let Some(child) = next {
+                    next = child.next_sibling();
+                    children.push(child);
+                }
+                assert_eq!(children.len(), 8);
+                let title_label = children[1]
+                    .first_child()
+                    .and_downcast::<gtk::Label>()
+                    .expect("conversation title label");
+                assert_eq!(title_label.text().as_str(), title);
+                assert!(!title_label.has_css_class("heading"));
+                for trailing in &children[2..] {
+                    assert!(
+                        !trailing.is_visible(),
+                        "trailing status/badge widget {:?} remained visible on plain row",
+                        trailing.type_()
+                    );
+                }
+                let mention_label = children[7]
+                    .clone()
+                    .downcast::<gtk::Label>()
+                    .expect("mention badge label");
+                assert_eq!(mention_label.text().as_str(), "");
+            }
+            assert!(
+                saw_original_conv_box,
+                "expected GtkListView recycle pool to reuse the original C_RICH ConversationRowWidgets"
+            );
+
+            window.destroy();
+        });
+    }
 }
