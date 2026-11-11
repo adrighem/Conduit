@@ -177,7 +177,8 @@ pub(crate) fn attach_label_links(
     context: &MessageRenderContext,
     on_action: Option<&ActionHandler>,
 ) {
-    let context = context.clone();
+    let current_user_id = context.current_user_id.clone();
+    let bot_user_ids = Arc::clone(&context.bot_user_ids);
     let on_action = on_action.cloned();
     label.connect_activate_link(move |label, uri| {
         if let Some(user_id) = uri.strip_prefix("conduit-user://") {
@@ -185,7 +186,8 @@ pub(crate) fn attach_label_links(
                 crate::author_menu::show_user_mention_popover(
                     label,
                     user_id,
-                    &context,
+                    current_user_id.as_deref(),
+                    &bot_user_ids,
                     on_action.clone(),
                     None,
                 );
@@ -238,7 +240,8 @@ fn attach_text_view_links(
         hrefs.push((name, link.href.clone()));
     }
     let click = gtk::GestureClick::new();
-    let context = context.clone();
+    let current_user_id = context.current_user_id.clone();
+    let bot_user_ids = Arc::clone(&context.bot_user_ids);
     let on_action = on_action.cloned();
     // Resolve view from gesture: capturing view form strong cycle and leak view.
     click.connect_released(move |gesture, _, x, y| {
@@ -259,7 +262,8 @@ fn attach_text_view_links(
                         crate::author_menu::show_user_mention_popover(
                             &click_view,
                             user_id,
-                            &context,
+                            current_user_id.as_deref(),
+                            &bot_user_ids,
                             on_action.clone(),
                             Some(rect),
                         );
@@ -323,6 +327,7 @@ impl TextMarkup {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn create_message_text_widget(
     pango: &str,
     context: &MessageRenderContext,
@@ -533,7 +538,43 @@ fn resolve_sourceview_style_scheme() -> Option<sourceview5::StyleScheme> {
     mgr.scheme(preferred).or_else(|| mgr.scheme(fallback))
 }
 
-fn build_code_view(code: &str, lang: Option<&str>) -> sourceview5::View {
+thread_local! {
+    static CODE_BUFFERS: RefCell<Vec<glib::WeakRef<sourceview5::Buffer>>> =
+        const { RefCell::new(Vec::new()) };
+    static CODE_DARK_LISTENER_INSTALLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn refresh_tracked_code_buffers() {
+    let scheme = resolve_sourceview_style_scheme();
+    CODE_BUFFERS.with(|buffers| {
+        buffers.borrow_mut().retain(|weak| {
+            let Some(buffer) = weak.upgrade() else {
+                return false;
+            };
+            buffer.set_style_scheme(scheme.as_ref());
+            true
+        });
+    });
+}
+
+fn track_code_buffer_style_scheme(buffer: &sourceview5::Buffer) {
+    let install_listener = CODE_DARK_LISTENER_INSTALLED.with(|installed| !installed.replace(true));
+    if install_listener {
+        adw::StyleManager::default().connect_dark_notify(|_| {
+            refresh_tracked_code_buffers();
+        });
+    }
+    CODE_BUFFERS.with(|buffers| {
+        let mut list = buffers.borrow_mut();
+        if list.len() >= 64 {
+            list.retain(|weak| weak.upgrade().is_some());
+        }
+        list.push(buffer.downgrade());
+    });
+}
+
+fn build_code_view_inner(code: &str, lang: Option<&str>, track_theme: bool) -> sourceview5::View {
     let buffer = sourceview5::Buffer::new(None);
     buffer.set_text(code);
 
@@ -546,6 +587,9 @@ fn build_code_view(code: &str, lang: Option<&str>) -> sourceview5::View {
     if let Some(scheme) = resolve_sourceview_style_scheme() {
         buffer.set_style_scheme(Some(&scheme));
     }
+    if track_theme {
+        track_code_buffer_style_scheme(&buffer);
+    }
 
     let view = sourceview5::View::with_buffer(&buffer);
     view.set_editable(false);
@@ -554,6 +598,10 @@ fn build_code_view(code: &str, lang: Option<&str>) -> sourceview5::View {
     view.set_show_line_numbers(code.lines().count() > 1);
     view.set_wrap_mode(gtk::WrapMode::WordChar);
     view
+}
+
+fn build_code_view(code: &str, lang: Option<&str>) -> sourceview5::View {
+    build_code_view_inner(code, lang, true)
 }
 
 /// Width GtkTextView keeps after each line for the cursor (its
@@ -580,7 +628,7 @@ fn code_view_text_insets(line_count: usize) -> (i32, i32) {
             } else {
                 10usize.pow(digits as u32 - 1).max(2)
             };
-            let view = build_code_view(&"\n".repeat(probe_lines - 1), None);
+            let view = build_code_view_inner(&"\n".repeat(probe_lines - 1), None, false);
             let gutter = sourceview5::prelude::ViewExt::gutter(&view, gtk::TextWindowType::Left);
             let gutter_width = if view.shows_line_numbers() {
                 gutter.measure(Orientation::Horizontal, -1).1
@@ -621,25 +669,34 @@ fn code_placeholder(code: &str) -> Label {
 
 /// Swaps `placeholder` for the highlighted source view at idle priority,
 /// after the first frame that maps it. A source view per block was the
-/// costliest part of a row bind; rows that never show skip it.
+/// costliest part of a row bind; rows that never show skip it, and a row
+/// that unmaps into the pool before idle stays a cheap placeholder until it
+/// actually stays mapped.
 fn upgrade_code_block_when_mapped(placeholder: &Label, code: &str, lang: Option<&str>) {
     let code = code.to_string();
     let lang = lang.map(str::to_string);
-    let scheduled = std::cell::Cell::new(false);
+    let scheduled = Rc::new(std::cell::Cell::new(false));
     placeholder.connect_map(move |placeholder| {
         if scheduled.replace(true) {
             return;
         }
         let weak = placeholder.downgrade();
+        let scheduled = scheduled.clone();
         let code = code.clone();
         let lang = lang.clone();
         glib::idle_add_local_once(move || {
             let Some(placeholder) = weak.upgrade() else {
                 return;
             };
+            if !placeholder.is_mapped() {
+                scheduled.set(false);
+                return;
+            }
             let Some(container) = placeholder.parent().and_downcast::<Box>() else {
                 return;
             };
+            #[cfg(test)]
+            CODE_VIEW_BUILDS.with(|builds| builds.set(builds.get() + 1));
             let view = build_code_view(&code, lang.as_deref());
             container.insert_child_after(&view, Some(&placeholder));
             container.remove(&placeholder);
@@ -791,44 +848,154 @@ impl MarkupStamp {
 /// Texts whose blocks are kept: a few screens of rows in both panes.
 const MAX_TEXT_MODELS: usize = 512;
 
-/// Recently rendered texts' blocks, for the context in `stamp`.
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MarkupStyle {
+    Plain,
+    Small,
+    Italic,
+}
+
+impl MarkupStyle {
+    fn wrap(self, pango: String) -> String {
+        match self {
+            Self::Plain => pango,
+            Self::Small => format!("<span size=\"small\">{pango}</span>"),
+            Self::Italic => format!("<i>{pango}</i>"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum MarkupCacheKey {
+    Styled(MarkupStyle, String),
+    Field {
+        title: Option<String>,
+        value: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum MarkupProbe<'a> {
+    Styled(MarkupStyle, &'a str),
+    Field {
+        title: Option<&'a str>,
+        value: Option<&'a str>,
+    },
+}
+
+impl MarkupProbe<'_> {
+    fn into_owned_key(self) -> MarkupCacheKey {
+        match self {
+            Self::Styled(style, text) => MarkupCacheKey::Styled(style, text.to_string()),
+            Self::Field { title, value } => MarkupCacheKey::Field {
+                title: title.map(str::to_string),
+                value: value.map(str::to_string),
+            },
+        }
+    }
+}
+
+trait LookupMarkupKey {
+    fn as_probe(&self) -> MarkupProbe<'_>;
+}
+
+impl LookupMarkupKey for MarkupCacheKey {
+    fn as_probe(&self) -> MarkupProbe<'_> {
+        match self {
+            Self::Styled(style, text) => MarkupProbe::Styled(*style, text.as_str()),
+            Self::Field { title, value } => MarkupProbe::Field {
+                title: title.as_deref(),
+                value: value.as_deref(),
+            },
+        }
+    }
+}
+
+impl LookupMarkupKey for MarkupProbe<'_> {
+    fn as_probe(&self) -> MarkupProbe<'_> {
+        *self
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn LookupMarkupKey + 'a> for MarkupCacheKey {
+    fn borrow(&self) -> &(dyn LookupMarkupKey + 'a) {
+        self
+    }
+}
+
+impl PartialEq for dyn LookupMarkupKey + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_probe() == other.as_probe()
+    }
+}
+
+impl Eq for dyn LookupMarkupKey + '_ {}
+
+impl std::hash::Hash for dyn LookupMarkupKey + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_probe().hash(state);
+    }
+}
+
+/// Recently rendered texts' blocks and standalone markup fragments, for the
+/// context in `stamp`.
 struct TextModelCache {
     stamp: Option<MarkupStamp>,
     /// Blocks and when each text was last used.
-    entries: HashMap<String, (Rc<[TextBlock]>, u64)>,
-    clock: u64,
+    entries: super::cache::BoundedLru<String, Rc<[TextBlock]>>,
+    /// Standalone mrkdwn fragments (document sections, context rows, fields,
+    /// footers, system messages) and when each was last used.
+    markups: super::cache::BoundedLru<MarkupCacheKey, Rc<TextMarkup>>,
+}
+
+impl Default for TextModelCache {
+    fn default() -> Self {
+        Self {
+            stamp: None,
+            entries: super::cache::BoundedLru::new(MAX_TEXT_MODELS),
+            markups: super::cache::BoundedLru::new(MAX_TEXT_MODELS),
+        }
+    }
 }
 
 impl TextModelCache {
-    fn blocks(&mut self, text: &str, context: &MessageRenderContext) -> Rc<[TextBlock]> {
+    fn ensure_stamp(&mut self, context: &MessageRenderContext) {
         if !self
             .stamp
             .as_ref()
             .is_some_and(|stamp| stamp.matches(context))
         {
             self.entries.clear();
+            self.markups.clear();
             self.stamp = Some(MarkupStamp::of(context));
         }
-        self.clock += 1;
-        if let Some((blocks, used)) = self.entries.get_mut(text) {
-            *used = self.clock;
+    }
+
+    fn blocks(&mut self, text: &str, context: &MessageRenderContext) -> Rc<[TextBlock]> {
+        self.ensure_stamp(context);
+        if let Some(blocks) = self.entries.get(text) {
             return blocks.clone();
         }
-        if self.entries.len() >= MAX_TEXT_MODELS {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (_, used))| *used)
-                .map(|(text, _)| text.clone());
-            if let Some(oldest) = oldest {
-                self.entries.remove(&oldest);
-            }
-        }
         let blocks: Rc<[TextBlock]> = text_blocks(text, context).into();
-        self.entries
-            .insert(text.to_string(), (blocks.clone(), self.clock));
+        self.entries.insert(text.to_string(), blocks.clone());
         blocks
+    }
+
+    fn markup(
+        &mut self,
+        probe: MarkupProbe<'_>,
+        context: &MessageRenderContext,
+        build: impl FnOnce() -> TextMarkup,
+    ) -> Rc<TextMarkup> {
+        self.ensure_stamp(context);
+        if let Some(markup) = self.markups.get(&probe as &dyn LookupMarkupKey) {
+            return markup.clone();
+        }
+        #[cfg(test)]
+        TEXT_MARKUP_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        let markup = Rc::new(build());
+        self.markups.insert(probe.into_owned_key(), markup.clone());
+        markup
     }
 }
 
@@ -836,10 +1003,20 @@ thread_local! {
     static TEXT_MODELS: RefCell<TextModelCache> = RefCell::default();
 }
 
+pub(crate) fn clear_text_model_cache() {
+    TEXT_MODELS.with(|models| *models.borrow_mut() = TextModelCache::default());
+}
+
 #[cfg(test)]
 thread_local! {
     /// Texts parsed into blocks on this thread.
     pub(crate) static TEXT_BLOCK_BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Standalone mrkdwn fragments converted to markup on this thread.
+    pub(crate) static TEXT_MARKUP_BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Highlighted `sourceview5::View` code blocks built on idle.
+    pub(crate) static CODE_VIEW_BUILDS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -847,6 +1024,49 @@ thread_local! {
 /// context's markup inputs stay the same.
 pub(crate) fn cached_text_blocks(text: &str, context: &MessageRenderContext) -> Rc<[TextBlock]> {
     TEXT_MODELS.with(|models| models.borrow_mut().blocks(text, context))
+}
+
+pub(crate) fn cached_mrkdwn_widget(
+    text: &str,
+    style: MarkupStyle,
+    context: &MessageRenderContext,
+    on_action: Option<&ActionHandler>,
+) -> Widget {
+    let markup = TEXT_MODELS.with(|models| {
+        models
+            .borrow_mut()
+            .markup(MarkupProbe::Styled(style, text), context, || {
+                let pango = crate::message_markup::mrkdwn_to_pango(text, context);
+                TextMarkup::new(style.wrap(pango))
+            })
+    });
+    text_markup_widget(&markup, context, on_action)
+}
+
+pub(crate) fn cached_field_widget(
+    title: Option<&str>,
+    value: Option<&str>,
+    context: &MessageRenderContext,
+    on_action: Option<&ActionHandler>,
+) -> Widget {
+    let markup = TEXT_MODELS.with(|models| {
+        models
+            .borrow_mut()
+            .markup(MarkupProbe::Field { title, value }, context, || {
+                let value =
+                    value.map(|value| crate::message_markup::mrkdwn_to_pango(value, context));
+                let pango = match (title, value) {
+                    (Some(title), Some(value)) => {
+                        format!("<b>{}</b>\n{value}", glib::markup_escape_text(title))
+                    }
+                    (Some(title), None) => format!("<b>{}</b>", glib::markup_escape_text(title)),
+                    (None, Some(value)) => value,
+                    (None, None) => String::new(),
+                };
+                TextMarkup::new(pango)
+            })
+    });
+    text_markup_widget(&markup, context, on_action)
 }
 
 pub(crate) fn render_text_content(

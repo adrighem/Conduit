@@ -19,41 +19,404 @@ use super::model::*;
 use super::quick_actions::*;
 use super::row::*;
 
+const MAX_POOLED_MESSAGE_ROWS: usize = 128;
+const MAX_POOLED_SEPARATOR_ROWS: usize = 32;
+
 thread_local! {
-    /// Row binds and their total cost since the last idle flush, plus whether
-    /// that flush is scheduled (debug only).
-    static BIND_STATS: Cell<(u32, f64, bool)> = const { Cell::new((0, 0.0, false)) };
+    /// Row binds, reused-widget hits and their total cost since the last
+    /// idle flush, plus whether that flush is scheduled (debug only).
+    static BIND_STATS: Cell<(u32, u32, f64, bool)> = const { Cell::new((0, 0, 0.0, false)) };
 }
 
 /// Times one row bind and folds it into [`BIND_STATS`] on drop, so every exit
 /// path of the bind closure is counted. Logged once per main-loop idle as
-/// `timeline_binds count=<n> elapsed_ms=<total>`.
-struct BindTimer(Option<Instant>);
+/// `timeline_binds count=<n> reused=<n> elapsed_ms=<total>`.
+struct BindTimer {
+    started: Option<Instant>,
+    reused: bool,
+}
 
 impl BindTimer {
     fn start() -> Self {
-        Self(crate::debug::enabled().then(Instant::now))
+        Self {
+            started: crate::debug::enabled().then(Instant::now),
+            reused: false,
+        }
+    }
+
+    fn mark_reused(&mut self) {
+        self.reused = true;
     }
 }
 
 impl Drop for BindTimer {
     fn drop(&mut self) {
-        let Some(started) = self.0 else {
+        let Some(started) = self.started else {
             return;
         };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-        let (count, total, scheduled) = BIND_STATS.get();
-        BIND_STATS.set((count + 1, total + elapsed_ms, true));
+        let (count, reused, total, scheduled) = BIND_STATS.get();
+        let next_reused = reused + u32::from(self.reused);
+        BIND_STATS.set((count + 1, next_reused, total + elapsed_ms, true));
         if !scheduled {
             glib::idle_add_local_once(|| {
-                let (count, total, _) = BIND_STATS.replace((0, 0.0, false));
+                let (count, reused, total, _) = BIND_STATS.replace((0, 0, 0.0, false));
                 crate::debug::log(
                     "performance",
-                    &format!("timeline_binds count={count} elapsed_ms={total:.2}"),
+                    &format!("timeline_binds count={count} reused={reused} elapsed_ms={total:.2}"),
                 );
             });
         }
     }
+}
+
+struct CachedMessageRow {
+    ts: String,
+    message: Arc<SlackMessage>,
+    show_header: bool,
+    has_unread_separator: bool,
+    root_preview: Option<String>,
+    opens_threads: bool,
+    widget: Box,
+}
+
+impl CachedMessageRow {
+    fn matches(
+        &self,
+        msg: &Arc<SlackMessage>,
+        show_header: bool,
+        want_unread_separator: bool,
+        root_preview: Option<&str>,
+        opens_threads: bool,
+    ) -> bool {
+        (Arc::ptr_eq(&self.message, msg) || self.message.renders_same(msg))
+            && self.show_header == show_header
+            && self.has_unread_separator == want_unread_separator
+            && self.root_preview.as_deref() == root_preview
+            && self.opens_threads == opens_threads
+    }
+}
+
+struct CachedSeparatorRow {
+    ts: String,
+    widget: Box,
+}
+
+enum BoundRowEntry {
+    Message {
+        row: CachedMessageRow,
+        dirty: bool,
+    },
+    Separator {
+        row: CachedSeparatorRow,
+        dirty: bool,
+    },
+}
+
+impl BoundRowEntry {
+    fn is_dirty(&self) -> bool {
+        match self {
+            Self::Message { dirty, .. } | Self::Separator { dirty, .. } => *dirty,
+        }
+    }
+
+    fn widget(&self) -> &Box {
+        match self {
+            Self::Message { row, .. } => &row.widget,
+            Self::Separator { row, .. } => &row.widget,
+        }
+    }
+
+    fn is_message_for(&self, ts: &str) -> bool {
+        matches!(self, Self::Message { row, .. } if row.ts == ts)
+    }
+
+    fn is_separator_for(&self, ts: &str) -> bool {
+        matches!(self, Self::Separator { row, .. } if row.ts == ts)
+    }
+}
+
+/// Evicted row entries returned to callers so GTK widgets are dropped outside
+/// any `RefCell` borrow on [`TimelineRowPool`].
+#[must_use]
+#[derive(Default)]
+struct PoolGarbage {
+    messages: Vec<CachedMessageRow>,
+    separators: Vec<CachedSeparatorRow>,
+}
+
+fn mutate_pool(
+    pool: &RefCell<TimelineRowPool>,
+    f: impl FnOnce(&mut TimelineRowPool) -> PoolGarbage,
+) {
+    let garbage = {
+        let mut guard = pool.borrow_mut();
+        f(&mut guard)
+    };
+    drop(garbage);
+}
+
+/// Per-view check-out / check-in widget pool. A bound widget lives only in
+/// `bound_rows` (keyed by `ListItem` pointer) and never in `messages` or
+/// `separators` at the same time, so pooled widgets always have `parent == None`.
+struct TimelineRowPool {
+    bound_rows: HashMap<usize, BoundRowEntry>,
+    messages: super::cache::BoundedLru<String, CachedMessageRow>,
+    separators: super::cache::BoundedLru<String, CachedSeparatorRow>,
+}
+
+impl Default for TimelineRowPool {
+    fn default() -> Self {
+        Self {
+            bound_rows: HashMap::new(),
+            messages: super::cache::BoundedLru::new(MAX_POOLED_MESSAGE_ROWS),
+            separators: super::cache::BoundedLru::new(MAX_POOLED_SEPARATOR_ROWS),
+        }
+    }
+}
+
+impl TimelineRowPool {
+    fn remove_bound(&mut self, item_key: usize) -> Option<BoundRowEntry> {
+        self.bound_rows.remove(&item_key)
+    }
+
+    fn insert_bound(&mut self, item_key: usize, entry: BoundRowEntry) -> Option<BoundRowEntry> {
+        self.bound_rows.insert(item_key, entry)
+    }
+
+    fn checkout_message(&mut self, ts: &str) -> Option<CachedMessageRow> {
+        self.messages.take(ts)
+    }
+
+    fn checkout_separator(&mut self, ts: &str) -> Option<CachedSeparatorRow> {
+        self.separators.take(ts)
+    }
+
+    fn checkin(&mut self, entry: BoundRowEntry) -> PoolGarbage {
+        let mut garbage = PoolGarbage::default();
+        if entry.is_dirty() || entry.widget().parent().is_some() {
+            match entry {
+                BoundRowEntry::Message { row, .. } => garbage.messages.push(row),
+                BoundRowEntry::Separator { row, .. } => garbage.separators.push(row),
+            }
+            return garbage;
+        }
+        match entry {
+            BoundRowEntry::Message { row, .. } => {
+                let ts = row.ts.clone();
+                garbage.messages = self.messages.insert(ts, row);
+            }
+            BoundRowEntry::Separator { row, .. } => {
+                let ts = row.ts.clone();
+                garbage.separators = self.separators.insert(ts, row);
+            }
+        }
+        garbage
+    }
+
+    fn invalidate_all(&mut self) -> PoolGarbage {
+        for entry in self.bound_rows.values_mut() {
+            match entry {
+                BoundRowEntry::Message { dirty, .. } | BoundRowEntry::Separator { dirty, .. } => {
+                    *dirty = true;
+                }
+            }
+        }
+        PoolGarbage {
+            messages: self.messages.clear(),
+            separators: self.separators.clear(),
+        }
+    }
+
+    fn invalidate_context_delta(
+        &mut self,
+        delta: &ContextDelta,
+        custom_emojis: &HashMap<String, String>,
+    ) -> PoolGarbage {
+        if delta.all {
+            return self.invalidate_all();
+        }
+        for entry in self.bound_rows.values_mut() {
+            if let BoundRowEntry::Message { row, dirty } = entry {
+                if delta.affects(&row.message, custom_emojis) {
+                    *dirty = true;
+                }
+            }
+        }
+        PoolGarbage {
+            messages: self
+                .messages
+                .remove_matching(|_, row| delta.affects(&row.message, custom_emojis)),
+            separators: Vec::new(),
+        }
+    }
+
+    fn invalidate_messages(&mut self, timestamps: &HashSet<String>) -> PoolGarbage {
+        if timestamps.is_empty() {
+            return PoolGarbage::default();
+        }
+        for entry in self.bound_rows.values_mut() {
+            if let BoundRowEntry::Message { row, dirty } = entry {
+                if timestamps.contains(&row.ts) {
+                    *dirty = true;
+                }
+            }
+        }
+        PoolGarbage {
+            messages: self
+                .messages
+                .remove_matching(|ts, _| timestamps.contains(ts)),
+            separators: Vec::new(),
+        }
+    }
+
+    fn invalidate_message(&mut self, ts: &str) -> PoolGarbage {
+        for entry in self.bound_rows.values_mut() {
+            if let BoundRowEntry::Message { row, dirty } = entry {
+                if row.ts == ts {
+                    *dirty = true;
+                }
+            }
+        }
+        PoolGarbage {
+            messages: self.messages.take(ts).into_iter().collect(),
+            separators: Vec::new(),
+        }
+    }
+
+    fn invalidate_root_previews(&mut self, changed_root_ts: &HashSet<String>) -> PoolGarbage {
+        if changed_root_ts.is_empty() {
+            return PoolGarbage::default();
+        }
+        let uses_changed_root = |msg: &SlackMessage| {
+            msg.thread_root_ts()
+                .is_some_and(|root_ts| changed_root_ts.contains(root_ts))
+        };
+        for entry in self.bound_rows.values_mut() {
+            if let BoundRowEntry::Message { row, dirty } = entry {
+                if uses_changed_root(&row.message) {
+                    *dirty = true;
+                }
+            }
+        }
+        PoolGarbage {
+            messages: self
+                .messages
+                .remove_matching(|_, row| uses_changed_root(&row.message)),
+            separators: Vec::new(),
+        }
+    }
+
+    fn invalidate_opens_threads(&mut self) -> PoolGarbage {
+        for entry in self.bound_rows.values_mut() {
+            if let BoundRowEntry::Message { dirty, .. } = entry {
+                *dirty = true;
+            }
+        }
+        PoolGarbage {
+            messages: self.messages.clear(),
+            separators: Vec::new(),
+        }
+    }
+}
+
+fn list_item_key(item: &gtk::ListItem) -> usize {
+    use glib::translate::ToGlibPtr;
+    let ptr: *mut gtk::ffi::GtkListItem = item.to_glib_none().0;
+    ptr as usize
+}
+
+/// Closes open menus, detaches Conduit transient mention popovers (leaving
+/// GTK's own internal `priv.popup_menu` parented so its cached pointer stays
+/// valid) and clears text selections on `root` before a row widget is unbound
+/// into the pool or replaced in place. Never called while holding a
+/// `TimelineRowPool` borrow.
+fn sanitize_row_widget(root: &Widget) {
+    let mut stack = vec![root.clone()];
+    while let Some(widget) = stack.pop() {
+        if let Some(menu_button) = widget.downcast_ref::<gtk::MenuButton>() {
+            menu_button.popdown();
+        } else if let Some(label) = widget.downcast_ref::<Label>() {
+            if label.is_selectable() && label.selection_bounds().is_some() {
+                label.select_region(0, 0);
+            }
+        } else if let Some(text_view) = widget.downcast_ref::<gtk::TextView>() {
+            let buffer = text_view.buffer();
+            if let Some((start, _)) = buffer.selection_bounds() {
+                buffer.select_range(&start, &start);
+            }
+        }
+
+        let mut popovers = Vec::new();
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            child = current.next_sibling();
+            if let Ok(popover) = current.clone().downcast::<gtk::Popover>() {
+                popovers.push(popover);
+            } else {
+                stack.push(current);
+            }
+        }
+        for popover in popovers {
+            popover.popdown();
+            if popover.has_css_class(crate::author_menu::TRANSIENT_POPOVER_CLASS)
+                && popover.parent().is_some()
+            {
+                popover.unparent();
+            }
+        }
+    }
+}
+
+/// Moves focus out of `item`'s outgoing child, reconciles hover/quick-bar
+/// state, strips focus-target CSS and sanitizes menus, transient popovers and
+/// text selections. When `keep_hover_ts` is `None` (separator replacement,
+/// unbind, teardown), any hover on the outgoing child unconditionally closes
+/// `current_popover`, clears `hovered` and hides `quick_bar` so `hovered.row`
+/// never retains a detached pooled widget.
+fn prepare_item_for_child_change(
+    item: &gtk::ListItem,
+    keep_hover_ts: Option<&str>,
+    hovered: &RefCell<Option<HoveredMessage>>,
+    hover_generation: &Cell<u64>,
+    current_popover: &RefCell<Option<gtk::Popover>>,
+    quick_bar: &Box,
+) {
+    keep_focus_on_row(item);
+    let Some(old_child) = item.child() else {
+        return;
+    };
+    let same_hovered_ts = keep_hover_ts.is_some_and(|ts| {
+        hovered
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.ts == ts)
+    });
+    if !same_hovered_ts
+        && hovered
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.row == old_child)
+    {
+        let force_close = keep_hover_ts.is_none();
+        if force_close {
+            if let Some(popover) = current_popover.borrow_mut().take() {
+                popover.popdown();
+            }
+        }
+        let popover_open = !force_close
+            && current_popover
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| p.is_visible());
+        if !popover_open {
+            hover_generation.set(hover_generation.get().wrapping_add(1));
+            *hovered.borrow_mut() = None;
+            quick_bar.set_visible(false);
+        }
+    }
+    old_child.remove_css_class(FOCUS_TARGET_CLASS);
+    sanitize_row_widget(&old_child);
 }
 
 #[derive(Clone)]
@@ -70,8 +433,8 @@ pub struct NativeTimelineView {
     asset_update_rows: Rc<RefCell<HashSet<String>>>,
     read_mark_target: ReadMarkTarget,
     latest_message_ts: Rc<RefCell<Option<String>>>,
-    /// Raw text of loaded thread roots, for broadcast reply banners.
-    thread_root_texts: Rc<RefCell<HashMap<String, String>>>,
+    /// Rendered plain-text previews of loaded thread roots, for broadcast reply banners.
+    thread_root_previews: Rc<RefCell<HashMap<String, Option<String>>>>,
     read_candidate: Rc<RefCell<Option<String>>>,
     read_generation: Rc<Cell<u64>>,
     /// True while a dwell timer for `read_candidate` is in flight, so a
@@ -85,6 +448,7 @@ pub struct NativeTimelineView {
     /// thread, so it gets no "N replies" footer linking to itself.
     opens_threads: Rc<Cell<bool>>,
     bind_row: Rc<dyn Fn(&gtk::ListItem)>,
+    row_pool: Rc<RefCell<TimelineRowPool>>,
     pub(crate) bound_items: BoundItems,
     /// Message opened from search, a link or a notification: highlighted
     /// briefly so it stands out after the jump.
@@ -134,7 +498,7 @@ impl NativeTimelineView {
         // actually do or when they fire.
         let current_popover: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
         let opens_threads = Rc::new(Cell::new(true));
-        let thread_root_texts: Rc<RefCell<HashMap<String, String>>> =
+        let thread_root_previews: Rc<RefCell<HashMap<String, Option<String>>>> =
             Rc::new(RefCell::new(HashMap::new()));
 
         let quick_bar = Box::new(Orientation::Horizontal, 2);
@@ -198,219 +562,408 @@ impl NativeTimelineView {
         let overlay = gtk::Overlay::new();
         overlay.add_overlay(&quick_bar);
 
-        factory.connect_setup(|_factory, list_item| {
-            let item = list_item
-                .downcast_ref::<gtk::ListItem>()
-                .expect("ListItem expected");
-            item.set_child(Some(&Box::new(Orientation::Vertical, 0)));
-        });
+        let row_pool: Rc<RefCell<TimelineRowPool>> = Rc::default();
+        let highlight_ts: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let quick_bar_cache = Rc::new(QuickBarCache::default());
+
+        let cb_media: OpenMediaCallback = {
+            let on_action = on_action.clone();
+            Rc::new(move |media_item| {
+                let on_action = on_action.clone();
+                glib::idle_add_local_once(move || {
+                    dispatch_timeline_action(&on_action, TimelineAction::OpenMedia(media_item));
+                });
+            })
+        };
+        let cb_thread: Rc<dyn Fn(String)> = {
+            let on_action = on_action.clone();
+            Rc::new(move |thread_ts| {
+                let on_action = on_action.clone();
+                glib::idle_add_local_once(move || {
+                    dispatch_timeline_action(&on_action, TimelineAction::OpenThread(thread_ts));
+                });
+            })
+        };
+        let cb_reaction: ToggleReactionCallback = {
+            let on_action = on_action.clone();
+            Rc::new(move |ts, name, add| {
+                let on_action = on_action.clone();
+                glib::idle_add_local_once(move || {
+                    dispatch_timeline_action(
+                        &on_action,
+                        TimelineAction::ToggleReaction { ts, name, add },
+                    );
+                });
+            })
+        };
+        let cb_author: ActionHandler = {
+            let on_action = on_action.clone();
+            let row_pool = row_pool.clone();
+            Rc::new(move |action| {
+                if let TimelineAction::ExecuteControlAction { ref ts, .. } = action {
+                    mutate_pool(&row_pool, |pool| pool.invalidate_message(ts));
+                }
+                let on_action = on_action.clone();
+                glib::idle_add_local_once(move || {
+                    dispatch_timeline_action(&on_action, action);
+                });
+            })
+        };
+        let cb_hover: Rc<dyn Fn(HoverEvent)> = {
+            let hovered = hovered.clone();
+            let hover_generation = hover_generation.clone();
+            let current_popover = current_popover.clone();
+            let bar_motion = bar_motion.clone();
+            let quick_bar = quick_bar.clone();
+            let quick_bar_cache = quick_bar_cache.clone();
+            let overlay = overlay.clone();
+            let context_for_hover = context.clone();
+            let on_action_for_hover = on_action.clone();
+            let read_mark_target = read_mark_target.clone();
+            Rc::new(move |event| match event {
+                HoverEvent::Enter { row, ts } => {
+                    hover_generation.set(hover_generation.get().wrapping_add(1));
+                    // Overlay/hit-test boundary jitter right at the bar's own
+                    // edge (e.g. over the overflow button) can fire a spurious
+                    // re-"enter" for the SAME row that's already showing the
+                    // bar. Rebuilding in that case would tear down (not
+                    // cleanly close) any popover the user currently has open.
+                    // Only rebuild when the hovered message actually changed.
+                    let already_showing_this_message = quick_bar.get_visible()
+                        && hovered
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|current| current.ts == ts);
+                    crate::debug::log(
+                        "quickbar",
+                        &format!(
+                            "row HoverEnter ts={ts} generation={} already_showing={already_showing_this_message}",
+                            hover_generation.get()
+                        ),
+                    );
+                    *hovered.borrow_mut() = Some(HoveredMessage {
+                        row,
+                        ts: ts.clone(),
+                    });
+                    if already_showing_this_message {
+                        return;
+                    }
+                    if let Some(ctx) = context_for_hover.borrow().as_ref() {
+                        // Read on hover, not at bind: reacting
+                        // changes them without rebuilding rows. The
+                        // buttons are rebuilt only when they change.
+                        show_quick_bar_for(
+                            &quick_bar,
+                            &quick_bar_cache,
+                            &ts,
+                            ctx,
+                            &QuickBarState {
+                                on_action: &on_action_for_hover,
+                                hover_generation: &hover_generation,
+                                hovered: &hovered,
+                                current_popover: &current_popover,
+                                bar_motion: &bar_motion,
+                                // Thread read state is local-only,
+                                // so only conversations rewind.
+                                can_mark_unread: read_mark_target
+                                    .borrow()
+                                    .as_ref()
+                                    .is_some_and(|(_, thread_ts)| thread_ts.is_none()),
+                            },
+                        );
+                    }
+                    quick_bar.set_visible(true);
+                    overlay.queue_allocate();
+                }
+                HoverEvent::Leave => {
+                    hover_generation.set(hover_generation.get().wrapping_add(1));
+                    let expected = hover_generation.get();
+                    crate::debug::log(
+                        "quickbar",
+                        &format!(
+                            "row HoverLeave generation={expected} scheduling hide check in 150ms"
+                        ),
+                    );
+                    let hovered = hovered.clone();
+                    let quick_bar_weak = quick_bar.downgrade();
+                    let hover_generation = hover_generation.clone();
+                    let current_popover = current_popover.clone();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(150),
+                        move || {
+                            let popover_open = current_popover
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|p| p.is_visible());
+                            let current_generation = hover_generation.get();
+                            let stale = current_generation != expected;
+                            crate::debug::log(
+                                "quickbar",
+                                &format!(
+                                    "row HoverLeave timeout fired expected_gen={expected} current_gen={current_generation} stale={stale} popover_open={popover_open} will_hide={}",
+                                    !stale && !popover_open
+                                ),
+                            );
+                            if current_generation == expected && !popover_open {
+                                *hovered.borrow_mut() = None;
+                                if let Some(bar) = quick_bar_weak.upgrade() {
+                                    bar.set_visible(false);
+                                }
+                            }
+                        },
+                    );
+                }
+            })
+        };
 
         let context_clone = context.clone();
-        let on_action_clone = on_action.clone();
         let opens_threads_for_bind = opens_threads.clone();
-        let thread_root_texts_for_bind = thread_root_texts.clone();
-        let highlight_ts: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let thread_root_previews_for_bind = thread_root_previews.clone();
         let highlight_ts_for_bind = highlight_ts.clone();
         let hovered_for_bind = hovered.clone();
         let hover_generation_for_bind = hover_generation.clone();
         let current_popover_for_bind = current_popover.clone();
-        let bar_motion_for_bind = bar_motion.clone();
         let quick_bar_for_bind = quick_bar.clone();
-        let quick_bar_cache = Rc::new(QuickBarCache::default());
         let overlay_for_bind = overlay.clone();
-        let read_mark_target_for_bind = read_mark_target.clone();
+        let row_pool_for_bind = row_pool.clone();
         let bind_row: Rc<dyn Fn(&gtk::ListItem)> = Rc::new(move |item| {
-            let _bind_timer = BindTimer::start();
+            let mut bind_timer = BindTimer::start();
             let msg_obj = item
                 .item()
                 .and_then(|obj| obj.downcast::<TimelineMessageObject>().ok())
                 .expect("TimelineMessageObject expected");
             let msg = msg_obj.message();
+            let item_key = list_item_key(item);
 
             let is_separator = msg_obj.is_day_separator();
             item.set_selectable(!is_separator);
             item.set_activatable(!is_separator);
             if is_separator {
-                item.set_child(Some(&day_separator_widget(&msg.ts)));
+                let already_bound = {
+                    let pool = row_pool_for_bind.borrow();
+                    matches!(
+                        pool.bound_rows.get(&item_key),
+                        Some(BoundRowEntry::Separator { row, dirty: false })
+                            if row.ts == msg.ts
+                                && item.child().as_ref() == Some(row.widget.upcast_ref())
+                    )
+                };
+                if already_bound {
+                    bind_timer.mark_reused();
+                    return;
+                }
+
+                let (old_bound, pooled) = {
+                    let mut pool = row_pool_for_bind.borrow_mut();
+                    (
+                        pool.remove_bound(item_key),
+                        pool.checkout_separator(&msg.ts),
+                    )
+                };
+                let mut stale_pooled = None;
+                let sep_row = match pooled {
+                    Some(row) if row.widget.parent().is_none() => {
+                        bind_timer.mark_reused();
+                        row
+                    }
+                    other => {
+                        stale_pooled = other;
+                        CachedSeparatorRow {
+                            ts: msg.ts.clone(),
+                            widget: day_separator_widget(&msg.ts),
+                        }
+                    }
+                };
+                drop(stale_pooled);
+
+                prepare_item_for_child_change(
+                    item,
+                    None,
+                    &hovered_for_bind,
+                    &hover_generation_for_bind,
+                    &current_popover_for_bind,
+                    &quick_bar_for_bind,
+                );
+                item.set_child(Some(&sep_row.widget));
+
+                if let Some(old) = old_bound {
+                    if !old.is_dirty()
+                        && !old.is_separator_for(&msg.ts)
+                        && old.widget().parent().is_none()
+                    {
+                        mutate_pool(&row_pool_for_bind, |pool| pool.checkin(old));
+                    } else {
+                        drop(old);
+                    }
+                }
+                let replaced = row_pool_for_bind.borrow_mut().insert_bound(
+                    item_key,
+                    BoundRowEntry::Separator {
+                        row: sep_row,
+                        dirty: false,
+                    },
+                );
+                drop(replaced);
                 return;
             }
 
-            if let Some(ctx) = context_clone.borrow().as_ref() {
-                let on_action = on_action_clone.clone();
-                let cb_media: OpenMediaCallback = {
-                    let on_action = on_action.clone();
-                    Rc::new(move |media_item| {
-                        let on_action = on_action.clone();
-                        glib::idle_add_local_once(move || {
-                            dispatch_timeline_action(
-                                &on_action,
-                                TimelineAction::OpenMedia(media_item),
-                            );
-                        });
-                    })
-                };
-                let cb_thread: Rc<dyn Fn(String)> = {
-                    let on_action = on_action.clone();
-                    Rc::new(move |thread_ts| {
-                        let on_action = on_action.clone();
-                        glib::idle_add_local_once(move || {
-                            dispatch_timeline_action(
-                                &on_action,
-                                TimelineAction::OpenThread(thread_ts),
-                            );
-                        });
-                    })
-                };
-                let cb_reaction: Rc<dyn Fn(String, String, bool)> = {
-                    let on_action = on_action.clone();
-                    Rc::new(move |ts, name, add| {
-                        let on_action = on_action.clone();
-                        glib::idle_add_local_once(move || {
-                            dispatch_timeline_action(
-                                &on_action,
-                                TimelineAction::ToggleReaction { ts, name, add },
-                            );
-                        });
-                    })
-                };
-                let cb_author: Rc<dyn Fn(TimelineAction)> = {
-                    let on_action = on_action.clone();
-                    Rc::new(move |action| {
-                        let on_action = on_action.clone();
-                        glib::idle_add_local_once(move || {
-                            dispatch_timeline_action(&on_action, action);
-                        });
-                    })
-                };
-                let cb_hover: Rc<dyn Fn(HoverEvent)> = {
-                    let hovered = hovered_for_bind.clone();
-                    let hover_generation = hover_generation_for_bind.clone();
-                    let current_popover = current_popover_for_bind.clone();
-                    let bar_motion = bar_motion_for_bind.clone();
-                    let quick_bar = quick_bar_for_bind.clone();
-                    let quick_bar_cache = quick_bar_cache.clone();
-                    let overlay = overlay_for_bind.clone();
-                    let context_for_hover = context_clone.clone();
-                    let on_action_for_hover = on_action_clone.clone();
-                    let read_mark_target = read_mark_target_for_bind.clone();
-                    Rc::new(move |event| match event {
-                        HoverEvent::Enter { row, ts } => {
-                            hover_generation.set(hover_generation.get().wrapping_add(1));
-                            // Overlay/hit-test boundary jitter right at the bar's own
-                            // edge (e.g. over the overflow button) can fire a spurious
-                            // re-"enter" for the SAME row that's already showing the
-                            // bar. Rebuilding in that case would tear down (not
-                            // cleanly close) any popover the user currently has open.
-                            // Only rebuild when the hovered message actually changed.
-                            let already_showing_this_message = quick_bar.get_visible()
-                                && hovered
-                                    .borrow()
-                                    .as_ref()
-                                    .is_some_and(|current| current.ts == ts);
-                            crate::debug::log(
-                                "quickbar",
-                                &format!(
-                                    "row HoverEnter ts={ts} generation={} already_showing={already_showing_this_message}",
-                                    hover_generation.get()
-                                ),
-                            );
-                            *hovered.borrow_mut() = Some(HoveredMessage {
-                                row,
-                                ts: ts.clone(),
-                            });
-                            if already_showing_this_message {
-                                return;
-                            }
-                            if let Some(ctx) = context_for_hover.borrow().as_ref() {
-                                // Read on hover, not at bind: reacting
-                                // changes them without rebuilding rows. The
-                                // buttons are rebuilt only when they change.
-                                show_quick_bar_for(
-                                    &quick_bar,
-                                    &quick_bar_cache,
-                                    &ts,
-                                    ctx,
-                                    &QuickBarState {
-                                        on_action: &on_action_for_hover,
-                                        hover_generation: &hover_generation,
-                                        hovered: &hovered,
-                                        current_popover: &current_popover,
-                                        bar_motion: &bar_motion,
-                                        // Thread read state is local-only,
-                                        // so only conversations rewind.
-                                        can_mark_unread: read_mark_target
-                                            .borrow()
-                                            .as_ref()
-                                            .is_some_and(|(_, thread_ts)| thread_ts.is_none()),
-                                    },
-                                );
-                            }
-                            quick_bar.set_visible(true);
-                            overlay.queue_allocate();
-                        }
-                        HoverEvent::Leave => {
-                            hover_generation.set(hover_generation.get().wrapping_add(1));
-                            let expected = hover_generation.get();
-                            crate::debug::log(
-                                "quickbar",
-                                &format!(
-                                    "row HoverLeave generation={expected} scheduling hide check in 150ms"
-                                ),
-                            );
-                            let hovered = hovered.clone();
-                            let quick_bar_weak = quick_bar.downgrade();
-                            let hover_generation = hover_generation.clone();
-                            let current_popover = current_popover.clone();
-                            glib::timeout_add_local_once(
-                                std::time::Duration::from_millis(150),
-                                move || {
-                                    let popover_open = current_popover
-                                        .borrow()
-                                        .as_ref()
-                                        .is_some_and(|p| p.is_visible());
-                                    let current_generation = hover_generation.get();
-                                    let stale = current_generation != expected;
-                                    crate::debug::log(
-                                        "quickbar",
-                                        &format!(
-                                            "row HoverLeave timeout fired expected_gen={expected} current_gen={current_generation} stale={stale} popover_open={popover_open} will_hide={}",
-                                            !stale && !popover_open
-                                        ),
-                                    );
-                                    if current_generation == expected && !popover_open {
-                                        *hovered.borrow_mut() = None;
-                                        if let Some(bar) = quick_bar_weak.upgrade() {
-                                            bar.set_visible(false);
-                                        }
-                                    }
-                                },
-                            );
-                        }
-                    })
-                };
-                let show_header = !msg_obj.hide_header();
-                let root_preview = msg.thread_root_ts().and_then(|root_ts| {
-                    thread_root_texts_for_bind
-                        .borrow()
-                        .get(root_ts)
-                        .and_then(|text| thread_root_preview(text, ctx))
-                });
-                let msg_widget = build_timeline_message_widget_with_root(
-                    &msg,
-                    ctx,
-                    Some(&cb_media),
-                    opens_threads_for_bind.get().then_some(&cb_thread),
-                    Some(&cb_reaction),
-                    Some(&cb_hover),
-                    Some(&cb_author),
-                    show_header,
-                    root_preview.as_deref(),
-                );
-                if highlight_ts_for_bind.borrow().as_deref() == Some(msg.ts.as_str()) {
-                    msg_widget.add_css_class(FOCUS_TARGET_CLASS);
+            let show_header = !msg_obj.hide_header();
+            let opens_threads = opens_threads_for_bind.get();
+            let Some((want_unread_separator, root_preview)) = ({
+                let ctx_ref = context_clone.borrow();
+                ctx_ref.as_ref().map(|ctx| {
+                    let unread = ctx.unread_separator_ts.as_deref() == Some(msg.ts.as_str());
+                    let preview = msg.thread_root_ts().and_then(|root_ts| {
+                        thread_root_previews_for_bind
+                            .borrow()
+                            .get(root_ts)
+                            .cloned()
+                            .flatten()
+                    });
+                    (unread, preview)
+                })
+            }) else {
+                return;
+            };
+            let highlighted = highlight_ts_for_bind.borrow().as_deref() == Some(msg.ts.as_str());
+
+            let reused_in_place = {
+                let mut pool = row_pool_for_bind.borrow_mut();
+                match pool.bound_rows.get_mut(&item_key) {
+                    Some(BoundRowEntry::Message { row, dirty: false })
+                        if row.matches(
+                            &msg,
+                            show_header,
+                            want_unread_separator,
+                            root_preview.as_deref(),
+                            opens_threads,
+                        ) && item.child().as_ref() == Some(row.widget.upcast_ref()) =>
+                    {
+                        row.message = Arc::clone(&msg);
+                        Some(row.widget.clone())
+                    }
+                    _ => None,
                 }
-                item.set_child(Some(&msg_widget));
+            };
+            if let Some(widget) = reused_in_place {
+                if highlighted {
+                    widget.add_css_class(FOCUS_TARGET_CLASS);
+                } else {
+                    widget.remove_css_class(FOCUS_TARGET_CLASS);
+                }
+                bind_timer.mark_reused();
+                return;
             }
+
+            let (old_bound, pooled_candidate) = {
+                let mut pool = row_pool_for_bind.borrow_mut();
+                (pool.remove_bound(item_key), pool.checkout_message(&msg.ts))
+            };
+            let mut stale_pooled = None;
+            let valid_pooled = match pooled_candidate {
+                Some(mut row)
+                    if row.widget.parent().is_none()
+                        && row.matches(
+                            &msg,
+                            show_header,
+                            want_unread_separator,
+                            root_preview.as_deref(),
+                            opens_threads,
+                        ) =>
+                {
+                    row.message = Arc::clone(&msg);
+                    Some(row)
+                }
+                other => {
+                    stale_pooled = other;
+                    None
+                }
+            };
+            drop(stale_pooled);
+
+            let msg_row = if let Some(row) = valid_pooled {
+                bind_timer.mark_reused();
+                row
+            } else {
+                let Some(widget) = ({
+                    let ctx_ref = context_clone.borrow();
+                    ctx_ref.as_ref().map(|ctx| {
+                        build_timeline_message_widget_with_root(
+                            &msg,
+                            ctx,
+                            Some(&cb_media),
+                            opens_threads.then_some(&cb_thread),
+                            Some(&cb_reaction),
+                            Some(&cb_hover),
+                            Some(&cb_author),
+                            show_header,
+                            root_preview.as_deref(),
+                        )
+                    })
+                }) else {
+                    drop(old_bound);
+                    return;
+                };
+                CachedMessageRow {
+                    ts: msg.ts.clone(),
+                    message: Arc::clone(&msg),
+                    show_header,
+                    has_unread_separator: want_unread_separator,
+                    root_preview,
+                    opens_threads,
+                    widget,
+                }
+            };
+
+            if highlighted {
+                msg_row.widget.add_css_class(FOCUS_TARGET_CLASS);
+            } else {
+                msg_row.widget.remove_css_class(FOCUS_TARGET_CLASS);
+            }
+
+            prepare_item_for_child_change(
+                item,
+                Some(&msg.ts),
+                &hovered_for_bind,
+                &hover_generation_for_bind,
+                &current_popover_for_bind,
+                &quick_bar_for_bind,
+            );
+
+            let attached_widget = msg_row.widget.clone();
+            item.set_child(Some(&attached_widget));
+
+            let retargeted_hover = {
+                let mut hovered_slot = hovered_for_bind.borrow_mut();
+                if let Some(current) = hovered_slot.as_mut().filter(|c| c.ts == msg.ts) {
+                    current.row = attached_widget.upcast();
+                    true
+                } else {
+                    false
+                }
+            };
+            if retargeted_hover {
+                overlay_for_bind.queue_allocate();
+            }
+
+            if let Some(old) = old_bound {
+                if !old.is_dirty()
+                    && !old.is_message_for(&msg.ts)
+                    && old.widget().parent().is_none()
+                {
+                    mutate_pool(&row_pool_for_bind, |pool| pool.checkin(old));
+                } else {
+                    drop(old);
+                }
+            }
+            let replaced = row_pool_for_bind.borrow_mut().insert_bound(
+                item_key,
+                BoundRowEntry::Message {
+                    row: msg_row,
+                    dirty: false,
+                },
+            );
+            drop(replaced);
         });
 
         // Rows currently bound to a widget, so in-place updates (image assets,
@@ -429,10 +982,62 @@ impl NativeTimelineView {
         }
         {
             let bound_items = bound_items.clone();
+            let row_pool = row_pool.clone();
+            let hovered = hovered.clone();
+            let hover_generation = hover_generation.clone();
+            let current_popover = current_popover.clone();
+            let quick_bar = quick_bar.clone();
             factory.connect_unbind(move |_factory, list_item| {
+                let item = list_item
+                    .downcast_ref::<gtk::ListItem>()
+                    .expect("ListItem expected");
                 bound_items
                     .borrow_mut()
-                    .retain(|weak| weak.upgrade().is_some_and(|bound| bound != *list_item));
+                    .retain(|weak| weak.upgrade().is_some_and(|bound| bound != *item));
+                let entry = row_pool.borrow_mut().remove_bound(list_item_key(item));
+                prepare_item_for_child_change(
+                    item,
+                    None,
+                    &hovered,
+                    &hover_generation,
+                    &current_popover,
+                    &quick_bar,
+                );
+                if item.child().is_some() {
+                    item.set_child(None::<&Widget>);
+                }
+                if let Some(entry) = entry {
+                    mutate_pool(&row_pool, |pool| pool.checkin(entry));
+                }
+            });
+        }
+        {
+            let bound_items = bound_items.clone();
+            let row_pool = row_pool.clone();
+            let hovered = hovered.clone();
+            let hover_generation = hover_generation.clone();
+            let current_popover = current_popover.clone();
+            let quick_bar = quick_bar.clone();
+            factory.connect_teardown(move |_factory, list_item| {
+                let item = list_item
+                    .downcast_ref::<gtk::ListItem>()
+                    .expect("ListItem expected");
+                bound_items
+                    .borrow_mut()
+                    .retain(|weak| weak.upgrade().is_some_and(|bound| bound != *item));
+                let removed = row_pool.borrow_mut().remove_bound(list_item_key(item));
+                prepare_item_for_child_change(
+                    item,
+                    None,
+                    &hovered,
+                    &hover_generation,
+                    &current_popover,
+                    &quick_bar,
+                );
+                if item.child().is_some() {
+                    item.set_child(None::<&Widget>);
+                }
+                drop(removed);
             });
         }
 
@@ -803,7 +1408,7 @@ impl NativeTimelineView {
             asset_update_rows: Rc::default(),
             read_mark_target,
             latest_message_ts,
-            thread_root_texts,
+            thread_root_previews,
             read_candidate,
             read_generation,
             dwell_pending,
@@ -811,6 +1416,7 @@ impl NativeTimelineView {
             window_active,
             opens_threads,
             bind_row,
+            row_pool: row_pool.clone(),
             bound_items,
             highlight_ts,
             highlight_generation: Rc::new(Cell::new(0)),
@@ -824,6 +1430,7 @@ impl NativeTimelineView {
         };
         schedule_day_rollover_rebind(
             view.container.downgrade(),
+            view.row_pool.clone(),
             view.bound_items.clone(),
             view.bind_row.clone(),
         );
@@ -897,9 +1504,16 @@ impl NativeTimelineView {
         });
     }
 
+    /// Clears all pooled row widgets and marks currently bound rows dirty so
+    /// the next bind rebuilds them (e.g. when session-scoped caches reset).
+    pub(crate) fn invalidate_all(&self) {
+        mutate_pool(&self.row_pool, TimelineRowPool::invalidate_all);
+    }
+
     /// Re-renders the row of message `ts`, e.g. to re-enable its controls
     /// after an action finished.
     pub(crate) fn refresh_message(&self, ts: &str) {
+        mutate_pool(&self.row_pool, |pool| pool.invalidate_message(ts));
         self.rebind_rows("other", |obj| {
             !obj.is_day_separator() && obj.message().ts == ts
         });
@@ -908,7 +1522,11 @@ impl NativeTimelineView {
     /// Rebuilds the bound rows matching `matches` in place. Store items are
     /// kept: replacing them destroys the focused row, and GTK's focus fallback
     /// then scrolls the list to its first item.
-    fn rebind_rows(&self, reason: &str, matches: impl Fn(&TimelineMessageObject) -> bool) -> usize {
+    pub(super) fn rebind_rows(
+        &self,
+        reason: &str,
+        matches: impl Fn(&TimelineMessageObject) -> bool,
+    ) -> usize {
         let started = crate::debug::enabled().then(Instant::now);
         let mut rebound = 0;
         let items = self
@@ -924,7 +1542,6 @@ impl NativeTimelineView {
             if !matches(&obj) {
                 continue;
             }
-            keep_focus_on_row(&item);
             (self.bind_row)(&item);
             rebound += 1;
         }
@@ -943,7 +1560,9 @@ impl NativeTimelineView {
     /// Whether messages with replies show a footer that opens their thread.
     /// The thread pane turns this off for its own root message.
     pub(crate) fn set_opens_threads(&self, opens_threads: bool) {
-        self.opens_threads.set(opens_threads);
+        if self.opens_threads.replace(opens_threads) != opens_threads {
+            mutate_pool(&self.row_pool, TimelineRowPool::invalidate_opens_threads);
+        }
     }
 
     /// Sets which conversation/thread this view's visibility-based
@@ -958,6 +1577,7 @@ impl NativeTimelineView {
     pub(crate) fn set_read_mark_target(&self, channel_id: &str, thread_ts: Option<&str>) {
         let target = Some((channel_id.to_string(), thread_ts.map(ToString::to_string)));
         if *self.read_mark_target.borrow() != target {
+            mutate_pool(&self.row_pool, TimelineRowPool::invalidate_all);
             self.surface_changed.set(true);
             self.older_backoff.reset();
             self.set_loading_older(false);
@@ -1054,8 +1674,9 @@ impl NativeTimelineView {
             }
             current.user_avatar_urls = context.user_avatar_urls.clone();
         }
+        mutate_pool(&self.row_pool, |pool| pool.invalidate_messages(&uses_asset));
         self.asset_update_rows.borrow_mut().extend(uses_asset);
-        if self.asset_update_pending.get() {
+        if self.asset_update_pending.replace(true) {
             return;
         }
         let this = self.clone();
@@ -1117,6 +1738,10 @@ impl NativeTimelineView {
             std::mem::replace(&mut context.unread_separator_ts, anchor_ts.clone())
         };
         let changed = self.update_store_grouping(anchor_ts.as_deref());
+        let mut affected = changed.clone();
+        affected.extend(previous.clone());
+        affected.extend(anchor_ts.clone());
+        mutate_pool(&self.row_pool, |pool| pool.invalidate_messages(&affected));
         // Rows scrolled out of view pick the new anchor up from the context
         // when they are bound again.
         self.rebind_rows("other", |obj| {
@@ -1151,20 +1776,48 @@ impl NativeTimelineView {
             |previous| context.delta_from(previous),
         );
         let previous_highlight = self.highlight_ts.borrow().clone();
-        {
+        let changed_root_ts: HashSet<String> = {
             let roots: HashSet<&str> = messages
                 .iter()
                 .filter(|msg| is_thread_broadcast(msg.as_ref()))
                 .filter_map(|m| m.thread_root_ts())
                 .collect();
-            let mut texts = self.thread_root_texts.borrow_mut();
-            texts.clear();
-            texts.extend(
-                messages
-                    .iter()
-                    .filter(|msg| roots.contains(msg.ts.as_str()))
-                    .filter_map(|msg| msg.text.clone().map(|text| (msg.ts.clone(), text))),
-            );
+            let next_previews: HashMap<String, Option<String>> = messages
+                .iter()
+                .filter(|msg| roots.contains(msg.ts.as_str()))
+                .map(|msg| {
+                    let preview = msg
+                        .text
+                        .as_deref()
+                        .and_then(|text| thread_root_preview(text, context));
+                    (msg.ts.clone(), preview)
+                })
+                .collect();
+            let mut previews = self.thread_root_previews.borrow_mut();
+            let mut changed = HashSet::new();
+            for key in previews.keys().chain(next_previews.keys()) {
+                if previews.get(key).and_then(Option::as_ref)
+                    != next_previews.get(key).and_then(Option::as_ref)
+                {
+                    changed.insert(key.clone());
+                }
+            }
+            *previews = next_previews;
+            changed
+        };
+        if messages.is_empty() || delta.all {
+            mutate_pool(&self.row_pool, TimelineRowPool::invalidate_all);
+        } else {
+            if !delta.is_empty() {
+                mutate_pool(&self.row_pool, |pool| {
+                    pool.invalidate_context_delta(&delta, &context.custom_emojis)
+                });
+            }
+            if !changed_root_ts.is_empty() {
+                mutate_pool(&self.row_pool, |pool| {
+                    pool.invalidate_root_previews(&changed_root_ts)
+                });
+            }
         }
         *self.latest_message_ts.borrow_mut() = messages.first().map(|msg| msg.ts.clone());
         self.reset_read_candidate();
@@ -1202,7 +1855,7 @@ impl NativeTimelineView {
             moved.extend(previous_highlight.as_deref());
             moved.extend(focus_ts);
         }
-        let rebound = if delta.is_empty() && moved.is_empty() {
+        let rebound = if delta.is_empty() && moved.is_empty() && changed_root_ts.is_empty() {
             0
         } else {
             self.rebind_rows("context", |obj| {
@@ -1211,6 +1864,9 @@ impl NativeTimelineView {
                         || !obj.is_day_separator()
                             && obj.with_message(|message| {
                                 moved.contains(&message.ts.as_str())
+                                    || message
+                                        .thread_root_ts()
+                                        .is_some_and(|root_ts| changed_root_ts.contains(root_ts))
                                     || delta.affects(message, &context.custom_emojis)
                             }))
             })
@@ -1229,25 +1885,26 @@ impl NativeTimelineView {
         }
 
         let list_view = self.list_view.clone();
-        let n_items = items.len() as u32;
         let bound_items = self.bound_items.clone();
         let recheck_read_visibility = self.recheck_read_visibility.clone();
         glib::idle_add_local_once(move || {
             // Without a focus target or a pin, GtkListView keeps its anchor
             // row in place, which preserves the position across prepends.
-            let target =
-                focus_index.or_else(|| pin_to_bottom.then(|| n_items.checked_sub(1)).flatten());
+            let live_n = list_view.model().map_or(0, |model| model.n_items());
+            let target = focus_index
+                .filter(|&index| index < live_n)
+                .or_else(|| pin_to_bottom.then(|| live_n.checked_sub(1)).flatten());
             if let Some(index) = target {
                 let info = gtk::ScrollInfo::new();
                 list_view.scroll_to(index, gtk::ListScrollFlags::FOCUS, Some(info));
-                if focus_index.is_some() {
-                    if vadj.page_size() > 0.0 && n_items > 0 {
-                        let approx = (f64::from(index) / f64::from(n_items)) * vadj.upper()
+                if focus_index.is_some_and(|idx| idx < live_n) {
+                    if vadj.page_size() > 0.0 && live_n > 0 {
+                        let approx = (f64::from(index) / f64::from(live_n)) * vadj.upper()
                             - vadj.page_size() / 2.0;
                         let max = (vadj.upper() - vadj.page_size()).max(vadj.lower());
                         vadj.set_value(approx.clamp(vadj.lower(), max));
                     }
-                    center_row_after_layout(&list_view, vadj, bound_items, index, n_items);
+                    center_row_after_layout(&list_view, vadj, bound_items, index, live_n);
                 }
             } else if pin_to_bottom {
                 vadj.set_value(vadj.upper() - vadj.page_size());
@@ -1317,10 +1974,56 @@ impl NativeTimelineView {
     /// the message list, for surfaces that have no structured content to render yet.
     pub fn show_placeholder(&self, text: &str) {
         self.set_loading_older(false);
+        mutate_pool(&self.row_pool, TimelineRowPool::invalidate_all);
         self.store.remove_all();
         self.placeholder_label.set_label(text);
         self.placeholder_label.set_visible(true);
         self.scrolled_window.set_visible(false);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pooled_row_counts(&self) -> (usize, usize) {
+        let pool = self.row_pool.borrow();
+        (pool.messages.len(), pool.separators.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_pool_invariants(&self) {
+        let pool = self.row_pool.borrow();
+        for (ts, row) in pool.messages.iter() {
+            assert!(
+                row.widget.parent().is_none(),
+                "pooled message row {ts} must have no parent"
+            );
+            assert!(
+                !row.widget.is_mapped(),
+                "pooled message row {ts} must not be mapped"
+            );
+            assert!(
+                !pool
+                    .bound_rows
+                    .values()
+                    .any(|bound| bound.widget() == &row.widget),
+                "pooled message row {ts} must not also be bound"
+            );
+        }
+        for (ts, row) in pool.separators.iter() {
+            assert!(
+                row.widget.parent().is_none(),
+                "pooled separator row {ts} must have no parent"
+            );
+            assert!(
+                !row.widget.is_mapped(),
+                "pooled separator row {ts} must not be mapped"
+            );
+            assert!(
+                !pool
+                    .bound_rows
+                    .values()
+                    .any(|bound| bound.widget() == &row.widget),
+                "pooled separator row {ts} must not also be bound"
+            );
+        }
     }
 
     pub fn widget(&self) -> &Widget {
@@ -1555,13 +2258,12 @@ impl Default for NativeTimelineView {
     }
 }
 
-/// Moves focus from inside `item`'s row content to the row itself before the
-/// content is replaced, so focus survives and the list does not jump.
 /// Rows compute their day-relative timestamp and day labels ("Today") at
 /// bind time, and re-renders keep unchanged rows bound, so rebind them all
 /// once the local day rolls over. Stops when the view's widgets are gone.
 fn schedule_day_rollover_rebind(
     container: glib::WeakRef<Box>,
+    row_pool: Rc<RefCell<TimelineRowPool>>,
     bound_items: BoundItems,
     bind_row: Rc<dyn Fn(&gtk::ListItem)>,
 ) {
@@ -1569,16 +2271,16 @@ fn schedule_day_rollover_rebind(
         if container.upgrade().is_none() {
             return;
         }
+        mutate_pool(&row_pool, TimelineRowPool::invalidate_all);
         let items = bound_items
             .borrow()
             .iter()
             .filter_map(glib::WeakRef::upgrade)
             .collect::<Vec<_>>();
         for item in items {
-            keep_focus_on_row(&item);
             bind_row(&item);
         }
-        schedule_day_rollover_rebind(container, bound_items, bind_row);
+        schedule_day_rollover_rebind(container, row_pool, bound_items, bind_row);
     });
 }
 
@@ -1608,6 +2310,8 @@ fn seconds_until_local_midnight() -> u32 {
     }
 }
 
+/// Moves focus from inside `item`'s row content to the row itself before the
+/// content is replaced, so focus survives and the list does not jump.
 fn keep_focus_on_row(item: &gtk::ListItem) {
     let Some(child) = item.child() else {
         return;

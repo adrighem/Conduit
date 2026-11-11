@@ -96,13 +96,113 @@ thread_local! {
     pub(crate) static REACTION_TEXTURE_CACHE: RefCell<BoundedTextureCache> =
         RefCell::new(BoundedTextureCache::new());
     // Collapsed image/video attachments, in-memory only (reset on app restart).
-    // Message rows are fully rebuilt on every scroll-recycle (no connect_unbind),
-    // so this state cannot live on the transient widget - it must survive here,
-    // keyed by a stable ts+index pair.
+    // Pooled rows may still be evicted or rebuilt across context changes, so
+    // collapse state lives here keyed by a stable ts+slot pair.
     pub(crate) static COLLAPSED_MEDIA: RefCell<HashSet<String>> =
         RefCell::new(HashSet::new());
 }
 
+/// Entry-bounded clock-LRU shared by timeline row pools and text-markup caches.
+pub(super) struct BoundedLru<K, V> {
+    entries: HashMap<K, (V, u64)>,
+    clock: u64,
+    max_entries: usize,
+}
+
+impl<K: Eq + std::hash::Hash + Clone, V> BoundedLru<K, V> {
+    pub(super) fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock: 0,
+            max_entries,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter().map(|(key, (value, _))| (key, value))
+    }
+
+    pub(super) fn get<Q>(&mut self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        if let Some((value, used)) = self.entries.get_mut(key) {
+            self.clock = self.clock.wrapping_add(1);
+            *used = self.clock;
+            return Some(&*value);
+        }
+        None
+    }
+
+    pub(super) fn take<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.entries.remove(key).map(|(value, _)| value)
+    }
+
+    pub(super) fn insert(&mut self, key: K, value: V) -> Vec<V> {
+        let mut evicted = Vec::new();
+        if let Some((previous, _)) = self.entries.remove(&key) {
+            evicted.push(previous);
+        }
+        while self.entries.len() >= self.max_entries {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some((removed, _)) = self.entries.remove(&oldest) {
+                evicted.push(removed);
+            }
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.insert(key, (value, self.clock));
+        evicted
+    }
+
+    pub(super) fn remove_matching(&mut self, mut predicate: impl FnMut(&K, &V) -> bool) -> Vec<V> {
+        let keys: Vec<K> = self
+            .entries
+            .iter()
+            .filter(|(key, (value, _))| predicate(key, value))
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.entries.remove(&key).map(|(value, _)| value))
+            .collect()
+    }
+
+    pub(super) fn clear(&mut self) -> Vec<V> {
+        self.entries.drain().map(|(_, (value, _))| value).collect()
+    }
+}
+
+/// Resets thread-local timeline texture, animation, metadata, media-collapse
+/// and text-markup caches (e.g. on workspace reset). Callers holding live
+/// [`super::view::NativeTimelineView`] instances must also call
+/// `NativeTimelineView::invalidate_all` so pooled and bound row widgets do not
+/// retain stale `COLLAPSED_MEDIA` toggle states or cached textures.
 pub fn clear_timeline_view_caches() {
     COLLAPSED_MEDIA.with(|set| set.borrow_mut().clear());
     TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
@@ -112,6 +212,7 @@ pub fn clear_timeline_view_caches() {
     crate::image_metadata::clear();
     forget_asset_misses();
     crate::timeline_document_widget::clear_document_accent_cache();
+    super::text::clear_text_model_cache();
 }
 
 pub(crate) fn media_collapse_key(ts: &str, slot: &str) -> String {
@@ -1539,6 +1640,8 @@ pub(crate) mod decode {
             pub(super) content: RefCell<Option<gdk::Paintable>>,
             /// Forwards a player's frames as this paintable's own.
             pub(super) frames: RefCell<Option<glib::SignalHandlerId>>,
+            /// Whether the owning picture is currently mapped on screen.
+            pub(super) mapped: Cell<bool>,
             /// Size the image's header declares, shown until it decodes.
             pub(super) declared: Cell<(i32, i32)>,
             /// Longest side the intrinsic size is fitted to; 0 keeps it.
@@ -1572,6 +1675,16 @@ pub(crate) mod decode {
 
         impl ObjectImpl for DeferredPaintable {
             fn dispose(&self) {
+                if self.mapped.replace(false) {
+                    if let Some(player) = self
+                        .content
+                        .borrow()
+                        .as_ref()
+                        .and_then(|c| c.downcast_ref::<crate::animated_image::AnimatedImage>())
+                    {
+                        player.viewer_unmapped();
+                    }
+                }
                 // Players are shared: do not leave a handler on one.
                 if let (Some(content), Some(handler)) =
                     (self.content.borrow().as_ref(), self.frames.take())
@@ -1627,11 +1740,79 @@ pub(crate) mod decode {
             self.imp().content.borrow().clone()
         }
 
+        fn set_mapped(&self, mapped: bool) {
+            let imp = self.imp();
+            if imp.mapped.replace(mapped) == mapped {
+                return;
+            }
+            if let Some(player) = imp
+                .content
+                .borrow()
+                .as_ref()
+                .and_then(|c| c.downcast_ref::<crate::animated_image::AnimatedImage>())
+            {
+                if mapped {
+                    player.viewer_mapped();
+                } else {
+                    player.viewer_unmapped();
+                }
+            }
+        }
+
+        /// Builds a [`gtk::Picture`] showing `paintable` and forwarding its
+        /// map state so offscreen pooled [`crate::animated_image::AnimatedImage`]
+        /// players pause their timers.
+        pub(crate) fn picture_for(paintable: &Self) -> gtk::Picture {
+            let picture = gtk::Picture::for_paintable(paintable);
+            if picture.is_mapped() {
+                paintable.set_mapped(true);
+            }
+            let weak = paintable.downgrade();
+            {
+                let weak = weak.clone();
+                picture.connect_map(move |pic| {
+                    if let Some(paintable) = weak.upgrade() {
+                        if pic.paintable().as_ref() == Some(paintable.upcast_ref()) {
+                            paintable.set_mapped(true);
+                        }
+                    }
+                });
+            }
+            {
+                let weak = weak.clone();
+                picture.connect_unmap(move |_| {
+                    if let Some(paintable) = weak.upgrade() {
+                        paintable.set_mapped(false);
+                    }
+                });
+            }
+            picture.connect_paintable_notify(move |pic| {
+                if let Some(paintable) = weak.upgrade() {
+                    let matches = pic.paintable().as_ref() == Some(paintable.upcast_ref());
+                    if !matches {
+                        paintable.set_mapped(false);
+                    } else if pic.is_mapped() {
+                        paintable.set_mapped(true);
+                    }
+                }
+            });
+            picture
+        }
+
         fn set_content(&self, content: &gdk::Paintable) {
             let imp = self.imp();
             let before = imp.size();
-            if let (Some(old), Some(handler)) = (imp.content.take(), imp.frames.take()) {
-                old.disconnect(handler);
+            let was_mapped = imp.mapped.get();
+            if let Some(old) = imp.content.take() {
+                if let Some(handler) = imp.frames.take() {
+                    old.disconnect(handler);
+                }
+                if was_mapped {
+                    if let Some(player) = old.downcast_ref::<crate::animated_image::AnimatedImage>()
+                    {
+                        player.viewer_unmapped();
+                    }
+                }
             }
             if !content.is::<gdk::Texture>() {
                 let weak = self.downgrade();
@@ -1641,6 +1822,12 @@ pub(crate) mod decode {
                     }
                 });
                 imp.frames.replace(Some(handler));
+            }
+            if was_mapped {
+                if let Some(player) = content.downcast_ref::<crate::animated_image::AnimatedImage>()
+                {
+                    player.viewer_mapped();
+                }
             }
             imp.content.replace(Some(content.clone()));
             if before != imp.size() {
@@ -1694,7 +1881,7 @@ pub(crate) mod decode {
             )
             .unwrap_or((0, 0));
         let paintable = DeferredPaintable::new(declared, fit);
-        let picture = gtk::Picture::for_paintable(&paintable);
+        let picture = DeferredPaintable::picture_for(&paintable);
         let ticket = DecodeTicket::default();
         let request = DeferredRequest {
             target: paintable.downgrade(),

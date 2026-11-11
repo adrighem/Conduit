@@ -3353,33 +3353,10 @@ fn message_image_asset_requests<'a, T: std::borrow::Borrow<SlackMessage> + 'a>(
                 }
             }
         }
-        if let Some(text) = msg.text.as_deref() {
-            let mut rest = text;
-            while let Some(start) = rest.find(':') {
-                rest = &rest[start + 1..];
-                if let Some(end) = rest.find(':') {
-                    let code = &rest[..end];
-                    if !code.is_empty()
-                        && code.len() <= 64
-                        && code
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
-                    {
-                        if let Some(crate::emoji::EmojiValue::CustomImage(url)) =
-                            catalog.resolve(code)
-                        {
-                            retain_image_asset_request(
-                                &mut requests,
-                                bounded_image_asset_request(&url),
-                            );
-                        }
-                    }
-                    rest = &rest[end + 1..];
-                } else {
-                    break;
-                }
-            }
-        }
+        crate::rendering::any_custom_emoji_url_in_message(msg, &catalog, |url| {
+            retain_image_asset_request(&mut requests, bounded_image_asset_request(url));
+            false
+        });
         if let Some(url) = msg
             .user
             .as_ref()
@@ -4082,8 +4059,15 @@ impl ConduitWindow {
                 }
             },
             TimelineAction::ExecuteControlAction { ts, key } => {
-                if let Some(channel_id) = self.visible_channel_id() {
+                let channel_id = self
+                    .visible_channel_id()
+                    .filter(|ch| self.find_message(ch, &ts).is_some())
+                    .or_else(|| self.selected_thread_target().map(|(ch, _)| ch))
+                    .or_else(|| self.visible_channel_id());
+                if let Some(channel_id) = channel_id {
                     self.execute_control_action(&channel_id, &ts, key);
+                } else {
+                    self.refresh_message_rows(&ts);
                 }
             }
             TimelineAction::LoadOlder {
@@ -4168,12 +4152,16 @@ impl ConduitWindow {
         key: crate::rich_message::MessageControlKey,
     ) {
         let Some(message) = self.find_message(channel_id, ts) else {
+            self.refresh_message_rows(ts);
             return;
         };
         let Some(control) = message.document.control(key) else {
+            self.refresh_message_rows(ts);
             return;
         };
         let Some(action) = control.action().cloned() else {
+            self.set_status(&gettext("This action is not available here"));
+            self.refresh_message_rows(ts);
             return;
         };
         let service_id = message
@@ -10566,6 +10554,12 @@ impl ConduitWindow {
         self.refresh_activity_badge();
         self.sync_workspace_chrome();
         crate::timeline_message_widget::clear_timeline_view_caches();
+        if let Some(timeline) = imp.native_timeline_view.borrow().as_ref() {
+            timeline.invalidate_all();
+        }
+        if let Some(timeline) = self.thread_pane().native_timeline_view.borrow().as_ref() {
+            timeline.invalidate_all();
+        }
         imp.conversation_opening.borrow_mut().reset();
         imp.message_control_registry.borrow_mut().reset_session();
         self.set_realtime_status(RealtimeStatus::default());
@@ -11021,6 +11015,9 @@ impl ConduitWindow {
     }
 
     fn replace_custom_emojis(&self, emojis: HashMap<String, String>) {
+        if **self.imp().custom_emojis.borrow() == emojis {
+            return;
+        }
         *self.imp().custom_emojis.borrow_mut() = Arc::new(emojis);
         if let Some(state) = self.imp().status_dialog.borrow().as_ref() {
             state
@@ -11029,6 +11026,10 @@ impl ConduitWindow {
             write_status_dialog_test_state(self, state);
         }
         self.invalidate_composer_completions();
+        self.queue_ui_invalidations(
+            UiInvalidations::MAIN | UiInvalidations::THREAD | UiInvalidations::SIDEBAR,
+        );
+        self.queue_activity_refresh();
     }
 
     fn handle_runtime_error(&self, context: &OperationContext, failure: &RuntimeFailure) {
@@ -15525,6 +15526,15 @@ impl ConduitWindow {
             .borrow()
             .selected_thread_ts()
             .map(ToString::to_string)
+    }
+
+    fn selected_thread_target(&self) -> Option<(String, String)> {
+        self.imp()
+            .workspace
+            .view
+            .borrow()
+            .selected_thread_target()
+            .map(|(channel_id, thread_ts)| (channel_id.to_string(), thread_ts.to_string()))
     }
 
     fn current_main_view(&self) -> MainMessageView {

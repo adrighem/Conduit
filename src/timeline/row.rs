@@ -14,11 +14,22 @@ use super::actions::{
     ActionHandler, HoverEvent, OpenMediaCallback, TimelineAction, ToggleReactionCallback,
 };
 use super::cache::decode::{
-    deferred_picture, deferred_texture_picture, set_avatar_image_when_mapped, TextureSpec,
+    deferred_picture, deferred_texture_picture, set_avatar_image_when_mapped, DeferredPaintable,
+    TextureSpec,
 };
 use super::cache::{is_media_collapsed, resolve_cached_asset_path, set_media_collapsed};
 use super::reactions::build_reactions_widget;
-use super::text::{create_message_text_widget, render_text_content};
+use super::text::{cached_mrkdwn_widget, render_text_content, MarkupStyle};
+
+#[cfg(test)]
+thread_local! {
+    /// Message row widget trees built on this thread.
+    pub(crate) static TIMELINE_MESSAGE_ROW_BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Day-separator row widget trees built on this thread.
+    pub(crate) static TIMELINE_DAY_SEPARATOR_BUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 pub const TIMELINE_AVATAR_SIZE: i32 = 36;
 pub const FOCUS_TARGET_CLASS: &str = "timeline-focus-target";
@@ -188,7 +199,7 @@ pub fn load_animated_or_static_picture(
 ) -> Widget {
     let longest_side = width.max(height);
     let pic = if let Some(player) = crate::animated_image::existing_player(path, longest_side) {
-        Picture::for_paintable(&player)
+        DeferredPaintable::picture_for(&DeferredPaintable::fitted(&player, 0))
     } else if let Some(texture) = TextureSpec::Full.cached(path) {
         Picture::for_paintable(&texture)
     } else {
@@ -536,6 +547,8 @@ pub fn build_thread_replies_widget(
 /// Full-width rule with the day label ("Today", "15 Sep", ...) centered on
 /// it. Deliberately distinct from the red/accent unread separator.
 pub fn day_separator_widget(ts: &str) -> Box {
+    #[cfg(test)]
+    TIMELINE_DAY_SEPARATOR_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let label_text = crate::message_timestamp::slack_ts_datetime(ts)
         .zip(gtk::glib::DateTime::now_local().ok())
         .and_then(|(dt, now)| crate::day_label::day_label(&dt, &now))
@@ -716,6 +729,8 @@ pub(crate) fn build_timeline_message_widget_with_root(
     show_header: bool,
     thread_root_preview: Option<&str>,
 ) -> Box {
+    #[cfg(test)]
+    TIMELINE_MESSAGE_ROW_BUILDS.with(|builds| builds.set(builds.get() + 1));
     register_timeline_css();
     if let Some(subtype) = message.subtype.as_deref() {
         if matches!(
@@ -741,9 +756,8 @@ pub(crate) fn build_timeline_message_widget_with_root(
                 _ => "system event",
             });
 
-            let pango = crate::message_markup::mrkdwn_to_pango(sys_text, context);
             let text_widget =
-                create_message_text_widget(&format!("<i>{}</i>", pango), context, on_author_action);
+                cached_mrkdwn_widget(sys_text, MarkupStyle::Italic, context, on_author_action);
             text_widget.add_css_class("dim-label");
             root_box.append(&text_widget);
 

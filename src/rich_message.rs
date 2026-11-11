@@ -646,6 +646,9 @@ fn project_node_text(node: &MessageNode, include_controls: bool, parts: &mut Vec
                     push_text(parts, fallback);
                 }
             }
+            if let Some(footer) = attachment.footer.as_deref() {
+                push_text(parts, footer);
+            }
         }
         MessageNode::Quote(quote) => {
             if let Some(author) = &quote.author_name {

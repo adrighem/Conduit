@@ -3,11 +3,13 @@
 //!
 //! Every file is decoded once per display size into an [`AnimatedImage`]
 //! paintable that all pictures showing it share. A single timer per paintable
-//! advances frames at the image's own delay and stops once no widget holds the
-//! paintable, so N copies of a GIF cost one decoder, one texture per frame and
-//! no per-widget frame-clock ticks. A player scales each frame once: it keeps
-//! the textures of its first loop and replays them, so a looping animation
-//! costs no pixel work on the GTK thread after one pass.
+//! advances frames at the image's own delay while at least one viewer widget
+//! is mapped, pausing when every viewer unmaps (for example into a detached
+//! row pool) and stopping once no widget holds the paintable, so N copies of a
+//! GIF cost one decoder, one texture per frame and no per-widget frame-clock
+//! ticks. A player scales each frame once: it keeps the textures of its first
+//! loop and replays them, so a looping animation costs no pixel work on the
+//! GTK thread after one pass.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -49,6 +51,8 @@ thread_local! {
 thread_local! {
     /// Frames scaled and turned into a texture on this thread.
     pub(crate) static FRAME_RENDERS: Cell<usize> = const { Cell::new(0) };
+    /// Animation timer callbacks fired on this thread.
+    pub(crate) static TIMER_FIRES: Cell<usize> = const { Cell::new(0) };
 }
 
 mod imp {
@@ -60,6 +64,9 @@ mod imp {
         pub(super) frame: RefCell<Option<gdk::Texture>>,
         pub(super) max_side: Cell<i32>,
         pub(super) timer: RefCell<Option<glib::SourceId>>,
+        /// Mapped widgets currently presenting this paintable. While 0, no
+        /// frame timer runs so pooled offscreen rows stay idle.
+        pub(super) mapped_viewers: Cell<usize>,
         /// The time `iter` started at, and how far it has been advanced.
         /// Each step moves it by exactly the current frame's delay, so the
         /// step count names the frame shown however late a timer fires.
@@ -136,8 +143,37 @@ impl AnimatedImage {
         );
         imp.iter.replace(Some(animation.iter(Some(start))));
         player.show_current_frame();
-        player.schedule_next_frame();
         player
+    }
+
+    pub(crate) fn viewer_mapped(&self) {
+        let imp = self.imp();
+        let previous = imp.mapped_viewers.get();
+        imp.mapped_viewers.set(previous.saturating_add(1));
+        if previous == 0 && imp.timer.borrow().is_none() {
+            self.schedule_next_frame();
+        }
+    }
+
+    pub(crate) fn viewer_unmapped(&self) {
+        let imp = self.imp();
+        let remaining = imp.mapped_viewers.get().saturating_sub(1);
+        imp.mapped_viewers.set(remaining);
+        if remaining == 0 {
+            if let Some(timer) = imp.timer.take() {
+                timer.remove();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mapped_viewers(&self) -> usize {
+        self.imp().mapped_viewers.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_timer(&self) -> bool {
+        self.imp().timer.borrow().is_some()
     }
 
     fn show_current_frame(&self) {
@@ -224,6 +260,9 @@ impl AnimatedImage {
     }
 
     fn schedule(&self, delay: Duration) {
+        if self.imp().mapped_viewers.get() == 0 {
+            return;
+        }
         let weak = self.downgrade();
         let timer = glib::timeout_add_local_once(delay, move || {
             let Some(player) = weak.upgrade() else {
@@ -231,18 +270,25 @@ impl AnimatedImage {
             };
             // This source has fired; dispose must not remove it again.
             player.imp().timer.take();
+            #[cfg(test)]
+            TIMER_FIRES.with(|fires| fires.set(fires.get() + 1));
             player.advance();
         });
         self.imp().timer.replace(Some(timer));
     }
 
     fn advance(&self) {
+        if self.imp().mapped_viewers.get() == 0 {
+            return;
+        }
         if !any_window_active() {
             self.schedule(PAUSED_POLL);
             return;
         }
         self.step_frame();
-        self.schedule_next_frame();
+        if self.imp().mapped_viewers.get() > 0 {
+            self.schedule_next_frame();
+        }
     }
 
     /// Moves to the next frame: the iterator is advanced by the current

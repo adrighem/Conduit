@@ -122,7 +122,7 @@ pub(crate) fn memory_texture(pixbuf: &gdk_pixbuf::Pixbuf) -> gtk::gdk::Texture {
 /// Custom emoji image whose longest side is `size` pixels.
 pub fn load_custom_emoji_picture(path: &Path, size: i32) -> Widget {
     let pic = if let Some(player) = crate::animated_image::existing_player(path, size) {
-        Picture::for_paintable(&DeferredPaintable::fitted(&player, size))
+        DeferredPaintable::picture_for(&DeferredPaintable::fitted(&player, size))
     } else if let Some(texture) = TextureSpec::Reaction.cached(path) {
         Picture::for_paintable(&fit_reaction_texture(texture, size))
     } else {

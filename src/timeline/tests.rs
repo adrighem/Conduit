@@ -3792,6 +3792,1756 @@ mod graphical {
             window.destroy();
         });
     }
+
+    fn timeline_row_builds() -> usize {
+        TIMELINE_MESSAGE_ROW_BUILDS.with(Cell::get) + TIMELINE_DAY_SEPARATOR_BUILDS.with(Cell::get)
+    }
+
+    fn total_markup_parses() -> usize {
+        TEXT_BLOCK_BUILDS.with(Cell::get) + TEXT_MARKUP_BUILDS.with(Cell::get)
+    }
+
+    #[test]
+    fn perf_guard_rebind_of_unchanged_timeline_row_builds_zero_widgets() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let messages = (0..30)
+                .rev()
+                .map(|i| {
+                    let day_base = 1_700_000_000 + (i / 10) * 86_400;
+                    SlackMessage {
+                        ts: format!("{}.{i:06}", day_base + (i % 10)),
+                        user: Some(if i % 3 == 0 { "U123" } else { "U456" }.to_string()),
+                        text: Some(format!("message {i}")),
+                        ..Default::default()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(400, 500);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+
+            let initial_before = timeline_row_builds();
+            let messages_arc = messages.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+            view.set_messages(&messages_arc, &ctx, None);
+            wait_until_at_bottom(&view);
+            pump(200);
+            assert!(timeline_row_builds() > initial_before);
+            view.assert_pool_invariants();
+
+            // Re-rendering fresh Arc clones that render the same builds zero rows.
+            let before = timeline_row_builds();
+            let fresh_clones = messages.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+            view.set_messages(&fresh_clones, &ctx, None);
+            pump(100);
+            assert_eq!(
+                timeline_row_builds() - before,
+                0,
+                "unchanged set_messages must build zero row or separator widgets"
+            );
+
+            // GListStore::splice around unchanged rows (removing an interior row
+            // into TimelineRowPool and splicing it back) builds zero widgets.
+            let before = timeline_row_builds();
+            let mid_idx = view.store.n_items() / 2;
+            let removed = view
+                .store
+                .item(mid_idx)
+                .and_downcast::<TimelineMessageObject>()
+                .expect("interior timeline item");
+            view.store
+                .splice(mid_idx, 1, &[] as &[TimelineMessageObject]);
+            pump(100);
+            assert_eq!(
+                timeline_row_builds() - before,
+                0,
+                "splicing removal around unchanged rows must build zero widgets"
+            );
+            view.store.splice(mid_idx, 0, &[removed]);
+            pump(100);
+            assert_eq!(
+                timeline_row_builds() - before,
+                0,
+                "splicing pooled row back around unchanged rows must build zero widgets"
+            );
+
+            // Forced in-place rebind across all currently bound rows reuses
+            // non-dirty BoundRowEntry widgets with zero builds.
+            let before = timeline_row_builds();
+            view.rebind_rows("perf_guard_in_place", |_| true);
+            pump(100);
+            assert_eq!(
+                timeline_row_builds() - before,
+                0,
+                "in-place rebind of unchanged bound rows must build zero widgets"
+            );
+
+            // Moving focus_ts between visible rows updates FOCUS_TARGET_CLASS
+            // dynamically without rebuilding any row widget.
+            let visible = bound_row_widgets(&view);
+            assert!(visible.len() >= 2);
+            let first_ts = visible[visible.len() - 1].0.clone();
+            let second_ts = visible[visible.len() - 2].0.clone();
+
+            let mut preserve = ctx.clone();
+            preserve.timeline_scroll = crate::message_markup::TimelineScrollBehavior::Preserve;
+            let before = timeline_row_builds();
+            view.set_messages(&messages_arc, &preserve, Some(&first_ts));
+            pump(100);
+            let first_widget = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == first_ts).then_some(w))
+                .expect("first target bound");
+            assert!(first_widget.has_css_class(FOCUS_TARGET_CLASS));
+
+            view.set_messages(&messages_arc, &preserve, Some(&second_ts));
+            pump(100);
+            let after_widgets = bound_row_widgets(&view);
+            let first_after = after_widgets
+                .iter()
+                .find_map(|(ts, w)| (ts == &first_ts).then(|| w.clone()))
+                .expect("first still bound");
+            let second_after = after_widgets
+                .iter()
+                .find_map(|(ts, w)| (ts == &second_ts).then(|| w.clone()))
+                .expect("second bound");
+            assert!(!first_after.has_css_class(FOCUS_TARGET_CLASS));
+            assert!(second_after.has_css_class(FOCUS_TARGET_CLASS));
+            assert_eq!(
+                timeline_row_builds() - before,
+                0,
+                "moving focus highlight across bound rows must build zero widgets"
+            );
+            view.assert_pool_invariants();
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn perf_guard_scrolling_back_over_seen_timeline_rows_builds_zero_widgets() {
+        run_gtk_test(|| {
+            let mut ctx = test_context();
+            ctx.custom_emojis = Arc::new(HashMap::from([(
+                "party".to_string(),
+                "https://example.com/party.png".to_string(),
+            )]));
+
+            let doc_msg = {
+                use crate::rich_message::*;
+                let mut msg = SlackMessage {
+                    ts: "1700086405.000100".to_string(),
+                    user: Some("U123".to_string()),
+                    text: Some("doc fallback".to_string()),
+                    content_version: MESSAGE_CONTENT_VERSION,
+                    ..Default::default()
+                };
+                msg.document = MessageDocument::new(
+                    vec![
+                        MessageNode::Section {
+                            text: Some("Section *bold* text".to_string()),
+                            fields: vec!["*Field A*".to_string(), "_Field B_".to_string()],
+                            accessory: None,
+                        },
+                        MessageNode::Context(vec![MessageContextElement::Text(
+                            "context note".to_string(),
+                        )]),
+                    ],
+                    None,
+                );
+                msg
+            };
+
+            // Use 255 messages across multiple days (> GtkListView's ~200-item
+            // tile cache so scrolling unbinds rows into TimelineRowPool, while
+            // keeping the detached delta well within the 128-row pool cap).
+            let mut messages = Vec::new();
+            for i in (0..255).rev() {
+                let day_base = 1_700_000_000 + (i / 30) * 86_400;
+                let ts = format!("{}.{i:06}", day_base + (i % 30) * 10);
+                let msg = if i == 245 || i == 15 {
+                    let mut m = doc_msg.clone();
+                    m.ts = ts;
+                    m
+                } else if i == 240 || i == 8 {
+                    SlackMessage {
+                        ts,
+                        user: Some("U123".to_string()),
+                        subtype: Some("channel_topic".to_string()),
+                        text: Some("updated the topic".to_string()),
+                        ..Default::default()
+                    }
+                } else {
+                    SlackMessage {
+                        ts,
+                        user: Some(if i % 2 == 0 { "U123" } else { "U456" }.to_string()),
+                        text: Some(if i % 5 == 0 {
+                            format!("inline custom emoji :party: row {i}")
+                        } else {
+                            format!("timeline row {i} with enough text to take vertical space")
+                        }),
+                        reactions: (i % 4 == 0).then(|| {
+                            vec![SlackReaction {
+                                name: Some("thumbsup".to_string()),
+                                count: Some(2),
+                                users: Some(vec!["U123".to_string(), "U456".to_string()]),
+                            }]
+                        }),
+                        ..Default::default()
+                    }
+                };
+                messages.push(Arc::new(msg));
+            }
+
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(400, 360);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+            view.set_messages(&messages, &ctx, None);
+            wait_until_at_bottom(&view);
+            pump(200);
+
+            // First sweep: scroll from bottom to the very top so every row and
+            // day separator in the timeline is bound at least once and bottom
+            // rows recycle into TimelineRowPool.
+            let vadj = view.scrolled_window.vadjustment();
+            let step = (vadj.page_size() * 0.75).max(80.0);
+            while vadj.value() > vadj.lower() + 0.5 {
+                let next = (vadj.value() - step).max(vadj.lower());
+                vadj.set_value(next);
+                pump(25);
+                view.assert_pool_invariants();
+                if (vadj.value() - vadj.lower()).abs() < 0.5 {
+                    break;
+                }
+            }
+            vadj.set_value(vadj.lower());
+            pump(120);
+            view.assert_pool_invariants();
+            let (pooled_msgs, _) = view.pooled_row_counts();
+            assert!(
+                pooled_msgs > 0 && pooled_msgs <= 128,
+                "detached rows should be pooled within cap after scrolling, got {pooled_msgs}"
+            );
+
+            // Second sweep: scroll all the way back to the bottom and back up
+            // again; every row has been seen and fits within the pool cap.
+            let before_return = timeline_row_builds();
+            loop {
+                let max_scroll = (vadj.upper() - vadj.page_size()).max(vadj.lower());
+                if vadj.value() >= max_scroll - 0.5 {
+                    break;
+                }
+                let next = (vadj.value() + step).min(max_scroll);
+                vadj.set_value(next);
+                pump(25);
+                view.assert_pool_invariants();
+            }
+            let max_scroll = (vadj.upper() - vadj.page_size()).max(vadj.lower());
+            vadj.set_value(max_scroll);
+            pump(120);
+            while vadj.value() > vadj.lower() + 0.5 {
+                let next = (vadj.value() - step).max(vadj.lower());
+                vadj.set_value(next);
+                pump(25);
+                view.assert_pool_invariants();
+                if (vadj.value() - vadj.lower()).abs() < 0.5 {
+                    break;
+                }
+            }
+            assert_eq!(
+                timeline_row_builds() - before_return,
+                0,
+                "scrolling back over already-seen timeline rows must build zero widgets"
+            );
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn perf_guard_document_and_system_message_rebind_parses_markup_once() {
+        run_gtk_test(|| {
+            use crate::rich_message::*;
+            clear_timeline_view_caches();
+            let mut ctx = test_context();
+            ctx.custom_emojis = Arc::new(HashMap::from([(
+                "shipit".to_string(),
+                "https://example.com/shipit.png".to_string(),
+            )]));
+
+            let mut rich_doc_msg = SlackMessage {
+                ts: "1700000010.000100".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("fallback".to_string()),
+                content_version: MESSAGE_CONTENT_VERSION,
+                ..Default::default()
+            };
+            rich_doc_msg.document = MessageDocument::new(
+                vec![
+                    MessageNode::Section {
+                        text: Some("Section *body* <@U123>".to_string()),
+                        fields: vec![
+                            "*Owner*\n<@U123>".to_string(),
+                            "*Status*\n:shipit: Ready".to_string(),
+                        ],
+                        accessory: None,
+                    },
+                    MessageNode::Context(vec![MessageContextElement::Text(
+                        "Context *meta* <#C1>".to_string(),
+                    )]),
+                    MessageNode::RichText(vec![
+                        RichTextNode::Paragraph(vec![RichInline::Text {
+                            text: "Paragraph text".to_string(),
+                            style: RichInlineStyle::default(),
+                        }]),
+                        RichTextNode::Quote(vec![RichInline::Text {
+                            text: "Quoted rich line".to_string(),
+                            style: RichInlineStyle::default(),
+                        }]),
+                        RichTextNode::List {
+                            ordered: true,
+                            items: vec![vec![RichInline::Text {
+                                text: "First item".to_string(),
+                                style: RichInlineStyle::default(),
+                            }]],
+                        },
+                    ]),
+                    MessageNode::Attachment(std::boxed::Box::new(MessageAttachment {
+                        color: Some("#2eb67d".to_string()),
+                        pretext: Some("Attachment *pretext*".to_string()),
+                        author: None,
+                        title: None,
+                        text: Some("Attachment _body_".to_string()),
+                        fallback: None,
+                        fields: vec![MessageField {
+                            title: Some("Env".to_string()),
+                            value: Some("*Prod* :shipit:".to_string()),
+                            short: true,
+                        }],
+                        image: None,
+                        actions: Vec::new(),
+                        footer: Some("Footer <https://example.com|docs> :shipit:".to_string()),
+                        footer_icon: None,
+                    })),
+                ],
+                None,
+            );
+
+            let sys_msg = SlackMessage {
+                ts: "1700000005.000100".to_string(),
+                user: Some("U123".to_string()),
+                subtype: Some("channel_topic".to_string()),
+                text: Some("<@U123> set topic to *Ship* :shipit:".to_string()),
+                ..Default::default()
+            };
+
+            let messages = vec![Arc::new(rich_doc_msg), Arc::new(sys_msg)];
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(500, 600);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+
+            let parses_before = total_markup_parses();
+            view.set_messages(&messages, &ctx, None);
+            pump(250);
+            let first_parses = total_markup_parses() - parses_before;
+            assert!(
+                first_parses >= 8,
+                "initial render parses all fragments, got {first_parses}"
+            );
+
+            // Force full widget rebuilds of both rows via refresh_message:
+            // widgets rebuild, while TextModelCache serves every fragment with 0 parses.
+            let before_widgets = bound_row_widgets(&view);
+            assert_eq!(before_widgets.len(), 2);
+            let parses_mid = total_markup_parses();
+            for msg in &messages {
+                view.refresh_message(&msg.ts);
+            }
+            pump(100);
+            assert_eq!(
+                rebound_rows(&view, &before_widgets).len(),
+                2,
+                "refresh_message must rebuild both row widgets"
+            );
+            assert_eq!(
+                total_markup_parses() - parses_mid,
+                0,
+                "rebuilding document and system rows under unchanged markup stamp must parse zero times"
+            );
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn pooled_offscreen_animated_image_pauses_timer_until_mapped_again() {
+        run_gtk_test(|| {
+            clear_timeline_view_caches();
+            decode::reset_texture_decoder_for_tests();
+            let assets = AssetCacheTestDir::new("pooled-anim-pause");
+            let gif_url = "https://files.slack.com/files-pri/T1-F1/anim.gif".to_string();
+            let gif_path = assets.0.join("anim_gif_key.gif");
+            std::fs::write(&gif_path, crate::animated_image::tests::ANIMATED_GIF)
+                .expect("write animated gif");
+
+            let mut ctx = test_context();
+            ctx.image_assets.insert(gif_url.clone(), gif_path.clone());
+
+            let mut messages = Vec::new();
+            for suffix in [1001, 1000] {
+                messages.push(Arc::new(SlackMessage {
+                    ts: format!("170000{suffix}.000100"),
+                    user: Some("U456".to_string()),
+                    text: Some(format!("tail anchor {suffix}")),
+                    ..Default::default()
+                }));
+            }
+            let gif_msg = SlackMessage {
+                ts: "1700000999.000100".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("animated row".to_string()),
+                files: Some(vec![SlackFile {
+                    id: Some("F1".to_string()),
+                    title: Some("anim.gif".to_string()),
+                    mimetype: Some("image/gif".to_string()),
+                    url_private: Some(gif_url),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            };
+            messages.push(Arc::new(gif_msg));
+            for i in (0..255).rev() {
+                messages.push(Arc::new(SlackMessage {
+                    ts: format!("1700000{i:03}.000100"),
+                    user: Some(if i % 2 == 0 { "U123" } else { "U456" }.to_string()),
+                    text: Some(format!("filler row {i}\nsecond line")),
+                    ..Default::default()
+                }));
+            }
+
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(400, 320);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+            view.set_messages(&messages, &ctx, None);
+
+            let vadj = view.scrolled_window.vadjustment();
+            let find_player = || -> Option<crate::animated_image::AnimatedImage> {
+                deferred_pictures(view.list_view.upcast_ref())
+                    .into_iter()
+                    .find_map(|(_, deferred)| {
+                        deferred
+                            .content()?
+                            .downcast::<crate::animated_image::AnimatedImage>()
+                            .ok()
+                    })
+            };
+            pump_until(5000, || {
+                let max_scroll = (vadj.upper() - vadj.page_size()).max(vadj.lower());
+                if max_scroll > vadj.value() + 1.0 {
+                    vadj.set_value(max_scroll);
+                }
+                find_player().is_some_and(|p| p.mapped_viewers() >= 1)
+            });
+            let player = find_player().expect("animated player loaded");
+            assert!(player.mapped_viewers() >= 1);
+            assert!(player.has_active_timer());
+
+            let newest_widget = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == "1700000999.000100").then_some(w))
+                .expect("newest animated row bound");
+
+            // Scroll to the oldest message so GtkListView recycles the bottom
+            // tile and checks the GIF row into TimelineRowPool.
+            let step = (vadj.page_size() * 0.85).max(100.0);
+            while vadj.value() > vadj.lower() + 0.5 {
+                let next = (vadj.value() - step).max(vadj.lower());
+                vadj.set_value(next);
+                pump(20);
+                if newest_widget.parent().is_none() {
+                    break;
+                }
+            }
+            vadj.set_value(vadj.lower());
+            pump_until(3000, || {
+                newest_widget.parent().is_none() && player.mapped_viewers() == 0
+            });
+            pump(50);
+            view.assert_pool_invariants();
+            assert!(
+                newest_widget.parent().is_none(),
+                "GIF row should be detached in TimelineRowPool"
+            );
+            assert_eq!(player.mapped_viewers(), 0);
+            assert!(
+                !player.has_active_timer(),
+                "unmapped pooled AnimatedImage must stop its frame timer"
+            );
+
+            let fires_while_pooled = crate::animated_image::TIMER_FIRES.with(Cell::get);
+            let renders_while_pooled = crate::animated_image::FRAME_RENDERS.with(Cell::get);
+            pump(350);
+            assert_eq!(
+                crate::animated_image::TIMER_FIRES.with(Cell::get),
+                fires_while_pooled,
+                "pooled offscreen animation must fire zero timer callbacks"
+            );
+            assert_eq!(
+                crate::animated_image::FRAME_RENDERS.with(Cell::get),
+                renders_while_pooled,
+                "pooled offscreen animation must render zero frames"
+            );
+
+            // Scroll back to the bottom: the pooled row is reused (0 builds) and
+            // the player's timer resumes immediately upon mapping.
+            let builds_before = TIMELINE_MESSAGE_ROW_BUILDS.with(Cell::get);
+            loop {
+                let max_scroll = (vadj.upper() - vadj.page_size()).max(vadj.lower());
+                if vadj.value() >= max_scroll - 0.5 {
+                    break;
+                }
+                let next = (vadj.value() + step).min(max_scroll);
+                vadj.set_value(next);
+                pump(20);
+            }
+            pump_until(3000, || {
+                let max_scroll = (vadj.upper() - vadj.page_size()).max(vadj.lower());
+                vadj.set_value(max_scroll);
+                player.mapped_viewers() >= 1
+            });
+            assert_eq!(
+                TIMELINE_MESSAGE_ROW_BUILDS.with(Cell::get) - builds_before,
+                0,
+                "scrolling back to the GIF row must reuse the pooled widget"
+            );
+            assert!(player.has_active_timer());
+            let fires_before_resume = crate::animated_image::TIMER_FIRES.with(Cell::get);
+            pump_until(1500, || {
+                crate::animated_image::TIMER_FIRES.with(Cell::get) > fires_before_resume
+            });
+            assert!(
+                crate::animated_image::TIMER_FIRES.with(Cell::get) > fires_before_resume,
+                "timer callbacks resume once mapped again"
+            );
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn refresh_message_rebuilds_disabled_controls_and_unbind_sanitizes_selection_and_popovers() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let action_msg =
+                crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                    "ts": "1700000900.000100",
+                    "user": "U456",
+                    "text": "Selectable message text <@U456>",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "Selectable message text <@U456>"
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "block_id": "b1",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "action_id": "approve",
+                                    "text": { "type": "plain_text", "text": "Approve" },
+                                    "value": "yes"
+                                }
+                            ]
+                        }
+                    ]
+                }))
+                .into_message()
+                .expect("normalize action message");
+
+            let mut messages = Vec::new();
+            for suffix in [902, 901] {
+                messages.push(Arc::new(SlackMessage {
+                    ts: format!("1700000{suffix}.000100"),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("tail anchor {suffix}")),
+                    ..Default::default()
+                }));
+            }
+            messages.push(Arc::new(action_msg));
+            for i in (0..8).rev() {
+                messages.push(Arc::new(SlackMessage {
+                    ts: format!("1700000{i:03}.000100"),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("spacer {i}")),
+                    ..Default::default()
+                }));
+            }
+
+            let view = NativeTimelineView::new();
+            view.set_on_action(|_| {});
+            let window = gtk::Window::new();
+            window.set_default_size(400, 360);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+            view.set_messages(&messages, &ctx, None);
+            pump(200);
+
+            let find_approve_button = |root: &Widget| -> Option<Button> {
+                let mut stack = vec![root.clone()];
+                while let Some(w) = stack.pop() {
+                    if let Some(btn) = w.downcast_ref::<Button>() {
+                        if btn.label().as_deref() == Some("Approve") {
+                            return Some(btn.clone());
+                        }
+                    }
+                    let mut c = w.first_child();
+                    while let Some(cur) = c {
+                        c = cur.next_sibling();
+                        stack.push(cur);
+                    }
+                }
+                None
+            };
+
+            let row_widget = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == "1700000900.000100").then_some(w))
+                .expect("action row bound");
+            let approve = find_approve_button(&row_widget).expect("Approve button");
+            assert!(approve.is_sensitive());
+            approve.emit_clicked();
+            pump(50);
+            assert!(!approve.is_sensitive(), "clicking action disables button");
+
+            // refresh_message evicts/marks dirty and rebuilds the row with an enabled button.
+            view.refresh_message("1700000900.000100");
+            pump(50);
+            let rebuilt_row = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == "1700000900.000100").then_some(w))
+                .expect("rebuilt action row");
+            assert_ne!(rebuilt_row, row_widget);
+            let rebuilt_approve = find_approve_button(&rebuilt_row).expect("rebuilt Approve");
+            assert!(rebuilt_approve.is_sensitive());
+
+            // Focus and select text on a selectable label and open a mention
+            // popover, then unbind the row into TimelineRowPool via store removal.
+            let selectable_label = {
+                let mut found = None;
+                let mut stack = vec![rebuilt_row.clone()];
+                while let Some(w) = stack.pop() {
+                    if let Some(lbl) = w.downcast_ref::<Label>() {
+                        if lbl.is_selectable() && lbl.text().contains("Selectable") {
+                            found = Some(lbl.clone());
+                            break;
+                        }
+                    }
+                    let mut c = w.first_child();
+                    while let Some(cur) = c {
+                        c = cur.next_sibling();
+                        stack.push(cur);
+                    }
+                }
+                found.expect("selectable label")
+            };
+            selectable_label.grab_focus();
+            selectable_label.select_region(0, 5);
+            assert!(selectable_label.selection_bounds().is_some());
+            let popover = crate::author_menu::user_mention_popover(
+                &selectable_label,
+                "U456",
+                &ctx,
+                Rc::new(|_| {}),
+                None,
+            )
+            .expect("mention popover");
+            popover.set_autohide(false);
+            popover.popup();
+            pump(30);
+            assert!(popover.parent().is_some());
+            assert!(selectable_label.selection_bounds().is_some());
+
+            let action_idx = (0..view.store.n_items())
+                .find(|&idx| {
+                    view.store
+                        .item(idx)
+                        .and_downcast::<TimelineMessageObject>()
+                        .is_some_and(|o| {
+                            !o.is_day_separator() && o.message().ts == "1700000900.000100"
+                        })
+                })
+                .expect("action item index");
+            let removed_obj = view
+                .store
+                .item(action_idx)
+                .and_downcast::<TimelineMessageObject>()
+                .expect("action item object");
+            view.store.remove(action_idx);
+            pump_until(1000, || rebuilt_row.parent().is_none());
+            pump(50);
+            view.assert_pool_invariants();
+            assert!(
+                rebuilt_row.parent().is_none(),
+                "action row should be unbound into TimelineRowPool"
+            );
+            assert!(view.pooled_row_counts().0 >= 1);
+            assert!(
+                selectable_label.selection_bounds().is_none(),
+                "unbinding into pool must clear active Label text selection"
+            );
+            assert!(
+                popover.parent().is_none(),
+                "unbinding into pool must popdown and unparent transient mention popovers"
+            );
+
+            // Re-inserting the item checks the sanitized row back out of the pool with 0 builds.
+            let builds_before = TIMELINE_MESSAGE_ROW_BUILDS.with(Cell::get);
+            view.store.insert(action_idx, &removed_obj);
+            pump(80);
+            view.assert_pool_invariants();
+            assert_eq!(
+                TIMELINE_MESSAGE_ROW_BUILDS.with(Cell::get) - builds_before,
+                0,
+                "re-binding the sanitized row from TimelineRowPool must build zero widgets"
+            );
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn unmapped_code_block_skips_sourceview_build_until_mapped_again() {
+        run_gtk_test(|| {
+            let block =
+                build_code_block_widget("fn hello() {\n    println!(\"hi\");\n}", Some("rs"));
+            let window = gtk::Window::new();
+            window.set_child(Some(&block));
+            window.present();
+            window.set_child(None::<&Widget>);
+            let builds_before = CODE_VIEW_BUILDS.with(Cell::get);
+            pump(100);
+            assert_eq!(
+                CODE_VIEW_BUILDS.with(Cell::get) - builds_before,
+                0,
+                "unmapping before idle must skip building sourceview5::View"
+            );
+
+            window.set_child(Some(&block));
+            pump_until(1000, || CODE_VIEW_BUILDS.with(Cell::get) > builds_before);
+            assert_eq!(CODE_VIEW_BUILDS.with(Cell::get) - builds_before, 1);
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn unbind_into_row_pool_preserves_gtk_context_menus_and_unparents_transient_popovers() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let target_ts = "1700000900.000100";
+            let messages = vec![
+                Arc::new(SlackMessage {
+                    ts: "1700000902.000100".to_string(),
+                    user: Some("U123".to_string()),
+                    text: Some("tail anchor 2".to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(SlackMessage {
+                    ts: "1700000901.000100".to_string(),
+                    user: Some("U123".to_string()),
+                    text: Some("tail anchor 1".to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(SlackMessage {
+                    ts: target_ts.to_string(),
+                    user: Some("U456".to_string()),
+                    text: Some(
+                        "Context menu probe <@U456>\n```rs\nlet answer = 42;\n```".to_string(),
+                    ),
+                    ..Default::default()
+                }),
+                Arc::new(SlackMessage {
+                    ts: "1700000000.000100".to_string(),
+                    user: Some("U123".to_string()),
+                    text: Some("head anchor".to_string()),
+                    ..Default::default()
+                }),
+            ];
+
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(420, 380);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+            view.set_messages(&messages, &ctx, None);
+            pump_until(1500, || {
+                bound_row_widgets(&view).iter().any(|(ts, w)| {
+                    ts == target_ts
+                        && find_descendant(w, &|d| d.downcast_ref::<gtk::TextView>().is_some())
+                            .is_some()
+                })
+            });
+            pump(40);
+
+            let row_widget = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == target_ts).then_some(w))
+                .expect("target row bound");
+
+            let selectable_label = {
+                let mut found = None;
+                let mut stack = vec![row_widget.clone()];
+                while let Some(w) = stack.pop() {
+                    if let Some(lbl) = w.downcast_ref::<Label>() {
+                        if lbl.is_selectable() && lbl.text().contains("Context menu probe") {
+                            found = Some(lbl.clone());
+                            break;
+                        }
+                    }
+                    let mut c = w.first_child();
+                    while let Some(cur) = c {
+                        c = cur.next_sibling();
+                        stack.push(cur);
+                    }
+                }
+                found.expect("selectable body label")
+            };
+            let code_text_view = find_descendant(&row_widget, &|d| {
+                d.downcast_ref::<gtk::TextView>().is_some()
+            })
+            .and_downcast::<gtk::TextView>()
+            .expect("upgraded code TextView");
+
+            let direct_popovers = |host: &Widget| -> Vec<gtk::Popover> {
+                let mut out = Vec::new();
+                let mut child = host.first_child();
+                while let Some(cur) = child {
+                    child = cur.next_sibling();
+                    if let Ok(pop) = cur.downcast::<gtk::Popover>() {
+                        out.push(pop);
+                    }
+                }
+                out
+            };
+
+            // Trigger GTK's lazy internal `priv.popup_menu` on both Label and TextView,
+            // then switch autohide off so both built-in menus and Conduit's transient
+            // popover can remain open simultaneously without an X11 grab blocking layout.
+            pump_until(1000, || {
+                selectable_label.is_mapped() && code_text_view.is_mapped()
+            });
+
+            selectable_label
+                .activate_action("menu.popup", None)
+                .expect("activate Label menu.popup");
+            pump(30);
+            let label_builtin_menu = direct_popovers(selectable_label.upcast_ref())
+                .into_iter()
+                .find(|p| !p.has_css_class(crate::author_menu::TRANSIENT_POPOVER_CLASS))
+                .expect("Label built-in GtkPopoverMenu created");
+            label_builtin_menu.popdown();
+            pump(20);
+            label_builtin_menu.set_autohide(false);
+            label_builtin_menu.popup();
+
+            // Attach and open Conduit's transient mention popover on the same label.
+            let transient_popover = crate::author_menu::user_mention_popover(
+                &selectable_label,
+                "U456",
+                &ctx,
+                Rc::new(|_| {}),
+                None,
+            )
+            .expect("transient mention popover");
+            assert!(transient_popover.has_css_class(crate::author_menu::TRANSIENT_POPOVER_CLASS));
+            transient_popover.set_autohide(false);
+            transient_popover.popup();
+
+            // Open TextView's built-in context menu so `priv.popup_menu` is populated
+            // on both Label and TextView before the row unbinds into TimelineRowPool.
+            code_text_view
+                .activate_action("menu.popup", None)
+                .expect("activate TextView menu.popup");
+            pump(30);
+            let textview_builtin_menu = direct_popovers(code_text_view.upcast_ref())
+                .into_iter()
+                .find(|p| !p.has_css_class(crate::author_menu::TRANSIENT_POPOVER_CLASS))
+                .expect("TextView built-in GtkPopoverMenu created");
+            assert!(label_builtin_menu.is_visible());
+            assert!(textview_builtin_menu.is_visible());
+            assert!(textview_builtin_menu.parent().is_some());
+            assert!(transient_popover.is_visible());
+            assert!(transient_popover.parent().is_some());
+
+            // Release the modal context-menu grab and park focus so GtkListView does not
+            // pin the focused tile across store removal.
+            textview_builtin_menu.popdown();
+            gtk::prelude::GtkWindowExt::set_focus(&window, None::<&Widget>);
+            let target_idx = (0..view.store.n_items())
+                .find(|&idx| {
+                    view.store
+                        .item(idx)
+                        .and_downcast::<TimelineMessageObject>()
+                        .is_some_and(|o| !o.is_day_separator() && o.message().ts == target_ts)
+                })
+                .expect("target index");
+            let removed_obj = view
+                .store
+                .item(target_idx)
+                .and_downcast::<TimelineMessageObject>()
+                .expect("removed object");
+            view.store.remove(target_idx);
+            pump_until(1000, || row_widget.parent().is_none());
+            pump(40);
+            assert!(
+                row_widget.parent().is_none(),
+                "target row must be unbound into TimelineRowPool"
+            );
+            view.assert_pool_invariants();
+
+            // Transient popover is unparented; Label keeps `priv.popup_menu`
+            // parented until dispose while TextView clears its own `priv.popup_menu`
+            // cleanly during unmap once `sanitize_row_widget` leaves it alone.
+            assert!(
+                transient_popover.parent().is_none(),
+                "Conduit transient popover must be unparented on unbind"
+            );
+            assert!(
+                !label_builtin_menu.is_visible() && label_builtin_menu.parent().is_some(),
+                "Label built-in context menu must be popped down without unparenting"
+            );
+            assert!(
+                !textview_builtin_menu.is_visible(),
+                "TextView built-in context menu must be popped down cleanly"
+            );
+
+            // Re-insert from pool (zero widget builds) and open built-in menus a second time.
+            let builds_before = TIMELINE_MESSAGE_ROW_BUILDS.with(Cell::get);
+            view.store.insert(target_idx, &removed_obj);
+            pump_until(1000, || {
+                selectable_label.is_mapped() && code_text_view.is_mapped()
+            });
+            pump(30);
+            assert_eq!(
+                TIMELINE_MESSAGE_ROW_BUILDS.with(Cell::get) - builds_before,
+                0
+            );
+            selectable_label
+                .activate_action("menu.popup", None)
+                .expect("second Label menu.popup after pool reuse");
+            pump(30);
+            assert!(label_builtin_menu.parent().is_some());
+            label_builtin_menu.popdown();
+            code_text_view
+                .activate_action("menu.popup", None)
+                .expect("second TextView menu.popup after pool reuse");
+            pump(30);
+            let second_textview_menu = direct_popovers(code_text_view.upcast_ref())
+                .into_iter()
+                .find(|p| !p.has_css_class(crate::author_menu::TRANSIENT_POPOVER_CLASS))
+                .expect("second TextView built-in GtkPopoverMenu");
+            assert!(second_textview_menu.is_visible());
+            // Replace the bound row while TextView's built-in context menu is actively open.
+            view.refresh_message(target_ts);
+            pump(30);
+            assert!(!second_textview_menu.is_visible());
+
+            window.destroy();
+            pump(40);
+        });
+    }
+
+    #[test]
+    fn shared_existing_animated_image_player_pauses_when_all_viewers_unmap_and_resumes_on_remap() {
+        run_gtk_test(|| {
+            clear_timeline_view_caches();
+            decode::reset_texture_decoder_for_tests();
+            let assets = AssetCacheTestDir::new("shared-existing-anim");
+            let gif_url = "https://files.slack.com/files-pri/T1-FSHARED/shared.gif".to_string();
+            let gif_path = assets.0.join("shared_anim.gif");
+            std::fs::write(&gif_path, crate::animated_image::tests::ANIMATED_GIF)
+                .expect("write animated gif");
+
+            let mut ctx = test_context();
+            ctx.image_assets.insert(gif_url.clone(), gif_path);
+
+            let make_gif_msg = |ts: &str, file_id: &str| {
+                Arc::new(SlackMessage {
+                    ts: ts.to_string(),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("gif row {ts}")),
+                    files: Some(vec![SlackFile {
+                        id: Some(file_id.to_string()),
+                        title: Some("shared.gif".to_string()),
+                        mimetype: Some("image/gif".to_string()),
+                        url_private: Some(gif_url.clone()),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                })
+            };
+
+            let ts_a = "1700000998.000100";
+            let ts_b = "1700000999.000100";
+            let tail_2 = Arc::new(SlackMessage {
+                ts: "1700001002.000100".to_string(),
+                user: Some("U456".to_string()),
+                text: Some("tail 2".to_string()),
+                ..Default::default()
+            });
+            let tail_1 = Arc::new(SlackMessage {
+                ts: "1700001001.000100".to_string(),
+                user: Some("U456".to_string()),
+                text: Some("tail 1".to_string()),
+                ..Default::default()
+            });
+            let head_anchor = Arc::new(SlackMessage {
+                ts: "1700000000.000100".to_string(),
+                user: Some("U456".to_string()),
+                text: Some("head anchor".to_string()),
+                ..Default::default()
+            });
+
+            let msg_a = make_gif_msg(ts_a, "FA");
+            let initial = vec![
+                tail_2.clone(),
+                tail_1.clone(),
+                msg_a.clone(),
+                head_anchor.clone(),
+            ];
+
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(420, 420);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+            view.set_messages(&initial, &ctx, None);
+
+            let find_players = || -> Vec<crate::animated_image::AnimatedImage> {
+                deferred_pictures(view.list_view.upcast_ref())
+                    .into_iter()
+                    .filter_map(|(_, deferred)| {
+                        deferred
+                            .content()?
+                            .downcast::<crate::animated_image::AnimatedImage>()
+                            .ok()
+                    })
+                    .collect()
+            };
+            pump_until(5000, || {
+                find_players()
+                    .first()
+                    .is_some_and(|p| p.mapped_viewers() == 1)
+            });
+            let player = find_players().into_iter().next().expect("first player");
+            assert_eq!(player.mapped_viewers(), 1);
+            assert!(player.has_active_timer());
+
+            // Now splice a second row referencing the SAME already-decoded GIF so
+            // `load_animated_or_static_picture` takes the synchronous `existing_player` branch.
+            let msg_b = make_gif_msg(ts_b, "FB");
+            let with_second = vec![tail_2, tail_1, msg_b, msg_a, head_anchor];
+            view.set_messages(&with_second, &ctx, None);
+            pump_until(2000, || player.mapped_viewers() == 2);
+            let players = find_players();
+            assert_eq!(players.len(), 2);
+            assert_eq!(players[0], players[1], "both rows share one AnimatedImage");
+            assert_eq!(player.mapped_viewers(), 2);
+            assert!(player.has_active_timer());
+
+            let find_idx = |target: &str| {
+                (0..view.store.n_items())
+                    .find(|&idx| {
+                        view.store
+                            .item(idx)
+                            .and_downcast::<TimelineMessageObject>()
+                            .is_some_and(|o| !o.is_day_separator() && o.message().ts == target)
+                    })
+                    .expect("message index")
+            };
+
+            // Unbind first GIF row into TimelineRowPool: second row keeps timer alive.
+            let idx_a = find_idx(ts_a);
+            view.store.remove(idx_a);
+            pump_until(1500, || player.mapped_viewers() == 1);
+            assert_eq!(player.mapped_viewers(), 1);
+            assert!(
+                player.has_active_timer(),
+                "timer stays active while second viewer remains mapped"
+            );
+
+            // Unbind second (existing_player) GIF row into TimelineRowPool: 0 viewers -> timer stops.
+            let idx_b = find_idx(ts_b);
+            let obj_b = view
+                .store
+                .item(idx_b)
+                .and_downcast::<TimelineMessageObject>()
+                .expect("row B object");
+            view.store.remove(idx_b);
+            pump_until(1500, || player.mapped_viewers() == 0);
+            pump(40);
+            view.assert_pool_invariants();
+            assert_eq!(player.mapped_viewers(), 0);
+            assert!(!player.has_active_timer());
+
+            let fires_paused = crate::animated_image::TIMER_FIRES.with(Cell::get);
+            pump(350);
+            assert_eq!(
+                crate::animated_image::TIMER_FIRES.with(Cell::get),
+                fires_paused,
+                "shared player must fire zero timer callbacks when all viewers unmap"
+            );
+
+            // Re-insert second row from pool (0 builds): timer resumes immediately.
+            let builds_before = TIMELINE_MESSAGE_ROW_BUILDS.with(Cell::get);
+            view.store.insert(idx_b, &obj_b);
+            pump_until(1500, || player.mapped_viewers() == 1);
+            assert_eq!(
+                TIMELINE_MESSAGE_ROW_BUILDS.with(Cell::get) - builds_before,
+                0
+            );
+            assert!(player.has_active_timer());
+            let fires_before_resume = crate::animated_image::TIMER_FIRES.with(Cell::get);
+            pump_until(1500, || {
+                crate::animated_image::TIMER_FIRES.with(Cell::get) > fires_before_resume
+            });
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn clicking_cached_control_with_no_action_never_pools_disabled_button() {
+        run_gtk_test(|| {
+            let ctx = test_context();
+            let target_ts = "1700000900.000100";
+            let fresh_msg =
+                crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                    "ts": target_ts,
+                    "user": "U456",
+                    "text": "Cached action message",
+                    "blocks": [{
+                        "type": "actions",
+                        "block_id": "b1",
+                        "elements": [{
+                            "type": "button",
+                            "action_id": "approve",
+                            "text": { "type": "plain_text", "text": "Approve" },
+                            "value": "v1"
+                        }]
+                    }]
+                }))
+                .into_message()
+                .expect("normalize wire message");
+            // Round-trip through JSON to reproduce SQLite-cached messages where
+            // `MessageControl.key` is preserved while `#[serde(skip)] action` is `None`.
+            let cached_msg: SlackMessage = serde_json::from_str(
+                &serde_json::to_string(&fresh_msg).expect("serialize message"),
+            )
+            .expect("deserialize cached message");
+
+            let messages = vec![
+                Arc::new(SlackMessage {
+                    ts: "1700000902.000100".to_string(),
+                    user: Some("U123".to_string()),
+                    text: Some("tail 2".to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(SlackMessage {
+                    ts: "1700000901.000100".to_string(),
+                    user: Some("U123".to_string()),
+                    text: Some("tail 1".to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(cached_msg.clone()),
+                Arc::new(SlackMessage {
+                    ts: "1700000000.000100".to_string(),
+                    user: Some("U123".to_string()),
+                    text: Some("head".to_string()),
+                    ..Default::default()
+                }),
+            ];
+
+            let find_approve = |view: &NativeTimelineView| -> Button {
+                let row = bound_row_widgets(view)
+                    .into_iter()
+                    .find_map(|(ts, w)| (ts == target_ts).then_some(w))
+                    .expect("bound target row");
+                let mut stack = vec![row];
+                while let Some(w) = stack.pop() {
+                    if let Some(btn) = w.downcast_ref::<Button>() {
+                        if btn.label().as_deref() == Some("Approve") {
+                            return btn.clone();
+                        }
+                    }
+                    let mut c = w.first_child();
+                    while let Some(cur) = c {
+                        c = cur.next_sibling();
+                        stack.push(cur);
+                    }
+                }
+                panic!("Approve button not found");
+            };
+
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(400, 340);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+            view.set_messages(&messages, &ctx, None);
+            pump(120);
+
+            // Case 1: even if on_action is a no-op and the row unbinds immediately after
+            // click, cb_author marked the bound row dirty so it is NOT pooled disabled.
+            let dispatched = Rc::new(Cell::new(0usize));
+            {
+                let dispatched = dispatched.clone();
+                view.set_on_action(move |action| {
+                    if matches!(action, TimelineAction::ExecuteControlAction { .. }) {
+                        dispatched.set(dispatched.get() + 1);
+                    }
+                });
+            }
+            let approve = find_approve(&view);
+            assert!(approve.is_sensitive());
+            approve.emit_clicked();
+            assert!(!approve.is_sensitive());
+
+            let idx = (0..view.store.n_items())
+                .find(|&i| {
+                    view.store
+                        .item(i)
+                        .and_downcast::<TimelineMessageObject>()
+                        .is_some_and(|o| !o.is_day_separator() && o.message().ts == target_ts)
+                })
+                .expect("row index");
+            let obj = view
+                .store
+                .item(idx)
+                .and_downcast::<TimelineMessageObject>()
+                .expect("row object");
+            view.store.remove(idx);
+            pump(60);
+            assert_eq!(dispatched.get(), 1);
+            assert_eq!(
+                view.pooled_row_counts().0,
+                0,
+                "clicked control row must be marked dirty and never checked into TimelineRowPool"
+            );
+
+            view.store.insert(idx, &obj);
+            pump(60);
+            let rebound_approve = find_approve(&view);
+            assert!(
+                rebound_approve.is_sensitive(),
+                "rebinding after unbind must rebuild the button enabled"
+            );
+
+            // Case 2: while remaining bound, `action == None` handler calling refresh_message
+            // rebuilds the row in place with `button.is_sensitive() == true`.
+            {
+                let view_for_cb = view.clone();
+                let cached_for_cb = cached_msg.clone();
+                view.set_on_action(move |action| {
+                    if let TimelineAction::ExecuteControlAction { ts, key } = action {
+                        let has_action = cached_for_cb
+                            .document
+                            .control(key)
+                            .and_then(|c| c.action())
+                            .is_some();
+                        assert!(!has_action, "SQLite-cached control has action == None");
+                        view_for_cb.refresh_message(&ts);
+                    }
+                });
+            }
+            rebound_approve.emit_clicked();
+            pump(60);
+            assert!(
+                find_approve(&view).is_sensitive(),
+                "in-place refresh on action == None restores button sensitivity"
+            );
+
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn document_and_attachment_footer_custom_emoji_and_mentions_invalidate_row_pool() {
+        run_gtk_test(|| {
+            clear_timeline_view_caches();
+            let assets = AssetCacheTestDir::new("doc-footer-invalidation");
+            let emoji_url = "https://emoji.slack-edge.com/T1/shipit/footer_shipit.png".to_string();
+            let emoji_path = assets.0.join("footer_shipit.png");
+            save_test_image(&emoji_path, "png", 32, 32);
+            crate::timeline::cache::forget_asset_miss(&emoji_url);
+
+            let mut ctx = test_context();
+            ctx.custom_emojis =
+                Arc::new(HashMap::from([("shipit".to_string(), emoji_url.clone())]));
+
+            let target_ts = "1700000900.000100";
+            // Generic fallback carries neither `:shipit:` nor `<@U999>`.
+            let doc_msg = Arc::new(
+                crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                    "ts": target_ts,
+                    "user": "U123",
+                    "text": "generic notification fallback",
+                    "blocks": [{
+                        "type": "section",
+                        "text": { "type": "mrkdwn", "text": "Release summary" }
+                    }],
+                    "attachments": [{
+                        "text": "Build #48 green",
+                        "footer": "Approved by <@U999> :shipit:"
+                    }]
+                }))
+                .into_message()
+                .expect("normalize document + attachment message"),
+            );
+
+            let catalog = crate::emoji::EmojiCatalog::new(&ctx.custom_emojis);
+            assert!(
+                crate::rendering::message_uses_image_asset_matching(&doc_msg, &catalog, |url| {
+                    url == emoji_url
+                }),
+                "message_uses_image_asset_matching must detect :shipit: inside MessageDocument/Attachment::footer"
+            );
+
+            let make_list = |doc: Arc<SlackMessage>| {
+                vec![
+                    Arc::new(SlackMessage {
+                        ts: "1700000902.000100".to_string(),
+                        user: Some("U123".to_string()),
+                        text: Some("tail 2".to_string()),
+                        ..Default::default()
+                    }),
+                    Arc::new(SlackMessage {
+                        ts: "1700000901.000100".to_string(),
+                        user: Some("U123".to_string()),
+                        text: Some("tail 1".to_string()),
+                        ..Default::default()
+                    }),
+                    doc,
+                    Arc::new(SlackMessage {
+                        ts: "1700000000.000100".to_string(),
+                        user: Some("U123".to_string()),
+                        text: Some("head".to_string()),
+                        ..Default::default()
+                    }),
+                ]
+            };
+            let messages = make_list(doc_msg.clone());
+
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(420, 380);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+            view.set_messages(&messages, &ctx, None);
+            pump(100);
+
+            let collect_labels = |root: &Widget| -> String {
+                let mut texts = Vec::new();
+                let mut stack = vec![root.clone()];
+                while let Some(w) = stack.pop() {
+                    if let Some(lbl) = w.downcast_ref::<Label>() {
+                        texts.push(lbl.text().to_string());
+                    } else if let Some(tv) = w.downcast_ref::<gtk::TextView>() {
+                        let buf = tv.buffer();
+                        texts.push(
+                            buf.text(&buf.start_iter(), &buf.end_iter(), false)
+                                .to_string(),
+                        );
+                    }
+                    let mut c = w.first_child();
+                    while let Some(cur) = c {
+                        c = cur.next_sibling();
+                        stack.push(cur);
+                    }
+                }
+                texts.join(" | ")
+            };
+            let count_pictures = |root: &Widget| -> usize {
+                let mut count = 0;
+                let mut stack = vec![root.clone()];
+                while let Some(w) = stack.pop() {
+                    if w.downcast_ref::<gtk::Picture>().is_some() {
+                        count += 1;
+                    }
+                    let mut c = w.first_child();
+                    while let Some(cur) = c {
+                        c = cur.next_sibling();
+                        stack.push(cur);
+                    }
+                }
+                count
+            };
+
+            let initial_row = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == target_ts).then_some(w))
+                .expect("initial bound doc row");
+            assert!(collect_labels(&initial_row).contains("@U999"));
+            assert_eq!(count_pictures(&initial_row), 0);
+
+            // Unbind into TimelineRowPool, then deliver the custom emoji asset.
+            let find_idx = || {
+                (0..view.store.n_items())
+                    .find(|&i| {
+                        view.store
+                            .item(i)
+                            .and_downcast::<TimelineMessageObject>()
+                            .is_some_and(|o| !o.is_day_separator() && o.message().ts == target_ts)
+                    })
+                    .expect("doc row index")
+            };
+            let idx = find_idx();
+            let obj = view
+                .store
+                .item(idx)
+                .and_downcast::<TimelineMessageObject>()
+                .expect("doc row obj");
+            view.store.remove(idx);
+            pump(50);
+            assert_eq!(view.pooled_row_counts().0, 1);
+
+            crate::timeline::cache::forget_asset_miss(&emoji_url);
+            ctx.image_assets.insert(emoji_url.clone(), emoji_path);
+            let arrived_keys = HashSet::from([emoji_url]);
+            view.update_image_assets(
+                &ctx,
+                Some(&arrived_keys),
+                HashSet::from([target_ts.to_string()]),
+            );
+            assert_eq!(
+                view.pooled_row_counts().0,
+                0,
+                "arriving custom emoji asset in attachment footer must evict pooled row"
+            );
+
+            view.store.insert(idx, &obj);
+            pump(80);
+            let row_with_emoji = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == target_ts).then_some(w))
+                .expect("row after emoji arrival");
+            assert!(
+                count_pictures(&row_with_emoji) >= 1,
+                "rebound attachment footer should render custom emoji Picture"
+            );
+
+            // Unbind into TimelineRowPool again, then rename U999 -> Grace Hopper.
+            view.store.remove(idx);
+            pump(50);
+            assert_eq!(view.pooled_row_counts().0, 1);
+
+            let mut names = (*ctx.user_names).clone();
+            names.insert("U999".to_string(), "Grace Hopper".to_string());
+            ctx.user_names = Arc::new(names);
+            view.set_messages(&messages, &ctx, None);
+            pump(80);
+            let row_after_pooled_rename = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == target_ts).then_some(w))
+                .expect("row after pooled rename");
+            assert!(
+                collect_labels(&row_after_pooled_rename).contains("@Grace Hopper"),
+                "mention inside attachment.footer must invalidate pooled row on user rename"
+            );
+
+            // Rename U999 -> Ada Lovelace while bound and verify in-place rebind updates footer.
+            let mut names2 = (*ctx.user_names).clone();
+            names2.insert("U999".to_string(), "Ada Lovelace".to_string());
+            ctx.user_names = Arc::new(names2);
+            view.set_messages(&messages, &ctx, None);
+            pump(80);
+            let row_after_bound_rename = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == target_ts).then_some(w))
+                .expect("row after bound rename");
+            assert!(
+                collect_labels(&row_after_bound_rename).contains("@Ada Lovelace"),
+                "mention inside attachment.footer must rebind bound row on user rename"
+            );
+
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn broadcast_reply_root_preview_updates_bound_and_pooled_rows_on_root_mention_rename() {
+        run_gtk_test(|| {
+            let mut ctx = test_context();
+            let root_ts = "1700000100.000100";
+            let pooled_reply_ts = "1700000105.000100";
+            let bound_reply_ts = "1700000950.000100";
+
+            let mut messages = Vec::new();
+            for suffix in [952, 951] {
+                messages.push(Arc::new(SlackMessage {
+                    ts: format!("1700000{suffix}.000100"),
+                    user: Some("U123".to_string()),
+                    text: Some(format!("tail {suffix}")),
+                    ..Default::default()
+                }));
+            }
+            // Neither broadcast reply mentions U999 in its own text, so only
+            // `changed_root_ts` + `invalidate_root_previews` can refresh them.
+            messages.push(Arc::new(SlackMessage {
+                ts: bound_reply_ts.to_string(),
+                user: Some("U456".to_string()),
+                subtype: Some("thread_broadcast".to_string()),
+                thread_ts: Some(root_ts.to_string()),
+                text: Some("Newest broadcast status".to_string()),
+                ..Default::default()
+            }));
+            for i in (110..365).rev() {
+                messages.push(Arc::new(SlackMessage {
+                    ts: format!("1700000{i:03}.000100"),
+                    user: Some(if i % 2 == 0 { "U123" } else { "U456" }.to_string()),
+                    text: Some(format!("filler {i}\nline two")),
+                    ..Default::default()
+                }));
+            }
+            messages.push(Arc::new(SlackMessage {
+                ts: pooled_reply_ts.to_string(),
+                user: Some("U456".to_string()),
+                subtype: Some("thread_broadcast".to_string()),
+                thread_ts: Some(root_ts.to_string()),
+                text: Some("Older broadcast status".to_string()),
+                ..Default::default()
+            }));
+            messages.push(Arc::new(SlackMessage {
+                ts: root_ts.to_string(),
+                user: Some("U123".to_string()),
+                text: Some("Deploy checklist with <@U999>".to_string()),
+                reply_count: Some(2),
+                ..Default::default()
+            }));
+            messages.push(Arc::new(SlackMessage {
+                ts: "1700000001.000100".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("oldest sentinel".to_string()),
+                ..Default::default()
+            }));
+
+            let button_labels = |root: &Widget| -> Vec<String> {
+                let mut out = Vec::new();
+                let mut stack = vec![root.clone()];
+                while let Some(w) = stack.pop() {
+                    if let Some(btn) = w.downcast_ref::<Button>() {
+                        if let Some(lbl) = btn.label() {
+                            out.push(lbl.to_string());
+                        }
+                    }
+                    let mut c = w.first_child();
+                    while let Some(cur) = c {
+                        c = cur.next_sibling();
+                        stack.push(cur);
+                    }
+                }
+                out
+            };
+
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(420, 320);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+            view.set_messages(&messages, &ctx, None);
+
+            let vadj = view.scrolled_window.vadjustment();
+            pump_until(3000, || {
+                let max_scroll = (vadj.upper() - vadj.page_size()).max(vadj.lower());
+                vadj.set_value(max_scroll);
+                bound_row_widgets(&view)
+                    .iter()
+                    .any(|(ts, _)| ts == bound_reply_ts)
+            });
+            pump(60);
+
+            let initial_bound = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == bound_reply_ts).then_some(w))
+                .expect("bound broadcast reply");
+            assert!(
+                button_labels(&initial_bound)
+                    .iter()
+                    .any(|l| l.contains("Deploy checklist with @U999")),
+                "initial root preview should show unresolved @U999"
+            );
+
+            // Scroll up to bind `pooled_reply_ts`, then back down to bottom so
+            // `pooled_reply_ts` is checked into `TimelineRowPool` while `bound_reply_ts` is bound.
+            vadj.set_value(vadj.lower());
+            pump_until(3000, || {
+                vadj.set_value(vadj.lower());
+                bound_row_widgets(&view)
+                    .iter()
+                    .any(|(ts, _)| ts == pooled_reply_ts)
+            });
+            let pooled_widget_before = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == pooled_reply_ts).then_some(w))
+                .expect("older broadcast reply bound at top");
+            assert!(button_labels(&pooled_widget_before)
+                .iter()
+                .any(|l| l.contains("Deploy checklist with @U999")));
+
+            let step = (vadj.page_size() * 0.85).max(100.0);
+            loop {
+                let max_scroll = (vadj.upper() - vadj.page_size()).max(vadj.lower());
+                if vadj.value() >= max_scroll - 0.5 && pooled_widget_before.parent().is_none() {
+                    break;
+                }
+                let next = (vadj.value() + step).min(max_scroll);
+                vadj.set_value(next);
+                pump(20);
+                let max_scroll = (vadj.upper() - vadj.page_size()).max(vadj.lower());
+                if vadj.value() >= max_scroll - 0.5 {
+                    break;
+                }
+            }
+            pump_until(3000, || pooled_widget_before.parent().is_none());
+            pump(40);
+            assert!(
+                pooled_widget_before.parent().is_none(),
+                "older broadcast reply should now sit in TimelineRowPool"
+            );
+
+            // Resolve U999 -> Grace in context and re-render.
+            let mut names = (*ctx.user_names).clone();
+            names.insert("U999".to_string(), "Grace".to_string());
+            ctx.user_names = Arc::new(names);
+            ctx.timeline_scroll = crate::message_markup::TimelineScrollBehavior::Preserve;
+            view.set_messages(&messages, &ctx, None);
+            pump(80);
+            view.assert_pool_invariants();
+
+            let updated_bound = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == bound_reply_ts).then_some(w))
+                .expect("updated bound broadcast reply");
+            assert!(
+                button_labels(&updated_bound)
+                    .iter()
+                    .any(|l| l.contains("Deploy checklist with @Grace")),
+                "bound broadcast reply must update root_preview when root mention is renamed"
+            );
+
+            // Scroll back to the top and verify the previously pooled broadcast reply
+            // was invalidated and renders "@Grace" instead of stale "@U999".
+            vadj.set_value(vadj.lower());
+            pump_until(3000, || {
+                vadj.set_value(vadj.lower());
+                bound_row_widgets(&view)
+                    .iter()
+                    .any(|(ts, _)| ts == pooled_reply_ts)
+            });
+            pump(40);
+            let updated_pooled = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == pooled_reply_ts).then_some(w))
+                .expect("rebound older broadcast reply");
+            assert!(
+                button_labels(&updated_pooled)
+                    .iter()
+                    .any(|l| l.contains("Deploy checklist with @Grace")),
+                "pooled broadcast reply must be invalidated and show updated @Grace preview"
+            );
+
+            window.destroy();
+        });
+    }
+
+    #[test]
+    fn duplicate_timestamps_and_separators_preserve_pool_invariants() {
+        run_gtk_test(|| {
+            let mut ctx = test_context();
+            ctx.timeline_scroll = crate::message_markup::TimelineScrollBehavior::Preserve;
+            let dup_day_a = "1700000000.000100";
+            let dup_day_b = "1700100000.000100";
+
+            // Adversarial list: duplicate message timestamps across two days, so
+            // `build_store_items` also emits day separators sharing those timestamps.
+            let mut messages = vec![
+                Arc::new(SlackMessage {
+                    ts: dup_day_b.to_string(),
+                    user: Some("U123".to_string()),
+                    text: Some("day B copy 1".to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(SlackMessage {
+                    ts: dup_day_b.to_string(),
+                    user: Some("U456".to_string()),
+                    text: Some("day B copy 2".to_string()),
+                    ..Default::default()
+                }),
+            ];
+            for i in (1..120).rev() {
+                messages.push(Arc::new(SlackMessage {
+                    ts: format!("1700050{i:03}.000100"),
+                    user: Some(if i % 2 == 0 { "U123" } else { "U456" }.to_string()),
+                    text: Some(format!("mid filler {i}\nextra")),
+                    ..Default::default()
+                }));
+            }
+            messages.push(Arc::new(SlackMessage {
+                ts: dup_day_a.to_string(),
+                user: Some("U123".to_string()),
+                text: Some("day A copy 1".to_string()),
+                ..Default::default()
+            }));
+            messages.push(Arc::new(SlackMessage {
+                ts: dup_day_a.to_string(),
+                user: Some("U123".to_string()),
+                text: Some("day A copy 1".to_string()),
+                ..Default::default()
+            }));
+
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(400, 300);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+            view.set_messages(&messages, &ctx, None);
+            pump(120);
+            view.assert_pool_invariants();
+
+            let vadj = view.scrolled_window.vadjustment();
+            let step = (vadj.page_size() * 0.8).max(80.0);
+            while vadj.value() < (vadj.upper() - vadj.page_size()).max(vadj.lower()) - 0.5 {
+                let max_scroll = (vadj.upper() - vadj.page_size()).max(vadj.lower());
+                vadj.set_value((vadj.value() + step).min(max_scroll));
+                pump(20);
+                view.assert_pool_invariants();
+            }
+            while vadj.value() > vadj.lower() + 0.5 {
+                vadj.set_value((vadj.value() - step).max(vadj.lower()));
+                pump(20);
+                view.assert_pool_invariants();
+            }
+
+            // Splice out and re-insert duplicate items and separators directly.
+            let mut narrowed = messages.clone();
+            narrowed.remove(0);
+            narrowed.pop();
+            view.set_messages(&narrowed, &ctx, None);
+            pump(80);
+            view.assert_pool_invariants();
+
+            view.set_messages(&messages, &ctx, None);
+            pump(80);
+            view.assert_pool_invariants();
+
+            window.destroy();
+        });
+    }
 }
 
 #[test]

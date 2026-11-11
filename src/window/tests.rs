@@ -4128,6 +4128,79 @@ fn workspace_theme_css_resets_popover_label_colors_on_active_conversations() {
     );
 }
 
+#[test]
+fn document_and_attachment_footer_custom_emojis_request_and_match_assets() {
+    let section_url = "https://emoji.slack-edge.com/T1/partyblob/blob.png".to_string();
+    let footer_url = "https://emoji.slack-edge.com/T1/shipit/ship.png".to_string();
+    let custom_emojis = HashMap::from([
+        ("partyblob".to_string(), section_url.clone()),
+        ("shipit".to_string(), footer_url.clone()),
+    ]);
+    let msg = crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+        "ts": "1710000000.000100",
+        "user": "U1",
+        "text": "generic notification fallback",
+        "blocks": [{
+            "type": "section",
+            "text": { "type": "mrkdwn", "text": "See https://example.com :partyblob:" }
+        }],
+        "attachments": [{
+            "footer": "at 12:30 :shipit:"
+        }]
+    }))
+    .into_message()
+    .expect("normalize wire message");
+
+    let requests =
+        message_image_asset_requests(std::slice::from_ref(&msg), &HashMap::new(), &custom_emojis);
+    let requested_urls: HashSet<String> = requests.into_iter().map(|(_, url)| url).collect();
+    assert!(requested_urls.contains(&section_url));
+    assert!(requested_urls.contains(&footer_url));
+
+    let affected = messages_showing_image_asset(
+        std::slice::from_ref(&msg),
+        &custom_emojis,
+        |key| key == footer_url,
+        &HashSet::new(),
+    );
+    assert!(affected.contains(&msg.ts));
+}
+
+#[test]
+fn replace_custom_emojis_and_control_actions_guard_invalidation_and_refresh_paths() {
+    let replace_body = window_method_source("replace_custom_emojis");
+    assert!(
+        replace_body.contains("**self.imp().custom_emojis.borrow() == emojis"),
+        "replace_custom_emojis must short-circuit when the catalog is unchanged"
+    );
+    for expected in [
+        "UiInvalidations::MAIN",
+        "UiInvalidations::THREAD",
+        "UiInvalidations::SIDEBAR",
+        "self.queue_activity_refresh()",
+    ] {
+        assert!(
+            replace_body.contains(expected),
+            "replace_custom_emojis must schedule {expected}"
+        );
+    }
+
+    let handle_body = window_method_source("handle_timeline_action");
+    assert!(
+        handle_body.contains("self.selected_thread_target()"),
+        "ExecuteControlAction must fall back to selected_thread_target when visible_channel_id is absent"
+    );
+
+    let execute_body = window_method_source("execute_control_action");
+    assert!(
+        execute_body
+            .matches("self.refresh_message_rows(ts)")
+            .count()
+            >= 4,
+        "execute_control_action must re-enable controls on every early return"
+    );
+}
+
 /// Tests that create GTK widgets. They run only when
 /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
 mod graphical {

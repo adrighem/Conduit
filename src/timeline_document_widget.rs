@@ -19,7 +19,8 @@ use crate::rich_message::{
 };
 use crate::timeline_media::{context_icon, fetchable_url, image_block, MediaSources};
 use crate::timeline_message_widget::{
-    create_message_text_widget, new_chip_wrap_box, register_timeline_css, render_text_content,
+    cached_field_widget, cached_mrkdwn_widget, new_chip_wrap_box, register_timeline_css,
+    render_text_content, MarkupStyle,
 };
 
 const ACCESSORY_IMAGE_SIZE: i32 = 72;
@@ -122,11 +123,7 @@ impl<'a> DocumentRenderer<'a> {
     }
 
     fn mrkdwn_widget(&self, text: &str) -> Widget {
-        create_message_text_widget(
-            &crate::message_markup::mrkdwn_to_pango(text, self.context),
-            self.context,
-            self.on_action,
-        )
+        cached_mrkdwn_widget(text, MarkupStyle::Plain, self.context, self.on_action)
     }
 
     fn render_section(
@@ -174,9 +171,9 @@ impl<'a> DocumentRenderer<'a> {
                     row.append(&context_icon(image, &self.sources))
                 }
                 MessageContextElement::Text(text) => {
-                    let pango = crate::message_markup::mrkdwn_to_pango(text, self.context);
-                    let widget = create_message_text_widget(
-                        &format!("<span size=\"small\">{pango}</span>"),
+                    let widget = cached_mrkdwn_widget(
+                        text,
+                        MarkupStyle::Small,
                         self.context,
                         self.on_action,
                     );
@@ -294,28 +291,21 @@ impl<'a> DocumentRenderer<'a> {
             row.append(&context_icon(&image, &self.sources));
         }
         if let Some(footer) = attachment.footer.as_deref() {
-            let pango = crate::message_markup::mrkdwn_to_pango(footer, self.context);
-            let label = self.link_label(&format!("<span size=\"small\">{pango}</span>"));
-            label.add_css_class("dim-label");
-            row.append(&label);
+            let widget =
+                cached_mrkdwn_widget(footer, MarkupStyle::Small, self.context, self.on_action);
+            widget.add_css_class("dim-label");
+            row.append(&widget);
         }
         row
     }
 
     fn field(&self, field: &MessageField) -> Widget {
-        let value = field
-            .value
-            .as_deref()
-            .map(|value| crate::message_markup::mrkdwn_to_pango(value, self.context));
-        let markup = match (field.title.as_deref(), value) {
-            (Some(title), Some(value)) => {
-                format!("<b>{}</b>\n{value}", glib::markup_escape_text(title))
-            }
-            (Some(title), None) => format!("<b>{}</b>", glib::markup_escape_text(title)),
-            (None, Some(value)) => value,
-            (None, None) => String::new(),
-        };
-        create_message_text_widget(&markup, self.context, self.on_action)
+        cached_field_widget(
+            field.title.as_deref(),
+            field.value.as_deref(),
+            self.context,
+            self.on_action,
+        )
     }
 
     fn quote(&self, quote: &MessageQuote) -> Box {
@@ -582,32 +572,24 @@ impl<'a> DocumentRenderer<'a> {
                             // Pending until the action completes or fails; the row is
                             // then re-rendered with fresh, enabled controls.
                             button_target.set_sensitive(false);
-                            let on_action = on_action.clone();
-                            let ts = ts.clone();
-                            glib::idle_add_local_once(move || {
-                                (on_action)(
-                                    crate::timeline_message_widget::TimelineAction::ExecuteControlAction {
-                                        ts,
-                                        key,
-                                    },
-                                );
-                            });
+                            (on_action)(
+                                crate::timeline_message_widget::TimelineAction::ExecuteControlAction {
+                                    ts: ts.clone(),
+                                    key,
+                                },
+                            );
                         });
                         dialog.present(Some(button));
                     } else {
                         // Pending until the action completes or fails; the row is
                         // then re-rendered with fresh, enabled controls.
                         button.set_sensitive(false);
-                        let on_action = on_action.clone();
-                        let ts = ts.clone();
-                        glib::idle_add_local_once(move || {
-                            (on_action)(
-                                crate::timeline_message_widget::TimelineAction::ExecuteControlAction {
-                                    ts,
-                                    key,
-                                },
-                            );
-                        });
+                        (on_action)(
+                            crate::timeline_message_widget::TimelineAction::ExecuteControlAction {
+                                ts: ts.clone(),
+                                key,
+                            },
+                        );
                     }
                 });
             } else {

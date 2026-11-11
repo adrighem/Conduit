@@ -11,6 +11,7 @@ use adw::prelude::*;
 use gettextrs::gettext;
 use gtk::gio;
 
+#[cfg(test)]
 use crate::message_markup::MessageRenderContext;
 use crate::timeline_message_widget::TimelineAction;
 
@@ -118,6 +119,7 @@ pub(crate) fn author_menu_button(
 }
 
 /// Builds "Message…" and "Profile" popover menu anchored to `parent` widget for `user_id`.
+#[cfg(test)]
 pub(crate) fn user_mention_popover(
     parent: &impl IsA<gtk::Widget>,
     user_id: &str,
@@ -125,11 +127,25 @@ pub(crate) fn user_mention_popover(
     on_action: Rc<dyn Fn(TimelineAction)>,
     pointing_to: Option<gtk::gdk::Rectangle>,
 ) -> Option<gtk::PopoverMenu> {
-    let access = author_menu_access(
-        Some(user_id),
+    user_mention_popover_for(
+        parent,
+        user_id,
         context.current_user_id.as_deref(),
         &context.bot_user_ids,
-    );
+        on_action,
+        pointing_to,
+    )
+}
+
+pub(crate) fn user_mention_popover_for(
+    parent: &impl IsA<gtk::Widget>,
+    user_id: &str,
+    current_user_id: Option<&str>,
+    bot_user_ids: &HashSet<String>,
+    on_action: Rc<dyn Fn(TimelineAction)>,
+    pointing_to: Option<gtk::gdk::Rectangle>,
+) -> Option<gtk::PopoverMenu> {
+    let access = author_menu_access(Some(user_id), current_user_id, bot_user_ids);
     if !access.any() {
         return None;
     }
@@ -180,6 +196,8 @@ pub(crate) fn channel_mention_popover(
     mention_popover(parent, channel_id, entries, on_action, pointing_to)
 }
 
+pub(crate) const TRANSIENT_POPOVER_CLASS: &str = "conduit-transient-popover";
+
 fn mention_popover(
     parent: &impl IsA<gtk::Widget>,
     target_id: &str,
@@ -200,6 +218,7 @@ fn mention_popover(
     }
 
     let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.add_css_class(TRANSIENT_POPOVER_CLASS);
     popover.set_parent(parent);
     popover.set_has_arrow(true);
     if let Some(rect) = pointing_to {
@@ -224,11 +243,19 @@ fn mention_popover(
 pub(crate) fn show_user_mention_popover(
     parent: &impl IsA<gtk::Widget>,
     user_id: &str,
-    context: &MessageRenderContext,
+    current_user_id: Option<&str>,
+    bot_user_ids: &HashSet<String>,
     on_action: Rc<dyn Fn(TimelineAction)>,
     pointing_to: Option<gtk::gdk::Rectangle>,
 ) {
-    if let Some(popover) = user_mention_popover(parent, user_id, context, on_action, pointing_to) {
+    if let Some(popover) = user_mention_popover_for(
+        parent,
+        user_id,
+        current_user_id,
+        bot_user_ids,
+        on_action,
+        pointing_to,
+    ) {
         popover.popup();
     }
 }

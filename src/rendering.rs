@@ -124,26 +124,58 @@ pub(crate) fn message_uses_image_asset_matching(
                     matches!(catalog.resolve(clean_name), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if is_key(url))
                 })
             })
-        || message.text.as_deref().is_some_and(|text| {
-            let mut rest = text;
-            while let Some(start) = rest.find(':') {
-                rest = &rest[start + 1..];
-                if let Some(end) = rest.find(':') {
-                    let code = &rest[..end];
-                    if !code.is_empty()
-                        && code.len() <= 64
-                        && code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
-                        && matches!(catalog.resolve(code), Some(crate::emoji::EmojiValue::CustomImage(ref url)) if is_key(url))
-                    {
-                        return true;
-                    }
-                    rest = &rest[end + 1..];
-                } else {
-                    break;
+        || any_custom_emoji_url_in_message(message, catalog, &is_key)
+}
+
+pub(crate) fn any_custom_emoji_url_in_message(
+    message: &SlackMessage,
+    catalog: &EmojiCatalog,
+    mut visit: impl FnMut(&str) -> bool,
+) -> bool {
+    if let Some(text) = message.text.as_deref() {
+        if any_custom_emoji_url_in_text(text, catalog, &mut visit) {
+            return true;
+        }
+    }
+    if !message.document.is_empty() {
+        let visible = message.visible_text();
+        if any_custom_emoji_url_in_text(&visible, catalog, &mut visit) {
+            return true;
+        }
+    }
+    false
+}
+
+fn any_custom_emoji_url_in_text(
+    text: &str,
+    catalog: &EmojiCatalog,
+    visit: &mut impl FnMut(&str) -> bool,
+) -> bool {
+    let mut rest = text;
+    while let Some(start) = rest.find(':') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find(':') else {
+            break;
+        };
+        let code = &rest[..end];
+        let valid_shortcode = !code.is_empty()
+            && code.len() <= 64
+            && code
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'));
+        if valid_shortcode {
+            if let Some(crate::emoji::EmojiValue::CustomImage(ref url)) = catalog.resolve(code) {
+                if visit(url) {
+                    return true;
                 }
             }
-            false
-        })
+            rest = &rest[end + 1..];
+        } else {
+            // Keep the second colon as a potential opening delimiter (e.g. after "https:" or "12:30").
+            rest = &rest[end..];
+        }
+    }
+    false
 }
 
 pub(crate) fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
