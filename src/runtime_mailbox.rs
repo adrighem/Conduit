@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use sha2::{Digest, Sha256};
@@ -10,6 +11,7 @@ use crate::message_handoff::MessageControlHandle;
 use crate::models::{SearchMessageLocation, SlackMessage, SlackUserStatus};
 use crate::runtime::{RuntimeEventKind, RuntimeEventMeta};
 use crate::slack::SlackMessageActionRequest;
+use crate::workspace_pipeline::WorkspacePatch;
 
 pub const RUNTIME_EVENT_QUEUE_CAPACITY: usize = 256;
 pub const RUNTIME_EVENT_PROGRESS_CAPACITY: usize = 32;
@@ -544,6 +546,7 @@ impl RuntimeEventMailboxState {
 #[derive(Debug)]
 pub struct RuntimeEventMailboxInner {
     pub state: Mutex<RuntimeEventMailboxState>,
+    pub queued_len: AtomicUsize,
     pub available: tokio::sync::Notify,
     pub space: Condvar,
 }
@@ -661,6 +664,9 @@ impl RuntimeEventMailboxSender {
                 if let Some(ticket) = reliable_ticket {
                     state.complete_reliable_ticket(ticket);
                 }
+                self.inner
+                    .queued_len
+                    .store(state.queue.len(), Ordering::Release);
                 drop(state);
                 self.inner.available.notify_one();
                 if reliable_ticket.is_some() {
@@ -731,6 +737,9 @@ impl RuntimeEventReceiver {
                         state.progress_depth -= 1;
                     }
                     state.metrics.dequeued = state.metrics.dequeued.saturating_add(1);
+                    self.inner
+                        .queued_len
+                        .store(state.queue.len(), Ordering::Release);
                     drop(state);
                     self.inner.space.notify_all();
                     return Some(event);
@@ -740,6 +749,49 @@ impl RuntimeEventReceiver {
                 }
             }
             available.await;
+        }
+    }
+
+    /// Pops consecutive `WorkspacePatch` events for `session` with `request: None`
+    /// from the front of the queue without crossing any non-patch event or
+    /// session/request boundary.
+    pub fn drain_workspace_patches(&mut self, session: SessionId, out: &mut Vec<WorkspacePatch>) {
+        if self.inner.queued_len.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("runtime event mailbox lock poisoned");
+        let limit = state.capacity;
+        let mut popped = 0_usize;
+        while popped < limit {
+            let matches_batch = state.queue.front().is_some_and(|front| {
+                front.meta.session == session
+                    && front.meta.request.is_none()
+                    && matches!(front.kind, RuntimeEventKind::WorkspacePatch(_))
+            });
+            if !matches_batch {
+                break;
+            }
+            let Some(RuntimeEvent {
+                kind: RuntimeEventKind::WorkspacePatch(patch),
+                ..
+            }) = state.queue.pop_front()
+            else {
+                unreachable!("verified front event is WorkspacePatch");
+            };
+            out.push(patch);
+            popped += 1;
+        }
+        if popped > 0 {
+            state.metrics.dequeued = state.metrics.dequeued.saturating_add(popped as u64);
+            self.inner
+                .queued_len
+                .store(state.queue.len(), Ordering::Release);
+            drop(state);
+            self.inner.space.notify_all();
         }
     }
 
@@ -755,6 +807,9 @@ impl RuntimeEventReceiver {
                 state.progress_depth -= 1;
             }
             state.metrics.dequeued = state.metrics.dequeued.saturating_add(1);
+            self.inner
+                .queued_len
+                .store(state.queue.len(), Ordering::Release);
             drop(state);
             self.inner.space.notify_all();
             return Ok(event);
@@ -786,6 +841,7 @@ impl Drop for RuntimeEventReceiver {
         state.receiver_open = false;
         state.queue.clear();
         state.progress_depth = 0;
+        self.inner.queued_len.store(0, Ordering::Release);
         drop(state);
         self.inner.space.notify_all();
     }
@@ -819,6 +875,7 @@ pub fn runtime_event_channel_with_capacity(
             receiver_open: true,
             metrics: RuntimeEventMailboxSnapshot::default(),
         }),
+        queued_len: AtomicUsize::new(0),
         available: tokio::sync::Notify::new(),
         space: Condvar::new(),
     });

@@ -573,6 +573,7 @@ pub(crate) struct WorkspacePatchApplication {
     read_state_changed_ids: Vec<String>,
     users_reset: bool,
     changed_user_ids: Vec<String>,
+    projected_user_ids: Vec<String>,
     timeline_changes: Vec<TimelineProjectionApplication>,
     removals: Vec<ConversationPatchRemoval>,
 }
@@ -648,7 +649,8 @@ impl WorkspacePatchApplication {
         self.selected_thread_record_changed
     }
 
-    /// Conversations whose read state changed without a conversation reset.
+    /// Conversations whose read state changed in this patch, including across a
+    /// bootstrap reset.
     pub(crate) fn read_state_changed_ids(&self) -> &[String] {
         &self.read_state_changed_ids
     }
@@ -659,6 +661,12 @@ impl WorkspacePatchApplication {
 
     pub(crate) fn changed_user_ids(&self) -> &[String] {
         &self.changed_user_ids
+    }
+
+    /// Users whose projected display fields (names, avatars, statuses, bots,
+    /// search aliases) changed in `user_directory` during this patch.
+    pub(crate) fn projected_user_ids(&self) -> &[String] {
+        &self.projected_user_ids
     }
 
     pub(crate) fn timeline_changes(&self) -> &[TimelineProjectionApplication] {
@@ -714,7 +722,6 @@ impl WorkspaceSessionState {
         *self.workspace_patches.borrow_mut() = WorkspacePatchConsumer::default();
     }
 
-    #[allow(dead_code)]
     pub(crate) fn workspace_patch_revision(&self) -> WorkspaceRevision {
         self.workspace_patches.borrow().revision
     }
@@ -733,6 +740,11 @@ impl WorkspaceSessionState {
         let mut view = self.view.borrow_mut();
         let mut threads = self.threads.borrow_mut();
         let mut read_states = self.read_states.borrow_mut();
+        let baseline_read_states = patch
+            .changes()
+            .iter()
+            .any(|change| matches!(change, WorkspaceChange::BootstrapReset(_)))
+            .then(|| read_states.clone());
         let mut application = WorkspacePatchApplication::default();
         for change in patch.changes() {
             match change {
@@ -746,8 +758,17 @@ impl WorkspaceSessionState {
                     *threads = ThreadCatalog::from_records(data.threads.clone());
                     application.thread_catalog_changed = true;
                     application.selected_thread_record_changed = true;
+                    application.read_state_changed_ids = baseline_read_states
+                        .as_ref()
+                        .expect("baseline read states captured when BootstrapReset is present")
+                        .changed_channel_ids(&data.read_states);
                     *read_states = data.read_states.clone();
-                    replace_patch_users(&mut users, &data.users, &mut application);
+                    replace_patch_users(
+                        &mut users,
+                        &self.user_directory,
+                        &data.users,
+                        &mut application,
+                    );
                 }
                 WorkspaceChange::ConversationsReset(conversations) => {
                     replace_patch_conversations(
@@ -766,6 +787,10 @@ impl WorkspaceSessionState {
                     application.record_conversation_structure_change(&conversation.id);
                 }
                 WorkspaceChange::ConversationRemoved { channel_id } => {
+                    clear_removed_conversation_timeline_changes(
+                        &mut application.timeline_changes,
+                        channel_id,
+                    );
                     application.removals.push(ConversationPatchRemoval {
                         channel_id: channel_id.clone(),
                         conversation: catalog.remove(channel_id),
@@ -796,7 +821,12 @@ impl WorkspaceSessionState {
                     }
                 }
                 WorkspaceChange::UsersReset(updated) => {
-                    replace_patch_users(&mut users, updated, &mut application);
+                    replace_patch_users(
+                        &mut users,
+                        &self.user_directory,
+                        updated,
+                        &mut application,
+                    );
                 }
                 WorkspaceChange::UserUpsert(user) => {
                     let Some(user_id) = user
@@ -807,6 +837,13 @@ impl WorkspaceSessionState {
                     else {
                         continue;
                     };
+                    self.user_directory
+                        .pending_user_ids
+                        .borrow_mut()
+                        .remove(user_id);
+                    application
+                        .projected_user_ids
+                        .extend(self.user_directory.project_users([user], false));
                     if users.get(user_id) != Some(user) {
                         users.insert(user_id.to_string(), user.clone());
                         application.changed_user_ids.push(user_id.to_string());
@@ -821,7 +858,10 @@ impl WorkspaceSessionState {
                         {
                             existing.render |= timeline_change.render;
                             existing.derived_view_changed |= timeline_change.derived_view_changed;
-                            existing.operations.extend(timeline_change.operations);
+                            merge_timeline_projection_operations(
+                                &mut existing.operations,
+                                timeline_change.operations,
+                            );
                         } else {
                             application.timeline_changes.push(timeline_change);
                         }
@@ -833,13 +873,90 @@ impl WorkspaceSessionState {
         application.changed_conversation_ids.dedup();
         application.read_state_changed_ids.sort_unstable();
         application.read_state_changed_ids.dedup();
+        application.changed_user_ids.sort_unstable();
+        application.changed_user_ids.dedup();
+        application.projected_user_ids.sort_unstable();
+        application.projected_user_ids.dedup();
         consumer.revision = patch.revision();
         Some(application)
     }
 }
 
+fn clear_removed_conversation_timeline_changes(
+    timeline_changes: &mut Vec<TimelineProjectionApplication>,
+    removed_channel_id: &str,
+) {
+    timeline_changes.retain_mut(|change| {
+        if change.target.channel_id() == removed_channel_id {
+            change.render = false;
+            change.operations.clear();
+            change.derived_view_changed
+        } else {
+            true
+        }
+    });
+}
+
+fn merge_timeline_projection_operations(
+    existing: &mut Vec<TimelineProjectionOperation>,
+    incoming: Vec<TimelineProjectionOperation>,
+) {
+    for operation in incoming {
+        match operation {
+            TimelineProjectionOperation::Remove { message_ts } => {
+                existing.retain(|op| {
+                    !matches!(
+                        op,
+                        TimelineProjectionOperation::Upsert { message, .. }
+                            if message.ts == message_ts
+                    )
+                });
+                if !existing.iter().any(|op| {
+                    matches!(
+                        op,
+                        TimelineProjectionOperation::Remove { message_ts: existing_ts }
+                            if *existing_ts == message_ts
+                    )
+                }) {
+                    existing.push(TimelineProjectionOperation::Remove { message_ts });
+                }
+            }
+            TimelineProjectionOperation::Upsert {
+                message,
+                inserted,
+                position,
+            } => {
+                if let Some(TimelineProjectionOperation::Upsert {
+                    message: prev_msg,
+                    inserted: prev_inserted,
+                    position: prev_position,
+                }) = existing.iter_mut().find(|op| {
+                    matches!(
+                        op,
+                        TimelineProjectionOperation::Upsert { message: existing_msg, .. }
+                            if existing_msg.ts == message.ts
+                    )
+                }) {
+                    if !*prev_inserted && inserted {
+                        *prev_inserted = true;
+                        *prev_position = position;
+                    }
+                    *prev_msg = message;
+                } else {
+                    existing.push(TimelineProjectionOperation::Upsert {
+                        message,
+                        inserted,
+                        position,
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn replace_patch_users(
     users: &mut crate::search::StampedRefMut<'_, HashMap<String, SlackUser>>,
+    user_directory: &UserDirectoryState,
     updated: &[SlackUser],
     application: &mut WorkspacePatchApplication,
 ) {
@@ -857,14 +974,27 @@ fn replace_patch_users(
     }
     // Report only users that were added, removed or changed: a reconnect
     // that re-sends the same directory must not invalidate every user.
-    let mut changed = changed_keys(&**users, &next);
+    let changed = changed_keys(&**users, &next);
     if changed.is_empty() {
         return;
     }
+    let (present, removed): (Vec<_>, Vec<_>) = changed
+        .iter()
+        .cloned()
+        .partition(|user_id| next.contains_key(user_id));
+    let mut affected =
+        user_directory.project_users(present.iter().filter_map(|id| next.get(id)), true);
+    affected.extend(user_directory.remove_users(&removed));
+    {
+        let mut pending = user_directory.pending_user_ids.borrow_mut();
+        for user_id in &changed {
+            pending.remove(user_id);
+        }
+    }
     **users = next;
-    changed.sort();
     application.users_reset = true;
-    application.changed_user_ids = changed;
+    application.changed_user_ids.extend(changed);
+    application.projected_user_ids.extend(affected);
 }
 
 fn replace_patch_conversations(
@@ -884,6 +1014,7 @@ fn replace_patch_conversations(
         .collect::<Vec<_>>();
     for conversation in removed {
         let channel_id = conversation.id.clone();
+        clear_removed_conversation_timeline_changes(&mut application.timeline_changes, &channel_id);
         application.removals.push(ConversationPatchRemoval {
             was_visible: view.visible_channel_id() == Some(channel_id.as_str()),
             channel_id: channel_id.clone(),
@@ -987,6 +1118,7 @@ struct ChannelHistoryState {
     next_cursor: Option<String>,
     loading: bool,
     loaded: bool,
+    fetched: bool,
     force_bottom: bool,
     focus_ts: Option<String>,
 }
@@ -1570,6 +1702,7 @@ impl WorkspaceViewState {
         };
         history.loading = false;
         if history.messages.is_empty() {
+            history.fetched = false;
             history.loaded = false;
         }
         WorkspaceFailureOutcome {
@@ -1598,6 +1731,7 @@ impl WorkspaceViewState {
             merge_channel_message_refresh(&history.messages, messages)
         };
         let messages_changed = replace_if_changed(&mut history.messages, merged);
+        history.fetched = true;
         history.loaded = true;
         if !cached {
             history.next_cursor = usable_cursor(has_more, next_cursor);
@@ -1629,6 +1763,7 @@ impl WorkspaceViewState {
         let history = self.channels.entry(channel_id.to_string()).or_default();
         let was_loaded = history.loaded;
         let had_context = history.context_messages.is_some();
+        history.fetched = true;
         history.loaded = true;
         if !cached {
             history.next_cursor = usable_cursor(has_more, next_cursor);
@@ -1986,10 +2121,7 @@ impl WorkspaceViewState {
         if changes.is_empty() {
             return None;
         }
-        let channel_id = match target {
-            TimelineTarget::Channel(channel_id) => channel_id.as_str(),
-            TimelineTarget::Thread { channel_id, .. } => channel_id.as_str(),
-        };
+        let channel_id = target.channel_id();
         let mut search_changed = false;
         let mut saved_changed = false;
         for change in changes {
@@ -2013,24 +2145,23 @@ impl WorkspaceViewState {
             TimelineTarget::Channel(channel_id) => {
                 let visible = self.visible_channel_id() == Some(channel_id.as_str());
                 let history = self.channels.entry(channel_id.clone()).or_default();
-                let operations = timeline_projection_operations(
-                    &history.messages,
-                    changes,
-                    SlackMessage::belongs_in_channel_timeline,
-                );
+                let operations =
+                    timeline_projection_operations(&history.messages, changes, |message| {
+                        target.accepts(message)
+                    });
                 // `operations` lists every effective change, so an empty list
                 // leaves the shared list untouched (no copy-on-write).
                 let base_changed = !operations.is_empty()
                     && apply_projection_message_changes(
                         Arc::make_mut(&mut history.messages),
                         changes,
-                        SlackMessage::belongs_in_channel_timeline,
+                        |message| target.accepts(message),
                     );
                 let context_changed = history.context_messages.as_mut().is_some_and(|messages| {
                     apply_context_message_changes(Arc::make_mut(messages), changes)
                 });
                 if base_changed {
-                    history.loaded = true;
+                    history.loaded = history.fetched || !history.messages.is_empty();
                 }
                 let changed = base_changed || context_changed;
                 (changed, visible && changed, operations)
@@ -2057,13 +2188,13 @@ impl WorkspaceViewState {
                 let (base_changed, projected_messages, operations) = {
                     let messages = self.thread_timelines.entry(key.clone()).or_default();
                     let operations = timeline_projection_operations(messages, changes, |message| {
-                        message.belongs_to_thread(thread_ts)
+                        target.accepts(message)
                     });
                     let changed = !operations.is_empty()
                         && apply_projection_message_changes(
                             Arc::make_mut(messages),
                             changes,
-                            |message| message.belongs_to_thread(thread_ts),
+                            |message| target.accepts(message),
                         );
                     (
                         changed,
@@ -4497,6 +4628,1391 @@ mod tests {
         assert!(!gate.should_request(now));
         gate.reset();
         assert!(gate.should_request(now));
+    }
+
+    use crate::thread_catalog::{ThreadKey, ThreadRecord};
+    use crate::unread_ledger::ConversationReadState;
+
+    #[derive(Debug, PartialEq)]
+    struct ChannelEquivalenceSnapshot {
+        id: String,
+        loaded: bool,
+        fetched: bool,
+        next_cursor: Option<String>,
+        messages: Vec<SlackMessage>,
+        context_messages: Option<Vec<SlackMessage>>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct OpenThreadEquivalenceSnapshot {
+        channel_id: String,
+        ts: String,
+        messages: Vec<SlackMessage>,
+        context_messages: Option<Vec<SlackMessage>>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct UserDirectoryEquivalenceSnapshot {
+        user_names: Vec<(String, String)>,
+        user_full_names: Vec<(String, String)>,
+        user_avatar_urls: Vec<(String, String)>,
+        user_search_aliases: Vec<(String, Vec<String>)>,
+        user_statuses: Vec<(String, crate::models::SlackUserStatus)>,
+        bot_user_ids: Vec<String>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SessionEquivalenceSnapshot {
+        revision: WorkspaceRevision,
+        conversations: Vec<SlackConversation>,
+        users: Vec<(String, SlackUser)>,
+        user_directory: UserDirectoryEquivalenceSnapshot,
+        threads: Vec<ThreadRecord>,
+        read_states: Vec<(String, ConversationReadState)>,
+        main_view: MainMessageView,
+        last_channel_id: Option<String>,
+        visible_channel_id: Option<String>,
+        selected_thread: Option<(String, String)>,
+        channels: Vec<ChannelEquivalenceSnapshot>,
+        thread_timelines: Vec<((String, String), Vec<SlackMessage>)>,
+        open_thread: Option<OpenThreadEquivalenceSnapshot>,
+        search_results: serde_json::Value,
+        saved_items: serde_json::Value,
+    }
+
+    fn sorted_map_entries<V: Clone>(map: &HashMap<String, V>) -> Vec<(String, V)> {
+        let mut entries = map
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    fn snapshot_session(session: &WorkspaceSessionState) -> SessionEquivalenceSnapshot {
+        let users = sorted_map_entries(&session.users.borrow());
+        let mut bot_user_ids = session
+            .user_directory
+            .bot_user_ids
+            .borrow()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        bot_user_ids.sort();
+        let user_directory = UserDirectoryEquivalenceSnapshot {
+            user_names: sorted_map_entries(&session.user_directory.user_names.borrow()),
+            user_full_names: sorted_map_entries(&session.user_directory.user_full_names.borrow()),
+            user_avatar_urls: sorted_map_entries(&session.user_directory.user_avatar_urls.borrow()),
+            user_search_aliases: sorted_map_entries(
+                &session.user_directory.user_search_aliases.borrow(),
+            ),
+            user_statuses: sorted_map_entries(&session.user_directory.user_statuses.borrow()),
+            bot_user_ids,
+        };
+
+        let mut threads = session.threads.borrow().clone().into_records();
+        threads.sort_by(|left, right| {
+            (&left.key.channel_id, &left.key.root_ts)
+                .cmp(&(&right.key.channel_id, &right.key.root_ts))
+        });
+
+        let view = session.view.borrow();
+        let mut channels = view
+            .channels
+            .iter()
+            .map(|(id, history)| ChannelEquivalenceSnapshot {
+                id: id.clone(),
+                loaded: history.loaded,
+                fetched: history.fetched,
+                next_cursor: history.next_cursor.clone(),
+                messages: history.messages.iter().map(|m| (**m).clone()).collect(),
+                context_messages: history
+                    .context_messages
+                    .as_ref()
+                    .map(|msgs| msgs.iter().map(|m| (**m).clone()).collect()),
+            })
+            .collect::<Vec<_>>();
+        channels.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut thread_timelines = view
+            .thread_timelines
+            .iter()
+            .map(|(key, msgs)| (key.clone(), msgs.iter().map(|m| (**m).clone()).collect()))
+            .collect::<Vec<_>>();
+        thread_timelines.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let open_thread = view
+            .thread
+            .as_ref()
+            .map(|thread| OpenThreadEquivalenceSnapshot {
+                channel_id: thread.channel_id.clone(),
+                ts: thread.ts.clone(),
+                messages: thread.messages.iter().map(|m| (**m).clone()).collect(),
+                context_messages: thread
+                    .context_messages
+                    .as_ref()
+                    .map(|msgs| msgs.iter().map(|m| (**m).clone()).collect()),
+            });
+
+        SessionEquivalenceSnapshot {
+            revision: session.workspace_patch_revision(),
+            conversations: session.conversations.borrow().conversations(),
+            users,
+            user_directory,
+            threads,
+            read_states: session.read_states.borrow().entries(),
+            main_view: view.main_view(),
+            last_channel_id: view.last_channel_id().map(str::to_owned),
+            visible_channel_id: view.visible_channel_id().map(str::to_owned),
+            selected_thread: view
+                .selected_thread_target()
+                .map(|(channel_id, ts)| (channel_id.to_owned(), ts.to_owned())),
+            channels,
+            thread_timelines,
+            open_thread,
+            search_results: serde_json::to_value(view.search_results()).expect("serialize search"),
+            saved_items: serde_json::to_value(view.saved_items()).expect("serialize saved"),
+        }
+    }
+
+    fn rev(step: u64) -> WorkspaceRevision {
+        let mut r = WorkspaceRevision::INITIAL;
+        for _ in 0..step {
+            r = r.successor();
+        }
+        r
+    }
+
+    #[test]
+    fn workspace_patch_merge_filters_stale_revisions_and_advances_on_empty_patch() {
+        assert!(WorkspacePatch::merge_after(
+            rev(3),
+            [
+                conversation_patch(
+                    rev(2),
+                    WorkspaceChange::ConversationUpsert(SlackConversation {
+                        id: "C_STALE".into(),
+                        ..Default::default()
+                    }),
+                ),
+                conversation_patch(
+                    rev(3),
+                    WorkspaceChange::ConversationUpsert(SlackConversation {
+                        id: "C_DUP".into(),
+                        ..Default::default()
+                    }),
+                ),
+            ],
+        )
+        .is_none());
+
+        let merged_empty = WorkspacePatch::merge_after(
+            rev(3),
+            [
+                conversation_patch(
+                    rev(3),
+                    WorkspaceChange::ConversationUpsert(SlackConversation {
+                        id: "C_IGNORED".into(),
+                        ..Default::default()
+                    }),
+                ),
+                WorkspacePatch::empty_for_test(rev(5)),
+                WorkspacePatch::empty_for_test(rev(4)),
+            ],
+        )
+        .expect("newer empty patch should still advance high-water revision");
+        assert_eq!(merged_empty.revision(), rev(5));
+        assert!(merged_empty.changes().is_empty());
+
+        let seq_session = WorkspaceSessionState::default();
+        seq_session.apply_workspace_patch(&WorkspacePatch::empty_for_test(rev(3)));
+        seq_session.apply_workspace_patch(&WorkspacePatch::empty_for_test(rev(5)));
+        seq_session.apply_workspace_patch(&WorkspacePatch::empty_for_test(rev(4)));
+
+        let merged_session = WorkspaceSessionState::default();
+        merged_session.apply_workspace_patch(&WorkspacePatch::empty_for_test(rev(3)));
+        merged_session.apply_workspace_patch(&merged_empty);
+
+        assert_eq!(
+            snapshot_session(&seq_session),
+            snapshot_session(&merged_session)
+        );
+    }
+
+    #[test]
+    fn workspace_patch_merge_preserves_unfetched_and_fetched_channel_loaded_state() {
+        let patches = vec![
+            WorkspacePatch::new(
+                rev(1),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Upsert(Box::new(message("2.0", "live")))],
+                }],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(2),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Remove {
+                        message_ts: "2.0".into(),
+                    }],
+                }],
+            )
+            .unwrap(),
+        ];
+
+        // Unfetched channel: Upsert then Remove leaves messages empty and loaded == false.
+        let seq_unfetched = WorkspaceSessionState::default();
+        for patch in &patches {
+            seq_unfetched.apply_workspace_patch(patch);
+        }
+        let merged_unfetched = WorkspaceSessionState::default();
+        let merged_patch =
+            WorkspacePatch::merge_after(WorkspaceRevision::INITIAL, patches.clone()).unwrap();
+        merged_unfetched.apply_workspace_patch(&merged_patch);
+        assert!(!seq_unfetched.view.borrow().channels["C1"].loaded);
+        assert_eq!(
+            snapshot_session(&seq_unfetched),
+            snapshot_session(&merged_unfetched)
+        );
+
+        // Fetched channel: Upsert then Remove leaves messages empty yet loaded stays true.
+        let seq_fetched = WorkspaceSessionState::default();
+        seq_fetched
+            .view
+            .borrow_mut()
+            .apply_history("C1", Vec::new(), false, None, false, false);
+        for patch in &patches {
+            seq_fetched.apply_workspace_patch(patch);
+        }
+        let merged_fetched = WorkspaceSessionState::default();
+        merged_fetched
+            .view
+            .borrow_mut()
+            .apply_history("C1", Vec::new(), false, None, false, false);
+        merged_fetched.apply_workspace_patch(&merged_patch);
+        assert!(seq_fetched.view.borrow().channels["C1"].loaded);
+        assert_eq!(
+            snapshot_session(&seq_fetched),
+            snapshot_session(&merged_fetched)
+        );
+    }
+
+    #[test]
+    fn workspace_patch_merge_preserves_user_upserts_before_users_reset() {
+        let u1 = projected_user("U1", "Ada");
+        let u2 = projected_user("U2", "Grace");
+        let patches = vec![
+            WorkspacePatch::new(rev(1), vec![WorkspaceChange::UserUpsert(u1.clone())]).unwrap(),
+            WorkspacePatch::new(
+                rev(2),
+                vec![WorkspaceChange::UsersReset(vec![u1.clone(), u2.clone()])],
+            )
+            .unwrap(),
+        ];
+
+        let merged = WorkspacePatch::merge(patches).unwrap();
+        let session = WorkspaceSessionState::default();
+        let app = session.apply_workspace_patch(&merged).unwrap();
+        // U1 was inserted before UsersReset(U1, U2), so BOTH U1 and U2 changed relative to initial empty state.
+        assert_eq!(
+            app.changed_user_ids(),
+            &["U1".to_string(), "U2".to_string()]
+        );
+    }
+
+    #[test]
+    fn workspace_patch_merge_clears_removed_conversation_timeline_render_while_keeping_derived_views(
+    ) {
+        let setup_session = || {
+            let session = WorkspaceSessionState::default();
+            *session.conversations.borrow_mut() =
+                ConversationCatalog::from_cached([SlackConversation {
+                    id: "C1".into(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                }]);
+            let mut view = session.view.borrow_mut();
+            view.select_conversation("C1");
+            view.start_search();
+            view.apply_search_results(vec![SearchMatch {
+                channel: Some(crate::models::SlackSearchChannel {
+                    id: Some("C1".into()),
+                    name: Some("general".into()),
+                }),
+                ts: Some("10.0".into()),
+                text: Some("before".into()),
+                ..Default::default()
+            }]);
+            drop(view);
+            session
+        };
+
+        let patches = vec![
+            WorkspacePatch::new(
+                rev(1),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Upsert(Box::new(message("10.0", "updated")))],
+                }],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(2),
+                vec![WorkspaceChange::ConversationRemoved {
+                    channel_id: "C1".into(),
+                }],
+            )
+            .unwrap(),
+        ];
+
+        let seq = setup_session();
+        for patch in &patches {
+            seq.apply_workspace_patch(patch);
+        }
+
+        let merged_session = setup_session();
+        let merged = WorkspacePatch::merge(patches).unwrap();
+        let app = merged_session.apply_workspace_patch(&merged).unwrap();
+
+        assert_eq!(snapshot_session(&seq), snapshot_session(&merged_session));
+        // C1 was removed after TimelineChanged: render and operations must be cleared,
+        // while derived_view_changed stays true so Search refreshes!
+        assert_eq!(app.timeline_changes().len(), 1);
+        assert!(!app.timeline_changes()[0].render());
+        assert!(app.timeline_changes()[0].operations().is_empty());
+        assert!(app.timeline_changes()[0].derived_view_changed());
+    }
+
+    #[test]
+    fn workspace_patch_merge_coalesces_remove_then_upsert_across_derived_views() {
+        let setup_session = || {
+            let session = WorkspaceSessionState::default();
+            let mut view = session.view.borrow_mut();
+            view.select_conversation("C1");
+            view.channels
+                .entry("C1".to_string())
+                .or_default()
+                .context_messages = Some(Arc::new(normalize_messages(vec![Arc::new(message(
+                "10.0", "ctx-old",
+            ))])));
+            view.start_search();
+            view.apply_search_results(vec![SearchMatch {
+                channel: Some(crate::models::SlackSearchChannel {
+                    id: Some("C1".into()),
+                    name: Some("general".into()),
+                }),
+                ts: Some("10.0".into()),
+                text: Some("search-old".into()),
+                ..Default::default()
+            }]);
+            view.start_saved();
+            view.apply_saved(vec![SavedItem {
+                channel: Some("C1".into()),
+                message: Some(message("10.0", "saved-old")),
+                ..Default::default()
+            }]);
+            view.select_conversation("C1");
+            drop(view);
+            session
+        };
+
+        let patches = vec![
+            WorkspacePatch::new(
+                rev(1),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Remove {
+                        message_ts: "10.0".into(),
+                    }],
+                }],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(2),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Upsert(Box::new(message("10.0", "reborn")))],
+                }],
+            )
+            .unwrap(),
+        ];
+
+        let seq = setup_session();
+        for patch in &patches {
+            seq.apply_workspace_patch(patch);
+        }
+
+        let merged_session = setup_session();
+        let merged = WorkspacePatch::merge(patches).unwrap();
+        // Coalesced into a SINGLE TimelineChanged for Channel("C1")!
+        assert_eq!(merged.changes().len(), 1);
+        let app = merged_session.apply_workspace_patch(&merged).unwrap();
+        assert_eq!(app.timeline_changes().len(), 1);
+
+        assert_eq!(snapshot_session(&seq), snapshot_session(&merged_session));
+        // Search, Saved, and context_messages had 10.0 removed, while channel messages has reborn!
+        assert!(merged_session.view.borrow().search_results().is_empty());
+        assert!(merged_session.view.borrow().saved_items().is_empty());
+        assert_eq!(
+            merged_session.view.borrow().channels["C1"]
+                .messages
+                .iter()
+                .map(|m| m.text.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("reborn")]
+        );
+    }
+
+    #[test]
+    fn workspace_patch_merge_coalesces_conversations_and_empty_thread_catalog_barriers() {
+        let mut c1_base = SlackConversation {
+            id: "C1".into(),
+            name: Some("initial".into()),
+            is_channel: Some(true),
+            is_starred: Some(true),
+            ..Default::default()
+        };
+        c1_base
+            .extra
+            .insert("topic".into(), serde_json::json!("alpha"));
+        let mut c1_meta = SlackConversation {
+            id: "C1".into(),
+            name: Some("renamed".into()),
+            is_private: Some(false),
+            ..Default::default()
+        };
+        c1_meta
+            .extra
+            .insert("purpose".into(), serde_json::json!("beta"));
+
+        let mut c2_meta1 = SlackConversation {
+            id: "C2".into(),
+            name: Some("meta-one".into()),
+            is_im: Some(true),
+            ..Default::default()
+        };
+        c2_meta1.extra.insert("k1".into(), serde_json::json!(1));
+        let mut c2_meta2 = SlackConversation {
+            id: "C2".into(),
+            user: Some("U9".into()),
+            ..Default::default()
+        };
+        c2_meta2.extra.insert("k2".into(), serde_json::json!(2));
+
+        let t1 = ThreadRecord::placeholder(ThreadKey::new("C1", "1.0").unwrap());
+        let t2 = ThreadRecord::placeholder(ThreadKey::new("C2", "2.0").unwrap());
+
+        let patches = vec![
+            WorkspacePatch::new(
+                rev(1),
+                vec![
+                    WorkspaceChange::ConversationUpsert(c1_base),
+                    WorkspaceChange::ConversationMetadataUpsert(c2_meta1),
+                    WorkspaceChange::ThreadCatalogChanged(vec![t1]),
+                ],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(2),
+                vec![
+                    WorkspaceChange::ConversationMetadataUpsert(c1_meta),
+                    WorkspaceChange::ConversationMetadataUpsert(c2_meta2),
+                    WorkspaceChange::ThreadCatalogChanged(Vec::new()),
+                ],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(3),
+                vec![WorkspaceChange::ThreadCatalogChanged(vec![t2.clone()])],
+            )
+            .unwrap(),
+        ];
+
+        let seq = WorkspaceSessionState::default();
+        for patch in &patches {
+            seq.apply_workspace_patch(patch);
+        }
+
+        let merged_session = WorkspaceSessionState::default();
+        let merged = WorkspacePatch::merge(patches).unwrap();
+        merged_session.apply_workspace_patch(&merged);
+
+        assert_eq!(snapshot_session(&seq), snapshot_session(&merged_session));
+        assert_eq!(
+            merged_session.threads.borrow().clone().into_records(),
+            vec![t2]
+        );
+    }
+
+    #[test]
+    fn workspace_patch_merge_preserves_cross_target_order_for_shared_message_in_derived_views() {
+        let setup_session = || {
+            let session = WorkspaceSessionState::default();
+            let mut view = session.view.borrow_mut();
+            view.select_conversation("C1");
+            view.start_search();
+            view.apply_search_results(vec![SearchMatch {
+                channel: Some(crate::models::SlackSearchChannel {
+                    id: Some("C1".into()),
+                    name: Some("general".into()),
+                }),
+                ts: Some("100.0".into()),
+                text: Some("v0".into()),
+                ..Default::default()
+            }]);
+            view.start_saved();
+            view.apply_saved(vec![SavedItem {
+                channel: Some("C1".into()),
+                message: Some(message("100.0", "v0")),
+                ..Default::default()
+            }]);
+            view.select_conversation("C1");
+            drop(view);
+            session
+        };
+
+        let patches = vec![
+            WorkspacePatch::new(
+                rev(1),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Upsert(Box::new(message("100.0", "v1")))],
+                }],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(2),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Thread {
+                        channel_id: "C1".into(),
+                        thread_ts: "100.0".into(),
+                    },
+                    changes: vec![MessageChange::Upsert(Box::new(message("100.0", "v2")))],
+                }],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(3),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Upsert(Box::new(message("100.0", "v3")))],
+                }],
+            )
+            .unwrap(),
+        ];
+
+        let seq = setup_session();
+        for patch in &patches {
+            seq.apply_workspace_patch(patch);
+        }
+
+        let merged_session = setup_session();
+        let merged = WorkspacePatch::merge(patches).unwrap();
+        let app = merged_session.apply_workspace_patch(&merged).unwrap();
+
+        assert_eq!(snapshot_session(&seq), snapshot_session(&merged_session));
+        assert_eq!(app.timeline_changes().len(), 2);
+        assert_eq!(
+            merged_session.view.borrow().search_results()[0]
+                .text
+                .as_deref(),
+            Some("v3")
+        );
+        assert_eq!(
+            merged_session.view.borrow().saved_items()[0]
+                .message
+                .as_ref()
+                .and_then(|m| m.text.as_deref()),
+            Some("v3")
+        );
+    }
+
+    #[test]
+    fn workspace_patch_merge_supersedes_unaccepted_upsert_with_newer_accepted_upsert_and_vice_versa(
+    ) {
+        let setup_session = || {
+            let session = WorkspaceSessionState::default();
+            let mut view = session.view.borrow_mut();
+            view.select_conversation("C1");
+            view.channels
+                .entry("C1".to_string())
+                .or_default()
+                .context_messages = Some(Arc::new(normalize_messages(vec![Arc::new(message(
+                "100.0", "ctx0",
+            ))])));
+            view.start_search();
+            view.apply_search_results(vec![SearchMatch {
+                channel: Some(crate::models::SlackSearchChannel {
+                    id: Some("C1".into()),
+                    name: Some("general".into()),
+                }),
+                ts: Some("100.0".into()),
+                text: Some("s0".into()),
+                ..Default::default()
+            }]);
+            view.start_saved();
+            view.apply_saved(vec![SavedItem {
+                channel: Some("C1".into()),
+                message: Some(message("100.0", "sv0")),
+                ..Default::default()
+            }]);
+            view.select_conversation("C1");
+            drop(view);
+            session
+        };
+
+        let mut unaccepted_old = message("100.0", "old");
+        unaccepted_old.thread_ts = Some("50.0".into());
+        let accepted_new = message("100.0", "new");
+
+        // Subcase A: [unaccepted("old"), accepted("new")] -> derived and base both end at "new".
+        let patches_a = vec![
+            WorkspacePatch::new(
+                rev(1),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Upsert(Box::new(unaccepted_old))],
+                }],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(2),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Upsert(Box::new(accepted_new))],
+                }],
+            )
+            .unwrap(),
+        ];
+        let seq_a = setup_session();
+        for patch in &patches_a {
+            seq_a.apply_workspace_patch(patch);
+        }
+        let merged_a = setup_session();
+        merged_a.apply_workspace_patch(&WorkspacePatch::merge(patches_a).unwrap());
+        assert_eq!(snapshot_session(&seq_a), snapshot_session(&merged_a));
+        assert_eq!(
+            merged_a.view.borrow().search_results()[0].text.as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            merged_a.view.borrow().saved_items()[0]
+                .message
+                .as_ref()
+                .and_then(|m| m.text.as_deref()),
+            Some("new")
+        );
+
+        // Subcase B: [accepted("v1"), unaccepted("v2")] -> base stays "v1", derived advances to "v2".
+        let accepted_v1 = message("100.0", "v1");
+        let mut unaccepted_v2 = message("100.0", "v2");
+        unaccepted_v2.thread_ts = Some("50.0".into());
+        let patches_b = vec![
+            WorkspacePatch::new(
+                rev(1),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Upsert(Box::new(accepted_v1))],
+                }],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(2),
+                vec![WorkspaceChange::TimelineChanged {
+                    target: TimelineTarget::Channel("C1".into()),
+                    changes: vec![MessageChange::Upsert(Box::new(unaccepted_v2))],
+                }],
+            )
+            .unwrap(),
+        ];
+        let seq_b = setup_session();
+        for patch in &patches_b {
+            seq_b.apply_workspace_patch(patch);
+        }
+        let merged_b = setup_session();
+        merged_b.apply_workspace_patch(&WorkspacePatch::merge(patches_b).unwrap());
+        assert_eq!(snapshot_session(&seq_b), snapshot_session(&merged_b));
+        assert_eq!(
+            merged_b.view.borrow().channels["C1"].messages[0]
+                .text
+                .as_deref(),
+            Some("v1")
+        );
+        assert_eq!(
+            merged_b.view.borrow().search_results()[0].text.as_deref(),
+            Some("v2")
+        );
+    }
+
+    #[test]
+    fn workspace_patch_merge_preserves_user_directory_across_users_reset_and_partial_user_upserts()
+    {
+        // Subcase A: unchanged sparse U2 in UsersReset followed by partial UserUpsert(U2 bot-only)
+        // must keep U2's prior projected display name ("Grace Hopper").
+        let setup_sparse = || {
+            let session = WorkspaceSessionState::default();
+            let u1_old = projected_user("U1", "Ada Old");
+            let u2_sparse = SlackUser {
+                id: Some("U2".into()),
+                ..Default::default()
+            };
+            session
+                .users
+                .borrow_mut()
+                .insert("U1".into(), u1_old.clone());
+            session.users.borrow_mut().insert("U2".into(), u2_sparse);
+            session.user_directory.project_users([&u1_old], true);
+            session
+                .user_directory
+                .merge_user_names([("U2".to_string(), "Grace Hopper".to_string())]);
+            session
+        };
+
+        let u1_new = projected_user("U1", "Ada New");
+        let u2_sparse = SlackUser {
+            id: Some("U2".into()),
+            ..Default::default()
+        };
+        let u2_bot_only = SlackUser {
+            id: Some("U2".into()),
+            is_bot: Some(true),
+            ..Default::default()
+        };
+        let patches_a = vec![
+            WorkspacePatch::new(
+                rev(1),
+                vec![WorkspaceChange::UsersReset(vec![u1_new, u2_sparse])],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(2),
+                vec![WorkspaceChange::UserUpsert(u2_bot_only.clone())],
+            )
+            .unwrap(),
+        ];
+
+        let seq_a = setup_sparse();
+        for patch in &patches_a {
+            seq_a.apply_workspace_patch(patch);
+        }
+        let merged_a = setup_sparse();
+        let app_a = merged_a
+            .apply_workspace_patch(&WorkspacePatch::merge(patches_a).unwrap())
+            .unwrap();
+        assert_eq!(snapshot_session(&seq_a), snapshot_session(&merged_a));
+        assert_eq!(
+            merged_a
+                .user_directory
+                .user_names
+                .borrow()
+                .get("U2")
+                .map(String::as_str),
+            Some("Grace Hopper")
+        );
+        assert!(merged_a.user_directory.bot_user_ids.borrow().contains("U2"));
+        assert_eq!(app_a.projected_user_ids(), &["U1", "U2"]);
+
+        // Subcase B: UsersReset([U2 named Alice]) followed by partial UserUpsert(U2 bot-only)
+        // must keep "Alice" while setting bot = true.
+        let patches_b = vec![
+            WorkspacePatch::new(
+                rev(1),
+                vec![WorkspaceChange::UsersReset(vec![projected_user(
+                    "U2", "Alice",
+                )])],
+            )
+            .unwrap(),
+            WorkspacePatch::new(rev(2), vec![WorkspaceChange::UserUpsert(u2_bot_only)]).unwrap(),
+        ];
+        let seq_b = WorkspaceSessionState::default();
+        for patch in &patches_b {
+            seq_b.apply_workspace_patch(patch);
+        }
+        let merged_b = WorkspaceSessionState::default();
+        merged_b.apply_workspace_patch(&WorkspacePatch::merge(patches_b).unwrap());
+        assert_eq!(snapshot_session(&seq_b), snapshot_session(&merged_b));
+        assert_eq!(
+            merged_b
+                .user_directory
+                .user_names
+                .borrow()
+                .get("U2")
+                .map(String::as_str),
+            Some("Alice")
+        );
+        assert!(merged_b.user_directory.bot_user_ids.borrow().contains("U2"));
+    }
+
+    #[test]
+    fn workspace_patch_bootstrap_reset_reports_net_read_state_changes_and_clears_superseded_ids() {
+        let unread = ConversationReadState {
+            server_has_unreads: true,
+            server_mention_count: 2,
+            ..Default::default()
+        };
+
+        // Subcase A: standalone BootstrapReset reports channels whose read state changed.
+        let session_a = WorkspaceSessionState::default();
+        session_a
+            .read_states
+            .borrow_mut()
+            .upsert("C2", unread.clone());
+        let boot_a = WorkspacePatch::new(
+            rev(1),
+            vec![WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                read_states: UnreadLedger::from_entries(vec![("C1".to_string(), unread.clone())]),
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        let app_a = session_a.apply_workspace_patch(&boot_a).unwrap();
+        assert_eq!(app_a.read_state_changed_ids(), &["C1", "C2"]);
+
+        // Subcase B: pre-reset ReadStatesChanged("C99") rolled back by BootstrapReset(empty)
+        // clears superseded "C99".
+        let session_b = WorkspaceSessionState::default();
+        let patches_b = vec![
+            WorkspacePatch::new(
+                rev(1),
+                vec![WorkspaceChange::ReadStatesChanged(vec![(
+                    "C99".to_string(),
+                    unread.clone(),
+                )])],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(2),
+                vec![WorkspaceChange::BootstrapReset(
+                    WorkspaceBootstrapData::default(),
+                )],
+            )
+            .unwrap(),
+        ];
+        let app_b = session_b
+            .apply_workspace_patch(&WorkspacePatch::merge(patches_b).unwrap())
+            .unwrap();
+        assert!(app_b.read_state_changed_ids().is_empty());
+
+        // Subcase C: pre-reset ReadStatesChanged("C1": unread) followed by
+        // BootstrapReset("C1": unread) still reports "C1" relative to baseline!
+        let session_c = WorkspaceSessionState::default();
+        let patches_c = vec![
+            WorkspacePatch::new(
+                rev(1),
+                vec![WorkspaceChange::ReadStatesChanged(vec![(
+                    "C1".to_string(),
+                    unread.clone(),
+                )])],
+            )
+            .unwrap(),
+            WorkspacePatch::new(
+                rev(2),
+                vec![WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                    read_states: UnreadLedger::from_entries(vec![("C1".to_string(), unread)]),
+                    ..Default::default()
+                })],
+            )
+            .unwrap(),
+        ];
+        let app_c = session_c
+            .apply_workspace_patch(&WorkspacePatch::merge(patches_c).unwrap())
+            .unwrap();
+        assert_eq!(app_c.read_state_changed_ids(), &["C1"]);
+    }
+
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn range(&mut self, upper: usize) -> usize {
+            (self.next_u64() as usize) % upper
+        }
+
+        fn bool(&mut self) -> bool {
+            (self.next_u64() & 1) == 1
+        }
+    }
+
+    fn random_conversation(rng: &mut SplitMix64, id: &str) -> SlackConversation {
+        let mut conv = SlackConversation {
+            id: id.to_string(),
+            name: rng.bool().then(|| format!("chan-{id}-{}", rng.range(4))),
+            user: rng.bool().then(|| format!("U{}", rng.range(4))),
+            is_channel: rng.bool().then(|| rng.bool()),
+            is_group: rng.bool().then(|| rng.bool()),
+            is_im: rng.bool().then(|| rng.bool()),
+            is_mpim: rng.bool().then(|| rng.bool()),
+            is_private: rng.bool().then(|| rng.bool()),
+            is_archived: rng.bool().then(|| rng.bool()),
+            is_starred: rng.bool().then(|| rng.bool()),
+            ..Default::default()
+        };
+        if rng.bool() {
+            conv.extra.insert(
+                format!("k{}", rng.range(3)),
+                serde_json::json!(rng.range(10)),
+            );
+        }
+        conv
+    }
+
+    fn random_message(rng: &mut SplitMix64, ts_pool: &[&str], roots: &[&str]) -> SlackMessage {
+        let ts = ts_pool[rng.range(ts_pool.len())];
+        let mut msg = message(ts, &format!("msg-{ts}-v{}", rng.range(8)));
+        msg.user = Some(format!("U{}", rng.range(4)));
+        match rng.range(4) {
+            0 => {}
+            1 => {
+                // Non-broadcast thread reply: always pick a parent root != ts.
+                let candidate = roots[rng.range(roots.len())];
+                let parent = if candidate == ts {
+                    roots
+                        .iter()
+                        .copied()
+                        .find(|&root| root != ts)
+                        .expect("at least two distinct roots")
+                } else {
+                    candidate
+                };
+                msg.thread_ts = Some(parent.to_string());
+            }
+            2 => {
+                // Broadcast thread reply
+                msg.thread_ts = Some(roots[rng.range(roots.len())].to_string());
+                msg.subtype = Some("thread_broadcast".to_string());
+            }
+            _ => {
+                msg.subtype = Some("reply_broadcast".to_string());
+                msg.thread_ts = Some(roots[rng.range(roots.len())].to_string());
+            }
+        }
+        msg
+    }
+
+    fn random_user_upsert(rng: &mut SplitMix64) -> SlackUser {
+        let uid = format!("U{}", rng.range(5));
+        match rng.range(5) {
+            0 => {
+                let mut user = projected_user(&uid, &format!("User-{uid}-{}", rng.range(4)));
+                if rng.range(6) == 0 {
+                    user.id = Some("   ".to_string());
+                }
+                user
+            }
+            1 => SlackUser {
+                id: Some(uid),
+                is_bot: Some(rng.bool()),
+                ..Default::default()
+            },
+            2 => SlackUser {
+                id: Some(uid),
+                profile: Some(crate::models::SlackUserProfile {
+                    status_text: Some(if rng.bool() {
+                        format!("status-{}", rng.range(3))
+                    } else {
+                        String::new()
+                    }),
+                    status_emoji: Some(":wave:".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            3 => {
+                let mut user = projected_user(&uid, &format!("NoAvatar-{uid}-{}", rng.range(3)));
+                if let Some(profile) = user.profile.as_mut() {
+                    profile.image_72 = None;
+                }
+                user
+            }
+            _ => SlackUser {
+                id: Some(uid.clone()),
+                name: Some(format!("Partial-{uid}-{}", rng.range(4))),
+                is_bot: rng.bool().then(|| rng.bool()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn random_read_state(rng: &mut SplitMix64, ts_pool: &[&str]) -> ConversationReadState {
+        let mut live_mentions = std::collections::BTreeSet::new();
+        if rng.bool() {
+            live_mentions.insert(ts_pool[rng.range(ts_pool.len())].to_string());
+        }
+        ConversationReadState {
+            last_read: rng
+                .bool()
+                .then(|| ts_pool[rng.range(ts_pool.len())].to_string()),
+            server_latest: rng
+                .bool()
+                .then(|| ts_pool[rng.range(ts_pool.len())].to_string()),
+            server_mention_count: rng.range(5) as u64,
+            server_unread_count: rng.range(5) as u64,
+            server_has_unreads: rng.bool(),
+            live_mentions,
+            live_latest_unread: rng
+                .bool()
+                .then(|| ts_pool[rng.range(ts_pool.len())].to_string()),
+        }
+    }
+
+    fn random_thread_record(
+        rng: &mut SplitMix64,
+        channels: &[&str],
+        roots: &[&str],
+    ) -> ThreadRecord {
+        let key = ThreadKey::new(
+            channels[rng.range(channels.len())],
+            roots[rng.range(roots.len())],
+        )
+        .unwrap();
+        let mut record = ThreadRecord::placeholder(key.clone());
+        record.reply_count = rng.range(6) as u64;
+        record.read_reply_count = rng.range(6) as u64;
+        record.subscribed = match rng.range(3) {
+            0 => None,
+            1 => Some(true),
+            _ => Some(false),
+        };
+        if rng.bool() {
+            record.root = Some(message(&key.root_ts, &format!("root-{}", rng.range(4))));
+        }
+        record
+    }
+
+    fn seed_initial_session(seed: u64, ts_pool: &[&str]) -> WorkspaceSessionState {
+        let mut rng = SplitMix64::new(seed ^ 0xA5A5_5A5A_F0F0_0F0F);
+        let session = WorkspaceSessionState::default();
+        let channels = ["C1", "C2", "C3"];
+
+        let mut initial_convs = Vec::new();
+        for &cid in &channels {
+            if rng.bool() {
+                initial_convs.push(random_conversation(&mut rng, cid));
+            }
+        }
+        *session.conversations.borrow_mut() = ConversationCatalog::from_cached(initial_convs);
+
+        for uid in ["U0", "U1", "U2", "U3"] {
+            match rng.range(4) {
+                0 => {}
+                1 => {
+                    let full = projected_user(uid, &format!("Rich-{uid}"));
+                    session.user_directory.project_users([&full], true);
+                    session.users.borrow_mut().insert(uid.to_string(), full);
+                }
+                2 => {
+                    // Sparse `users` entry alongside rich pre-projected `user_directory`.
+                    let rich = projected_user(uid, &format!("Cached-{uid}"));
+                    session.user_directory.project_users([&rich], true);
+                    session.users.borrow_mut().insert(
+                        uid.to_string(),
+                        SlackUser {
+                            id: Some(uid.to_string()),
+                            ..Default::default()
+                        },
+                    );
+                }
+                _ => {
+                    session
+                        .user_directory
+                        .merge_user_names([(uid.to_string(), format!("Lookup-{uid}"))]);
+                }
+            }
+        }
+
+        let mut view = session.view.borrow_mut();
+        for &cid in &channels {
+            match rng.range(4) {
+                0 => {}
+                1 => {
+                    let msgs = (0..rng.range(3))
+                        .map(|_| message(ts_pool[rng.range(ts_pool.len())], "hist"))
+                        .collect();
+                    view.apply_history(cid, msgs, rng.bool(), None, false, false);
+                }
+                2 => {
+                    let msgs = vec![
+                        Arc::new(message(ts_pool[1], "ctx1")),
+                        Arc::new(message(ts_pool[3], "ctx2")),
+                    ];
+                    view.channels
+                        .entry(cid.to_string())
+                        .or_default()
+                        .context_messages = Some(Arc::new(normalize_messages(msgs)));
+                }
+                _ => {
+                    view.fail_history(cid);
+                }
+            }
+        }
+
+        let mut search_matches = Vec::with_capacity(channels.len() * ts_pool.len());
+        let mut saved_items = Vec::with_capacity(channels.len() * ts_pool.len());
+        for &cid in &channels {
+            for &ts in ts_pool {
+                search_matches.push(SearchMatch {
+                    channel: Some(crate::models::SlackSearchChannel {
+                        id: Some(cid.to_string()),
+                        name: Some("chan".to_string()),
+                    }),
+                    ts: Some(ts.to_string()),
+                    text: Some(format!("s-{cid}-{ts}")),
+                    ..Default::default()
+                });
+                saved_items.push(SavedItem {
+                    channel: Some(cid.to_string()),
+                    message: Some(message(ts, &format!("sv-{cid}-{ts}"))),
+                    ..Default::default()
+                });
+            }
+        }
+        view.start_search();
+        view.apply_search_results(search_matches);
+        view.start_saved();
+        view.apply_saved(saved_items);
+
+        match rng.range(4) {
+            0 => {
+                view.select_conversation(channels[rng.range(channels.len())]);
+            }
+            1 => {
+                let cid = channels[rng.range(channels.len())];
+                let root = ts_pool[rng.range(2)];
+                view.select_conversation(cid);
+                view.open_thread(cid, root);
+                if rng.bool() {
+                    view.apply_thread(cid, root, vec![message(root, "parent")], false, None, false);
+                } else if let Some(thread) = view.thread.as_mut() {
+                    thread.context_messages = Some(Arc::new(normalize_messages(vec![Arc::new(
+                        message(root, "tctx"),
+                    )])));
+                }
+            }
+            2 => view.show_threads(),
+            _ => {}
+        }
+        drop(view);
+
+        let base_steps = rng.range(4) as u64;
+        if base_steps > 0 {
+            session.apply_workspace_patch(&WorkspacePatch::empty_for_test(rev(base_steps)));
+        }
+        session
+    }
+
+    #[test]
+    fn workspace_patch_merge_after_matches_sequential_application_across_250_random_sequences() {
+        let channels = ["C1", "C2", "C3"];
+        let roots = ["100.0", "200.0"];
+        let ts_pool = ["100.0", "200.0", "300.0", "400.0", "500.0"];
+
+        for seed in 0..250u64 {
+            let seq_session = seed_initial_session(seed, &ts_pool);
+            let merged_session = seed_initial_session(seed, &ts_pool);
+            let base_rev = seq_session.workspace_patch_revision();
+
+            let mut rng = SplitMix64::new(seed.wrapping_mul(6364136223846793005).wrapping_add(1));
+            let patch_count = 1 + rng.range(20);
+            let mut next_step = (0..10u64).find(|&s| rev(s) == base_rev).unwrap_or(0);
+            let mut patches = Vec::with_capacity(patch_count);
+
+            for _ in 0..patch_count {
+                let patch_rev = match rng.range(8) {
+                    // Stale or duplicate revision
+                    0 if next_step > 0 => rev(rng.range(next_step as usize + 1) as u64),
+                    // Monotonic step (+1 or +2)
+                    _ => {
+                        next_step += 1 + (rng.range(2) as u64);
+                        rev(next_step)
+                    }
+                };
+
+                if rng.range(12) == 0 && patch_rev > WorkspaceRevision::INITIAL {
+                    patches.push(WorkspacePatch::empty_for_test(patch_rev));
+                    continue;
+                }
+
+                let barrier_free = seed % 2 == 1;
+                let change_count = 1 + rng.range(5);
+                let mut changes = Vec::with_capacity(change_count);
+                for _ in 0..change_count {
+                    let kind = if barrier_free {
+                        // Exercise long barrier-free segments with dense cross-target
+                        // `(Channel, Thread)` and same-`ts` interleavings.
+                        match rng.range(8) {
+                            0 => 0,
+                            1 => 1,
+                            2 => 4,
+                            3..=5 => 6,
+                            6 => 8,
+                            _ => 10,
+                        }
+                    } else {
+                        rng.range(12)
+                    };
+                    let change = match kind {
+                        0 => {
+                            let cid = channels[rng.range(channels.len())];
+                            WorkspaceChange::ConversationUpsert(random_conversation(&mut rng, cid))
+                        }
+                        1 => {
+                            let cid = channels[rng.range(channels.len())];
+                            WorkspaceChange::ConversationMetadataUpsert(random_conversation(
+                                &mut rng, cid,
+                            ))
+                        }
+                        2 => WorkspaceChange::ConversationRemoved {
+                            channel_id: channels[rng.range(channels.len())].to_string(),
+                        },
+                        3 => {
+                            let mut convs = Vec::new();
+                            for &cid in &channels {
+                                if rng.bool() {
+                                    convs.push(random_conversation(&mut rng, cid));
+                                }
+                            }
+                            WorkspaceChange::ConversationsReset(convs)
+                        }
+                        4 => WorkspaceChange::UserUpsert(random_user_upsert(&mut rng)),
+                        5 => {
+                            let mut users = Vec::new();
+                            for i in 0..4 {
+                                if rng.bool() {
+                                    let uid = format!("U{i}");
+                                    if rng.bool() {
+                                        users.push(projected_user(
+                                            &uid,
+                                            &format!("Reset-{uid}-{}", rng.range(3)),
+                                        ));
+                                    } else {
+                                        users.push(SlackUser {
+                                            id: Some(uid),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+                            }
+                            WorkspaceChange::UsersReset(users)
+                        }
+                        6 | 7 => {
+                            let target = if rng.bool() {
+                                TimelineTarget::Channel(
+                                    channels[rng.range(channels.len())].to_string(),
+                                )
+                            } else {
+                                TimelineTarget::Thread {
+                                    channel_id: channels[rng.range(channels.len())].to_string(),
+                                    thread_ts: roots[rng.range(roots.len())].to_string(),
+                                }
+                            };
+                            let msg_op_count = 1 + rng.range(5);
+                            let mut msg_changes = Vec::with_capacity(msg_op_count);
+                            for _ in 0..msg_op_count {
+                                if rng.range(3) == 0 {
+                                    msg_changes.push(MessageChange::Remove {
+                                        message_ts: ts_pool[rng.range(ts_pool.len())].to_string(),
+                                    });
+                                } else {
+                                    msg_changes.push(MessageChange::Upsert(Box::new(
+                                        random_message(&mut rng, &ts_pool, &roots),
+                                    )));
+                                }
+                            }
+                            WorkspaceChange::TimelineChanged {
+                                target,
+                                changes: msg_changes,
+                            }
+                        }
+                        8 => {
+                            let records = (0..(1 + rng.range(3)))
+                                .map(|_| random_thread_record(&mut rng, &channels, &roots))
+                                .collect();
+                            WorkspaceChange::ThreadCatalogChanged(records)
+                        }
+                        9 => WorkspaceChange::ThreadCatalogChanged(Vec::new()),
+                        10 => {
+                            let states = (0..(1 + rng.range(3)))
+                                .map(|_| {
+                                    (
+                                        channels[rng.range(channels.len())].to_string(),
+                                        random_read_state(&mut rng, &ts_pool),
+                                    )
+                                })
+                                .collect();
+                            WorkspaceChange::ReadStatesChanged(states)
+                        }
+                        _ => {
+                            let mut convs = Vec::new();
+                            for &cid in &channels {
+                                if rng.bool() {
+                                    convs.push(random_conversation(&mut rng, cid));
+                                }
+                            }
+                            let mut users = Vec::new();
+                            for i in 0..3 {
+                                if rng.bool() {
+                                    users.push(projected_user(
+                                        &format!("U{i}"),
+                                        &format!("Boot{i}"),
+                                    ));
+                                }
+                            }
+                            let threads = (0..rng.range(3))
+                                .map(|_| random_thread_record(&mut rng, &channels, &roots))
+                                .collect();
+                            let mut read_entries = Vec::new();
+                            for &cid in &channels {
+                                if rng.bool() {
+                                    read_entries.push((
+                                        cid.to_string(),
+                                        random_read_state(&mut rng, &ts_pool),
+                                    ));
+                                }
+                            }
+                            let read_states = UnreadLedger::from_entries(read_entries);
+                            WorkspaceChange::BootstrapReset(WorkspaceBootstrapData {
+                                conversations: convs,
+                                users,
+                                histories: HashMap::new(),
+                                threads,
+                                read_states,
+                            })
+                        }
+                    };
+                    changes.push(change);
+                }
+
+                if patch_rev > WorkspaceRevision::INITIAL {
+                    patches.push(WorkspacePatch::new(patch_rev, changes).unwrap());
+                }
+            }
+
+            for patch in &patches {
+                seq_session.apply_workspace_patch(patch);
+            }
+            if let Some(merged) = WorkspacePatch::merge_after(base_rev, patches) {
+                merged_session.apply_workspace_patch(&merged);
+            }
+
+            assert_eq!(
+                snapshot_session(&seq_session),
+                snapshot_session(&merged_session),
+                "merge_after diverged from sequential application on seed {seed}"
+            );
+        }
     }
 }
 

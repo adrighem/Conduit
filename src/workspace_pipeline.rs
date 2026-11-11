@@ -230,10 +230,34 @@ pub(crate) enum TimelineTarget {
     },
 }
 
+impl TimelineTarget {
+    pub(crate) fn channel_id(&self) -> &str {
+        match self {
+            Self::Channel(channel_id) | Self::Thread { channel_id, .. } => channel_id,
+        }
+    }
+
+    pub(crate) fn accepts(&self, message: &SlackMessage) -> bool {
+        match self {
+            Self::Channel(_) => message.belongs_in_channel_timeline(),
+            Self::Thread { thread_ts, .. } => message.belongs_to_thread(thread_ts),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum MessageChange {
     Upsert(Box<SlackMessage>),
     Remove { message_ts: String },
+}
+
+impl MessageChange {
+    fn message_ts(&self) -> &str {
+        match self {
+            Self::Upsert(message) => message.ts.as_str(),
+            Self::Remove { message_ts } => message_ts.as_str(),
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -268,12 +292,407 @@ impl WorkspacePatch {
             .then_some(Self { revision, changes })
     }
 
+    #[cfg(test)]
+    pub(crate) fn empty_for_test(revision: WorkspaceRevision) -> Self {
+        Self {
+            revision,
+            changes: Vec::new(),
+        }
+    }
+
     pub(crate) fn revision(&self) -> WorkspaceRevision {
         self.revision
     }
 
     pub(crate) fn changes(&self) -> &[WorkspaceChange] {
         &self.changes
+    }
+
+    pub(crate) fn merge(patches: impl IntoIterator<Item = Self>) -> Option<Self> {
+        Self::merge_after(WorkspaceRevision::INITIAL, patches)
+    }
+
+    /// Coalesces accepted patches strictly newer than `base_revision` into one
+    /// patch whose state effect matches sequential application.
+    pub(crate) fn merge_after(
+        base_revision: WorkspaceRevision,
+        patches: impl IntoIterator<Item = Self>,
+    ) -> Option<Self> {
+        let mut high_water = base_revision;
+        let mut accepted_any = false;
+        let mut merged_changes = Vec::new();
+        let mut segment = PatchMergeSegment::default();
+
+        for patch in patches {
+            if patch.revision <= high_water {
+                continue;
+            }
+            high_water = patch.revision;
+            accepted_any = true;
+
+            for change in patch.changes {
+                match change {
+                    WorkspaceChange::BootstrapReset(data) => {
+                        segment.flush_into(&mut merged_changes);
+                        merged_changes.push(WorkspaceChange::BootstrapReset(data));
+                    }
+                    WorkspaceChange::ConversationsReset(conversations) => {
+                        segment.flush_into(&mut merged_changes);
+                        merged_changes.push(WorkspaceChange::ConversationsReset(conversations));
+                    }
+                    WorkspaceChange::ConversationRemoved { channel_id } => {
+                        segment.flush_into(&mut merged_changes);
+                        merged_changes.push(WorkspaceChange::ConversationRemoved { channel_id });
+                    }
+                    WorkspaceChange::UsersReset(users) => {
+                        segment.flush_into(&mut merged_changes);
+                        merged_changes.push(WorkspaceChange::UsersReset(users));
+                    }
+                    WorkspaceChange::ThreadCatalogChanged(records) if records.is_empty() => {
+                        segment.clear_thread_records();
+                        segment.flush_into(&mut merged_changes);
+                        merged_changes.push(WorkspaceChange::ThreadCatalogChanged(Vec::new()));
+                    }
+                    WorkspaceChange::ConversationUpsert(conversation) => {
+                        segment.push_conversation_upsert(conversation);
+                    }
+                    WorkspaceChange::ConversationMetadataUpsert(conversation) => {
+                        segment.push_conversation_metadata(conversation);
+                    }
+                    WorkspaceChange::UserUpsert(user) => {
+                        segment.push_user_upsert(user);
+                    }
+                    WorkspaceChange::TimelineChanged { target, changes } => {
+                        segment.push_timeline_changes(target, changes);
+                    }
+                    WorkspaceChange::ThreadCatalogChanged(records) => {
+                        segment.push_thread_records(records);
+                    }
+                    WorkspaceChange::ReadStatesChanged(states) => {
+                        segment.push_read_states(states);
+                    }
+                }
+            }
+        }
+
+        if !accepted_any {
+            return None;
+        }
+        segment.flush_into(&mut merged_changes);
+        Some(Self {
+            revision: high_water,
+            changes: merged_changes,
+        })
+    }
+}
+
+struct InsertionMap<K, V> {
+    entries: Vec<(K, V)>,
+    index: HashMap<K, usize>,
+}
+
+impl<K, V> Default for InsertionMap<K, V> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Clone + Eq + std::hash::Hash, V> InsertionMap<K, V> {
+    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        self.index.get(key).map(|&idx| &mut self.entries[idx].1)
+    }
+
+    fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        self.index.contains_key(key)
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if let Some(&idx) = self.index.get(&key) {
+            self.entries[idx].1 = value;
+        } else {
+            let idx = self.entries.len();
+            self.index.insert(key.clone(), idx);
+            self.entries.push((key, value));
+        }
+    }
+
+    fn entry_or_default(&mut self, key: K) -> &mut V
+    where
+        V: Default,
+    {
+        if let Some(&idx) = self.index.get(&key) {
+            &mut self.entries[idx].1
+        } else {
+            let idx = self.entries.len();
+            self.index.insert(key.clone(), idx);
+            self.entries.push((key, V::default()));
+            &mut self.entries[idx].1
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.index.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn into_entries(self) -> Vec<(K, V)> {
+        self.entries
+    }
+
+    fn into_values(self) -> impl Iterator<Item = V> {
+        self.entries.into_iter().map(|(_, value)| value)
+    }
+}
+
+enum PendingConversationChange {
+    Authoritative(SlackConversation),
+    Metadata(SlackConversation),
+}
+
+/// Coalesced per-message edits within one [`TimelineTarget`] bucket.
+///
+/// Base timeline projection (`apply_projection_message_changes`) only applies
+/// upserts where `target.accepts(&message)` is true, whereas `context_messages`,
+/// `search_results`, and `saved_items` update on every upsert regardless of
+/// target acceptance. Therefore:
+/// - An accepted upsert updates both the base timeline and derived views, so it
+///   replaces `accepted_upsert` and clears any prior `unaccepted_upsert`.
+/// - A subsequent unaccepted upsert leaves an earlier `accepted_upsert` intact
+///   for the base timeline and is emitted after it so derived/context views
+///   still observe the latest payload.
+#[derive(Default)]
+struct CoalescedMessageChanges {
+    leading_remove: bool,
+    accepted_upsert: Option<Box<SlackMessage>>,
+    unaccepted_upsert: Option<Box<SlackMessage>>,
+}
+
+impl CoalescedMessageChanges {
+    fn record(&mut self, target: &TimelineTarget, change: MessageChange) {
+        match change {
+            MessageChange::Remove { .. } => {
+                self.leading_remove = true;
+                self.accepted_upsert = None;
+                self.unaccepted_upsert = None;
+            }
+            MessageChange::Upsert(message) => {
+                if target.accepts(&message) {
+                    self.accepted_upsert = Some(message);
+                    self.unaccepted_upsert = None;
+                } else {
+                    self.unaccepted_upsert = Some(message);
+                }
+            }
+        }
+    }
+}
+
+struct PendingTimelineChanges {
+    target: TimelineTarget,
+    entries: InsertionMap<String, CoalescedMessageChanges>,
+}
+
+impl PendingTimelineChanges {
+    fn new(target: TimelineTarget) -> Self {
+        Self {
+            target,
+            entries: InsertionMap::default(),
+        }
+    }
+
+    fn contains_ts(&self, ts: &str) -> bool {
+        self.entries.contains_key(ts)
+    }
+
+    fn push_changes(&mut self, changes: Vec<MessageChange>) {
+        let target = &self.target;
+        for change in changes {
+            let ts = change.message_ts().to_owned();
+            self.entries.entry_or_default(ts).record(target, change);
+        }
+    }
+
+    fn into_workspace_change(self) -> Option<WorkspaceChange> {
+        let mut changes = Vec::with_capacity(self.entries.len());
+        for (ts, state) in self.entries.into_entries() {
+            if state.leading_remove {
+                changes.push(MessageChange::Remove { message_ts: ts });
+            }
+            if let Some(message) = state.accepted_upsert {
+                changes.push(MessageChange::Upsert(message));
+            }
+            if let Some(message) = state.unaccepted_upsert {
+                changes.push(MessageChange::Upsert(message));
+            }
+        }
+        (!changes.is_empty()).then_some(WorkspaceChange::TimelineChanged {
+            target: self.target,
+            changes,
+        })
+    }
+}
+
+#[derive(Default)]
+struct PatchMergeSegment {
+    conversations: InsertionMap<String, PendingConversationChange>,
+    users: Vec<SlackUser>,
+    user_latest: HashMap<String, usize>,
+    timelines: Vec<PendingTimelineChanges>,
+    timeline_latest: HashMap<TimelineTarget, usize>,
+    thread_records: InsertionMap<ThreadKey, ThreadRecord>,
+    read_states: InsertionMap<String, ConversationReadState>,
+}
+
+fn user_upsert_supersedes(prev: &SlackUser, next: &SlackUser) -> bool {
+    let touches_status = |user: &SlackUser| {
+        user.status().is_some()
+            || user
+                .profile
+                .as_ref()
+                .is_some_and(|profile| profile.contains_status_fields())
+    };
+    (prev.display_name().is_none() || next.display_name().is_some())
+        && (prev.full_name().is_none() || next.full_name().is_some())
+        && (prev.avatar_url().is_none() || next.avatar_url().is_some())
+        && (prev.search_aliases().is_empty() || !next.search_aliases().is_empty())
+        && (!touches_status(prev) || touches_status(next))
+}
+
+impl PatchMergeSegment {
+    fn push_conversation_upsert(&mut self, conversation: SlackConversation) {
+        let id = conversation.id.clone();
+        self.conversations
+            .insert(id, PendingConversationChange::Authoritative(conversation));
+    }
+
+    fn push_conversation_metadata(&mut self, conversation: SlackConversation) {
+        let id = conversation.id.clone();
+        if let Some(
+            PendingConversationChange::Authoritative(existing)
+            | PendingConversationChange::Metadata(existing),
+        ) = self.conversations.get_mut(&id)
+        {
+            merge_conversation_metadata(existing, &conversation);
+        } else {
+            self.conversations
+                .insert(id, PendingConversationChange::Metadata(conversation));
+        }
+    }
+
+    fn push_user_upsert(&mut self, user: SlackUser) {
+        let Some(user_id) = user
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|user_id| !user_id.is_empty())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        if let Some(&idx) = self.user_latest.get(&user_id) {
+            if user_upsert_supersedes(&self.users[idx], &user) {
+                self.users[idx] = user;
+                return;
+            }
+        }
+        let idx = self.users.len();
+        self.user_latest.insert(user_id, idx);
+        self.users.push(user);
+    }
+
+    fn push_timeline_changes(&mut self, target: TimelineTarget, changes: Vec<MessageChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        // Only coalesce into an earlier bucket for `target` when no intervening
+        // bucket in the same channel touched any timestamp in `changes`;
+        // otherwise `search_results` and `saved_items` would apply a newer edit
+        // ahead of an older cross-target edit for the same `(channel_id, ts)`.
+        let reusable_idx = self.timeline_latest.get(&target).copied().filter(|&idx| {
+            let channel_id = target.channel_id();
+            !self.timelines[idx + 1..].iter().any(|later| {
+                later.target.channel_id() == channel_id
+                    && changes
+                        .iter()
+                        .any(|change| later.contains_ts(change.message_ts()))
+            })
+        });
+        let idx = if let Some(idx) = reusable_idx {
+            idx
+        } else {
+            let idx = self.timelines.len();
+            self.timeline_latest.insert(target.clone(), idx);
+            self.timelines.push(PendingTimelineChanges::new(target));
+            idx
+        };
+        self.timelines[idx].push_changes(changes);
+    }
+
+    fn push_thread_records(&mut self, records: Vec<ThreadRecord>) {
+        for record in records {
+            self.thread_records.insert(record.key.clone(), record);
+        }
+    }
+
+    fn clear_thread_records(&mut self) {
+        self.thread_records.clear();
+    }
+
+    fn push_read_states(&mut self, states: Vec<(String, ConversationReadState)>) {
+        for (channel_id, state) in states {
+            self.read_states.insert(channel_id, state);
+        }
+    }
+
+    fn flush_into(&mut self, out: &mut Vec<WorkspaceChange>) {
+        let prev = std::mem::take(self);
+        for conversation in prev.conversations.into_values() {
+            match conversation {
+                PendingConversationChange::Authoritative(c) => {
+                    out.push(WorkspaceChange::ConversationUpsert(c));
+                }
+                PendingConversationChange::Metadata(c) => {
+                    out.push(WorkspaceChange::ConversationMetadataUpsert(c));
+                }
+            }
+        }
+        for user in prev.users {
+            out.push(WorkspaceChange::UserUpsert(user));
+        }
+        for timeline in prev.timelines {
+            if let Some(change) = timeline.into_workspace_change() {
+                out.push(change);
+            }
+        }
+        if !prev.thread_records.is_empty() {
+            out.push(WorkspaceChange::ThreadCatalogChanged(
+                prev.thread_records.into_values().collect(),
+            ));
+        }
+        if !prev.read_states.is_empty() {
+            out.push(WorkspaceChange::ReadStatesChanged(
+                prev.read_states.into_entries(),
+            ));
+        }
     }
 }
 

@@ -333,33 +333,90 @@ fn perf_guard_pasted_screenshots_encode_off_the_gtk_thread() {
     assert_eq!(source.matches("write_screenshot_png(&texture").count(), 1);
 }
 
-/// The source of the `ConduitWindow` method `name`, up to the next method.
+/// The full source of the `ConduitWindow` method `name`, parsed by balanced
+/// brace depth from its opening `{` so nested `fn` helpers never truncate it.
 fn window_method_source(name: &str) -> &'static str {
     let source = include_str!("../window.rs");
-    let start = source
-        .find(&format!("    fn {name}("))
-        .unwrap_or_else(|| panic!("window method {name} not found"));
-    let rest = &source[start + 1..];
-    let end = rest.find("\n    fn ").map_or(rest.len(), |end| end + 1);
-    &rest[..end]
+    let pattern = format!("\n    fn {name}(");
+    let sig_start = source
+        .find(&pattern)
+        .unwrap_or_else(|| panic!("window method {name} not found"))
+        + 1;
+    let body_open_rel = source[sig_start..]
+        .find("{\n")
+        .unwrap_or_else(|| panic!("opening brace for {name} not found"));
+    let bytes = source.as_bytes();
+    let mut i = sig_start + body_open_rel;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'\'' if i + 2 < bytes.len() && bytes[i + 2] == b'\'' => {
+                i += 3;
+            }
+            b'\'' if i + 3 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 3] == b'\'' => {
+                i += 4;
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return &source[sig_start..i];
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    panic!("unclosed method body for {name}");
 }
 
 #[test]
 fn perf_guard_workspace_patches_only_queue_derived_view_renders() {
     // Each socket event is its own workspace patch. Rebuilding the Threads
-    // list, re-rendering Search or Saved, or moving unread separators per
-    // patch made a burst of K events cost K rebuilds; the handlers queue
-    // invalidations so the frame flush renders each surface once.
+    // list, re-rendering Search or Saved, moving unread separators, updating
+    // sidebar rows, or recounting badges per patch made a burst of K events
+    // cost K updates; the handlers queue invalidations so the frame flush
+    // renders each surface once.
     for method in [
         "apply_workspace_patch",
         "apply_workspace_timeline_projection",
+        "sync_changed_conversations",
+        "sync_workspace_user_projection",
+        "sync_conversations_from_catalog",
     ] {
         let body = window_method_source(method);
         for direct in [
+            "self.render_conversations()",
             "self.populate_threads()",
             "self.rerender_current_main_messages()",
             "self.refresh_unread_separators()",
             "self.recheck_visible_reads(",
+            "self.render_changed_conversations(",
+            "self.refresh_activity_badge()",
+            "self.refresh_threads_badge()",
         ] {
             assert!(
                 !body.contains(direct),
@@ -367,6 +424,315 @@ fn perf_guard_workspace_patches_only_queue_derived_view_renders() {
             );
         }
     }
+    let source = include_str!("../window.rs");
+    assert_eq!(
+        source.matches("self.render_changed_conversations(").count(),
+        1,
+        "only flush_ui_invalidations may render incremental sidebar rows directly"
+    );
+}
+
+#[test]
+fn perf_guard_mailbox_patch_drain_fast_path_burst_coalescing_and_causal_barriers() {
+    use crate::runtime::{OperationContext, RuntimeEventMeta, SessionId};
+    use crate::runtime_mailbox::runtime_event_channel;
+    use crate::workspace_pipeline::{MessageChange, TimelineTarget, WorkspaceChange};
+
+    let session_a = SessionId(1);
+    let session_b = SessionId(2);
+    let patch_meta = |session| RuntimeEventMeta {
+        session,
+        request: None,
+        context: OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
+    };
+    let rev = |n: u64| {
+        let mut r = WorkspaceRevision::INITIAL;
+        for _ in 0..n {
+            r = r.successor();
+        }
+        r
+    };
+    let msg_patch = |n: u64, ts: &str, text: &str| {
+        WorkspacePatch::new(
+            rev(n),
+            vec![WorkspaceChange::TimelineChanged {
+                target: TimelineTarget::Channel("C1".to_string()),
+                changes: vec![MessageChange::Upsert(Box::new(SlackMessage {
+                    ts: ts.to_string(),
+                    text: Some(text.to_string()),
+                    ..SlackMessage::default()
+                }))],
+            }],
+        )
+        .expect("non-empty test patch")
+    };
+
+    let (sender, mut receiver) = runtime_event_channel();
+    let mut patch_batch = Vec::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+
+    // 1. Single-patch fast path: zero extra allocation or coalescing wrapper.
+    sender
+        .send(RuntimeEvent {
+            meta: patch_meta(session_a),
+            kind: RuntimeEventKind::WorkspacePatch(msg_patch(1, "1.0", "single")),
+        })
+        .expect("send single patch");
+    let first = rt
+        .block_on(receiver.recv())
+        .expect("receive single patch immediately");
+    let drained = coalesce_runtime_event(
+        first,
+        true,
+        WorkspaceRevision::INITIAL,
+        &mut receiver,
+        &mut patch_batch,
+    );
+    assert!(matches!(drained, DrainedRuntimeEvent::Single(_)));
+    assert_eq!(patch_batch.capacity(), 0);
+
+    // 2. 32-patch burst on the same channel: drained in one batch and merged
+    // into 1 WorkspacePatch application and 1 TimelineProjectionApplication.
+    let session_state = crate::workspace_state::WorkspaceSessionState::default();
+    session_state.view.borrow_mut().select_conversation("C1");
+    for i in 2..=33u64 {
+        let ts = format!("{}.0", (i % 8) + 1);
+        sender
+            .send(RuntimeEvent {
+                meta: patch_meta(session_a),
+                kind: RuntimeEventKind::WorkspacePatch(msg_patch(i, &ts, &format!("v{i}"))),
+            })
+            .expect("send burst patch");
+    }
+    let burst_head = rt.block_on(receiver.recv()).expect("receive burst head");
+    let coalesced = coalesce_runtime_event(
+        burst_head,
+        true,
+        WorkspaceRevision::INITIAL,
+        &mut receiver,
+        &mut patch_batch,
+    );
+    match coalesced {
+        DrainedRuntimeEvent::CoalescedWorkspacePatch {
+            merged,
+            patch_count,
+            ..
+        } => {
+            assert_eq!(patch_count, 32);
+            let merged = merged.expect("32 newer patches merge into one");
+            assert_eq!(merged.revision(), rev(33));
+            assert_eq!(merged.changes().len(), 1);
+            let app = session_state
+                .apply_workspace_patch(&merged)
+                .expect("merged patch applies once");
+            assert_eq!(app.timeline_changes().len(), 1);
+        }
+        DrainedRuntimeEvent::Single(_) => panic!("expected coalesced workspace patch burst"),
+    }
+    assert_eq!(sender.snapshot().depth, 0);
+    assert_eq!(sender.snapshot().admitted, sender.snapshot().dequeued);
+
+    // 3. Causal barrier + session boundary: [P34..P36, Status, P37..P38, P_session_b].
+    for i in 34..=36u64 {
+        sender
+            .send(RuntimeEvent {
+                meta: patch_meta(session_a),
+                kind: RuntimeEventKind::WorkspacePatch(msg_patch(i, &format!("{i}.0"), "pre")),
+            })
+            .expect("send pre-barrier patch");
+    }
+    sender
+        .send(RuntimeEvent {
+            meta: patch_meta(session_a),
+            kind: RuntimeEventKind::Status("barrier".to_string()),
+        })
+        .expect("send non-patch causal barrier");
+    for i in 37..=38u64 {
+        sender
+            .send(RuntimeEvent {
+                meta: patch_meta(session_a),
+                kind: RuntimeEventKind::WorkspacePatch(msg_patch(i, &format!("{i}.0"), "post")),
+            })
+            .expect("send post-barrier patch");
+    }
+    sender
+        .send(RuntimeEvent {
+            meta: patch_meta(session_b),
+            kind: RuntimeEventKind::WorkspacePatch(msg_patch(1, "99.0", "next-session")),
+        })
+        .expect("send next-session patch");
+
+    // Segment before Status barrier (P34..P36 -> 3 patches).
+    let pre_head = rt.block_on(receiver.recv()).expect("pre-barrier head");
+    match coalesce_runtime_event(
+        pre_head,
+        true,
+        session_state.workspace_patch_revision(),
+        &mut receiver,
+        &mut patch_batch,
+    ) {
+        DrainedRuntimeEvent::CoalescedWorkspacePatch {
+            merged: Some(merged),
+            patch_count: 3,
+            ..
+        } => {
+            assert_eq!(merged.revision(), rev(36));
+            session_state.apply_workspace_patch(&merged);
+        }
+        _ => panic!("expected 3 pre-barrier patches coalesced"),
+    }
+
+    // Non-patch Status barrier arrives next in exact causal order.
+    let barrier = rt.block_on(receiver.recv()).expect("barrier event");
+    assert!(matches!(
+        coalesce_runtime_event(
+            barrier,
+            true,
+            session_state.workspace_patch_revision(),
+            &mut receiver,
+            &mut patch_batch,
+        ),
+        DrainedRuntimeEvent::Single(RuntimeEvent {
+            kind: RuntimeEventKind::Status(status),
+            ..
+        }) if status == "barrier"
+    ));
+
+    // Segment after Status barrier stops before session_b (P37..P38 -> 2 patches).
+    let post_head = rt.block_on(receiver.recv()).expect("post-barrier head");
+    match coalesce_runtime_event(
+        post_head,
+        true,
+        session_state.workspace_patch_revision(),
+        &mut receiver,
+        &mut patch_batch,
+    ) {
+        DrainedRuntimeEvent::CoalescedWorkspacePatch {
+            merged: Some(merged),
+            patch_count: 2,
+            ..
+        } => {
+            assert_eq!(merged.revision(), rev(38));
+            session_state.apply_workspace_patch(&merged);
+        }
+        _ => panic!("expected 2 post-barrier patches coalesced before session_b"),
+    }
+
+    // Remaining event belongs to session_b.
+    let next_session_event = rt.block_on(receiver.recv()).expect("session_b event");
+    assert_eq!(next_session_event.meta.session, session_b);
+    assert_eq!(sender.snapshot().depth, 0);
+
+    // 4. Request boundary symmetry: neither a head WorkspacePatch carrying
+    // `request: Some(...)` nor a queued `request: Some(...)` patch merges
+    // across a request boundary.
+    let request_meta = |id| RuntimeEventMeta {
+        session: session_a,
+        request: Some(crate::runtime::RequestId(id)),
+        context: OperationContext::new(RuntimeOperation::Conversations, RuntimeTarget::Workspace),
+    };
+    sender
+        .send(RuntimeEvent {
+            meta: request_meta(7),
+            kind: RuntimeEventKind::WorkspacePatch(msg_patch(39, "39.0", "req-head")),
+        })
+        .expect("send request-tagged head patch");
+    sender
+        .send(RuntimeEvent {
+            meta: patch_meta(session_a),
+            kind: RuntimeEventKind::WorkspacePatch(msg_patch(40, "40.0", "plain-1")),
+        })
+        .expect("send plain patch 1");
+    sender
+        .send(RuntimeEvent {
+            meta: patch_meta(session_a),
+            kind: RuntimeEventKind::WorkspacePatch(msg_patch(41, "41.0", "plain-2")),
+        })
+        .expect("send plain patch 2");
+    sender
+        .send(RuntimeEvent {
+            meta: request_meta(8),
+            kind: RuntimeEventKind::WorkspacePatch(msg_patch(42, "42.0", "req-tail")),
+        })
+        .expect("send request-tagged tail patch");
+
+    let req_head = rt.block_on(receiver.recv()).expect("request head patch");
+    assert!(matches!(
+        coalesce_runtime_event(
+            req_head,
+            true,
+            session_state.workspace_patch_revision(),
+            &mut receiver,
+            &mut patch_batch,
+        ),
+        DrainedRuntimeEvent::Single(RuntimeEvent {
+            meta: RuntimeEventMeta {
+                request: Some(crate::runtime::RequestId(7)),
+                ..
+            },
+            ..
+        })
+    ));
+
+    let plain_head = rt.block_on(receiver.recv()).expect("plain head patch");
+    match coalesce_runtime_event(plain_head, true, rev(39), &mut receiver, &mut patch_batch) {
+        DrainedRuntimeEvent::CoalescedWorkspacePatch {
+            merged: Some(merged),
+            patch_count: 2,
+            ..
+        } => assert_eq!(merged.revision(), rev(41)),
+        _ => panic!("expected plain patches 40..=41 to coalesce before request=Some(8)"),
+    }
+
+    let req_tail = rt.block_on(receiver.recv()).expect("request tail patch");
+    assert_eq!(req_tail.meta.request, Some(crate::runtime::RequestId(8)));
+    assert_eq!(sender.snapshot().depth, 0);
+}
+
+#[test]
+fn perf_guard_sidebar_rows_and_badges_coalesce_in_frame_invalidations() {
+    let mut pending = PendingUiInvalidations::default();
+    assert!(pending.is_empty());
+
+    // Incremental row updates and badge invalidations accumulate dirty IDs and flags.
+    for _ in 0..20 {
+        assert!(pending.queue_sidebar_rows(&["C1".to_string(), "C2".to_string()]));
+        assert!(pending.queue(UiInvalidations::ACTIVITY_BADGE | UiInvalidations::THREADS_BADGE));
+    }
+    assert!(pending.flags().contains(UiInvalidations::SIDEBAR_ROWS));
+    assert!(pending.flags().contains(UiInvalidations::ACTIVITY_BADGE));
+    assert!(pending.flags().contains(UiInvalidations::THREADS_BADGE));
+    assert_eq!(pending.dirty_sidebar_conversation_ids().len(), 2);
+
+    // Queueing a full SIDEBAR invalidation supersedes SIDEBAR_ROWS and clears dirty IDs.
+    assert!(pending.queue(UiInvalidations::SIDEBAR));
+    assert!(pending.flags().contains(UiInvalidations::SIDEBAR));
+    assert!(!pending.flags().contains(UiInvalidations::SIDEBAR_ROWS));
+    assert!(pending.dirty_sidebar_conversation_ids().is_empty());
+
+    // Subsequent SIDEBAR_ROWS requests while SIDEBAR is pending are ignored.
+    assert!(!pending.queue_sidebar_rows(&["C3".to_string()]));
+    assert!(!pending.queue(UiInvalidations::SIDEBAR_ROWS));
+    assert!(!pending.flags().contains(UiInvalidations::SIDEBAR_ROWS));
+    assert!(pending.dirty_sidebar_conversation_ids().is_empty());
+
+    let (flushed, dirty_ids) = pending.take();
+    assert!(flushed.contains(UiInvalidations::SIDEBAR));
+    assert!(!flushed.contains(UiInvalidations::SIDEBAR_ROWS));
+    assert!(flushed.contains(UiInvalidations::ACTIVITY_BADGE));
+    assert!(flushed.contains(UiInvalidations::THREADS_BADGE));
+    assert!(dirty_ids.is_empty());
+    assert!(pending.is_empty());
+
+    // `reset` drops both queued flags and dirty row IDs.
+    assert!(pending.queue_sidebar_rows(&["C9".to_string()]));
+    assert!(pending.queue(UiInvalidations::MAIN));
+    pending.reset();
+    assert!(pending.is_empty());
+    assert!(pending.dirty_sidebar_conversation_ids().is_empty());
 }
 
 #[test]
@@ -4473,6 +4839,400 @@ mod graphical {
             );
 
             window.destroy();
+        });
+    }
+
+    fn ensure_test_window_resources() {
+        static REGISTER_RESOURCES: std::sync::Once = std::sync::Once::new();
+        REGISTER_RESOURCES.call_once(|| {
+            let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let src_dir = manifest.join("src");
+            let xml_path = src_dir.join("conduit.gresource.xml");
+            let target = std::env::temp_dir().join(format!(
+                "conduit-test-resources-{}-{}.gresource",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            let status = std::process::Command::new("glib-compile-resources")
+                .arg(format!("--sourcedir={}", src_dir.display()))
+                .arg(format!("--target={}", target.display()))
+                .arg(&xml_path)
+                .status()
+                .expect("run glib-compile-resources");
+            assert!(status.success(), "glib-compile-resources failed");
+            let resource = gio::Resource::load(&target).expect("load compiled test gresource");
+            let _ = std::fs::remove_file(&target);
+            gio::resources_register(&resource);
+        });
+    }
+
+    #[test]
+    fn perf_guard_window_burst_of_workspace_patches_applies_and_flushes_once() {
+        run_gtk_test(|| {
+            use crate::runtime::{OperationContext, RuntimeEventMeta};
+            use crate::runtime_mailbox::runtime_event_channel;
+            use crate::thread_catalog::{ThreadKey, ThreadRecord};
+            use crate::timeline::tests::{pump, pump_until};
+            use crate::unread_ledger::ConversationReadState;
+            use crate::workspace_pipeline::{MessageChange, TimelineTarget, WorkspaceChange};
+
+            crate::http_client::ensure_tls_crypto_provider();
+            ensure_test_window_resources();
+            let _ = adw::init();
+            sourceview5::init();
+
+            let window = glib::Object::new::<ConduitWindow>();
+            // Advance request_coordinator directly without sending a command to
+            // the idle default runtime, so only our test mailbox feeds events.
+            let session = window
+                .imp()
+                .request_coordinator
+                .borrow_mut()
+                .begin_session(&RuntimeCommand::LoadStoredToken)
+                .session;
+
+            window.apply_workspace_lifecycle(WorkspaceLifecycleEvent::ConnectRequested);
+            window.apply_workspace_lifecycle(WorkspaceLifecycleEvent::Authenticated);
+            window.show_workspace(crate::models::AuthInfo {
+                team: Some("Test Workspace".to_string()),
+                user: Some("Test User".to_string()),
+                user_id: Some("UTEST".to_string()),
+                ..Default::default()
+            });
+            window.populate_conversations(vec![
+                SlackConversation {
+                    id: "C1".to_string(),
+                    name: Some("general".to_string()),
+                    is_channel: Some(true),
+                    ..Default::default()
+                },
+                SlackConversation {
+                    id: "C2".to_string(),
+                    name: Some("random".to_string()),
+                    is_channel: Some(true),
+                    ..Default::default()
+                },
+            ]);
+            window.populate_user_names(
+                [("UADA".to_string(), "Ada Lovelace".to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+            window.imp().workspace.view.borrow_mut().apply_history(
+                "C1",
+                Vec::new(),
+                false,
+                None,
+                false,
+                false,
+            );
+            window.apply_workspace_lifecycle(WorkspaceLifecycleEvent::SyncCompleted);
+            window.select_conversation("C1", "#general");
+            window.set_default_size(1100, 760);
+            window.present();
+
+            pump_until(5000, || {
+                window.imp().pending_ui_invalidations.borrow().is_empty()
+            });
+            pump(30);
+
+            window.imp().workspace_patch_applies.set(0);
+            window.imp().workspace_timeline_projections.set(0);
+            window.imp().ui_invalidation_flushes.set(0);
+
+            let (sender, receiver) = runtime_event_channel();
+            window.spawn_runtime_event_loop(receiver, false);
+
+            let patch_meta = || RuntimeEventMeta {
+                session,
+                request: None,
+                context: OperationContext::new(
+                    RuntimeOperation::Conversations,
+                    RuntimeTarget::Workspace,
+                ),
+            };
+            let rev = |n: u64| {
+                let mut r = WorkspaceRevision::INITIAL;
+                for _ in 0..n {
+                    r = r.successor();
+                }
+                r
+            };
+
+            // Queue 20 distinct WorkspacePatch events synchronously (new messages,
+            // edits, a deletion, conversation metadata, read states, thread catalog)
+            // before yielding to the GTK main loop.
+            for step in 1..=20u64 {
+                let change = match step {
+                    1..=10 => WorkspaceChange::TimelineChanged {
+                        target: TimelineTarget::Channel("C1".to_string()),
+                        changes: vec![MessageChange::Upsert(Box::new(SlackMessage {
+                            ts: format!("{step}.0"),
+                            user: Some("UADA".to_string()),
+                            text: Some(format!("msg-{step}")),
+                            ..Default::default()
+                        }))],
+                    },
+                    11..=14 => WorkspaceChange::TimelineChanged {
+                        target: TimelineTarget::Channel("C1".to_string()),
+                        changes: vec![MessageChange::Upsert(Box::new(SlackMessage {
+                            ts: format!("{}.0", step - 10),
+                            user: Some("UADA".to_string()),
+                            text: Some(format!("edited-{}", step - 10)),
+                            ..Default::default()
+                        }))],
+                    },
+                    15 => WorkspaceChange::TimelineChanged {
+                        target: TimelineTarget::Channel("C1".to_string()),
+                        changes: vec![MessageChange::Remove {
+                            message_ts: "5.0".to_string(),
+                        }],
+                    },
+                    16 | 17 => WorkspaceChange::ReadStatesChanged(vec![(
+                        "C2".to_string(),
+                        ConversationReadState {
+                            server_mention_count: step - 15,
+                            server_has_unreads: true,
+                            ..Default::default()
+                        },
+                    )]),
+                    18 => WorkspaceChange::ConversationMetadataUpsert(SlackConversation {
+                        id: "C2".to_string(),
+                        name: Some("random-renamed".to_string()),
+                        is_channel: Some(true),
+                        ..Default::default()
+                    }),
+                    _ => {
+                        let mut record =
+                            ThreadRecord::placeholder(ThreadKey::new("C1", "1.0").unwrap());
+                        record.reply_count = step - 17;
+                        record.subscribed = Some(true);
+                        WorkspaceChange::ThreadCatalogChanged(vec![record])
+                    }
+                };
+                let patch = WorkspacePatch::new(rev(step), vec![change]).unwrap();
+                sender
+                    .send(RuntimeEvent {
+                        meta: patch_meta(),
+                        kind: RuntimeEventKind::WorkspacePatch(patch),
+                    })
+                    .expect("enqueue burst workspace patch");
+            }
+
+            pump_until(5000, || {
+                window.imp().workspace.workspace_patch_revision() == rev(20)
+                    && window.imp().pending_ui_invalidations.borrow().is_empty()
+            });
+
+            assert_eq!(
+                window.imp().workspace_patch_applies.get(),
+                1,
+                "20 queued workspace patches must coalesce into 1 window patch application"
+            );
+            assert_eq!(
+                window.imp().workspace_timeline_projections.get(),
+                1,
+                "20 queued workspace patches must run timeline projection once"
+            );
+            assert_eq!(
+                window.imp().ui_invalidation_flushes.get(),
+                1,
+                "20 queued workspace patches must flush UI invalidations once"
+            );
+
+            let c1_messages = window
+                .imp()
+                .workspace
+                .view
+                .borrow()
+                .channel_messages_shared("C1");
+            assert_eq!(c1_messages.len(), 9);
+            assert_eq!(
+                c1_messages.last().unwrap().text.as_deref(),
+                Some("edited-1")
+            );
+            assert!(!c1_messages.iter().any(|m| m.ts == "5.0"));
+
+            // Verify a non-patch RuntimeEvent acts as an exact causal barrier:
+            // [P21..P23, Status, P24..P25] -> 2 merged patch applications + 1 frame flush.
+            for step in 21..=23u64 {
+                let patch = WorkspacePatch::new(
+                    rev(step),
+                    vec![WorkspaceChange::TimelineChanged {
+                        target: TimelineTarget::Channel("C1".to_string()),
+                        changes: vec![MessageChange::Upsert(Box::new(SlackMessage {
+                            ts: format!("{step}.0"),
+                            text: Some(format!("pre-{step}")),
+                            ..Default::default()
+                        }))],
+                    }],
+                )
+                .unwrap();
+                sender
+                    .send(RuntimeEvent {
+                        meta: patch_meta(),
+                        kind: RuntimeEventKind::WorkspacePatch(patch),
+                    })
+                    .unwrap();
+            }
+            sender
+                .send(RuntimeEvent {
+                    meta: patch_meta(),
+                    kind: RuntimeEventKind::Status("Barrier synced".to_string()),
+                })
+                .unwrap();
+            for step in 24..=25u64 {
+                let patch = WorkspacePatch::new(
+                    rev(step),
+                    vec![WorkspaceChange::TimelineChanged {
+                        target: TimelineTarget::Channel("C1".to_string()),
+                        changes: vec![MessageChange::Upsert(Box::new(SlackMessage {
+                            ts: format!("{step}.0"),
+                            text: Some(format!("post-{step}")),
+                            ..Default::default()
+                        }))],
+                    }],
+                )
+                .unwrap();
+                sender
+                    .send(RuntimeEvent {
+                        meta: patch_meta(),
+                        kind: RuntimeEventKind::WorkspacePatch(patch),
+                    })
+                    .unwrap();
+            }
+
+            pump_until(5000, || {
+                window.imp().workspace.workspace_patch_revision() == rev(25)
+                    && window.imp().pending_ui_invalidations.borrow().is_empty()
+            });
+
+            assert_eq!(
+                window.imp().workspace_patch_applies.get(),
+                3,
+                "non-patch event must split surrounding patch runs into two merged applications"
+            );
+            assert_eq!(
+                window.imp().ui_invalidation_flushes.get(),
+                2,
+                "both segments in the same frame must share one UI invalidation flush"
+            );
+
+            drop(sender);
+            window.destroy();
+            pump(20);
+        });
+    }
+
+    #[test]
+    fn context_timeline_rerenders_when_merged_patch_leaves_base_operations_empty() {
+        run_gtk_test(|| {
+            use crate::models::SearchMessageLocation;
+            use crate::timeline::tests::{pump, pump_until};
+            use crate::workspace_pipeline::{MessageChange, TimelineTarget, WorkspaceChange};
+
+            crate::http_client::ensure_tls_crypto_provider();
+            ensure_test_window_resources();
+            let _ = adw::init();
+            sourceview5::init();
+
+            let window = glib::Object::new::<ConduitWindow>();
+            window.apply_workspace_lifecycle(WorkspaceLifecycleEvent::ConnectRequested);
+            window.apply_workspace_lifecycle(WorkspaceLifecycleEvent::Authenticated);
+            window.show_workspace(crate::models::AuthInfo {
+                team: Some("Test Workspace".to_string()),
+                user: Some("Test User".to_string()),
+                user_id: Some("UTEST".to_string()),
+                ..Default::default()
+            });
+            window.populate_conversations(vec![SlackConversation {
+                id: "C1".to_string(),
+                name: Some("general".to_string()),
+                is_channel: Some(true),
+                ..Default::default()
+            }]);
+
+            let make_msg = |ts: &str, text: &str| {
+                let mut msg = SlackMessage {
+                    ts: ts.to_string(),
+                    user: Some("UTEST".to_string()),
+                    text: Some(text.to_string()),
+                    ..Default::default()
+                };
+                msg.refresh_canonical_content();
+                msg
+            };
+            window.imp().workspace.view.borrow_mut().apply_history(
+                "C1",
+                vec![make_msg("100.0", "v1")],
+                false,
+                None,
+                false,
+                false,
+            );
+            window.apply_workspace_lifecycle(WorkspaceLifecycleEvent::SyncCompleted);
+            window.select_conversation("C1", "#general");
+            {
+                let location = SearchMessageLocation::new("C1", "100.0", None).unwrap();
+                let mut view = window.imp().workspace.view.borrow_mut();
+                assert!(view.focus_message(&location));
+                assert!(view.apply_message_context(
+                    &location,
+                    vec![std::sync::Arc::new(make_msg("100.0", "v0"))],
+                ));
+                assert!(view.has_channel_context("C1"));
+            }
+            window.set_default_size(960, 640);
+            window.present();
+
+            pump_until(5000, || {
+                window.imp().pending_ui_invalidations.borrow().is_empty()
+            });
+            pump(20);
+
+            let rev1 = WorkspaceRevision::INITIAL.successor();
+            let rev2 = rev1.successor();
+            let merged = WorkspacePatch::merge([
+                WorkspacePatch::new(
+                    rev1,
+                    vec![WorkspaceChange::TimelineChanged {
+                        target: TimelineTarget::Channel("C1".to_string()),
+                        changes: vec![MessageChange::Upsert(Box::new(make_msg("100.0", "v2")))],
+                    }],
+                )
+                .unwrap(),
+                WorkspacePatch::new(
+                    rev2,
+                    vec![WorkspaceChange::TimelineChanged {
+                        target: TimelineTarget::Channel("C1".to_string()),
+                        changes: vec![MessageChange::Upsert(Box::new(make_msg("100.0", "v1")))],
+                    }],
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+
+            // `history.messages` already holds "v1" so `operations` is empty, while
+            // `context_messages` updates from "v0" -> "v1" (`change.render() == true`).
+            window.apply_workspace_patch(&merged, 2);
+            assert!(
+                window
+                    .imp()
+                    .pending_ui_invalidations
+                    .borrow()
+                    .flags()
+                    .contains(UiInvalidations::MAIN),
+                "context-only timeline update with empty base operations must still queue MAIN"
+            );
+
+            pump_until(5000, || {
+                window.imp().pending_ui_invalidations.borrow().is_empty()
+            });
+            window.destroy();
+            pump(20);
         });
     }
 }

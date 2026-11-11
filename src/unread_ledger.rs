@@ -352,6 +352,25 @@ impl UnreadLedger {
         changed.dedup();
         changed
     }
+
+    /// Conversation IDs whose effective read state differs between `self` and
+    /// `other` (treating missing entries as [`ConversationReadState::default`]).
+    pub(crate) fn changed_channel_ids(&self, other: &Self) -> Vec<String> {
+        let default = ConversationReadState::default();
+        let mut changed = self
+            .states
+            .keys()
+            .chain(other.states.keys())
+            .filter(|channel_id| {
+                self.states.get(*channel_id).unwrap_or(&default)
+                    != other.states.get(*channel_id).unwrap_or(&default)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        changed.sort_unstable();
+        changed.dedup();
+        changed
+    }
 }
 
 #[cfg(test)]

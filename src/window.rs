@@ -19,7 +19,7 @@
  */
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
@@ -82,6 +82,7 @@ use crate::runtime::{
     RuntimeEventKind, RuntimeEventMeta, RuntimeFailure, RuntimeFailureCategory, RuntimeIdentity,
     RuntimeOperation, RuntimeTarget, SessionId, UploadAttachment,
 };
+use crate::runtime_mailbox::RuntimeEventReceiver;
 use crate::search::{CompletionCache, CompletionMatches, StampedCell};
 use crate::shortcuts::WINDOW_SHORTCUTS;
 use crate::sidebar::{
@@ -97,7 +98,7 @@ use crate::slack_link::{
 use crate::status_dialog::*;
 use crate::thread_pane::ThreadPane;
 use crate::timeline::cache::decode;
-use crate::workspace_pipeline::{TimelineTarget, WorkspaceRevision};
+use crate::workspace_pipeline::{TimelineTarget, WorkspacePatch, WorkspaceRevision};
 use crate::workspace_state::{
     ChannelLookupOutcome, ConversationOpenCoordinator, ConversationOpenIntent,
     ConversationOpenPosition, ConversationOpenRenderAction, ConversationPatchRemoval,
@@ -126,6 +127,12 @@ impl UiInvalidations {
     /// Image assets that arrived since the last flush
     /// (`imp::ConduitWindow::arrived_image_keys`).
     pub const IMAGES: Self = Self(1 << 10);
+    /// Incremental sidebar conversation row updates (`PendingUiInvalidations`).
+    pub const SIDEBAR_ROWS: Self = Self(1 << 11);
+    /// Unread mention and reaction count on the Activity rail button.
+    pub const ACTIVITY_BADGE: Self = Self(1 << 12);
+    /// Unread followed-thread count on the Threads rail button.
+    pub const THREADS_BADGE: Self = Self(1 << 13);
 
     pub fn contains(self, invalidation: Self) -> bool {
         self.0 & invalidation.0 != 0
@@ -157,6 +164,87 @@ impl std::ops::BitOr for UiInvalidations {
 
     fn bitor(self, rhs: Self) -> Self::Output {
         Self(self.0 | rhs.0)
+    }
+}
+
+/// Coalesced per-frame UI invalidation flags and incremental sidebar row IDs.
+///
+/// Keeps `SIDEBAR` and `SIDEBAR_ROWS` mutually exclusive so a full sidebar
+/// rebuild always supersedes and clears dirty row IDs.
+#[derive(Debug, Default)]
+struct PendingUiInvalidations {
+    flags: UiInvalidations,
+    dirty_sidebar_conversation_ids: BTreeSet<String>,
+}
+
+impl PendingUiInvalidations {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.flags.is_empty()
+    }
+
+    #[cfg(test)]
+    fn flags(&self) -> UiInvalidations {
+        self.flags
+    }
+
+    #[cfg(test)]
+    fn dirty_sidebar_conversation_ids(&self) -> &BTreeSet<String> {
+        &self.dirty_sidebar_conversation_ids
+    }
+
+    fn queue(&mut self, mut invalidations: UiInvalidations) -> bool {
+        if invalidations.contains(UiInvalidations::SIDEBAR) {
+            invalidations.remove(UiInvalidations::SIDEBAR_ROWS);
+            self.flags.remove(UiInvalidations::SIDEBAR_ROWS);
+            self.dirty_sidebar_conversation_ids.clear();
+        } else if self.flags.contains(UiInvalidations::SIDEBAR) {
+            invalidations.remove(UiInvalidations::SIDEBAR_ROWS);
+        }
+        if invalidations.is_empty() {
+            return false;
+        }
+        self.flags.insert(invalidations);
+        true
+    }
+
+    fn queue_sidebar_rows(&mut self, channel_ids: &[String]) -> bool {
+        if channel_ids.is_empty() || self.flags.contains(UiInvalidations::SIDEBAR) {
+            return false;
+        }
+        self.dirty_sidebar_conversation_ids
+            .extend(channel_ids.iter().cloned());
+        self.flags.insert(UiInvalidations::SIDEBAR_ROWS);
+        true
+    }
+
+    fn clear_flags(&mut self, flags: UiInvalidations) {
+        self.flags.remove(flags);
+        if flags.contains(UiInvalidations::SIDEBAR) || flags.contains(UiInvalidations::SIDEBAR_ROWS)
+        {
+            self.dirty_sidebar_conversation_ids.clear();
+        }
+    }
+
+    fn take(&mut self) -> (UiInvalidations, Vec<String>) {
+        let flags = self.flags.take();
+        let dirty_ids = if flags.contains(UiInvalidations::SIDEBAR) {
+            self.dirty_sidebar_conversation_ids.clear();
+            Vec::new()
+        } else if flags.contains(UiInvalidations::SIDEBAR_ROWS) {
+            std::mem::take(&mut self.dirty_sidebar_conversation_ids)
+                .into_iter()
+                .collect()
+        } else {
+            self.dirty_sidebar_conversation_ids.clear();
+            Vec::new()
+        };
+        (flags, dirty_ids)
+    }
+
+    fn reset(&mut self) {
+        self.flags = UiInvalidations::default();
+        self.dirty_sidebar_conversation_ids.clear();
     }
 }
 
@@ -510,7 +598,14 @@ mod imp {
         pub(super) composer_cap_pending: Cell<bool>,
         pub(super) thread_attachments: RefCell<Vec<ComposerAttachmentDraft>>,
         pub(super) message_edit: RefCell<Option<MessageEditState>>,
-        pub(super) pending_ui_invalidations: Cell<UiInvalidations>,
+        pub(super) pending_ui_invalidations: RefCell<PendingUiInvalidations>,
+        pub(super) ui_flush_scheduled: Cell<bool>,
+        #[cfg(test)]
+        pub(super) workspace_patch_applies: Cell<usize>,
+        #[cfg(test)]
+        pub(super) workspace_timeline_projections: Cell<usize>,
+        #[cfg(test)]
+        pub(super) ui_invalidation_flushes: Cell<usize>,
         pub(super) native_timeline_view:
             RefCell<Option<crate::timeline_message_widget::NativeTimelineView>>,
         pub(super) sidebar_projection: RefCell<SidebarProjection>,
@@ -663,7 +758,7 @@ mod imp {
                         )],
                     )
                     .expect("test bootstrap patch should contain workspace data");
-                    obj.apply_workspace_patch(&bootstrap_patch);
+                    obj.apply_workspace_patch(&bootstrap_patch, 1);
                 } else {
                     obj.populate_conversations(test_conversations);
                     obj.populate_user_names(
@@ -2271,6 +2366,52 @@ fn runtime_event_is_start_failure(event: &RuntimeEvent) -> bool {
     matches!(event.kind, RuntimeEventKind::RuntimeStartFailed(_))
 }
 
+enum DrainedRuntimeEvent {
+    Single(RuntimeEvent),
+    CoalescedWorkspacePatch {
+        meta: RuntimeEventMeta,
+        merged: Option<WorkspacePatch>,
+        patch_count: usize,
+    },
+}
+
+fn coalesce_runtime_event(
+    event: RuntimeEvent,
+    accepted: bool,
+    base_revision: WorkspaceRevision,
+    events: &mut RuntimeEventReceiver,
+    patch_batch: &mut Vec<WorkspacePatch>,
+) -> DrainedRuntimeEvent {
+    if !accepted || event.meta.request.is_some() {
+        return DrainedRuntimeEvent::Single(event);
+    }
+    let RuntimeEvent {
+        meta,
+        kind: RuntimeEventKind::WorkspacePatch(first_patch),
+    } = event
+    else {
+        return DrainedRuntimeEvent::Single(event);
+    };
+    patch_batch.clear();
+    events.drain_workspace_patches(meta.session, patch_batch);
+    if patch_batch.is_empty() {
+        return DrainedRuntimeEvent::Single(RuntimeEvent {
+            meta,
+            kind: RuntimeEventKind::WorkspacePatch(first_patch),
+        });
+    }
+    let patch_count = 1 + patch_batch.len();
+    let merged = WorkspacePatch::merge_after(
+        base_revision,
+        std::iter::once(first_patch).chain(patch_batch.drain(..)),
+    );
+    DrainedRuntimeEvent::CoalescedWorkspacePatch {
+        meta,
+        merged,
+        patch_count,
+    }
+}
+
 fn message_notification_body(
     message: Option<&SlackMessage>,
     user_names: &HashMap<String, String>,
@@ -3758,20 +3899,24 @@ impl ConduitWindow {
 
     fn setup_runtime(&self) {
         let imp = self.imp();
-        let (runtime, mut events) = AppRuntime::start();
+        let (runtime, events) = AppRuntime::start();
 
-        *imp.runtime.borrow_mut() = Some(runtime.clone());
+        *imp.runtime.borrow_mut() = Some(runtime);
+        self.spawn_runtime_event_loop(events, true);
+    }
 
+    fn spawn_runtime_event_loop(&self, mut events: RuntimeEventReceiver, report_stop_error: bool) {
         let weak_window = self.downgrade();
         glib::spawn_future_local(async move {
             let mut startup_failed = false;
             let mut events_since_yield = 0_usize;
+            let mut patch_batch = Vec::new();
             while let Some(event) = events.recv().await {
                 let Some(window) = weak_window.upgrade() else {
                     return;
                 };
                 startup_failed |= runtime_event_is_start_failure(&event);
-                window.handle_runtime_event(event);
+                window.handle_drained_runtime_event(event, &mut events, &mut patch_batch);
                 events_since_yield += 1;
                 if events_since_yield >= UI_EVENT_BATCH_LIMIT {
                     events_since_yield = 0;
@@ -3780,13 +3925,66 @@ impl ConduitWindow {
                     glib::timeout_future(Duration::from_millis(1)).await;
                 }
             }
-            if !startup_failed {
+            if report_stop_error && !startup_failed {
                 let Some(window) = weak_window.upgrade() else {
                     return;
                 };
                 window.show_session_error("Background runtime stopped");
             }
         });
+    }
+
+    fn handle_drained_runtime_event(
+        &self,
+        event: RuntimeEvent,
+        events: &mut RuntimeEventReceiver,
+        patch_batch: &mut Vec<WorkspacePatch>,
+    ) {
+        if !self.imp().request_coordinator.borrow().accepts(&event.meta) {
+            crate::debug::log(
+                "ui",
+                &format!(
+                    "RuntimeEventIgnored reason=stale session={:?} request={:?} operation={:?}",
+                    event.meta.session, event.meta.request, event.meta.context.operation
+                ),
+            );
+            return;
+        }
+        let base_revision = self.imp().workspace.workspace_patch_revision();
+        match coalesce_runtime_event(event, true, base_revision, events, patch_batch) {
+            DrainedRuntimeEvent::Single(event) => self.handle_runtime_event(event, 1),
+            DrainedRuntimeEvent::CoalescedWorkspacePatch {
+                meta,
+                merged: Some(patch),
+                patch_count,
+            } => self.handle_runtime_event(
+                RuntimeEvent {
+                    meta,
+                    kind: RuntimeEventKind::WorkspacePatch(patch),
+                },
+                patch_count,
+            ),
+            DrainedRuntimeEvent::CoalescedWorkspacePatch {
+                meta,
+                merged: None,
+                patch_count,
+            } => {
+                let started = Instant::now();
+                crate::debug::log(
+                    "ui",
+                    &format!(
+                        "WorkspacePatchIgnored reason=stale revision={} coalesced={patch_count}",
+                        base_revision.value()
+                    ),
+                );
+                log_performance(started, |elapsed_ms| {
+                    format!(
+                        "runtime_event operation={:?} coalesced={patch_count} elapsed_ms={:.2}",
+                        meta.context.operation, elapsed_ms
+                    )
+                });
+            }
+        }
     }
 
     fn handle_timeline_action(&self, action: crate::timeline_message_widget::TimelineAction) {
@@ -5059,7 +5257,7 @@ impl ConduitWindow {
     }
 
     fn setup_settings(&self) {
-        let settings = gio::Settings::new(config::APPLICATION_ID);
+        let settings = load_application_settings();
         self.restore_window_state(&settings);
         *self.imp().drafts.borrow_mut() = DraftSettings::new(settings.clone()).load();
         let (workspace_id, channel_id) = settings
@@ -7812,19 +8010,9 @@ impl ConduitWindow {
         glib::Propagation::Stop
     }
 
-    fn handle_runtime_event(&self, event: RuntimeEvent) {
+    fn handle_runtime_event(&self, event: RuntimeEvent, coalesced_patches: usize) {
         let started = Instant::now();
         let RuntimeEvent { meta, kind } = event;
-        if !self.imp().request_coordinator.borrow().accepts(&meta) {
-            crate::debug::log(
-                "ui",
-                &format!(
-                    "RuntimeEventIgnored reason=stale session={:?} request={:?} operation={:?}",
-                    meta.session, meta.request, meta.context.operation
-                ),
-            );
-            return;
-        }
 
         match kind {
             RuntimeEventKind::WorkspaceLifecycle(event) => {
@@ -7853,7 +8041,7 @@ impl ConduitWindow {
                 }
             }
             RuntimeEventKind::WorkspacePatch(patch) => {
-                self.apply_workspace_patch(&patch);
+                self.apply_workspace_patch(&patch, coalesced_patches);
             }
             RuntimeEventKind::ConversationsSynchronized => {
                 if !self.imp().connect_requested.get() {
@@ -8474,21 +8662,35 @@ impl ConduitWindow {
             }
         }
         log_performance(started, |elapsed_ms| {
-            format!(
-                "runtime_event operation={:?} elapsed_ms={:.2}",
-                meta.context.operation, elapsed_ms
-            )
+            if coalesced_patches > 1 {
+                format!(
+                    "runtime_event operation={:?} coalesced={coalesced_patches} elapsed_ms={:.2}",
+                    meta.context.operation, elapsed_ms
+                )
+            } else {
+                format!(
+                    "runtime_event operation={:?} elapsed_ms={:.2}",
+                    meta.context.operation, elapsed_ms
+                )
+            }
         });
     }
 
     fn queue_ui_invalidations(&self, invalidations: UiInvalidations) {
-        let mut pending = self.imp().pending_ui_invalidations.get();
-        let should_schedule = pending.insert(invalidations);
-        self.imp().pending_ui_invalidations.set(pending);
-        if !should_schedule {
+        if self
+            .imp()
+            .pending_ui_invalidations
+            .borrow_mut()
+            .queue(invalidations)
+        {
+            self.schedule_ui_invalidation_flush();
+        }
+    }
+
+    fn schedule_ui_invalidation_flush(&self) {
+        if self.imp().ui_flush_scheduled.replace(true) {
             return;
         }
-
         let weak_window = self.downgrade();
         self.add_tick_callback(move |_, _| {
             if let Some(window) = weak_window.upgrade() {
@@ -8505,6 +8707,18 @@ impl ConduitWindow {
         self.queue_ui_invalidations(UiInvalidations::SIDEBAR);
     }
 
+    /// Coalesces incremental sidebar row updates into the next frame flush.
+    fn queue_changed_conversations(&self, channel_ids: &[String]) {
+        if self
+            .imp()
+            .pending_ui_invalidations
+            .borrow_mut()
+            .queue_sidebar_rows(channel_ids)
+        {
+            self.schedule_ui_invalidation_flush();
+        }
+    }
+
     /// Queues the sidebar render after a main-view switch. The navigation
     /// toggle group, composer visibility and back button are cheap and give
     /// immediate feedback, so they stay synchronous; only the expensive
@@ -8515,9 +8729,16 @@ impl ConduitWindow {
     }
 
     fn flush_ui_invalidations(&self) {
-        let mut pending = self.imp().pending_ui_invalidations.get();
-        let mut invalidations = pending.take();
-        self.imp().pending_ui_invalidations.set(pending);
+        self.imp().ui_flush_scheduled.set(false);
+        let (mut invalidations, dirty_sidebar_ids) =
+            self.imp().pending_ui_invalidations.borrow_mut().take();
+        if invalidations.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        self.imp()
+            .ui_invalidation_flushes
+            .set(self.imp().ui_invalidation_flushes.get() + 1);
         let started = Instant::now();
 
         if invalidations.contains(UiInvalidations::IMAGES) {
@@ -8525,8 +8746,18 @@ impl ConduitWindow {
             invalidations.insert(self.apply_arrived_images(&keys));
         }
 
-        if invalidations.contains(UiInvalidations::SIDEBAR) {
+        let mut full_sidebar = invalidations.contains(UiInvalidations::SIDEBAR);
+        if !full_sidebar && invalidations.contains(UiInvalidations::SIDEBAR_ROWS) {
+            full_sidebar = !self.render_changed_conversations(&dirty_sidebar_ids);
+        }
+        if full_sidebar {
             self.render_conversations();
+        }
+        if invalidations.contains(UiInvalidations::ACTIVITY_BADGE) {
+            self.refresh_activity_badge();
+        }
+        if invalidations.contains(UiInvalidations::THREADS_BADGE) {
+            self.refresh_threads_badge();
         }
         if invalidations.contains(UiInvalidations::PICKER) {
             self.refresh_open_conversation_picker();
@@ -10325,6 +10556,8 @@ impl ConduitWindow {
         imp.pending_status_update.borrow_mut().take();
         imp.huddle_revealer.set_reveal_child(false);
         imp.workspace.reset();
+        imp.pending_ui_invalidations.borrow_mut().reset();
+        imp.ui_flush_scheduled.set(false);
         imp.activity_refresh.set(PickerRefreshGate::default());
         if let Some(view) = self.activity_view() {
             view.show_rows(Vec::new(), &MessageRenderContext::default());
@@ -10459,6 +10692,10 @@ impl ConduitWindow {
     /// Unread-thread count on the Threads rail button: followed threads with
     /// unread replies.
     fn refresh_threads_badge(&self) {
+        self.imp()
+            .pending_ui_invalidations
+            .borrow_mut()
+            .clear_flags(UiInvalidations::THREADS_BADGE);
         let unread = {
             let view = self.imp().workspace.view.borrow();
             self.imp()
@@ -10554,7 +10791,7 @@ impl ConduitWindow {
     /// The feed changed: update the rail badge, refresh the list and, unless
     /// the change just came from the store, persist it shortly after.
     fn activity_changed(&self, persist: bool) {
-        self.refresh_activity_badge();
+        self.queue_ui_invalidations(UiInvalidations::ACTIVITY_BADGE);
         self.queue_activity_refresh();
         if persist && !self.imp().activity_save_pending.replace(true) {
             let weak_window = self.downgrade();
@@ -10622,6 +10859,9 @@ impl ConduitWindow {
     /// Unread mention and reaction items on the Activity rail button.
     fn refresh_activity_badge(&self) {
         let imp = self.imp();
+        imp.pending_ui_invalidations
+            .borrow_mut()
+            .clear_flags(UiInvalidations::ACTIVITY_BADGE);
         let unread = activity::badge_count(
             &imp.workspace.activity.borrow(),
             &imp.workspace.read_states.borrow(),
@@ -11211,7 +11451,8 @@ impl ConduitWindow {
         self.set_sidebar_error(error);
     }
 
-    fn apply_workspace_patch(&self, patch: &crate::workspace_pipeline::WorkspacePatch) {
+    fn apply_workspace_patch(&self, patch: &WorkspacePatch, merged_patches: usize) {
+        let started = Instant::now();
         let selected_before = self.selected_channel_id();
         let pending_before = self.imp().pending_last_conversation.borrow().clone();
         let revision = patch.revision();
@@ -11226,11 +11467,15 @@ impl ConduitWindow {
             );
             return;
         };
-        if application.users_reset() || !application.changed_user_ids().is_empty() {
-            self.sync_workspace_user_projection(
-                application.users_reset(),
-                application.changed_user_ids(),
-            );
+        #[cfg(test)]
+        self.imp()
+            .workspace_patch_applies
+            .set(self.imp().workspace_patch_applies.get() + 1);
+        if application.users_reset()
+            || !application.changed_user_ids().is_empty()
+            || !application.projected_user_ids().is_empty()
+        {
+            self.sync_workspace_user_projection(application.projected_user_ids());
         }
         if !application.timeline_changes().is_empty() {
             self.apply_workspace_timeline_projection(revision, application.timeline_changes());
@@ -11273,12 +11518,12 @@ impl ConduitWindow {
             }
         }
         if !application.read_state_changed_ids().is_empty() || application.conversation_reset() {
-            self.refresh_activity_badge();
+            self.queue_ui_invalidations(UiInvalidations::ACTIVITY_BADGE);
             self.queue_activity_refresh();
         }
-        if !application.read_state_changed_ids().is_empty() && !application.conversation_reset() {
-            if !self.render_changed_conversations(application.read_state_changed_ids()) {
-                self.queue_sidebar_render();
+        if !application.read_state_changed_ids().is_empty() {
+            if !application.conversation_reset() {
+                self.queue_changed_conversations(application.read_state_changed_ids());
             }
             // Only the visible channel's read state moves its "New" line.
             let visible_changed = self
@@ -11289,12 +11534,11 @@ impl ConduitWindow {
             }
         }
         if application.thread_catalog_changed() {
-            self.refresh_threads_badge();
             self.queue_activity_refresh();
             // Sidebar thread sub-rows ("Thread (N responses) (M unread)")
             // are derived from the thread catalog independently of which
             // main view is active, so they need their own invalidation here.
-            let mut invalidations = UiInvalidations::SIDEBAR;
+            let mut invalidations = UiInvalidations::SIDEBAR | UiInvalidations::THREADS_BADGE;
             if self.current_main_view() == MainMessageView::Threads {
                 invalidations.insert(UiInvalidations::MAIN);
             }
@@ -11303,32 +11547,20 @@ impl ConduitWindow {
             }
             self.queue_ui_invalidations(invalidations);
         }
+        let timeline_count = application.timeline_changes().len();
+        log_performance(started, |elapsed_ms| {
+            format!(
+                "workspace_patch_apply patches={merged_patches} changes={} timelines={timeline_count} elapsed_ms={:.2}",
+                patch.changes().len(),
+                elapsed_ms
+            )
+        });
     }
 
-    fn sync_workspace_user_projection(&self, reset: bool, changed_user_ids: &[String]) {
-        let imp = self.imp();
-        let directory = &imp.workspace.user_directory;
-        // `changed_user_ids` are exactly the added, changed or (on a reset)
-        // removed users, so the projection work scales with the change, not
-        // with the directory. A reset replaces values a user lacks.
-        let affected_user_ids = {
-            let users = imp.workspace.users.borrow();
-            let (present, removed): (Vec<_>, Vec<_>) = changed_user_ids
-                .iter()
-                .partition(|user_id| users.contains_key(*user_id));
-            let mut affected =
-                directory.project_users(present.iter().filter_map(|id| users.get(*id)), reset);
-            if reset {
-                let removed = removed.into_iter().cloned().collect::<Vec<_>>();
-                affected.extend(directory.remove_users(&removed));
-            }
-            let mut pending = directory.pending_user_ids.borrow_mut();
-            for user_id in changed_user_ids {
-                pending.remove(user_id);
-            }
-            affected
-        };
-        // Expiry scheduling reads the status map, so all projection borrows must be released first.
+    fn sync_workspace_user_projection(&self, affected_user_ids: &[String]) {
+        // `WorkspaceSessionState::apply_workspace_patch` already updated
+        // `user_directory` at each reset (`replace = true`) and partial upsert
+        // (`replace = false`); only surface invalidation and expiry remain.
         self.schedule_status_expiry();
         self.update_huddle_surface();
         if !affected_user_ids.is_empty() {
@@ -11338,10 +11570,8 @@ impl ConduitWindow {
                 self.refresh_composer_mention_names(target);
             }
             self.invalidate_composer_completions();
-            let mut affected_user_ids = affected_user_ids.into_iter().collect::<Vec<_>>();
-            affected_user_ids.sort();
-            self.patch_users_on_timelines(&affected_user_ids);
-            self.queue_user_projection_invalidations(&affected_user_ids);
+            self.patch_users_on_timelines(affected_user_ids);
+            self.queue_user_projection_invalidations(affected_user_ids);
         }
         self.flush_pending_message_notifications();
     }
@@ -11376,10 +11606,14 @@ impl ConduitWindow {
         _revision: WorkspaceRevision,
         changes: &[TimelineProjectionApplication],
     ) {
+        #[cfg(test)]
+        self.imp()
+            .workspace_timeline_projections
+            .set(self.imp().workspace_timeline_projections.get() + 1);
         let mut refresh_derived_view = false;
         for change in changes {
             refresh_derived_view |= change.derived_view_changed();
-            if !change.render() || change.operations().is_empty() {
+            if !change.render() {
                 continue;
             }
             let (surface, channel_id, has_context, fallback) = match change.target() {
@@ -11409,6 +11643,9 @@ impl ConduitWindow {
             };
             if has_context {
                 self.queue_ui_invalidations(fallback);
+                continue;
+            }
+            if change.operations().is_empty() {
                 continue;
             }
 
@@ -11511,8 +11748,10 @@ impl ConduitWindow {
         self.invalidate_composer_completions();
         *self.imp().sidebar_error.borrow_mut() = None;
         self.request_changed_conversation_user_names(changed_channel_ids);
-        if structure_changed || !self.render_changed_conversations(changed_channel_ids) {
+        if structure_changed {
             self.queue_sidebar_render();
+        } else {
+            self.queue_changed_conversations(changed_channel_ids);
         }
         if self.selected_channel_id().as_ref().is_some_and(|selected| {
             changed_channel_ids
@@ -11837,9 +12076,10 @@ impl ConduitWindow {
         let started = Instant::now();
         // This render covers any queued sidebar flush, so drop it rather than
         // rebuilding the same rows again on the next tick.
-        let mut pending = self.imp().pending_ui_invalidations.get();
-        pending.remove(UiInvalidations::SIDEBAR);
-        self.imp().pending_ui_invalidations.set(pending);
+        self.imp()
+            .pending_ui_invalidations
+            .borrow_mut()
+            .clear_flags(UiInvalidations::SIDEBAR | UiInvalidations::SIDEBAR_ROWS);
         self.sync_workspace_chrome();
         let thread_summaries = self.unread_thread_summaries();
         let unread_thread_channel_ids = thread_summaries
@@ -15572,6 +15812,57 @@ fn update_huddle_device_picker(
     picker.dropdown.set_model(Some(&model));
     picker.dropdown.set_selected(selected);
     picker.updating.set(false);
+}
+
+#[cfg(not(test))]
+fn load_application_settings() -> gio::Settings {
+    gio::Settings::new(config::APPLICATION_ID)
+}
+
+#[cfg(test)]
+fn load_application_settings() -> gio::Settings {
+    thread_local! {
+        static TEST_SCHEMA: std::cell::OnceCell<gio::SettingsSchema> = const { std::cell::OnceCell::new() };
+    }
+    TEST_SCHEMA.with(|cell| {
+        let schema = cell.get_or_init(|| {
+            if let Some(schema) = gio::SettingsSchemaSource::default()
+                .and_then(|s| s.lookup(config::APPLICATION_ID, true))
+            {
+                return schema;
+            }
+            let dir = std::env::temp_dir().join(format!(
+                "conduit-test-schema-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("create test schema dir");
+            let schema_src = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("data")
+                .join("eu.vanadrighem.conduit.gschema.xml");
+            std::fs::copy(&schema_src, dir.join("eu.vanadrighem.conduit.gschema.xml"))
+                .expect("copy gschema xml");
+            let status = std::process::Command::new("glib-compile-schemas")
+                .arg(&dir)
+                .status()
+                .expect("run glib-compile-schemas");
+            assert!(status.success(), "glib-compile-schemas failed");
+            let source = gio::SettingsSchemaSource::from_directory(
+                &dir,
+                gio::SettingsSchemaSource::default().as_ref(),
+                false,
+            )
+            .expect("load compiled test schema source");
+            let _ = std::fs::remove_dir_all(&dir);
+            source
+                .lookup(config::APPLICATION_ID, true)
+                .expect("lookup conduit test schema")
+        });
+        gio::Settings::new_full(schema, Some(&gio::memory_settings_backend_new()), None)
+    })
 }
 
 #[cfg(test)]
