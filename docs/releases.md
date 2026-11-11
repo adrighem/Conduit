@@ -64,7 +64,7 @@ Flathub onboarding is deliberately not automated here. It requires a separate ma
    git clone --branch=new-pr git@github.com:adrighem/flathub.git && cd flathub
    git checkout -b add-conduit new-pr
    ```
-3. Copy `packaging/flatpak/flathub/eu.vanadrighem.conduit.json` and `packaging/flatpak/flathub/cargo-sources.json` to root of branch.
+3. Update `packaging/flatpak/flathub/eu.vanadrighem.conduit.json` (`url` and `sha256`) to the published release tag archive (`v<version>.tar.gz`), regenerate `packaging/flatpak/flathub/cargo-sources.json` from that tag's `Cargo.lock` (or copy `packaging/flatpak/cargo-sources.json` when `Cargo.lock` matches the tag), and copy both files to the root of the `flathub` branch.
 4. Verify local build:
    ```sh
    flatpak-builder --force-clean --user --install-deps-from=flathub build-dir eu.vanadrighem.conduit.json

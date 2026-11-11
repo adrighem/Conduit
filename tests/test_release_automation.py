@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 
+import copy
 import json
 import re
+import shutil
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from typing import Any
 from xml.etree import ElementTree
 
 
@@ -42,6 +46,10 @@ RELEASE_PR_FILES = {
     f"data/{APP_ID}.metainfo.xml.in",
     "meson.build",
 }
+FLATPAK_CARGO_SOURCES_PATHS = (
+    "packaging/flatpak/cargo-sources.json",
+    "packaging/flatpak/flathub/cargo-sources.json",
+)
 
 
 def read(path: str) -> str:
@@ -203,9 +211,8 @@ def test_release_versions_are_synchronized() -> None:
     manifest = json.loads(read(".release-please-manifest.json"))
     cargo = tomllib.loads(read("Cargo.toml"))
     meson = read("meson.build")
-    metainfo = ElementTree.parse(
-        ROOT / "data" / f"{APP_ID}.metainfo.xml.in"
-    ).getroot()
+    metainfo_text = read(f"data/{APP_ID}.metainfo.xml.in")
+    metainfo = ElementTree.fromstring(metainfo_text)
 
     assert config["release-type"] == "rust"
     assert config["include-component-in-tag"] is False
@@ -219,17 +226,53 @@ def test_release_versions_are_synchronized() -> None:
         f"data/{APP_ID}.metainfo.xml.in",
     }
     assert "x-release-please-version" in meson
-    assert "x-release-please-version-date" in read(
-        f"data/{APP_ID}.metainfo.xml.in"
-    )
+    assert "x-release-please-version-date" in metainfo_text
 
     meson_version = re.search(r"version:\s*'([^']+)'", meson)
     appstream_release = metainfo.find("./releases/release")
+    screenshot_images = metainfo.findall("./screenshots/screenshot/image")
     assert meson_version is not None
     assert appstream_release is not None
-    assert cargo["package"]["version"] == meson_version.group(1)
-    assert cargo["package"]["version"] == appstream_release.attrib["version"]
-    assert manifest == {".": cargo["package"]["version"]}
+    assert screenshot_images
+    version = cargo["package"]["version"]
+    assert version == meson_version.group(1)
+    assert version == appstream_release.attrib["version"]
+
+    expected_release_url = f"https://github.com/adrighem/Conduit/releases/tag/v{version}"
+    assert appstream_release.findtext("url") == expected_release_url
+    release_url_lines = [
+        line for line in metainfo_text.splitlines() if 'type="details"' in line
+    ]
+    assert len(release_url_lines) == 1
+    assert expected_release_url in release_url_lines[0]
+    assert "</url>" in release_url_lines[0]
+    assert "x-release-please-version" in release_url_lines[0]
+    first_url_semver = re.search(r"\d+\.\d+\.\d+", release_url_lines[0])
+    assert first_url_semver is not None and first_url_semver.group(0) == version
+
+    raw_prefix = f"https://raw.githubusercontent.com/adrighem/Conduit/v{version}/"
+    for image in screenshot_images:
+        assert image.text is not None
+        assert image.text == image.text.strip()
+        assert image.text.startswith(raw_prefix)
+        relative_path = image.text.removeprefix(raw_prefix)
+        assert not relative_path.startswith("/")
+        assert ".." not in Path(relative_path).parts
+        assert relative_path.endswith(".png")
+        assert (ROOT / relative_path).is_file(), (
+            f"AppStream screenshot {relative_path!r} does not exist"
+        )
+    image_lines = [
+        line for line in metainfo_text.splitlines() if re.search(r"<image\b", line)
+    ]
+    assert len(image_lines) == len(screenshot_images)
+    for line in image_lines:
+        assert "</image>" in line
+        assert raw_prefix in line
+        assert "x-release-please-version" in line
+        first_semver = re.search(r"\d+\.\d+\.\d+", line)
+        assert first_semver is not None and first_semver.group(0) == version
+    assert manifest == {".": version}
 
 
 def test_rust_toolchain_is_pinned_across_local_ci_and_release() -> None:
@@ -248,21 +291,41 @@ def test_rust_toolchain_is_pinned_across_local_ci_and_release() -> None:
 
 def test_local_meson_suite_enforces_strict_rust_lints() -> None:
     rust_build = read("src/meson.build")
-    assert "test('Rust strict lints'" in rust_build
-    assert "'clippy'," in rust_build
-    assert "'--locked'," in rust_build
-    assert "'--all-targets'," in rust_build
-    assert "cargo_clippy_args += ['--features', cargo_features_arg]" in rust_build
-    assert "'-D', 'warnings'" in rust_build
-    assert "suite: 'rust-lint'" in rust_build
+    clippy_section = rust_build.split("if cargo_clippy_compatible", maxsplit=1)[1]
+    lint_test = clippy_section.split("test('Rust strict lints'", maxsplit=1)[1]
+    assert "'clippy'," in clippy_section
+    assert "'--locked'," in clippy_section
+    assert "'--all-targets'," in clippy_section
+    assert "cargo_clippy_args += ['--features', cargo_features_arg]" in clippy_section
+    assert "'-D', 'warnings'" in clippy_section
+    assert "args: cargo_clippy_args," in lint_test
+    assert "suite: 'rust-lint'" in lint_test
 
 
 def test_local_meson_suite_enforces_rust_formatting() -> None:
     rust_build = read("src/meson.build")
-    assert "test('Rust formatting'" in rust_build
-    assert "'fmt'," in rust_build
-    assert "'--check'," in rust_build
-    assert "suite: 'rust'" in rust_build
+    fmt_test = rust_build.split("test('Rust formatting'", maxsplit=1)[1].split(
+        "\n)", maxsplit=1
+    )[0]
+    assert "'fmt'," in fmt_test
+    assert "'--check'," in fmt_test
+    assert "suite: 'rust-lint'" in fmt_test
+
+    assert "--no-suite rust-lint" in read("packaging/debian/rules")
+    assert "--no-suite rust-lint" in read("packaging/rpm/conduit.spec")
+    if BUILD_ROOT is not None:
+        configured_tests = json.loads(
+            (BUILD_ROOT / "meson-info" / "intro-tests.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fmt_entries = [
+            entry for entry in configured_tests if entry["name"] == "Rust formatting"
+        ]
+        assert len(fmt_entries) == 1
+        assert "conduit:rust-lint" in fmt_entries[0]["suite"]
+        assert "fmt" in fmt_entries[0]["cmd"]
+        assert "--check" in fmt_entries[0]["cmd"]
 
 
 def test_cargo_build_depends_on_compiled_resources() -> None:
@@ -493,24 +556,34 @@ def test_release_packages_disable_nonproduction_features() -> None:
     assert_headless_tests_disabled(rpm_build, "RPM package")
 
 
-def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
-    manifest = json.loads(read(f"packaging/flatpak/{APP_ID}.json"))
+def find_conduit_module(
+    manifest: dict[str, Any], manifest_path: str
+) -> dict[str, Any]:
+    conduit_modules = [
+        module for module in manifest["modules"] if module.get("name") == "conduit"
+    ]
+    assert len(conduit_modules) == 1, f"{manifest_path} has no conduit module"
+    return conduit_modules[0]
+
+
+def assert_flatpak_manifest_safety(
+    manifest_path: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    manifest: dict[str, Any] = json.loads(read(manifest_path))
 
     assert manifest["id"] == APP_ID
     assert manifest["runtime"] == "org.gnome.Platform"
     assert manifest["runtime-version"] == "50"
     assert manifest["command"] == "conduit"
     assert "--socket=pulseaudio" not in manifest["finish-args"]
+    assert "--filesystem=xdg-download:ro" not in manifest["finish-args"]
     assert not any(
         argument == "--env=RUST_LOG"
         or argument.startswith("--env=RUST_LOG=")
         for argument in manifest["finish-args"]
     )
 
-    conduit = next(
-        module for module in manifest["modules"] if module["name"] == "conduit"
-    )
-    assert conduit["sources"][0] == {"type": "dir", "path": "../.."}
+    conduit = find_conduit_module(manifest, manifest_path)
     assert "cargo-sources.json" in conduit["sources"]
     assert any(
         source.get("type") == "shell"
@@ -519,34 +592,137 @@ def test_release_flatpak_uses_current_checkout_without_debug_logging() -> None:
         if isinstance(source, dict)
     )
     assert "--libdir=lib" in conduit["config-opts"]
-    assert_native_media_disabled(conduit["config-opts"], "Flatpak package")
-    assert_headless_tests_disabled(conduit["config-opts"], "Flatpak package")
+    assert "--buildtype=release" in conduit["config-opts"]
+    assert (
+        conduit.get("build-options", {}).get("env", {}).get("CARGO_NET_OFFLINE")
+        == "true"
+    )
+    assert_native_media_disabled(conduit["config-opts"], manifest_path)
+    assert_headless_tests_disabled(conduit["config-opts"], manifest_path)
     for scope in (manifest, *manifest["modules"]):
-        environment = scope.get("build-options", {}).get("env", {})
+        build_options = scope.get("build-options", {})
+        environment = build_options.get("env", {})
+        build_args = build_options.get("build-args", [])
         assert "RUST_LOG" not in environment
+        assert "--share=network" not in build_args
+    return manifest, conduit
+
+
+def test_release_and_flathub_flatpak_manifests_are_hardened() -> None:
+    release_manifest, conduit = assert_flatpak_manifest_safety(
+        f"packaging/flatpak/{APP_ID}.json"
+    )
+    assert conduit["sources"][0] == {"type": "dir", "path": "../.."}
+
+    flathub_manifest, flathub_conduit = assert_flatpak_manifest_safety(
+        f"packaging/flatpak/flathub/{APP_ID}.json"
+    )
+    archive = flathub_conduit["sources"][0]
+    assert archive["type"] == "archive"
+    assert re.fullmatch(
+        r"https://github\.com/adrighem/Conduit/archive/refs/tags/v\d+\.\d+\.\d+\.tar\.gz",
+        archive["url"],
+    )
+    assert re.fullmatch(r"[0-9a-f]{64}", archive["sha256"])
+
+    release_normalized = copy.deepcopy(release_manifest)
+    flathub_normalized = copy.deepcopy(flathub_manifest)
+    find_conduit_module(
+        release_normalized, f"packaging/flatpak/{APP_ID}.json"
+    )["sources"][0] = None
+    find_conduit_module(
+        flathub_normalized, f"packaging/flatpak/flathub/{APP_ID}.json"
+    )["sources"][0] = None
+    assert release_normalized == flathub_normalized
+
+
+def expected_crates_from_lockfile(lockfile_toml: str) -> dict[str, str]:
+    lockfile = tomllib.loads(lockfile_toml)
+    expected: dict[str, str] = {}
+    for package in lockfile["package"]:
+        source = package.get("source")
+        if source is None:
+            continue
+        assert source == "registry+https://github.com/rust-lang/crates.io-index", (
+            f"unexpected non-crates.io dependency source for {package['name']}: {source}"
+        )
+        url = (
+            f"https://static.crates.io/crates/{package['name']}/"
+            f"{package['name']}-{package['version']}.crate"
+        )
+        expected[url] = package["checksum"]
+    return expected
+
+
+def parse_and_validate_cargo_sources(sources_path: str) -> dict[str, str]:
+    sources = json.loads(read(sources_path))
+    archives: dict[str, str] = {}
+    archive_dests: dict[str, str] = {}
+    checksum_dests: dict[str, str] = {}
+    for source in sources:
+        if source.get("type") == "archive":
+            url = source["url"]
+            dest = source["dest"]
+            sha256 = source["sha256"]
+            assert re.fullmatch(r"[0-9a-f]{64}", sha256)
+            assert url not in archives, f"duplicate archive {url} in {sources_path}"
+            assert dest not in archive_dests, (
+                f"duplicate vendor dest {dest} in {sources_path}"
+            )
+            archives[url] = sha256
+            archive_dests[dest] = sha256
+        elif (
+            source.get("type") == "inline"
+            and source.get("dest-filename") == ".cargo-checksum.json"
+        ):
+            dest = source["dest"]
+            payload = json.loads(source["contents"])
+            assert dest not in checksum_dests
+            checksum_dests[dest] = payload["package"]
+
+    assert archive_dests == checksum_dests, (
+        f"mismatched .cargo-checksum.json entries in {sources_path}"
+    )
+    assert any(
+        source.get("dest-filename") == "config"
+        and 'replace-with = "vendored-sources"' in source.get("contents", "")
+        for source in sources
+    )
+    return archives
 
 
 def test_flatpak_cargo_sources_match_the_lockfile() -> None:
-    lockfile = tomllib.loads(read("Cargo.lock"))
-    sources = json.loads(read("packaging/flatpak/cargo-sources.json"))
-    archives = {
-        source["url"]: source["sha256"]
-        for source in sources
-        if source.get("type") == "archive"
-    }
-    expected = {
-        f"https://static.crates.io/crates/{package['name']}/"
-        f"{package['name']}-{package['version']}.crate": package["checksum"]
-        for package in lockfile["package"]
-        if package.get("source", "").startswith("registry+")
-    }
-
-    assert archives == expected
-    assert any(
-        source.get("dest-filename") == "config"
-        and "replace-with = \"vendored-sources\"" in source.get("contents", "")
-        for source in sources
+    head_expected = expected_crates_from_lockfile(read("Cargo.lock"))
+    release_archives = parse_and_validate_cargo_sources(
+        "packaging/flatpak/cargo-sources.json"
     )
+    assert release_archives == head_expected
+
+    flathub_archives = parse_and_validate_cargo_sources(
+        "packaging/flatpak/flathub/cargo-sources.json"
+    )
+    flathub_manifest_path = f"packaging/flatpak/flathub/{APP_ID}.json"
+    flathub_manifest = json.loads(read(flathub_manifest_path))
+    flathub_conduit = find_conduit_module(flathub_manifest, flathub_manifest_path)
+    archive_url = flathub_conduit["sources"][0]["url"]
+    tag_match = re.search(r"/refs/tags/(v\d+\.\d+\.\d+)\.tar\.gz$", archive_url)
+    assert tag_match is not None
+    pinned_tag = tag_match.group(1)
+    git = shutil.which("git")
+    if (ROOT / ".git").exists() and git is not None:
+        tag_lockfile = subprocess.run(
+            [git, "-C", str(ROOT), "show", f"refs/tags/{pinned_tag}:Cargo.lock"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if tag_lockfile.returncode == 0:
+            assert flathub_archives == expected_crates_from_lockfile(
+                tag_lockfile.stdout
+            ), (
+                f"packaging/flatpak/flathub/cargo-sources.json does not match "
+                f"{pinned_tag}:Cargo.lock"
+            )
 
 
 def test_unstable_http3_stack_is_not_locked_or_vendored() -> None:
@@ -570,11 +746,12 @@ def test_unstable_http3_stack_is_not_locked_or_vendored() -> None:
     }
     assert locked_packages.isdisjoint(unused_http3_packages)
 
-    sources = read("packaging/flatpak/cargo-sources.json")
-    assert all(
-        f"/{package}/" not in sources and f"/{package}-" not in sources
-        for package in unused_http3_packages
-    )
+    for sources_path in FLATPAK_CARGO_SOURCES_PATHS:
+        sources = read(sources_path)
+        assert all(
+            f"/{package}/" not in sources and f"/{package}-" not in sources
+            for package in unused_http3_packages
+        )
 
 
 def main() -> None:
@@ -582,12 +759,13 @@ def main() -> None:
         test_release_versions_are_synchronized,
         test_rust_toolchain_is_pinned_across_local_ci_and_release,
         test_local_meson_suite_enforces_strict_rust_lints,
+        test_local_meson_suite_enforces_rust_formatting,
         test_cargo_build_depends_on_compiled_resources,
         test_release_workflow_builds_validates_and_publishes_all_assets,
         test_generated_release_pull_requests_use_verified_dispatched_ci,
         test_release_build_tests_reuse_the_release_profile,
         test_release_packages_disable_nonproduction_features,
-        test_release_flatpak_uses_current_checkout_without_debug_logging,
+        test_release_and_flathub_flatpak_manifests_are_hardened,
         test_flatpak_cargo_sources_match_the_lockfile,
         test_unstable_http3_stack_is_not_locked_or_vendored,
     ]
