@@ -515,6 +515,8 @@ mod imp {
         pub close_thread_button: TemplateChild<gtk::Button>,
 
         pub runtime: RefCell<Option<AppRuntime>>,
+        #[cfg(test)]
+        pub(super) test_runtime: RefCell<Option<crate::runtime::InertTestRuntime>>,
         pub(super) request_coordinator: RefCell<RequestCoordinator>,
         pub(super) message_control_registry: RefCell<MessageControlRegistry>,
         pub(super) conversation_opening: RefCell<ConversationOpenCoordinator>,
@@ -946,7 +948,7 @@ mod imp {
                         });
                     }
                 }
-            } else {
+            } else if !cfg!(test) {
                 obj.show_loading("Checking secure storage");
                 obj.send_session_command(RuntimeCommand::LoadStoredToken);
             }
@@ -990,6 +992,11 @@ mod imp {
             if let Some(state) = status_dialog {
                 state.dialog.force_close();
             }
+            self.runtime.borrow_mut().take();
+            #[cfg(test)]
+            {
+                self.test_runtime.borrow_mut().take();
+            }
         }
     }
 
@@ -1017,6 +1024,9 @@ fn hex_to_rgba(hex: &str, alpha: f32) -> Option<String> {
 }
 
 fn save_cached_theme_file(theme: &crate::slack::SidebarTheme) {
+    if cfg!(test) {
+        return;
+    }
     let path = crate::config::state_cache_dir().join("cached_theme.json");
     if let Ok(json) = serde_json::to_string(theme) {
         if let Some(parent) = path.parent() {
@@ -1027,6 +1037,9 @@ fn save_cached_theme_file(theme: &crate::slack::SidebarTheme) {
 }
 
 fn load_cached_theme_file() -> Option<crate::slack::SidebarTheme> {
+    if cfg!(test) {
+        return None;
+    }
     let path = crate::config::state_cache_dir().join("cached_theme.json");
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
@@ -2826,9 +2839,16 @@ fn referenced_staged_uploads(drafts: &Drafts, directory: &Path) -> HashSet<PathB
 }
 
 fn clear_stale_upload_staging(drafts: &Drafts) {
+    if cfg!(test) {
+        return;
+    }
     let directory = config::upload_staging_dir();
-    let referenced = referenced_staged_uploads(drafts, &directory);
-    let entries = match std::fs::read_dir(&directory) {
+    clear_stale_upload_staging_in_dir(drafts, &directory);
+}
+
+fn clear_stale_upload_staging_in_dir(drafts: &Drafts, directory: &Path) {
+    let referenced = referenced_staged_uploads(drafts, directory);
+    let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
@@ -3876,10 +3896,20 @@ impl ConduitWindow {
 
     fn setup_runtime(&self) {
         let imp = self.imp();
-        let (runtime, events) = AppRuntime::start();
+        #[cfg(not(test))]
+        {
+            let (runtime, events) = AppRuntime::start();
 
-        *imp.runtime.borrow_mut() = Some(runtime);
-        self.spawn_runtime_event_loop(events, true);
+            *imp.runtime.borrow_mut() = Some(runtime);
+            self.spawn_runtime_event_loop(events, true);
+        }
+        #[cfg(test)]
+        {
+            let (runtime, test_runtime, event_rx) = AppRuntime::inert_for_test();
+            *imp.runtime.borrow_mut() = Some(runtime);
+            *imp.test_runtime.borrow_mut() = Some(test_runtime);
+            self.spawn_runtime_event_loop(event_rx, false);
+        }
     }
 
     fn spawn_runtime_event_loop(&self, mut events: RuntimeEventReceiver, report_stop_error: bool) {
@@ -3892,6 +3922,9 @@ impl ConduitWindow {
                 let Some(window) = weak_window.upgrade() else {
                     return;
                 };
+                if window.in_destruction() {
+                    return;
+                }
                 startup_failed |= runtime_event_is_start_failure(&event);
                 window.handle_drained_runtime_event(event, &mut events, &mut patch_batch);
                 events_since_yield += 1;
@@ -3906,6 +3939,9 @@ impl ConduitWindow {
                 let Some(window) = weak_window.upgrade() else {
                     return;
                 };
+                if window.in_destruction() {
+                    return;
+                }
                 window.show_session_error("Background runtime stopped");
             }
         });
@@ -10615,12 +10651,14 @@ impl ConduitWindow {
     }
 
     fn show_workspace(&self, auth: AuthInfo) {
-        let preview_scope = preview_workspace_scope(&auth);
         let workspace_id = workspace_identity(&auth);
-        self.imp()
-            .image_assets
-            .borrow_mut()
-            .set_workspace(Some(preview_workspace_cache_key(&preview_scope)));
+        if !cfg!(test) {
+            let preview_scope = preview_workspace_scope(&auth);
+            self.imp()
+                .image_assets
+                .borrow_mut()
+                .set_workspace(Some(preview_workspace_cache_key(&preview_scope)));
+        }
         *self.imp().workspace_id.borrow_mut() = workspace_id;
         self.validate_last_conversation_workspace();
         self.imp().workspace_ready.set(false);
@@ -15101,7 +15139,9 @@ impl ConduitWindow {
             return true;
         };
         *self.imp().request_coordinator.borrow_mut() = previous;
-        self.handle_command_rejection(rejection);
+        if !self.in_destruction() {
+            self.handle_command_rejection(rejection);
+        }
         false
     }
 

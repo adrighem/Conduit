@@ -17,6 +17,7 @@
 
   With the variable set, a GTK that cannot initialise fails the test instead of skipping. Meson runs the same command as the "Graphical tests" target (`meson test --suite graphical`); "Cargo tests" runs everything else once, without a display.
 - Wait on conditions with the shared `pump_until` (and `pump` for a fixed settle) from `src/timeline/tests.rs`, not ad-hoc loops or sleeps.
+- In-process `#[cfg(test)]` `ConduitWindow` instances bind `AppRuntime::inert_for_test()` (`InertTestRuntime` / `test_runtime`) and skip the startup `LoadStoredToken` keyring probe, so graphical window tests never touch D-Bus Secret Service, host caches, or live Slack sessions.
 
 ## Performance
 

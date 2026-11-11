@@ -2641,6 +2641,62 @@ fn stale_staging_cleanup_preserves_files_referenced_by_drafts() {
 }
 
 #[test]
+fn test_host_cache_guards_and_upload_staging_cleanup() {
+    let theme = crate::slack::SidebarTheme {
+        column_bg: "#123456".into(),
+        menu_bg_hover: "#234567".into(),
+        active_item: "#345678".into(),
+        active_item_text: "#ffffff".into(),
+        hover_item: "#456789".into(),
+        text_color: "#dddddd".into(),
+        active_presence: "#00ff00".into(),
+        mention_badge: None,
+        top_nav_bg: None,
+        top_nav_text: None,
+    };
+    save_cached_theme_file(&theme);
+    assert!(
+        load_cached_theme_file().is_none(),
+        "cfg(test) must never read or persist host cached_theme.json"
+    );
+
+    let staging_dir = std::env::temp_dir().join(format!(
+        "conduit-upload-staging-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&staging_dir).expect("create temp upload staging dir");
+    let retained = staging_dir.join("retained.png");
+    let stale = staging_dir.join("stale.png");
+    std::fs::write(&retained, b"keep").expect("write retained file");
+    std::fs::write(&stale, b"remove").expect("write stale file");
+
+    let draft = RichComposerDraft {
+        attachments: vec![ComposerAttachmentDraft {
+            path: retained.clone(),
+            remove_after_upload: true,
+        }],
+        ..Default::default()
+    };
+    let mut drafts = Drafts::default();
+    drafts.upsert(
+        DraftKey::new("T1:U1", "C1", None),
+        &encode_rich_composer_draft(&draft),
+    );
+
+    clear_stale_upload_staging_in_dir(&drafts, &staging_dir);
+    assert!(retained.exists(), "referenced staged upload must survive");
+    assert!(
+        !stale.exists(),
+        "unreferenced staged upload must be removed"
+    );
+    let _ = std::fs::remove_dir_all(&staging_dir);
+}
+
+#[test]
 fn sidebar_leave_action_is_only_available_for_active_channels() {
     let public_channel = SlackConversation {
         is_channel: Some(true),
@@ -4918,6 +4974,15 @@ mod graphical {
     fn ensure_test_window_resources() {
         static REGISTER_RESOURCES: std::sync::Once = std::sync::Once::new();
         REGISTER_RESOURCES.call_once(|| {
+            if let Some(explicit) = std::env::var_os("CONDUIT_RESOURCE_PATH") {
+                let candidate = PathBuf::from(explicit);
+                if candidate.is_file() {
+                    let resource =
+                        gio::Resource::load(&candidate).expect("load prebuilt test gresource");
+                    gio::resources_register(&resource);
+                    return;
+                }
+            }
             let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
             let src_dir = manifest.join("src");
             let xml_path = src_dir.join("conduit.gresource.xml");
@@ -4946,7 +5011,6 @@ mod graphical {
     fn perf_guard_window_burst_of_workspace_patches_applies_and_flushes_once() {
         run_gtk_test(|| {
             use crate::runtime::{OperationContext, RuntimeEventMeta};
-            use crate::runtime_mailbox::runtime_event_channel;
             use crate::thread_catalog::{ThreadKey, ThreadRecord};
             use crate::timeline::tests::{pump, pump_until};
             use crate::unread_ledger::ConversationReadState;
@@ -5016,8 +5080,13 @@ mod graphical {
             window.imp().workspace_timeline_projections.set(0);
             window.imp().ui_invalidation_flushes.set(0);
 
-            let (sender, receiver) = runtime_event_channel();
-            window.spawn_runtime_event_loop(receiver, false);
+            let sender = window
+                .imp()
+                .test_runtime
+                .borrow()
+                .as_ref()
+                .expect("inert test runtime")
+                .event_sender();
 
             let patch_meta = || RuntimeEventMeta {
                 session,
@@ -5204,7 +5273,7 @@ mod graphical {
     fn context_timeline_rerenders_when_merged_patch_leaves_base_operations_empty() {
         run_gtk_test(|| {
             use crate::models::SearchMessageLocation;
-            use crate::timeline::tests::{pump, pump_until};
+            use crate::timeline::tests::{pump, try_pump_until};
             use crate::workspace_pipeline::{MessageChange, TimelineTarget, WorkspaceChange};
 
             crate::http_client::ensure_tls_crypto_provider();
@@ -5238,6 +5307,43 @@ mod graphical {
                 msg.refresh_canonical_content();
                 msg
             };
+            let make_reply = |ts: &str, thread_ts: &str, text: &str| {
+                let mut msg = make_msg(ts, text);
+                msg.thread_ts = Some(thread_ts.to_string());
+                msg.refresh_canonical_content();
+                msg
+            };
+
+            let collect_visible_list_labels = |list_view: &gtk::ListView| -> Vec<String> {
+                let mut labels = Vec::new();
+                let mut stack = vec![list_view.clone().upcast::<gtk::Widget>()];
+                while let Some(widget) = stack.pop() {
+                    if !widget.is_visible() {
+                        continue;
+                    }
+                    if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                        labels.push(label.text().to_string());
+                    }
+                    let mut child = widget.first_child();
+                    while let Some(current) = child {
+                        child = current.next_sibling();
+                        stack.push(current);
+                    }
+                }
+                labels
+            };
+            let visible_main_labels = || -> Vec<String> {
+                let timeline_ref = window.imp().native_timeline_view.borrow();
+                let timeline = timeline_ref.as_ref().expect("main native timeline view");
+                collect_visible_list_labels(&timeline.list_view)
+            };
+            let visible_thread_labels = || -> Vec<String> {
+                let pane = window.thread_pane();
+                let timeline_ref = pane.native_timeline_view.borrow();
+                let timeline = timeline_ref.as_ref().expect("thread native timeline view");
+                collect_visible_list_labels(&timeline.list_view)
+            };
+
             window.imp().workspace.view.borrow_mut().apply_history(
                 "C1",
                 vec![make_msg("100.0", "v1")],
@@ -5258,13 +5364,27 @@ mod graphical {
                 ));
                 assert!(view.has_channel_context("C1"));
             }
-            window.set_default_size(960, 640);
+            window.rerender_current_main_messages();
+            window.set_default_size(1100, 760);
             window.present();
 
-            pump_until(5000, || {
+            try_pump_until(5000, || {
                 window.imp().pending_ui_invalidations.borrow().is_empty()
             });
-            pump(20);
+            try_pump_until(5000, || {
+                let labels = visible_main_labels();
+                labels.iter().any(|text| text.contains("v0"))
+                    && !labels.iter().any(|text| text.contains("v1"))
+            });
+            let pre_labels = visible_main_labels();
+            assert!(
+                pre_labels.iter().any(|text| text.contains("v0")),
+                "pre-patch main timeline labels must show focused context 'v0': {pre_labels:?}"
+            );
+            assert!(
+                !pre_labels.iter().any(|text| text.contains("v1")),
+                "pre-patch main timeline labels must not show base history 'v1': {pre_labels:?}"
+            );
 
             let rev1 = WorkspaceRevision::INITIAL.successor();
             let rev2 = rev1.successor();
@@ -5301,9 +5421,169 @@ mod graphical {
                 "context-only timeline update with empty base operations must still queue MAIN"
             );
 
-            pump_until(5000, || {
+            try_pump_until(5000, || {
                 window.imp().pending_ui_invalidations.borrow().is_empty()
             });
+            try_pump_until(5000, || {
+                let labels = visible_main_labels();
+                labels.iter().any(|text| text.contains("v1"))
+                    && !labels.iter().any(|text| text.contains("v0"))
+            });
+
+            assert!(
+                window
+                    .imp()
+                    .workspace
+                    .view
+                    .borrow()
+                    .has_channel_context("C1"),
+                "channel C1 must remain in focused message context mode"
+            );
+            assert_eq!(
+                window
+                    .imp()
+                    .workspace
+                    .view
+                    .borrow()
+                    .channel_messages_shared("C1")[0]
+                    .text
+                    .as_deref(),
+                Some("v1")
+            );
+            let post_labels = visible_main_labels();
+            assert!(
+                post_labels.iter().any(|text| text.contains("v1")),
+                "visible main timeline labels must contain updated message text 'v1': {post_labels:?}"
+            );
+            assert!(
+                !post_labels.iter().any(|text| text.contains("v0")),
+                "visible main timeline labels must not retain stale message text 'v0': {post_labels:?}"
+            );
+
+            // Symmetric `TimelineTarget::Thread` + `has_thread_context` arm:
+            {
+                let mut view = window.imp().workspace.view.borrow_mut();
+                view.open_thread("C1", "100.0");
+                view.apply_thread(
+                    "C1",
+                    "100.0",
+                    vec![make_msg("100.0", "v1"), make_reply("101.0", "100.0", "tv1")],
+                    false,
+                    None,
+                    false,
+                );
+                let thread_location =
+                    SearchMessageLocation::new("C1", "101.0", Some("100.0")).unwrap();
+                assert!(view.focus_message(&thread_location));
+                assert!(view.apply_message_context(
+                    &thread_location,
+                    vec![
+                        std::sync::Arc::new(make_msg("100.0", "v1")),
+                        std::sync::Arc::new(make_reply("101.0", "100.0", "tv0")),
+                    ],
+                ));
+                assert!(view.has_thread_context("C1", "100.0"));
+            }
+            window.rerender_current_thread();
+
+            try_pump_until(5000, || {
+                let labels = visible_thread_labels();
+                labels.iter().any(|text| text.contains("tv0"))
+                    && !labels.iter().any(|text| text.contains("tv1"))
+            });
+            let pre_thread_labels = visible_thread_labels();
+            assert!(
+                pre_thread_labels.iter().any(|text| text.contains("tv0")),
+                "pre-patch thread timeline labels must show focused context 'tv0': {pre_thread_labels:?}"
+            );
+            assert!(
+                !pre_thread_labels.iter().any(|text| text.contains("tv1")),
+                "pre-patch thread timeline labels must not show base reply 'tv1': {pre_thread_labels:?}"
+            );
+
+            let rev3 = rev2.successor();
+            let rev4 = rev3.successor();
+            let merged_thread = WorkspacePatch::merge([
+                WorkspacePatch::new(
+                    rev3,
+                    vec![WorkspaceChange::TimelineChanged {
+                        target: TimelineTarget::Thread {
+                            channel_id: "C1".to_string(),
+                            thread_ts: "100.0".to_string(),
+                        },
+                        changes: vec![MessageChange::Upsert(Box::new(make_reply(
+                            "101.0", "100.0", "tv2",
+                        )))],
+                    }],
+                )
+                .unwrap(),
+                WorkspacePatch::new(
+                    rev4,
+                    vec![WorkspaceChange::TimelineChanged {
+                        target: TimelineTarget::Thread {
+                            channel_id: "C1".to_string(),
+                            thread_ts: "100.0".to_string(),
+                        },
+                        changes: vec![MessageChange::Upsert(Box::new(make_reply(
+                            "101.0", "100.0", "tv1",
+                        )))],
+                    }],
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+
+            window.apply_workspace_patch(&merged_thread, 2);
+            assert!(
+                window
+                    .imp()
+                    .pending_ui_invalidations
+                    .borrow()
+                    .flags()
+                    .contains(UiInvalidations::THREAD),
+                "context-only thread timeline update with empty base operations must still queue THREAD"
+            );
+
+            try_pump_until(5000, || {
+                window.imp().pending_ui_invalidations.borrow().is_empty()
+            });
+            try_pump_until(5000, || {
+                let labels = visible_thread_labels();
+                labels.iter().any(|text| text.contains("tv1"))
+                    && !labels.iter().any(|text| text.contains("tv0"))
+            });
+
+            assert!(
+                window
+                    .imp()
+                    .workspace
+                    .view
+                    .borrow()
+                    .has_thread_context("C1", "100.0"),
+                "thread C1:100.0 must remain in focused message context mode"
+            );
+            assert_eq!(
+                window
+                    .imp()
+                    .workspace
+                    .view
+                    .borrow()
+                    .current_thread_messages_shared()
+                    .iter()
+                    .find(|msg| msg.ts == "101.0")
+                    .and_then(|msg| msg.text.as_deref()),
+                Some("tv1")
+            );
+            let post_thread_labels = visible_thread_labels();
+            assert!(
+                post_thread_labels.iter().any(|text| text.contains("tv1")),
+                "visible thread timeline labels must contain updated reply text 'tv1': {post_thread_labels:?}"
+            );
+            assert!(
+                !post_thread_labels.iter().any(|text| text.contains("tv0")),
+                "visible thread timeline labels must not retain stale reply text 'tv0': {post_thread_labels:?}"
+            );
+
             window.destroy();
             pump(20);
         });

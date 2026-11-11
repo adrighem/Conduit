@@ -2636,6 +2636,31 @@ pub struct AppRuntime {
     commands: RuntimeCommandSender,
 }
 
+/// Holds the undrained command receiver and event sender for [`AppRuntime::inert_for_test`].
+///
+/// `_commands` uses [`RuntimeCommandAdmissionConfig::production`] lane capacities (undrained),
+/// and synchronous unpumped sends on [`Self::event_sender`] must stay below
+/// [`RUNTIME_EVENT_QUEUE_CAPACITY`] (`256`) on `gtk-test-worker`.
+#[cfg(test)]
+pub(crate) struct InertTestRuntime {
+    _commands: RuntimeCommandReceiver,
+    events: RuntimeEventMailboxSender,
+}
+
+#[cfg(test)]
+impl InertTestRuntime {
+    pub(crate) fn event_sender(&self) -> RuntimeEventMailboxSender {
+        self.events.clone()
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for InertTestRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("InertTestRuntime").finish()
+    }
+}
+
 pub(crate) struct RuntimeCommandRejection {
     pub(crate) context: OperationContext,
     pub(crate) command: RuntimeCommand,
@@ -3628,6 +3653,26 @@ fn spawn_runtime_command_drivers(
 }
 
 impl AppRuntime {
+    /// Creates an in-memory runtime pair without spawning Tokio workers or sweeping caches.
+    ///
+    /// Commands accumulate in undrained [`RuntimeCommandAdmissionConfig::production`] lanes,
+    /// and synchronous unpumped sends on [`InertTestRuntime::event_sender`] must stay below
+    /// [`RUNTIME_EVENT_QUEUE_CAPACITY`] (`256`) on `gtk-test-worker`.
+    #[cfg(test)]
+    pub(crate) fn inert_for_test() -> (Self, InertTestRuntime, RuntimeEventReceiver) {
+        let (commands, receiver) =
+            RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::production());
+        let (events, event_receiver) = runtime_event_channel();
+        (
+            Self { commands },
+            InertTestRuntime {
+                _commands: receiver,
+                events,
+            },
+            event_receiver,
+        )
+    }
+
     pub fn start() -> (Self, RuntimeEventReceiver) {
         let (commands, receiver) =
             RuntimeCommandAdmission::channel(RuntimeCommandAdmissionConfig::production());

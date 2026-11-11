@@ -153,10 +153,24 @@ pub(crate) fn run_gtk_test<F: FnOnce() + Send + 'static>(f: F) {
         std::sync::mpsc::channel::<Result<(), std::boxed::Box<dyn std::any::Any + Send>>>();
     let job = std::boxed::Box::new(move || {
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        if res.is_err() {
+            for widget in gtk::Window::list_toplevels() {
+                if let Ok(window) = widget.downcast::<gtk::Window>() {
+                    window.destroy();
+                }
+            }
+            pump(10);
+        }
         let _ = done_tx.send(res);
     });
     sender.send(job).expect("GTK test worker is gone");
     if let Err(panic_payload) = done_rx.recv().expect("GTK test worker died mid-test") {
+        let msg = panic_payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic_payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        eprintln!("gtk-test-worker panic: {msg}");
         std::panic::resume_unwind(panic_payload);
     }
 }
@@ -441,13 +455,25 @@ pub(crate) fn pump(ms: u64) {
     }
 }
 
+/// Pumps until `condition` holds or `timeout_ms` elapses, returning whether
+/// `condition` became true before the deadline.
+pub(crate) fn try_pump_until(timeout_ms: u64, mut condition: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if condition() {
+            return true;
+        }
+        if std::time::Instant::now() >= end {
+            return condition();
+        }
+        pump(10);
+    }
+}
+
 /// Pumps until `done` holds or `ms` elapse, so a loaded test run still
 /// gets the first layout and dwell in.
 pub(crate) fn pump_until(ms: u64, done: impl Fn() -> bool) {
-    let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-    while !done() && std::time::Instant::now() < end {
-        pump(10);
-    }
+    let _ = try_pump_until(ms, done);
 }
 
 /// [`pump_until`] that fails at once when `done` never holds, naming what
