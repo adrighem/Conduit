@@ -96,11 +96,9 @@ pub(crate) fn message_uses_image_asset_matching(
 ) -> bool {
     message.avatar_url().is_some_and(&is_key)
         || message
-            .files
-            .as_ref()
-            .into_iter()
-            .flatten()
-            .filter_map(image_asset_request)
+            .display_files()
+            .flat_map(SlackFile::preview_candidates)
+            .filter_map(bounded_image_asset_request)
             .any(|(candidate, _)| is_key(&candidate))
         || message
             .attachments
@@ -179,24 +177,8 @@ fn any_custom_emoji_url_in_text(
 }
 
 pub(crate) fn image_asset_request(file: &SlackFile) -> Option<(String, String)> {
-    let is_video = file.supported_media_kind() == Some("video")
-        || file
-            .mimetype
-            .as_deref()
-            .is_some_and(|m| m.starts_with("video/"))
-        || file.thumb_video.is_some();
-    let url = if is_video {
-        file.thumb_video
-            .as_deref()
-            .or(file.thumb_720.as_deref())
-            .or(file.thumb_480.as_deref())
-            .or(file.thumb_360.as_deref())
-            .or(file.url_static_preview.as_deref())
-            .or_else(|| file.preview_url())?
-    } else {
-        file.preview_url()?
-    };
-    bounded_image_asset_request(url)
+    file.preview_candidates()
+        .find_map(bounded_image_asset_request)
 }
 
 pub(crate) fn attachment_image_asset_request(
@@ -556,5 +538,80 @@ mod tests {
             Some("a b\n\nc d")
         );
         assert_eq!(plain("   ").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn message_uses_image_asset_matches_forwarded_quote_files_before_and_after_cache() {
+        let preview_url = "https://files.slack.com/files-tmb/T1-FQUOTE/preview_480.png";
+        let custom = HashMap::new();
+        let catalog = EmojiCatalog::new(&custom);
+
+        let raw = SlackMessage {
+            ts: "1710000005.000100".to_string(),
+            attachments: Some(vec![crate::models::SlackAttachment {
+                is_share: Some(true),
+                files: Some(vec![SlackFile {
+                    id: Some("F_QUOTE".to_string()),
+                    mimetype: Some("image/png".to_string()),
+                    thumb_480: Some(preview_url.to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert!(message_uses_image_asset(&raw, &catalog, preview_url));
+
+        let cached = crate::slack_message_wire::normalize_cached_message(raw);
+        assert!(cached.attachments.is_none());
+        assert!(message_uses_image_asset(&cached, &catalog, preview_url));
+
+        let poster_url = "https://files.slack.com/files-tmb/T1-FVID/poster.png";
+        let fallback_thumb = "https://files.slack.com/files-tmb/T1-FVID/thumb_360.jpg";
+        let motion_mp4 = "https://files.slack.com/files-tmb/T1-FVID/motion.mp4";
+        let full_video = "https://files.slack.com/files-pri/T1-FVID/clip.mp4";
+        let anim_gif = "https://files.slack.com/files-tmb/T1-FGIF/anim_480.gif";
+        let gif_mp4 = "https://files.slack.com/files-tmb/T1-FGIF/gif.mp4";
+
+        let vid_file = SlackFile {
+            id: Some("F_VID".to_string()),
+            mimetype: Some("video/mp4".to_string()),
+            url_private: Some(full_video.to_string()),
+            url_static_preview: Some(poster_url.to_string()),
+            thumb_360: Some(fallback_thumb.to_string()),
+            thumb_video: Some(motion_mp4.to_string()),
+            ..Default::default()
+        };
+        let gif_file = SlackFile {
+            id: Some("F_GIF".to_string()),
+            mimetype: Some("image/gif".to_string()),
+            thumb_480_gif: Some(anim_gif.to_string()),
+            thumb_video: Some(gif_mp4.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            image_asset_request(&vid_file),
+            Some((poster_url.to_string(), poster_url.to_string()))
+        );
+        assert_eq!(
+            image_asset_request(&gif_file),
+            Some((anim_gif.to_string(), anim_gif.to_string()))
+        );
+
+        let mixed = crate::slack_message_wire::normalize_cached_message(SlackMessage {
+            ts: "1710000005.000200".to_string(),
+            attachments: Some(vec![crate::models::SlackAttachment {
+                is_share: Some(true),
+                files: Some(vec![vid_file, gif_file]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert!(message_uses_image_asset(&mixed, &catalog, poster_url));
+        assert!(message_uses_image_asset(&mixed, &catalog, fallback_thumb));
+        assert!(message_uses_image_asset(&mixed, &catalog, motion_mp4));
+        assert!(!message_uses_image_asset(&mixed, &catalog, full_video));
+        assert!(message_uses_image_asset(&mixed, &catalog, anim_gif));
+        assert!(!message_uses_image_asset(&mixed, &catalog, gif_mp4));
     }
 }

@@ -231,56 +231,41 @@ pub fn format_file_size(bytes: u64) -> String {
     }
 }
 
-fn render_files(
-    files: &[SlackFile],
+fn is_video_container_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["mp4", "webm", "mov", "ogv", "ogg", "mkv"]
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        })
+}
+
+pub(crate) fn render_files<'a>(
+    files: impl IntoIterator<Item = &'a SlackFile>,
     root_box: &Box,
-    context: &MessageRenderContext,
+    resolve: crate::timeline_media::AssetResolver<'_>,
     on_open_media: Option<&OpenMediaCallback>,
     on_action: Option<&ActionHandler>,
     ts: &str,
+    media_key_prefix: &str,
 ) {
+    let mut files = files.into_iter().peekable();
+    if files.peek().is_none() {
+        return;
+    }
+
     let files_box = Box::new(Orientation::Vertical, 6);
     files_box.set_halign(gtk::Align::Start);
 
-    for (index, file) in files.iter().enumerate() {
-        let is_video = file
-            .mimetype
-            .as_deref()
-            .is_some_and(|m| m.starts_with("video/"))
-            || file.thumb_video.is_some()
-            || file.supported_media_kind() == Some("video");
-
-        let is_image = file
-            .mimetype
-            .as_deref()
-            .is_some_and(|m| m.starts_with("image/"))
-            || file.thumb_360.is_some()
-            || file.thumb_480.is_some()
-            || file.thumb_720.is_some()
-            || file.thumb_1024.is_some()
-            || file.url_static_preview.is_some()
-            || file.preview_url().is_some();
-
+    for (index, file) in files.enumerate() {
         let title = file.display_title().to_string();
 
-        if is_video {
-            let video_candidates: Vec<&str> = [
-                file.thumb_video.as_deref(),
-                file.thumb_1024.as_deref(),
-                file.thumb_720.as_deref(),
-                file.thumb_480.as_deref(),
-                file.thumb_360.as_deref(),
-                file.url_static_preview.as_deref(),
-                file.preview_url(),
-                file.url_private.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-
-            let local_thumb = video_candidates
-                .iter()
-                .find_map(|&url| resolve_cached_asset_path(url, context));
+        if file.is_video() {
+            let local_thumb = file
+                .preview_candidates()
+                .filter_map(resolve)
+                .find(|path| !is_video_container_path(path));
 
             let video_url = file
                 .media_url()
@@ -319,19 +304,16 @@ fn render_files(
 
             container.append(&overlay);
 
-            if !video_url.is_empty() {
+            if let Some(cb) = on_open_media.filter(|_| !video_url.is_empty()).cloned() {
                 let gesture = gtk::GestureClick::new();
-                let cb = on_open_media.cloned();
                 let url = video_url.to_string();
                 let name = title.clone();
                 gesture.connect_pressed(move |_, _, _, _| {
-                    if let Some(cb) = &cb {
-                        cb(crate::window::MediaGalleryItem {
-                            url: url.clone(),
-                            name: name.clone(),
-                            kind: crate::window::MediaKind::Video,
-                        });
-                    }
+                    cb(crate::window::MediaGalleryItem {
+                        url: url.clone(),
+                        name: name.clone(),
+                        kind: crate::window::MediaKind::Video,
+                    });
                 });
                 container.add_controller(gesture);
                 container.set_cursor_from_name(Some("pointer"));
@@ -340,31 +322,15 @@ fn render_files(
             files_box.append(&wrap_collapsible_media(
                 container.upcast::<Widget>(),
                 ts,
-                &format!("file:{index}"),
+                &format!("{media_key_prefix}:{index}"),
                 None,
             ));
-        } else if is_image {
+        } else if file.is_image() {
             let container = Box::new(Orientation::Vertical, 2);
             container.add_css_class("timeline-image-container");
             container.set_halign(gtk::Align::Start);
 
-            let candidates: Vec<&str> = [
-                file.preview_url(),
-                file.url_static_preview.as_deref(),
-                file.thumb_1024.as_deref(),
-                file.thumb_720.as_deref(),
-                file.thumb_480.as_deref(),
-                file.thumb_360.as_deref(),
-                file.thumb_160.as_deref(),
-                file.url_private.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-
-            let local_path = candidates
-                .iter()
-                .find_map(|&url| resolve_cached_asset_path(url, context));
+            let local_path = file.preview_candidates().find_map(resolve);
 
             let img_widget: Widget = if let Some(path) = local_path {
                 let pic =
@@ -380,19 +346,16 @@ fn render_files(
             img_widget.set_tooltip_text(Some(&title));
             container.append(&img_widget);
 
-            if let Some(media_url) = file.media_url() {
+            if let (Some(cb), Some(media_url)) = (on_open_media.cloned(), file.media_url()) {
                 let gesture = gtk::GestureClick::new();
-                let cb = on_open_media.cloned();
                 let url = media_url.to_string();
                 let name = title.clone();
                 gesture.connect_pressed(move |_, _, _, _| {
-                    if let Some(cb) = &cb {
-                        cb(crate::window::MediaGalleryItem {
-                            url: url.clone(),
-                            name: name.clone(),
-                            kind: crate::window::MediaKind::Image,
-                        });
-                    }
+                    cb(crate::window::MediaGalleryItem {
+                        url: url.clone(),
+                        name: name.clone(),
+                        kind: crate::window::MediaKind::Image,
+                    });
                 });
                 container.add_controller(gesture);
                 container.set_cursor_from_name(Some("pointer"));
@@ -401,7 +364,7 @@ fn render_files(
             files_box.append(&wrap_collapsible_media(
                 container.upcast::<Widget>(),
                 ts,
-                &format!("file:{index}"),
+                &format!("{media_key_prefix}:{index}"),
                 None,
             ));
         } else {
@@ -653,26 +616,23 @@ fn render_message_content(
         &message.ts,
         on_action,
     )
+    .with_open_media(on_open_media)
     .render(document.nodes(), root_box);
 
-    let files = message
-        .files
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter(|file| !SlackMessage::document_renders_file(&document, file))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !files.is_empty() {
-        render_files(
-            &files,
-            root_box,
-            context,
-            on_open_media,
-            on_action,
-            &message.ts,
-        );
-    }
+    render_files(
+        message
+            .files
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|file| !SlackMessage::document_renders_file(&document, file)),
+        root_box,
+        &resolve,
+        on_open_media,
+        on_action,
+        &message.ts,
+        "file",
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

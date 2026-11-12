@@ -3,7 +3,7 @@
 //!
 //! Cached messages keep only the document (raw blocks and attachments are
 //! discarded on save), so this is the single content path for the native
-//! timeline; files and reactions are rendered by the caller.
+//! timeline; top-level files and reactions are rendered by the caller.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -51,6 +51,7 @@ pub(crate) struct DocumentRenderer<'a> {
     sources: MediaSources<'a>,
     ts: &'a str,
     on_action: Option<&'a crate::timeline_message_widget::ActionHandler>,
+    on_open_media: Option<&'a crate::timeline_message_widget::OpenMediaCallback>,
     next_media_slot: Cell<usize>,
 }
 
@@ -66,8 +67,23 @@ impl<'a> DocumentRenderer<'a> {
             sources,
             ts,
             on_action,
+            on_open_media: None,
             next_media_slot: Cell::new(0),
         }
+    }
+
+    pub(crate) fn with_open_media(
+        mut self,
+        on_open_media: Option<&'a crate::timeline_message_widget::OpenMediaCallback>,
+    ) -> Self {
+        self.on_open_media = on_open_media;
+        self
+    }
+
+    fn take_media_slot(&self) -> usize {
+        let slot = self.next_media_slot.get();
+        self.next_media_slot.set(slot + 1);
+        slot
     }
 
     pub(crate) fn render(&self, nodes: &[MessageNode], target: &Box) {
@@ -117,8 +133,7 @@ impl<'a> DocumentRenderer<'a> {
     }
 
     fn image(&self, image: &MessageImage) -> Widget {
-        let slot = self.next_media_slot.get();
-        self.next_media_slot.set(slot + 1);
+        let slot = self.take_media_slot();
         image_block(image, &self.sources, self.ts, &format!("document:{slot}"))
     }
 
@@ -352,6 +367,24 @@ impl<'a> DocumentRenderer<'a> {
         card.append(&header);
 
         self.render(&quote.body, &card);
+
+        let mut quote_files = quote
+            .files
+            .iter()
+            .filter(|file| !crate::models::SlackMessage::nodes_render_file(&quote.body, file))
+            .peekable();
+        if quote_files.peek().is_some() {
+            let slot = self.take_media_slot();
+            crate::timeline::row::render_files(
+                quote_files,
+                &card,
+                self.sources.resolve,
+                self.on_open_media,
+                self.on_action,
+                self.ts,
+                &format!("quote:{slot}:file"),
+            );
+        }
 
         if let Some(footer) = quote.footer.as_deref() {
             let markup = match quote
@@ -753,6 +786,46 @@ mod tests {
                 let regular_control = MessageControl::new("Regular", None);
                 let regular_button = renderer.control_button(&regular_control);
                 assert!(!regular_button.has_css_class("suggested-action"));
+            });
+        }
+
+        #[test]
+        fn standalone_document_renderer_renders_quote_files_inside_quote_card() {
+            crate::timeline::tests::run_gtk_test(|| {
+                let context = MessageRenderContext::default();
+                let sources = MediaSources {
+                    resolve: &|_| None,
+                    is_failed: &|_| false,
+                };
+                let renderer = DocumentRenderer::new(&context, sources, "1710000020.000100", None);
+                let root = Box::new(Orientation::Vertical, 4);
+                let quote = MessageNode::Quote(std::boxed::Box::new(MessageQuote {
+                    author_name: Some("Alice".to_string()),
+                    author_icon: None,
+                    author_id: None,
+                    channel_id: None,
+                    message_ts: Some("1710000019.000100".to_string()),
+                    thread_ts: None,
+                    permalink_url: None,
+                    footer: Some("Shared in DM".to_string()),
+                    is_reply: false,
+                    body: Vec::new(),
+                    files: vec![crate::models::SlackFile {
+                        id: Some("F_DOC".to_string()),
+                        name: Some("runbook.pdf".to_string()),
+                        title: Some("Incident Runbook".to_string()),
+                        mimetype: Some("application/pdf".to_string()),
+                        size: Some(2048),
+                        ..Default::default()
+                    }],
+                }));
+                renderer.render(&[quote], &root);
+
+                let widgets = crate::timeline::tests::descendants(root.upcast_ref());
+                assert!(
+                    widgets.iter().any(|w| w.has_css_class("file-card")),
+                    "quote card should render its attached file card without optional callback"
+                );
             });
         }
     }

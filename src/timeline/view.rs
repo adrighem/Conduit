@@ -77,6 +77,7 @@ struct CachedMessageRow {
     has_unread_separator: bool,
     root_preview: Option<String>,
     opens_threads: bool,
+    collapsed_media_generation: u64,
     widget: Box,
 }
 
@@ -94,6 +95,7 @@ impl CachedMessageRow {
             && self.has_unread_separator == want_unread_separator
             && self.root_preview.as_deref() == root_preview
             && self.opens_threads == opens_threads
+            && self.collapsed_media_generation == super::cache::collapsed_media_generation()
     }
 }
 
@@ -911,6 +913,7 @@ impl NativeTimelineView {
                     has_unread_separator: want_unread_separator,
                     root_preview,
                     opens_threads,
+                    collapsed_media_generation: super::cache::collapsed_media_generation(),
                     widget,
                 }
             };

@@ -5568,6 +5568,615 @@ mod graphical {
             window.destroy();
         });
     }
+
+    #[test]
+    fn quote_card_renders_forwarded_files_distinct_collapse_keys_and_scoped_dedup() {
+        run_gtk_test(|| {
+            let assets = AssetCacheTestDir::new("forwarded-quote-files");
+            let outer_preview = "https://files.slack.com/files-tmb/T1-FOUTER/outer_480.png";
+            let quote_preview = "https://files.slack.com/files-tmb/T1-FQUOTE/quote_480.png";
+            let quote_download =
+                "https://files.slack.com/files-pri/T1-FPDF/download/architecture.pdf";
+
+            let message = crate::slack_message_wire::normalize_cached_message(
+                crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                    "ts": "1710000030.000100",
+                    "user": "U123",
+                    "text": "FYI",
+                    "files": [{
+                        "id": "F_OUTER",
+                        "name": "outer.png",
+                        "title": "Outer Diagram",
+                        "mimetype": "image/png",
+                        "url_private_download": "https://files.slack.com/files-pri/T1-FOUTER/download/outer.png",
+                        "thumb_480": outer_preview
+                    }],
+                    "attachments": [{
+                        "is_share": true,
+                        "author_name": "Bob",
+                        "fallback": "[no preview available]",
+                        "footer": "Shared from private channel",
+                        "files": [
+                            {
+                                "id": "F_QUOTE_IMG",
+                                "name": "quoted.png",
+                                "title": "Quoted Screenshot",
+                                "mimetype": "image/png",
+                                "url_private_download": "https://files.slack.com/files-pri/T1-FQUOTE/download/quote.png",
+                                "thumb_480": quote_preview
+                            },
+                            {
+                                "id": "F_QUOTE_PDF",
+                                "name": "architecture.pdf",
+                                "title": "Architecture PDF",
+                                "mimetype": "application/pdf",
+                                "size": 3072,
+                                "url_private_download": quote_download
+                            }
+                        ]
+                    }]
+                }))
+                .into_message()
+                .expect("forwarded message normalizes"),
+            );
+
+            let actions: Rc<RefCell<Vec<TimelineAction>>> = Rc::new(RefCell::new(Vec::new()));
+            let actions_sink = actions.clone();
+            let on_action: ActionHandler = Rc::new(move |action| {
+                actions_sink.borrow_mut().push(action);
+            });
+
+            // 1. Before assets arrive: placeholder image icon + file card + download action.
+            let mut ctx = test_context();
+            let row_pending = build_timeline_message_widget(
+                &message,
+                &ctx,
+                None,
+                None,
+                None,
+                None,
+                Some(&on_action),
+                true,
+            );
+            let labels = label_texts(row_pending.upcast_ref());
+            assert!(
+                labels.iter().any(|text| text == "Architecture PDF"),
+                "expected PDF title in quote card: {labels:?}"
+            );
+            assert!(
+                labels.iter().any(|text| text == "3.0 KB"),
+                "expected PDF size in quote card: {labels:?}"
+            );
+            assert!(
+                !labels
+                    .iter()
+                    .any(|text| text.contains("[no preview available]")),
+                "file-only forward must suppress Slack placeholder fallback: {labels:?}"
+            );
+
+            let quote_card = descendants(row_pending.upcast_ref())
+                .into_iter()
+                .find(|w| w.has_css_class("timeline-attachment"))
+                .expect("quote card widget");
+            let quote_descendants = descendants(&quote_card);
+            assert!(
+                quote_descendants
+                    .iter()
+                    .any(|w| w.has_css_class("file-card")),
+                "quote card should contain the PDF file-card"
+            );
+            assert!(
+                quote_descendants
+                    .iter()
+                    .any(|w| w.has_css_class("timeline-image-container")),
+                "quote card should contain the quoted image container"
+            );
+            assert_eq!(
+                quote_descendants
+                    .iter()
+                    .filter(|w| w.downcast_ref::<Picture>().is_some())
+                    .count(),
+                0,
+                "pending quote image should render placeholder icon before asset lands"
+            );
+
+            let download_btn = quote_descendants
+                .iter()
+                .filter_map(|w| w.clone().downcast::<Button>().ok())
+                .find(|btn| btn.tooltip_text().as_deref() == Some("Download file"))
+                .expect("download button on quoted file-card");
+            download_btn.emit_clicked();
+            assert!(matches!(
+                actions.borrow().as_slice(),
+                [TimelineAction::DownloadFile { url, name }]
+                    if url == quote_download && name == "architecture.pdf"
+            ));
+
+            // 2. Distinct collapsible media keys between outer "file:0" and quoted "quote:0:file:0".
+            let toggles: Vec<ToggleButton> = descendants(row_pending.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<ToggleButton>().ok())
+                .filter(|btn| btn.tooltip_text().as_deref() == Some("Show or hide image"))
+                .collect();
+            assert_eq!(
+                toggles.len(),
+                2,
+                "expected one toggle for quoted image and one for outer image"
+            );
+            toggles[0].set_active(false);
+            assert!(is_media_collapsed(&message.ts, "quote:0:file:0"));
+            assert!(!is_media_collapsed(&message.ts, "file:0"));
+            set_media_collapsed(&message.ts, "quote:0:file:0", false);
+
+            // 3. Once the quoted preview asset lands, Picture replaces the placeholder icon.
+            let quote_path = assets.0.join("quote_480.png");
+            save_test_image(&quote_path, "png", 80, 60);
+            crate::timeline::cache::forget_asset_miss(quote_preview);
+            ctx.image_assets
+                .insert(quote_preview.to_string(), quote_path);
+
+            let row_ready = build_timeline_message_widget(
+                &message,
+                &ctx,
+                None,
+                None,
+                None,
+                None,
+                Some(&on_action),
+                true,
+            );
+            let ready_quote_card = descendants(row_ready.upcast_ref())
+                .into_iter()
+                .find(|w| w.has_css_class("timeline-attachment"))
+                .expect("quote card widget");
+            assert_eq!(
+                descendants(&ready_quote_card)
+                    .iter()
+                    .filter(|w| w.downcast_ref::<Picture>().is_some())
+                    .count(),
+                1,
+                "resolved quote image should render a Picture inside the quote card"
+            );
+
+            // 4. Scoped deduplication: an Image block in quote.body suppresses the duplicate
+            // quote file card without suppressing an outer file.
+            let dedup_msg = crate::slack_message_wire::normalize_cached_message(
+                crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                    "ts": "1710000031.000100",
+                    "user": "U123",
+                    "files": [{
+                        "id": "F_OUTER2",
+                        "title": "Outer Photo",
+                        "mimetype": "image/png",
+                        "thumb_480": outer_preview
+                    }],
+                    "attachments": [{
+                        "is_share": true,
+                        "author_name": "Bob",
+                        "blocks": [{
+                            "type": "image",
+                            "slack_file": { "id": "F_INLINE" },
+                            "alt_text": "Inline Quoted Image"
+                        }],
+                        "files": [{
+                            "id": "F_INLINE",
+                            "title": "Inline Quoted Image",
+                            "mimetype": "image/png",
+                            "thumb_480": quote_preview
+                        }]
+                    }]
+                }))
+                .into_message()
+                .expect("dedup message normalizes"),
+            );
+            let dedup_row =
+                build_timeline_message_widget(&dedup_msg, &ctx, None, None, None, None, None, true);
+            let dedup_quote_card = descendants(dedup_row.upcast_ref())
+                .into_iter()
+                .find(|w| w.has_css_class("timeline-attachment"))
+                .expect("dedup quote card");
+            assert!(
+                !descendants(&dedup_quote_card)
+                    .iter()
+                    .any(|w| w.has_css_class("timeline-image-container")),
+                "quote.body Image node must suppress duplicate render_files image container in quote"
+            );
+            assert_eq!(
+                descendants(dedup_row.upcast_ref())
+                    .iter()
+                    .filter(|w| w.has_css_class("timeline-image-container"))
+                    .count(),
+                1,
+                "outer file must still render its timeline-image-container"
+            );
+        });
+    }
+
+    #[test]
+    fn quoted_video_and_gif_previews_cursor_guard_and_multi_quote_collapse_slots() {
+        run_gtk_test(|| {
+            clear_timeline_view_caches();
+            let assets = AssetCacheTestDir::new("quoted-video-gif-slots");
+            let poster_url = "https://files.slack.com/files-tmb/T1-FVID/poster.png";
+            let motion_url = "https://files.slack.com/files-tmb/T1-FVID/motion.mp4";
+            let mp4_only_url = "https://files.slack.com/files-tmb/T1-FVID2/only_motion.mp4";
+            let gif_url = "https://files.slack.com/files-tmb/T1-FGIF/anim_480.gif";
+            let gif_mp4_url = "https://files.slack.com/files-tmb/T1-FGIF/gif.mp4";
+
+            let poster_path = assets.0.join("poster.png");
+            save_test_image(&poster_path, "png", 120, 80);
+            let motion_path = assets.0.join("motion.mp4");
+            std::fs::write(&motion_path, b"not-a-raster-image").expect("write motion mp4");
+            let mp4_only_path = assets.0.join("only_motion.mp4");
+            std::fs::write(&mp4_only_path, b"not-a-raster-image").expect("write mp4 only");
+
+            let mut ctx = test_context();
+            ctx.image_assets.insert(poster_url.to_string(), poster_path);
+            ctx.image_assets.insert(motion_url.to_string(), motion_path);
+            ctx.image_assets
+                .insert(mp4_only_url.to_string(), mp4_only_path);
+
+            let media_msg = crate::slack_message_wire::normalize_cached_message(
+                crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                    "ts": "1710000040.000100",
+                    "user": "U123",
+                    "attachments": [
+                        {
+                            "is_share": true,
+                            "author_name": "Alice",
+                            "files": [{
+                                "id": "F_VID_POSTER",
+                                "title": "Clip With Poster",
+                                "mimetype": "video/mp4",
+                                "url_private_download": "https://files.slack.com/files-pri/T1-FVID/clip.mp4",
+                                "url_static_preview": poster_url,
+                                "thumb_video": motion_url
+                            }]
+                        },
+                        {
+                            "is_share": true,
+                            "author_name": "Bob",
+                            "files": [{
+                                "id": "F_VID_MP4_ONLY",
+                                "title": "Clip Motion Only",
+                                "mimetype": "video/mp4",
+                                "url_private_download": "https://files.slack.com/files-pri/T1-FVID2/clip2.mp4",
+                                "thumb_video": mp4_only_url
+                            }]
+                        },
+                        {
+                            "is_share": true,
+                            "author_name": "Carol",
+                            "files": [{
+                                "id": "F_GIF",
+                                "title": "Reaction GIF",
+                                "mimetype": "image/gif",
+                                "url_private_download": "https://files.slack.com/files-pri/T1-FGIF/anim.gif",
+                                "thumb_480_gif": gif_url,
+                                "thumb_video": gif_mp4_url
+                            }]
+                        }
+                    ]
+                }))
+                .into_message()
+                .expect("media forward normalizes"),
+            );
+
+            // Without on_open_media: no pointer cursor on video or image containers.
+            let row_inert =
+                build_timeline_message_widget(&media_msg, &ctx, None, None, None, None, None, true);
+            let quote_cards: Vec<Widget> = descendants(row_inert.upcast_ref())
+                .into_iter()
+                .filter(|w| w.has_css_class("timeline-attachment"))
+                .collect();
+            assert_eq!(quote_cards.len(), 3);
+
+            // Quote 0: video with static PNG poster renders Picture inside .timeline-video-container.
+            let q0_desc = descendants(&quote_cards[0]);
+            let q0_video = q0_desc
+                .iter()
+                .find(|w| w.has_css_class("timeline-video-container"))
+                .expect("video container for poster video");
+            assert!(q0_video.cursor().is_none());
+            assert_eq!(
+                descendants(q0_video)
+                    .iter()
+                    .filter(|w| w.downcast_ref::<Picture>().is_some())
+                    .count(),
+                1,
+                "video with url_static_preview PNG should decode poster into Picture"
+            );
+
+            // Quote 1: video with only .mp4 cached falls back to .card poster without Picture.
+            let q1_desc = descendants(&quote_cards[1]);
+            let q1_video = q1_desc
+                .iter()
+                .find(|w| w.has_css_class("timeline-video-container"))
+                .expect("video container for mp4-only video");
+            assert!(q1_video.cursor().is_none());
+            assert_eq!(
+                descendants(q1_video)
+                    .iter()
+                    .filter(|w| w.downcast_ref::<Picture>().is_some())
+                    .count(),
+                0,
+                "cached .mp4 thumb_video must not be fed to deferred_texture_picture"
+            );
+            assert!(
+                descendants(q1_video)
+                    .iter()
+                    .any(|w| w.has_css_class("card")),
+                "mp4-only video should render fallback .card poster"
+            );
+
+            // Quote 2: GIF with thumb_video renders .timeline-image-container, never .timeline-video-container.
+            let q2_desc = descendants(&quote_cards[2]);
+            assert!(
+                !q2_desc
+                    .iter()
+                    .any(|w| w.has_css_class("timeline-video-container")),
+                "image/gif with thumb_video must not be classified as video"
+            );
+            let q2_image = q2_desc
+                .iter()
+                .find(|w| w.has_css_class("timeline-image-container"))
+                .expect("image container for quoted gif");
+            assert!(q2_image.cursor().is_none());
+
+            // With on_open_media present: pointer cursor IS set on clickable containers.
+            let on_open: OpenMediaCallback = Rc::new(|_| {});
+            let row_interactive = build_timeline_message_widget(
+                &media_msg,
+                &ctx,
+                Some(&on_open),
+                None,
+                None,
+                None,
+                None,
+                true,
+            );
+            for w in descendants(row_interactive.upcast_ref()) {
+                if w.has_css_class("timeline-video-container")
+                    || w.has_css_class("timeline-image-container")
+                {
+                    assert!(
+                        w.cursor().is_some(),
+                        "interactive media container should set pointer cursor"
+                    );
+                }
+            }
+
+            // Multi-quote + document-image slot stability:
+            // [Image("doc"), Quote(files: [img1, img2]), Quote(files: [img3])] + outer img4
+            let img_file = |id: &str| crate::models::SlackFile {
+                id: Some(id.to_string()),
+                title: Some(format!("Img {id}")),
+                mimetype: Some("image/png".to_string()),
+                thumb_480: Some(format!("https://files.slack.com/{id}.png")),
+                ..Default::default()
+            };
+            let multi_slot_msg = SlackMessage {
+                ts: "1710000041.000100".to_string(),
+                user: Some("U123".to_string()),
+                files: Some(vec![img_file("OUTER")]),
+                content_version: crate::rich_message::MESSAGE_CONTENT_VERSION,
+                document: crate::rich_message::MessageDocument::new(
+                    vec![
+                        crate::rich_message::MessageNode::Image(
+                            crate::rich_message::MessageImage::new(
+                                Some("https://files.slack.com/doc_block.png".to_string()),
+                                "Doc Block",
+                                Some("Doc Block".to_string()),
+                            ),
+                        ),
+                        crate::rich_message::MessageNode::Quote(std::boxed::Box::new(
+                            crate::rich_message::MessageQuote {
+                                author_name: Some("Q1".to_string()),
+                                author_icon: None,
+                                author_id: None,
+                                channel_id: None,
+                                message_ts: None,
+                                thread_ts: None,
+                                permalink_url: None,
+                                footer: None,
+                                is_reply: false,
+                                body: Vec::new(),
+                                files: vec![img_file("Q1_A"), img_file("Q1_B")],
+                            },
+                        )),
+                        crate::rich_message::MessageNode::Quote(std::boxed::Box::new(
+                            crate::rich_message::MessageQuote {
+                                author_name: Some("Q2".to_string()),
+                                author_icon: None,
+                                author_id: None,
+                                channel_id: None,
+                                message_ts: None,
+                                thread_ts: None,
+                                permalink_url: None,
+                                footer: None,
+                                is_reply: false,
+                                body: Vec::new(),
+                                files: vec![img_file("Q2_A")],
+                            },
+                        )),
+                    ],
+                    None,
+                ),
+                ..Default::default()
+            };
+            let slot_row = build_timeline_message_widget(
+                &multi_slot_msg,
+                &ctx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+            );
+            let slot_toggles: Vec<ToggleButton> = descendants(slot_row.upcast_ref())
+                .into_iter()
+                .filter_map(|w| w.downcast::<ToggleButton>().ok())
+                .filter(|btn| btn.tooltip_text().as_deref() == Some("Show or hide image"))
+                .collect();
+            let expected_slots = [
+                "document:0",
+                "quote:1:file:0",
+                "quote:1:file:1",
+                "quote:2:file:0",
+                "file:0",
+            ];
+            assert_eq!(slot_toggles.len(), expected_slots.len());
+            for (toggle, expected_slot) in slot_toggles.iter().zip(expected_slots) {
+                toggle.set_active(false);
+                assert!(
+                    is_media_collapsed(&multi_slot_msg.ts, expected_slot),
+                    "expected slot {expected_slot} to be collapsed"
+                );
+                for other in expected_slots {
+                    if other != expected_slot {
+                        assert!(
+                            !is_media_collapsed(&multi_slot_msg.ts, other),
+                            "collapsing {expected_slot} must not affect {other}"
+                        );
+                    }
+                }
+                toggle.set_active(true);
+            }
+            clear_timeline_view_caches();
+        });
+    }
+
+    #[test]
+    fn native_timeline_view_updates_quoted_image_assets_and_invalidates_pooled_collapsed_media() {
+        run_gtk_test(|| {
+            clear_timeline_view_caches();
+            let assets = AssetCacheTestDir::new("view-pool-quoted-media");
+            let quote_preview = "https://files.slack.com/files-tmb/T1-FPOOL/quote_480.png";
+            let target_ts = "1710000050.000100";
+
+            let message = Arc::new(crate::slack_message_wire::normalize_cached_message(
+                crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+                    "ts": target_ts,
+                    "user": "U123",
+                    "text": "Forwarded image",
+                    "attachments": [{
+                        "is_share": true,
+                        "author_name": "Alice",
+                        "files": [{
+                            "id": "F_POOL_IMG",
+                            "title": "Pooled Screenshot",
+                            "mimetype": "image/png",
+                            "url_private_download": "https://files.slack.com/files-pri/T1-FPOOL/quote.png",
+                            "thumb_480": quote_preview
+                        }]
+                    }]
+                }))
+                .into_message()
+                .expect("forwarded message normalizes"),
+            ));
+
+            let mut ctx = test_context();
+            let messages = vec![message.clone()];
+
+            let view = NativeTimelineView::new();
+            let window = gtk::Window::new();
+            window.set_default_size(420, 360);
+            window.set_child(Some(view.widget()));
+            present_and_wait_for_layout(&window);
+            view.set_messages(&messages, &ctx, None);
+            pump_until(2000, || {
+                bound_row_widgets(&view)
+                    .iter()
+                    .any(|(ts, _)| ts == target_ts)
+            });
+            view.assert_pool_invariants();
+
+            let find_quote_pictures = |view: &NativeTimelineView| -> usize {
+                let row = bound_row_widgets(view)
+                    .into_iter()
+                    .find_map(|(ts, w)| (ts == target_ts).then_some(w))
+                    .expect("bound row for target_ts");
+                let quote_card = descendants(&row)
+                    .into_iter()
+                    .find(|w| w.has_css_class("timeline-attachment"))
+                    .expect("quote card");
+                descendants(&quote_card)
+                    .iter()
+                    .filter(|w| w.downcast_ref::<Picture>().is_some())
+                    .count()
+            };
+            assert_eq!(
+                find_quote_pictures(&view),
+                0,
+                "initial bound quote card should show placeholder before asset lands"
+            );
+
+            // Land the quoted preview image and notify NativeTimelineView via update_image_assets.
+            let quote_path = assets.0.join("quote_480.png");
+            save_test_image(&quote_path, "png", 96, 64);
+            crate::timeline::cache::forget_asset_miss(quote_preview);
+            ctx.image_assets
+                .insert(quote_preview.to_string(), quote_path);
+            let custom = HashMap::new();
+            let catalog = crate::emoji::EmojiCatalog::new(&custom);
+            assert!(crate::rendering::message_uses_image_asset(
+                &message,
+                &catalog,
+                quote_preview
+            ));
+            let arrived = HashSet::from([quote_preview.to_string()]);
+            view.update_image_assets(&ctx, Some(&arrived), HashSet::from([target_ts.to_string()]));
+            pump_until(2000, || find_quote_pictures(&view) == 1);
+            view.assert_pool_invariants();
+
+            // Unbind row into TimelineRowPool, then toggle COLLAPSED_MEDIA (as if in ThreadPane).
+            let idx = (0..view.store.n_items())
+                .find(|&i| {
+                    view.store
+                        .item(i)
+                        .and_downcast::<TimelineMessageObject>()
+                        .is_some_and(|o| !o.is_day_separator() && o.message().ts == target_ts)
+                })
+                .expect("message store index");
+            let obj = view
+                .store
+                .item(idx)
+                .and_downcast::<TimelineMessageObject>()
+                .expect("message object");
+            view.store.remove(idx);
+            pump(50);
+            assert_eq!(view.pooled_row_counts().0, 1);
+            view.assert_pool_invariants();
+
+            set_media_collapsed(target_ts, "quote:0:file:0", true);
+            let builds_before = timeline_row_builds();
+            view.store.insert(idx, &obj);
+            pump(80);
+            view.assert_pool_invariants();
+            assert_eq!(
+                timeline_row_builds() - builds_before,
+                1,
+                "toggling COLLAPSED_MEDIA must invalidate stale pooled row on rebind"
+            );
+
+            let rebound_row = bound_row_widgets(&view)
+                .into_iter()
+                .find_map(|(ts, w)| (ts == target_ts).then_some(w))
+                .expect("rebound row");
+            let img_container = descendants(&rebound_row)
+                .into_iter()
+                .find(|w| w.has_css_class("timeline-image-container"))
+                .expect("rebound quote image container");
+            assert!(
+                !img_container.is_visible(),
+                "rebound row must reflect collapsed quote image state"
+            );
+
+            clear_timeline_view_caches();
+            window.destroy();
+        });
+    }
 }
 
 #[test]

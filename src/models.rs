@@ -423,7 +423,7 @@ pub(crate) fn is_slack_timestamp(value: &str) -> bool {
     slack_timestamp_parts(value).is_some()
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlackFile {
     pub id: Option<String>,
     pub name: Option<String>,
@@ -464,10 +464,52 @@ impl SlackFile {
     }
 
     pub fn is_image(&self) -> bool {
-        self.mimetype
-            .as_deref()
-            .is_some_and(|mimetype| mimetype.starts_with("image/"))
-            || self.preview_url().is_some()
+        self.is_declared_image() || self.preview_url().is_some()
+    }
+
+    pub(crate) fn is_video(&self) -> bool {
+        if self.is_declared_image() || self.is_gif() {
+            return false;
+        }
+        self.supported_media_kind() == Some("video")
+            || self
+                .mimetype
+                .as_deref()
+                .is_some_and(|mimetype| mimetype.starts_with("video/"))
+            || self.thumb_video.is_some()
+    }
+
+    pub(crate) fn preview_candidates(&self) -> impl Iterator<Item = &str> {
+        let slots: [Option<&str>; 10] = if self.is_video() {
+            [
+                self.url_static_preview.as_deref(),
+                self.thumb_480.as_deref(),
+                self.thumb_360.as_deref(),
+                self.thumb_720.as_deref(),
+                self.thumb_1024.as_deref(),
+                self.thumb_160.as_deref(),
+                self.thumb_80.as_deref(),
+                self.thumb_64.as_deref(),
+                self.thumb_video.as_deref(),
+                None,
+            ]
+        } else if self.is_image() {
+            [
+                self.preview_url(),
+                self.url_static_preview.as_deref(),
+                self.thumb_1024.as_deref(),
+                self.thumb_720.as_deref(),
+                self.thumb_480.as_deref(),
+                self.thumb_360.as_deref(),
+                self.thumb_160.as_deref(),
+                self.thumb_80.as_deref(),
+                self.thumb_64.as_deref(),
+                self.url_private.as_deref(),
+            ]
+        } else {
+            [None; 10]
+        };
+        slots.into_iter().flatten()
     }
 
     pub fn preview_url(&self) -> Option<&str> {
@@ -510,6 +552,19 @@ impl SlackFile {
         self.mimetype
             .as_deref()
             .is_some_and(|mimetype| mimetype.starts_with("image/"))
+            || self.filetype.as_deref().map(str::trim).is_some_and(|ft| {
+                ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "svg"]
+                    .iter()
+                    .any(|candidate| ft.eq_ignore_ascii_case(candidate))
+            })
+    }
+
+    fn is_declared_video_filetype(&self) -> bool {
+        self.filetype.as_deref().map(str::trim).is_some_and(|ft| {
+            ["mp4", "webm", "ogv", "ogg", "mov", "mkv"]
+                .iter()
+                .any(|candidate| ft.eq_ignore_ascii_case(candidate))
+        })
     }
 
     fn is_gif(&self) -> bool {
@@ -555,13 +610,20 @@ impl SlackFile {
     }
 
     pub fn supported_media_kind(&self) -> Option<&'static str> {
-        let mime = self.mimetype.as_deref()?;
-        if mime.starts_with("image/") {
+        if let Some(mime) = self.mimetype.as_deref() {
+            if mime.starts_with("image/") {
+                Some("image")
+            } else if matches!(
+                mime,
+                "video/mp4" | "video/webm" | "video/ogg" | "video/quicktime" | "video/x-matroska"
+            ) {
+                Some("video")
+            } else {
+                None
+            }
+        } else if self.is_declared_image() {
             Some("image")
-        } else if matches!(
-            mime,
-            "video/mp4" | "video/webm" | "video/ogg" | "video/quicktime" | "video/x-matroska"
-        ) {
+        } else if self.is_declared_video_filetype() {
             Some("video")
         } else {
             None
@@ -756,6 +818,10 @@ pub struct SlackAttachment {
     pub is_msg_unfurl: Option<bool>,
     #[serde(default)]
     pub is_reply_unfurl: Option<bool>,
+    #[serde(default)]
+    pub is_share: Option<bool>,
+    #[serde(default)]
+    pub files: Option<Vec<SlackFile>>,
     pub from_url: Option<String>,
     pub original_url: Option<String>,
     pub title: Option<String>,
@@ -782,6 +848,7 @@ impl SlackAttachment {
     pub fn is_quote_unfurl(&self) -> bool {
         self.is_msg_unfurl == Some(true)
             || self.is_reply_unfurl == Some(true)
+            || self.is_share == Some(true)
             || (self.channel_id.is_some() && self.ts.is_some())
     }
 
@@ -812,9 +879,14 @@ impl SlackAttachment {
             parts.push(footer.to_string());
         }
         if parts.is_empty() {
-            non_empty(self.fallback.as_deref())
-                .unwrap_or_default()
-                .to_string()
+            if self.is_quote_unfurl() && self.files.as_ref().is_some_and(|files| !files.is_empty())
+            {
+                String::new()
+            } else {
+                non_empty(self.fallback.as_deref())
+                    .unwrap_or_default()
+                    .to_string()
+            }
         } else {
             parts.join("\n")
         }
@@ -825,6 +897,16 @@ impl SlackAttachment {
         let visible = self.visible_text();
         if !visible.is_empty() {
             parts.push(visible);
+        }
+        if self.is_quote_unfurl() {
+            parts.extend(
+                self.files
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|file| non_empty(Some(file.display_title())))
+                    .map(ToString::to_string),
+            );
         }
         parts.extend(
             self.actions
@@ -837,11 +919,23 @@ impl SlackAttachment {
         parts.join("\n")
     }
 
+    fn has_quote_content(&self) -> bool {
+        self.files.as_ref().is_some_and(|files| !files.is_empty())
+            || self.blocks.as_ref().is_some_and(slack_value_has_content)
+            || non_empty(self.author_name.as_deref()).is_some()
+            || non_empty(self.author_subname.as_deref()).is_some()
+            || non_empty(self.author_id.as_deref()).is_some()
+            || non_empty(self.channel_id.as_deref()).is_some()
+            || non_empty(self.original_url.as_deref()).is_some()
+            || non_empty(self.from_url.as_deref()).is_some()
+            || non_empty(self.footer.as_deref()).is_some()
+    }
+
     pub fn has_visible_content(&self) -> bool {
         !self.visible_text().is_empty()
             || non_empty(self.image_url.as_deref()).is_some()
             || non_empty(self.thumb_url.as_deref()).is_some()
-            || self.is_quote_unfurl()
+            || (self.is_quote_unfurl() && self.has_quote_content())
             || self.actions.as_ref().is_some_and(|actions| {
                 actions.iter().any(|action| {
                     action.label().is_some() || non_empty(action.url.as_deref()).is_some()
@@ -1239,10 +1333,11 @@ impl SlackMessage {
         std::borrow::Cow::Owned(normalized.document)
     }
 
-    /// True when `file` is already shown as an image node of `document`, so
-    /// renderers can skip the duplicate file card.
-    pub(crate) fn document_renders_file(document: &MessageDocument, file: &SlackFile) -> bool {
-        document.image_urls().any(|document_url| {
+    /// True when `file` is already shown as a direct image node of `nodes`
+    /// (without descending into nested quotes), so renderers can skip the
+    /// duplicate file card within that scope.
+    pub(crate) fn nodes_render_file(nodes: &[MessageNode], file: &SlackFile) -> bool {
+        crate::rich_message::any_scope_image_url(nodes, |node_url| {
             [
                 file.url_private.as_deref(),
                 file.url_private_download.as_deref(),
@@ -1259,8 +1354,40 @@ impl SlackMessage {
             ]
             .into_iter()
             .flatten()
-            .any(|file_url| file_url == document_url)
+            .any(|file_url| file_url == node_url)
         })
+    }
+
+    /// True when `file` is already shown as a top-level image node of
+    /// `document`, so renderers can skip the duplicate file card.
+    pub(crate) fn document_renders_file(document: &MessageDocument, file: &SlackFile) -> bool {
+        Self::nodes_render_file(document.nodes(), file)
+    }
+
+    /// All files displayed on this message: top-level files followed by files
+    /// carried on quoted or forwarded message attachments.
+    pub(crate) fn display_files(&self) -> impl Iterator<Item = &SlackFile> + '_ {
+        let canonical_quotes = (self.content_version == MESSAGE_CONTENT_VERSION)
+            .then(|| self.document.quote_files())
+            .into_iter()
+            .flatten();
+        let wire_quotes = (self.content_version != MESSAGE_CONTENT_VERSION)
+            .then(|| {
+                self.attachments
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|attachment| attachment.is_quote_unfurl())
+                    .flat_map(|attachment| attachment.files.as_deref().unwrap_or_default())
+            })
+            .into_iter()
+            .flatten();
+        self.files
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .chain(canonical_quotes)
+            .chain(wire_quotes)
     }
 
     pub fn author_key(&self) -> String {
@@ -1353,7 +1480,21 @@ impl SlackMessage {
 
     pub fn accessible_text(&self) -> String {
         if self.content_version == MESSAGE_CONTENT_VERSION {
-            return self.document.accessible_text();
+            let mut parts = Vec::new();
+            let doc_text = self.document.accessible_text();
+            if !doc_text.is_empty() {
+                parts.push(doc_text);
+            }
+            parts.extend(
+                self.files
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|file| !Self::document_renders_file(&self.document, file))
+                    .filter_map(|file| non_empty(Some(file.display_title())))
+                    .map(ToString::to_string),
+            );
+            return parts.join("\n");
         }
         let mut parts = non_empty(self.text.as_deref())
             .map(ToString::to_string)
@@ -1366,6 +1507,14 @@ impl SlackMessage {
                 .iter()
                 .map(SlackAttachment::accessible_text)
                 .filter(|text| !text.is_empty()),
+        );
+        parts.extend(
+            self.files
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|file| non_empty(Some(file.display_title())))
+                .map(ToString::to_string),
         );
         parts.join("\n")
     }
@@ -2800,6 +2949,190 @@ mod tests {
         }))
         .expect("attachment with empty ts deserializes");
         assert_eq!(empty_ts.ts, None);
+
+        let shared_dm: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "is_share": true,
+            "fallback": "[no preview available]",
+            "files": [{
+                "id": "F_SHARE",
+                "name": "report.pdf",
+                "mimetype": "application/pdf"
+            }]
+        }))
+        .expect("shared DM attachment deserializes");
+        assert!(shared_dm.is_quote_unfurl());
+        assert!(shared_dm.has_visible_content());
+        assert_eq!(shared_dm.visible_text(), "");
+        assert_eq!(shared_dm.files.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn scoped_file_dedup_and_display_files_do_not_cross_quote_boundary() {
+        let outer_file = SlackFile {
+            id: Some("F_OUTER".to_string()),
+            mimetype: Some("image/png".to_string()),
+            thumb_480: Some("https://files.slack.com/outer-480.png".to_string()),
+            ..Default::default()
+        };
+        let quote_file = SlackFile {
+            id: Some("F_QUOTE".to_string()),
+            mimetype: Some("image/png".to_string()),
+            thumb_480: Some("https://files.slack.com/quote-480.png".to_string()),
+            ..Default::default()
+        };
+
+        let mut message = SlackMessage {
+            ts: "1710000000.000100".to_string(),
+            files: Some(vec![outer_file.clone()]),
+            attachments: Some(vec![SlackAttachment {
+                is_share: Some(true),
+                blocks: Some(serde_json::json!([{
+                    "type": "image",
+                    "slack_file": { "id": "F_QUOTE" },
+                    "alt_text": "Quoted chart"
+                }])),
+                files: Some(vec![quote_file.clone()]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            message
+                .display_files()
+                .filter_map(|file| file.id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["F_OUTER", "F_QUOTE"]
+        );
+
+        message.refresh_canonical_content();
+        message.discard_wire_content();
+        assert!(message.attachments.is_none());
+        assert_eq!(
+            message
+                .display_files()
+                .filter_map(|file| file.id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["F_OUTER", "F_QUOTE"]
+        );
+
+        let [MessageNode::Quote(quote)] = message.document.nodes() else {
+            panic!("expected canonical quote node");
+        };
+        assert!(SlackMessage::nodes_render_file(&quote.body, &quote_file));
+        assert!(!SlackMessage::nodes_render_file(&quote.body, &outer_file));
+        assert!(!SlackMessage::document_renders_file(
+            &message.document,
+            &quote_file
+        ));
+        assert!(!SlackMessage::document_renders_file(
+            &message.document,
+            &outer_file
+        ));
+        assert_eq!(message.visible_text(), "Quoted chart");
+        assert_eq!(message.accessible_text(), "Quoted chart\nF_OUTER");
+    }
+
+    #[test]
+    fn slack_file_media_classification_and_preview_candidates_cover_gifs_videos_and_filetypes() {
+        let gif_with_thumb_video = SlackFile {
+            id: Some("F_GIF".to_string()),
+            mimetype: Some("image/gif".to_string()),
+            thumb_480_gif: Some("https://files.slack.com/anim_480.gif".to_string()),
+            thumb_480: Some("https://files.slack.com/static_480.png".to_string()),
+            thumb_video: Some("https://files.slack.com/gif.mp4".to_string()),
+            ..Default::default()
+        };
+        assert!(gif_with_thumb_video.is_gif());
+        assert!(gif_with_thumb_video.is_image());
+        assert!(!gif_with_thumb_video.is_video());
+        assert_eq!(gif_with_thumb_video.supported_media_kind(), Some("image"));
+        assert_eq!(
+            gif_with_thumb_video.preview_candidates().next(),
+            Some("https://files.slack.com/anim_480.gif")
+        );
+
+        let video = SlackFile {
+            id: Some("F_VID".to_string()),
+            mimetype: Some("video/mp4".to_string()),
+            url_private: Some("https://files.slack.com/full.mp4".to_string()),
+            url_static_preview: Some("https://files.slack.com/poster.png".to_string()),
+            thumb_360: Some("https://files.slack.com/thumb_360.jpg".to_string()),
+            thumb_video: Some("https://files.slack.com/motion.mp4".to_string()),
+            ..Default::default()
+        };
+        assert!(video.is_video());
+        assert_eq!(video.supported_media_kind(), Some("video"));
+        assert_eq!(
+            video.preview_candidates().collect::<Vec<_>>(),
+            vec![
+                "https://files.slack.com/poster.png",
+                "https://files.slack.com/thumb_360.jpg",
+                "https://files.slack.com/motion.mp4",
+            ]
+        );
+
+        let ext_png = SlackFile {
+            id: Some("F_PNG".to_string()),
+            filetype: Some("PNG".to_string()),
+            url_private: Some("https://files.slack.com/raw.png".to_string()),
+            ..Default::default()
+        };
+        assert!(ext_png.is_declared_image());
+        assert!(ext_png.is_image());
+        assert!(!ext_png.is_video());
+        assert_eq!(ext_png.supported_media_kind(), Some("image"));
+
+        let ext_mp4 = SlackFile {
+            id: Some("F_MP4".to_string()),
+            filetype: Some("MP4".to_string()),
+            url_private: Some("https://files.slack.com/clip.mp4".to_string()),
+            ..Default::default()
+        };
+        assert!(!ext_mp4.is_declared_image());
+        assert!(ext_mp4.is_video());
+        assert_eq!(ext_mp4.supported_media_kind(), Some("video"));
+    }
+
+    #[test]
+    fn empty_share_attachment_has_no_visible_content_and_accessible_text_includes_file_titles() {
+        let empty_share: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "is_share": true
+        }))
+        .expect("empty share deserializes");
+        assert!(empty_share.is_quote_unfurl());
+        assert!(!empty_share.has_visible_content());
+
+        let mut empty_msg = SlackMessage {
+            ts: "1710000001.000100".to_string(),
+            attachments: Some(vec![empty_share]),
+            ..Default::default()
+        };
+        assert!(!empty_msg.has_visible_content());
+        empty_msg.refresh_canonical_content();
+        assert!(!empty_msg.has_visible_content());
+
+        let mut file_forward = SlackMessage {
+            ts: "1710000001.000200".to_string(),
+            attachments: Some(vec![SlackAttachment {
+                is_share: Some(true),
+                fallback: Some("[no preview available]".to_string()),
+                files: Some(vec![SlackFile {
+                    id: Some("F_SPEC".to_string()),
+                    title: Some("Design Spec.pdf".to_string()),
+                    mimetype: Some("application/pdf".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(file_forward.visible_text(), "");
+        assert_eq!(file_forward.accessible_text(), "Design Spec.pdf");
+        file_forward.refresh_canonical_content();
+        file_forward.discard_wire_content();
+        assert_eq!(file_forward.visible_text(), "");
+        assert_eq!(file_forward.accessible_text(), "Design Spec.pdf");
     }
 
     #[test]

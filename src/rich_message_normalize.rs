@@ -21,7 +21,7 @@ pub(crate) fn normalize_blocks_with_files(
         blocks,
         choose_option_label,
         more_actions_label,
-        files,
+        &[files],
         CallbackScope::Message,
     )
 }
@@ -48,7 +48,7 @@ fn normalize_blocks_with_callback_mode(
     blocks: &Value,
     choose_option_label: &str,
     more_actions_label: &str,
-    files: &[SlackFile],
+    file_scopes: &[&[SlackFile]],
     callbacks: CallbackScope,
 ) -> RichDocument {
     let nodes = blocks
@@ -60,7 +60,7 @@ fn normalize_blocks_with_callback_mode(
                 block,
                 choose_option_label,
                 more_actions_label,
-                files,
+                file_scopes,
                 callbacks,
             )
         })
@@ -72,7 +72,7 @@ fn normalize_block(
     block: &Value,
     choose_option_label: &str,
     more_actions_label: &str,
-    files: &[SlackFile],
+    file_scopes: &[&[SlackFile]],
     callbacks: CallbackScope,
 ) -> Option<RichNode> {
     match block.get("type")?.as_str()? {
@@ -92,7 +92,7 @@ fn normalize_block(
                     block.get("block_id").and_then(Value::as_str),
                     choose_option_label,
                     more_actions_label,
-                    files,
+                    file_scopes,
                     callbacks,
                 )
             });
@@ -110,12 +110,12 @@ fn normalize_block(
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(|element| normalize_context_element(element, files))
+                .filter_map(|element| normalize_context_element(element, file_scopes))
                 .collect::<Vec<_>>();
             (!elements.is_empty()).then_some(RichNode::Context(elements))
         }
         "divider" => Some(RichNode::Divider),
-        "image" => normalize_image(block, files).map(RichNode::Image),
+        "image" => normalize_image(block, file_scopes).map(RichNode::Image),
         "actions" => {
             let controls = block
                 .get("elements")
@@ -154,11 +154,11 @@ fn normalize_accessory(
     block_id: Option<&str>,
     choose_option_label: &str,
     more_actions_label: &str,
-    files: &[SlackFile],
+    file_scopes: &[&[SlackFile]],
     callbacks: CallbackScope,
 ) -> Option<RichAccessory> {
     if value.get("type").and_then(Value::as_str) == Some("image") {
-        return normalize_image(value, files).map(RichAccessory::Image);
+        return normalize_image(value, file_scopes).map(RichAccessory::Image);
     }
     normalize_control(
         value,
@@ -170,7 +170,7 @@ fn normalize_accessory(
     .map(RichAccessory::Control)
 }
 
-fn normalize_image(value: &Value, files: &[SlackFile]) -> Option<RichImage> {
+fn normalize_image(value: &Value, file_scopes: &[&[SlackFile]]) -> Option<RichImage> {
     let alt = value
         .get("alt_text")
         .and_then(Value::as_str)
@@ -190,8 +190,10 @@ fn normalize_image(value: &Value, files: &[SlackFile]) -> Option<RichImage> {
                 .get("slack_file")
                 .and_then(|file| file.get("id"))
                 .and_then(Value::as_str)?;
-            files
+            file_scopes
                 .iter()
+                .copied()
+                .flatten()
                 .find(|file| file.id.as_deref() == Some(file_id))
                 .and_then(SlackFile::preview_url)
         })
@@ -208,9 +210,12 @@ fn normalize_image(value: &Value, files: &[SlackFile]) -> Option<RichImage> {
     })
 }
 
-fn normalize_context_element(value: &Value, files: &[SlackFile]) -> Option<RichContextElement> {
+fn normalize_context_element(
+    value: &Value,
+    file_scopes: &[&[SlackFile]],
+) -> Option<RichContextElement> {
     if value.get("type").and_then(Value::as_str) == Some("image") {
-        return normalize_image(value, files).map(RichContextElement::Image);
+        return normalize_image(value, file_scopes).map(RichContextElement::Image);
     }
     block_text(value)
         .filter(|text| !text.trim().is_empty())
@@ -559,7 +564,7 @@ pub(crate) fn normalize_attachments(
                 blocks,
                 "Choose an option",
                 "More actions",
-                files,
+                &[files],
                 CallbackScope::Attachment(attachment_id),
             )
             .nodes;
@@ -604,38 +609,68 @@ fn normalize_quote_attachment(
         }
     }
 
-    let body = if let Some(blocks) = attachment.blocks.as_ref() {
-        normalize_blocks_with_callback_mode(
-            blocks,
-            "Choose an option",
-            "More actions",
-            files,
-            CallbackScope::None,
-        )
-        .nodes
+    let quote_files = attachment.files.as_deref().unwrap_or_default();
+    let block_nodes = attachment
+        .blocks
+        .as_ref()
+        .map(|blocks| {
+            normalize_blocks_with_callback_mode(
+                blocks,
+                "Choose an option",
+                "More actions",
+                &[quote_files, files],
+                CallbackScope::None,
+            )
+            .nodes
+        })
+        .unwrap_or_default();
+    let body = if !block_nodes.is_empty() {
+        block_nodes
     } else if let Some(text) = non_empty(attachment.text.as_deref()) {
         vec![RichNode::Text(text.to_string())]
-    } else if let Some(fallback) = non_empty(attachment.fallback.as_deref()) {
-        vec![RichNode::Text(fallback.to_string())]
+    } else if quote_files.is_empty() {
+        non_empty(attachment.fallback.as_deref())
+            .map(|fallback| vec![RichNode::Text(fallback.to_string())])
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
 
+    let author_name = non_empty(attachment.author_name.as_deref())
+        .or_else(|| non_empty(attachment.author_subname.as_deref()))
+        .map(ToString::to_string);
+    let author_icon = non_empty(attachment.author_icon.as_deref()).map(ToString::to_string);
+    let author_id = non_empty(attachment.author_id.as_deref()).map(ToString::to_string);
+    let channel_id = non_empty(attachment.channel_id.as_deref()).map(ToString::to_string);
+    let message_ts = non_empty(attachment.ts.as_deref()).map(ToString::to_string);
+    let permalink_url = non_empty(attachment.original_url.as_deref())
+        .or_else(|| non_empty(attachment.from_url.as_deref()))
+        .map(ToString::to_string);
+    let footer = non_empty(attachment.footer.as_deref()).map(ToString::to_string);
+
+    if author_name.is_none()
+        && author_id.is_none()
+        && channel_id.is_none()
+        && body.is_empty()
+        && quote_files.is_empty()
+        && footer.is_none()
+        && permalink_url.is_none()
+    {
+        return None;
+    }
+
     Some(RichQuote {
-        author_name: non_empty(attachment.author_name.as_deref())
-            .or_else(|| non_empty(attachment.author_subname.as_deref()))
-            .map(ToString::to_string),
-        author_icon: non_empty(attachment.author_icon.as_deref()).map(ToString::to_string),
-        author_id: non_empty(attachment.author_id.as_deref()).map(ToString::to_string),
-        channel_id: non_empty(attachment.channel_id.as_deref()).map(ToString::to_string),
-        message_ts: non_empty(attachment.ts.as_deref()).map(ToString::to_string),
+        author_name,
+        author_icon,
+        author_id,
+        channel_id,
+        message_ts,
         thread_ts,
-        permalink_url: non_empty(attachment.original_url.as_deref())
-            .or_else(|| non_empty(attachment.from_url.as_deref()))
-            .map(ToString::to_string),
-        footer: non_empty(attachment.footer.as_deref()).map(ToString::to_string),
+        permalink_url,
+        footer,
         is_reply: attachment.is_reply_unfurl.unwrap_or(false),
         body,
+        files: quote_files.to_vec(),
     })
 }
 
@@ -1136,5 +1171,118 @@ mod tests {
             document.visible_text(),
             "Vincent van Adrighem\nThis week is fine. Next week isn't\nThread in Slack conversation"
         );
+    }
+
+    #[test]
+    fn file_only_forward_omits_no_preview_fallback_and_resolves_quote_slack_files() {
+        let file_only: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "is_share": true,
+            "author_name": "Alice",
+            "fallback": "[no preview available]",
+            "footer": "Posted in #private",
+            "files": [{
+                "id": "F_PDF",
+                "name": "spec.pdf",
+                "title": "Architecture Spec",
+                "mimetype": "application/pdf",
+                "size": 4096
+            }]
+        }))
+        .expect("file-only shared attachment deserializes");
+
+        let document = normalize_attachments(&[file_only], &[]);
+        let [RichNode::Quote(quote)] = document.nodes() else {
+            panic!("expected quote node");
+        };
+        assert!(quote.body.is_empty());
+        assert_eq!(quote.files.len(), 1);
+        assert_eq!(quote.files[0].id.as_deref(), Some("F_PDF"));
+        assert!(!document.visible_text().contains("[no preview available]"));
+        assert_eq!(document.visible_text(), "Alice\nPosted in #private");
+
+        let fileless_fallback: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "is_share": true,
+            "fallback": "Shared message fallback"
+        }))
+        .expect("fileless shared attachment deserializes");
+        let fallback_doc = normalize_attachments(&[fileless_fallback], &[]);
+        assert_eq!(fallback_doc.visible_text(), "Shared message fallback");
+
+        let block_quote: SlackAttachment = serde_json::from_value(serde_json::json!({
+            "is_share": true,
+            "blocks": [{
+                "type": "image",
+                "slack_file": {"id": "F_QUOTE"},
+                "alt_text": "Quoted screenshot"
+            }],
+            "files": [{
+                "id": "F_QUOTE",
+                "mimetype": "image/png",
+                "thumb_480": "https://files.slack.com/files-tmb/T1-FQUOTE/shot_480.png"
+            }]
+        }))
+        .expect("block quote attachment deserializes");
+        let outer_shadow = SlackFile {
+            id: Some("F_QUOTE".to_string()),
+            mimetype: Some("image/png".to_string()),
+            thumb_480: Some("https://files.slack.com/files-tmb/T1-FOUTER/wrong.png".to_string()),
+            ..Default::default()
+        };
+        let block_doc = normalize_attachments(&[block_quote], &[outer_shadow]);
+        let [RichNode::Quote(quote)] = block_doc.nodes() else {
+            panic!("expected quote node");
+        };
+        let [RichNode::Image(image)] = quote.body.as_slice() else {
+            panic!("expected image node inside quote body");
+        };
+        assert_eq!(
+            image.url.as_deref(),
+            Some("https://files.slack.com/files-tmb/T1-FQUOTE/shot_480.png")
+        );
+    }
+
+    #[test]
+    fn quote_attachment_with_unsupported_or_empty_blocks_falls_back_to_text_and_keeps_files() {
+        for blocks in [
+            serde_json::json!([{"type": "file", "external_id": "F1"}]),
+            serde_json::json!([]),
+        ] {
+            let shared: SlackAttachment = serde_json::from_value(serde_json::json!({
+                "is_share": true,
+                "author_name": "Alice",
+                "text": "Forwarded caption",
+                "fallback": "[no preview available]",
+                "blocks": blocks,
+                "files": [{
+                    "id": "F1",
+                    "title": "Deck.pdf",
+                    "mimetype": "application/pdf"
+                }]
+            }))
+            .expect("shared attachment deserializes");
+
+            let document = normalize_attachments(&[shared], &[]);
+            let [RichNode::Quote(quote)] = document.nodes() else {
+                panic!("expected quote node");
+            };
+            assert_eq!(
+                quote.body,
+                vec![RichNode::Text("Forwarded caption".to_string())]
+            );
+            assert_eq!(quote.files.len(), 1);
+            assert_eq!(quote.files[0].id.as_deref(), Some("F1"));
+            assert_eq!(document.visible_text(), "Alice\nForwarded caption");
+            assert_eq!(
+                document.accessible_text(),
+                "Alice\nForwarded caption\nDeck.pdf"
+            );
+        }
+
+        let empty_share: SlackAttachment =
+            serde_json::from_value(serde_json::json!({"is_share": true}))
+                .expect("empty share deserializes");
+        assert!(normalize_attachments(&[empty_share], &[])
+            .nodes()
+            .is_empty());
     }
 }

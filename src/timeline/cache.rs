@@ -100,6 +100,8 @@ thread_local! {
     // collapse state lives here keyed by a stable ts+slot pair.
     pub(crate) static COLLAPSED_MEDIA: RefCell<HashSet<String>> =
         RefCell::new(HashSet::new());
+    pub(crate) static COLLAPSED_MEDIA_GENERATION: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Entry-bounded clock-LRU shared by timeline row pools and text-markup caches.
@@ -204,7 +206,13 @@ impl<K: Eq + std::hash::Hash + Clone, V> BoundedLru<K, V> {
 /// `NativeTimelineView::invalidate_all` so pooled and bound row widgets do not
 /// retain stale `COLLAPSED_MEDIA` toggle states or cached textures.
 pub fn clear_timeline_view_caches() {
-    COLLAPSED_MEDIA.with(|set| set.borrow_mut().clear());
+    COLLAPSED_MEDIA.with(|set| {
+        let mut set = set.borrow_mut();
+        if !set.is_empty() {
+            set.clear();
+            COLLAPSED_MEDIA_GENERATION.with(|cell| cell.set(cell.get().wrapping_add(1)));
+        }
+    });
     TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
     decode::reset_texture_decodes();
     REACTION_TEXTURE_CACHE.with(|cache| cache.borrow_mut().clear());
@@ -213,6 +221,10 @@ pub fn clear_timeline_view_caches() {
     forget_asset_misses();
     crate::timeline_document_widget::clear_document_accent_cache();
     super::text::clear_text_model_cache();
+}
+
+pub(crate) fn collapsed_media_generation() -> u64 {
+    COLLAPSED_MEDIA_GENERATION.with(|cell| cell.get())
 }
 
 pub(crate) fn media_collapse_key(ts: &str, slot: &str) -> String {
@@ -226,13 +238,16 @@ pub(crate) fn is_media_collapsed(ts: &str, slot: &str) -> bool {
 
 pub(crate) fn set_media_collapsed(ts: &str, slot: &str, collapsed: bool) {
     let key = media_collapse_key(ts, slot);
-    COLLAPSED_MEDIA.with(|set| {
+    let changed = COLLAPSED_MEDIA.with(|set| {
         if collapsed {
-            set.borrow_mut().insert(key);
+            set.borrow_mut().insert(key)
         } else {
-            set.borrow_mut().remove(&key);
+            set.borrow_mut().remove(&key)
         }
     });
+    if changed {
+        COLLAPSED_MEDIA_GENERATION.with(|cell| cell.set(cell.get().wrapping_add(1)));
+    }
 }
 
 const EXTENSIONS: &[&str] = &[

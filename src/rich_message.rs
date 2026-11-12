@@ -2,6 +2,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::models::SlackFile;
+
 pub const MESSAGE_CONTENT_VERSION: u16 = 1;
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +269,8 @@ pub struct MessageQuote {
     pub(crate) footer: Option<String>,
     pub(crate) is_reply: bool,
     pub(crate) body: Vec<MessageNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) files: Vec<SlackFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,6 +420,15 @@ impl MessageDocument {
         urls.into_iter()
     }
 
+    /// Files carried by top-level [`MessageNode::Quote`] nodes in this document.
+    /// Block normalization never emits nested quotes inside a quote body.
+    pub(crate) fn quote_files(&self) -> impl Iterator<Item = &SlackFile> {
+        self.nodes.iter().flat_map(|node| match node {
+            MessageNode::Quote(quote) => quote.files.as_slice(),
+            _ => &[],
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -475,53 +488,70 @@ impl MessageDocument {
     }
 }
 
-fn collect_image_urls<'a>(node: &'a MessageNode, urls: &mut Vec<&'a str>) {
+/// Calls `predicate` on each direct image URL in `nodes` without descending
+/// into [`MessageNode::Quote`], stopping at the first match.
+pub(crate) fn any_scope_image_url(
+    nodes: &[MessageNode],
+    mut predicate: impl FnMut(&str) -> bool,
+) -> bool {
+    nodes
+        .iter()
+        .any(|node| any_direct_node_image_url(node, &mut predicate))
+}
+
+fn any_direct_node_image_url<'a>(
+    node: &'a MessageNode,
+    predicate: &mut impl FnMut(&'a str) -> bool,
+) -> bool {
     match node {
-        MessageNode::Image(image) => {
-            if let Some(url) = image.url.as_deref().and_then(non_empty) {
-                urls.push(url);
-            }
-        }
-        MessageNode::Section {
+        MessageNode::Image(image)
+        | MessageNode::Section {
             accessory: Some(MessageAccessory::Image(image)),
             ..
-        } => {
-            if let Some(url) = image.url.as_deref().and_then(non_empty) {
-                urls.push(url);
-            }
-        }
-        MessageNode::Context(elements) => {
-            for element in elements {
-                if let MessageContextElement::Image(image) = element {
-                    if let Some(url) = image.url.as_deref().and_then(non_empty) {
-                        urls.push(url);
-                    }
-                }
-            }
-        }
+        } => image
+            .url
+            .as_deref()
+            .and_then(non_empty)
+            .is_some_and(predicate),
+        MessageNode::Context(elements) => elements.iter().any(|element| match element {
+            MessageContextElement::Image(image) => image
+                .url
+                .as_deref()
+                .and_then(non_empty)
+                .is_some_and(&mut *predicate),
+            MessageContextElement::Text(_) => false,
+        }),
         MessageNode::Attachment(attachment) => {
-            if let Some(url) = attachment
+            attachment
                 .image
                 .as_ref()
                 .and_then(|img| img.url.as_deref())
                 .and_then(non_empty)
-            {
-                urls.push(url);
-            }
-            if let Some(url) = attachment.footer_icon.as_deref().and_then(non_empty) {
-                urls.push(url);
-            }
+                .is_some_and(&mut *predicate)
+                || attachment
+                    .footer_icon
+                    .as_deref()
+                    .and_then(non_empty)
+                    .is_some_and(predicate)
         }
-        MessageNode::Quote(quote) => {
-            if let Some(icon) = quote.author_icon.as_deref().and_then(non_empty) {
-                urls.push(icon);
-            }
-            for inner in &quote.body {
-                collect_image_urls(inner, urls);
-            }
-        }
-        _ => {}
+        _ => false,
     }
+}
+
+fn collect_image_urls<'a>(node: &'a MessageNode, urls: &mut Vec<&'a str>) {
+    if let MessageNode::Quote(quote) = node {
+        if let Some(icon) = quote.author_icon.as_deref().and_then(non_empty) {
+            urls.push(icon);
+        }
+        for inner in &quote.body {
+            collect_image_urls(inner, urls);
+        }
+        return;
+    }
+    any_direct_node_image_url(node, &mut |url| {
+        urls.push(url);
+        false
+    });
 }
 
 fn assign_control_keys(nodes: &mut [MessageNode]) {
@@ -656,6 +686,13 @@ fn project_node_text(node: &MessageNode, include_controls: bool, parts: &mut Vec
             }
             for inner in &quote.body {
                 project_node_text(inner, include_controls, parts);
+            }
+            if include_controls {
+                for file in &quote.files {
+                    if !crate::models::SlackMessage::nodes_render_file(&quote.body, file) {
+                        push_text(parts, file.display_title());
+                    }
+                }
             }
             if let Some(footer) = &quote.footer {
                 push_text(parts, footer);
@@ -938,6 +975,7 @@ mod tests {
                     MessageNode::Text("Quoted text".to_string()),
                     MessageNode::Image(image("https://files.slack.com/inner.png")),
                 ],
+                files: Vec::new(),
             }))],
             None,
         );

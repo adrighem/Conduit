@@ -1942,11 +1942,7 @@ fn valid_channel_name(name: &str) -> bool {
 }
 
 fn media_gallery_items(messages: &[Arc<SlackMessage>]) -> Vec<MediaGalleryItem> {
-    file_media_gallery_items(
-        messages
-            .iter()
-            .flat_map(|message| message.files.as_deref().unwrap_or_default()),
-    )
+    file_media_gallery_items(messages.iter().flat_map(|message| message.display_files()))
 }
 
 fn file_media_gallery_items<'a>(
@@ -2434,10 +2430,7 @@ fn message_notification_body(
     let text = rendering::notification_plain_text(&visible_text, user_names, user_full_names)?;
     if !text.is_empty() {
         Some(text)
-    } else if message
-        .and_then(|message| message.files.as_ref())
-        .is_some_and(|files| !files.is_empty())
-    {
+    } else if message.is_some_and(|message| message.display_files().next().is_some()) {
         Some(gettext("Shared a file"))
     } else {
         Some(gettext("New message"))
@@ -3338,13 +3331,7 @@ fn message_image_asset_requests<'a, T: std::borrow::Borrow<SlackMessage> + 'a>(
     let catalog = crate::emoji::EmojiCatalog::new(custom_emojis);
     for message in messages {
         let msg = message.borrow();
-        for request in msg
-            .files
-            .as_ref()
-            .into_iter()
-            .flatten()
-            .filter_map(image_asset_request)
-        {
+        for request in msg.display_files().filter_map(image_asset_request) {
             retain_image_asset_request(&mut requests, Some(request));
         }
         for request in msg

@@ -233,4 +233,62 @@ mod tests {
         assert_eq!(image.title.as_deref(), Some("Animated reaction"));
         assert_eq!(message.document.image_urls().next(), Some(image_url));
     }
+
+    #[test]
+    fn shared_quote_files_survive_cache_round_trip_after_discarding_wire_content() {
+        let preview_url = "https://files.slack.com/files-tmb/T1-FIMG/diagram_480.png";
+        let message = SlackMessageWire::from_value(serde_json::json!({
+            "ts": "1710000002.000100",
+            "user": "U123",
+            "text": "",
+            "attachments": [{
+                "is_share": true,
+                "author_name": "Bob",
+                "fallback": "[no preview available]",
+                "files": [
+                    {
+                        "id": "F_IMG",
+                        "name": "diagram.png",
+                        "title": "Architecture Diagram",
+                        "mimetype": "image/png",
+                        "url_private_download": "https://files.slack.com/files-pri/T1-FIMG/download/diagram.png",
+                        "thumb_480": preview_url
+                    },
+                    {
+                        "id": "F_PDF",
+                        "name": "notes.pdf",
+                        "title": "Release Notes",
+                        "mimetype": "application/pdf",
+                        "size": 2048,
+                        "url_private_download": "https://files.slack.com/files-pri/T1-FPDF/download/notes.pdf"
+                    }
+                ]
+            }]
+        }))
+        .into_message()
+        .expect("shared message should normalize");
+
+        let mut cached = message;
+        cached.discard_wire_content();
+        assert!(cached.attachments.is_none());
+
+        let json = serde_json::to_string(&cached).expect("cached message serializes");
+        let restored: SlackMessage =
+            serde_json::from_str(&json).expect("cached message deserializes");
+        let restored = normalize_cached_message(restored);
+
+        assert!(restored.attachments.is_none());
+        let [MessageNode::Quote(quote)] = restored.document.nodes() else {
+            panic!("expected canonical quote node");
+        };
+        assert_eq!(quote.files.len(), 2);
+        assert_eq!(
+            restored
+                .display_files()
+                .filter_map(|file| file.id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["F_IMG", "F_PDF"]
+        );
+        assert_eq!(restored.visible_text(), "Bob");
+    }
 }

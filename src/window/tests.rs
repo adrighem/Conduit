@@ -3802,6 +3802,137 @@ fn cached_canonical_image_remains_eligible_for_dom_asset_patch() {
 }
 
 #[test]
+fn forwarded_quote_files_feed_gallery_notifications_and_asset_requests() {
+    let outer_url = "https://files.slack.com/files-pri/T1-FOUTER/download/outer.png";
+    let quote_download = "https://files.slack.com/files-pri/T1-FQUOTE/download/quoted.png";
+    let quote_preview = "https://files.slack.com/files-tmb/T1-FQUOTE/quoted_480.png";
+    let video_download = "https://files.slack.com/files-pri/T1-FVID/download/clip.mp4";
+    let video_poster = "https://files.slack.com/files-tmb/T1-FVID/poster.png";
+    let video_motion = "https://files.slack.com/files-tmb/T1-FVID/motion.mp4";
+    let gif_download = "https://files.slack.com/files-pri/T1-FGIF/download/anim.gif";
+    let gif_preview = "https://files.slack.com/files-tmb/T1-FGIF/anim_480.gif";
+    let gif_mp4 = "https://files.slack.com/files-tmb/T1-FGIF/gif.mp4";
+
+    let forwarded_media = crate::slack_message_wire::normalize_cached_message(
+        crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+            "ts": "1710000010.000100",
+            "user": "U123",
+            "text": "",
+            "files": [{
+                "id": "F_OUTER",
+                "title": "Outer Photo",
+                "mimetype": "image/png",
+                "url_private_download": outer_url,
+                "thumb_480": "https://files.slack.com/files-tmb/T1-FOUTER/outer_480.png"
+            }],
+            "attachments": [{
+                "is_share": true,
+                "fallback": "[no preview available]",
+                "files": [
+                    {
+                        "id": "F_QUOTE",
+                        "title": "Quoted Photo",
+                        "mimetype": "image/png",
+                        "url_private_download": quote_download,
+                        "thumb_480": quote_preview
+                    },
+                    {
+                        "id": "F_VID",
+                        "title": "Quoted Clip",
+                        "mimetype": "video/mp4",
+                        "url_private_download": video_download,
+                        "url_static_preview": video_poster,
+                        "thumb_video": video_motion
+                    },
+                    {
+                        "id": "F_GIF",
+                        "title": "Quoted Reaction GIF",
+                        "mimetype": "image/gif",
+                        "url_private_download": gif_download,
+                        "thumb_480_gif": gif_preview,
+                        "thumb_video": gif_mp4
+                    },
+                    {
+                        "id": "F_PDF",
+                        "title": "Quoted Spec",
+                        "mimetype": "application/pdf",
+                        "url_private_download": "https://files.slack.com/files-pri/T1-FPDF/download/spec.pdf"
+                    }
+                ]
+            }]
+        }))
+        .into_message()
+        .expect("forwarded media message should normalize"),
+    );
+    assert!(forwarded_media.attachments.is_none());
+
+    let gallery = media_gallery_items(&[Arc::new(forwarded_media.clone())]);
+    assert_eq!(gallery.len(), 4);
+    assert_eq!(gallery[0].url, outer_url);
+    assert_eq!(gallery[0].name, "Outer Photo");
+    assert_eq!(gallery[0].kind, MediaKind::Image);
+    assert_eq!(gallery[1].url, quote_download);
+    assert_eq!(gallery[1].name, "Quoted Photo");
+    assert_eq!(gallery[1].kind, MediaKind::Image);
+    assert_eq!(gallery[2].url, video_download);
+    assert_eq!(gallery[2].name, "Quoted Clip");
+    assert_eq!(gallery[2].kind, MediaKind::Video);
+    assert_eq!(gallery[3].url, gif_download);
+    assert_eq!(gallery[3].name, "Quoted Reaction GIF");
+    assert_eq!(gallery[3].kind, MediaKind::Image);
+
+    let requests = message_image_asset_requests::<SlackMessage>(
+        &[forwarded_media],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    assert!(
+        requests.contains(&(quote_preview.to_string(), quote_preview.to_string())),
+        "expected forwarded image preview in requests: {requests:?}"
+    );
+    assert!(
+        requests.contains(&(video_poster.to_string(), video_poster.to_string())),
+        "expected static video poster in requests: {requests:?}"
+    );
+    assert!(
+        !requests.iter().any(|(key, _)| key == video_motion),
+        "video with static preview should not request motion mp4: {requests:?}"
+    );
+    assert!(
+        requests.contains(&(gif_preview.to_string(), gif_preview.to_string())),
+        "expected animated gif preview in requests: {requests:?}"
+    );
+    assert!(
+        !requests.iter().any(|(key, _)| key == gif_mp4),
+        "gif with thumb_video must request gif preview rather than mp4: {requests:?}"
+    );
+
+    let textless_forward = crate::slack_message_wire::normalize_cached_message(
+        crate::slack_message_wire::SlackMessageWire::from_value(serde_json::json!({
+            "ts": "1710000010.000200",
+            "user": "U123",
+            "text": "",
+            "attachments": [{
+                "is_share": true,
+                "fallback": "[no preview available]",
+                "files": [{
+                    "id": "F_ONLY",
+                    "name": "handout.pdf",
+                    "mimetype": "application/pdf"
+                }]
+            }]
+        }))
+        .into_message()
+        .expect("textless file forward should normalize"),
+    );
+    assert_eq!(
+        message_notification_body(Some(&textless_forward), &HashMap::new(), &HashMap::new())
+            .as_deref(),
+        Some("Shared a file")
+    );
+}
+
+#[test]
 fn message_user_ids_cover_author_mentions_and_reactions() {
     let message = SlackMessage {
         ts: "1710000000.000100".to_string(),
