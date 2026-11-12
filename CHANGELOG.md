@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.10.0](https://github.com/adrighem/Conduit/compare/v0.9.0...v0.10.0) (2026-11-12)
+
+
+### Features
+
+* new screenshot to show off the updated window ([b69e4c2](https://github.com/adrighem/Conduit/commit/b69e4c23c1b8f97491df3f4475acd8c812013bbf))
+* **packaging:** prepare metainfo and manifest for Flathub submission ([0bdc2e2](https://github.com/adrighem/Conduit/commit/0bdc2e26f8f325e24e1025313d52bf60a5f312d2))
+* **timeline:** show files of forwarded and shared messages (fixes [#47](https://github.com/adrighem/Conduit/issues/47)) ([615980a](https://github.com/adrighem/Conduit/commit/615980a90c246d2219222860ce938469b27869e8))
+
+
+### Bug Fixes
+
+* **notifications:** keep full link URL when Slack link label is ellipsed ([ba6bbe2](https://github.com/adrighem/Conduit/commit/ba6bbe226bc7ff0729f902f6b51702a5d8739324))
+
+
+### Performance Improvements
+
+* keep the GTK main thread responsive ([#46](https://github.com/adrighem/Conduit/issues/46)) ([c5751ac](https://github.com/adrighem/Conduit/commit/c5751acadae7e418c064342e3f08690c21e151e1))
+* **sidebar:** build sidebar row widgets once in setup and update in bind (fixes [#49](https://github.com/adrighem/Conduit/issues/49)) ([4a36f30](https://github.com/adrighem/Conduit/commit/4a36f30804f393f27a00d95eb40e01c70c3d3238))
+* **timeline:** reuse timeline row widgets across binds (fixes [#48](https://github.com/adrighem/Conduit/issues/48)) ([f733e52](https://github.com/adrighem/Conduit/commit/f733e52c3e3979706afa55938b5d8adfaf14e7e5))
+* **timeline:** share messages with timeline rows instead of cloning (fixes [#50](https://github.com/adrighem/Conduit/issues/50)) ([629292a](https://github.com/adrighem/Conduit/commit/629292adc1530488a26e8f9e59a6cb7bf657588e))
+* **workspace:** merge queued workspace patches per frame (fixes [#51](https://github.com/adrighem/Conduit/issues/51)) ([4e70538](https://github.com/adrighem/Conduit/commit/4e7053892f6f186cd3e1a4dc5f4104ad8194d233))
+
 ## [0.9.0](https://github.com/adrighem/Conduit/compare/v0.8.0...v0.9.0) (2026-11-08)
 
 
