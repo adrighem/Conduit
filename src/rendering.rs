@@ -303,7 +303,7 @@ fn plain_angle_token(
     let is_link = !target.contains(char::is_whitespace)
         && (target.contains("://") || target.starts_with("mailto:") || target.starts_with("tel:"));
     if is_link {
-        return Some(label.unwrap_or(target).to_string());
+        return Some(notification_link_text(target, label));
     }
     // Anything else is an HTML tag: drop it, keeping line breaks.
     let tag = target.trim_start_matches('/').to_ascii_lowercase();
@@ -316,6 +316,22 @@ fn plain_angle_token(
     } else {
         String::new()
     })
+}
+
+/// Notification text for a link. Notification servers only linkify bare URLs,
+/// so web links always carry the full target: a label that is itself a (often
+/// ellipsed) URL is dropped, any other label is kept ahead of the target.
+fn notification_link_text(target: &str, label: Option<&str>) -> String {
+    let Some(label) = label else {
+        return target.to_string();
+    };
+    if !target.contains("://") {
+        return label.to_string();
+    }
+    if label.contains("://") || label.ends_with('\u{2026}') || label.ends_with("...") {
+        return target.to_string();
+    }
+    format!("{label} ({target})")
 }
 
 /// Resolves a leading `name:` shortcode (the opening colon already consumed).
@@ -485,7 +501,12 @@ mod tests {
     fn notification_text_flattens_links_and_html() {
         assert_eq!(
             plain("<https://x.io|site> <https://y.io> <mailto:a@b.io|mail>").as_deref(),
-            Some("site https://y.io mail")
+            Some("site (https://x.io) https://y.io mail")
+        );
+        assert_eq!(
+            plain("<https://x.io/long/path|https://x.io/lo\u{2026}> <https://y.io/p|y.io/p...>")
+                .as_deref(),
+            Some("https://x.io/long/path https://y.io/p")
         );
         assert_eq!(
             plain("<a href=\"https://x.io\">label</a> <b>bold</b>").as_deref(),
