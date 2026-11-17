@@ -15,6 +15,7 @@ This slice provides honest affordances for advanced surfaces:
 - Block Kit action elements with URLs render as clickable action chips instead of inert labels.
 - The existing external link handler opens those URLs in the user's browser or Slack-capable handler.
 - Block Kit and legacy attachment callback controls retain their labels and shape, then open the exact originating message in Slack through `chat.getPermalink`.
+- Block Kit `table` blocks render as a bordered native grid (raw and rich text cells, bold header row) instead of being dropped.
 - Slack remains responsible for confirmations, option loading, authorization, callback delivery, and message updates.
 
 This keeps workflow buttons, menus, canvas/list links, and other Slack-hosted controls understandable and usable without fabricating another app's interaction payload.

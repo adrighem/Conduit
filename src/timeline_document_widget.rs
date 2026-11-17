@@ -108,6 +108,14 @@ impl<'a> DocumentRenderer<'a> {
             } => self.render_section(text.as_deref(), fields, accessory.as_ref(), target),
             MessageNode::Context(elements) => target.append(&self.context_row(elements)),
             MessageNode::Divider => target.append(&Separator::new(Orientation::Horizontal)),
+            MessageNode::Table(rows) => {
+                register_timeline_css();
+                let scroller = gtk::ScrolledWindow::new();
+                scroller.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+                scroller.set_propagate_natural_height(true);
+                scroller.set_child(Some(&self.table(rows)));
+                target.append(&scroller);
+            }
             MessageNode::Image(image) => target.append(&self.image(image)),
             MessageNode::Control(control) => {
                 target.append(&self.controls_row(std::slice::from_ref(control)))
@@ -130,6 +138,34 @@ impl<'a> DocumentRenderer<'a> {
                 }
             }
         }
+    }
+
+    fn table(&self, rows: &[Vec<String>]) -> Grid {
+        let grid = Grid::new();
+        grid.add_css_class("timeline-table");
+        grid.set_halign(gtk::Align::Start);
+        for (row_index, row) in rows.iter().enumerate() {
+            for (column, cell) in row.iter().enumerate() {
+                let text = if row_index == 0 && !cell.trim().is_empty() {
+                    format!("*{}*", cell.trim())
+                } else {
+                    cell.clone()
+                };
+                let widget = self.mrkdwn_widget(&text);
+                widget.add_css_class("timeline-table-cell");
+                // Wrapping cells make the grid's height depend on its width,
+                // and the row then keeps height measured at a narrower width.
+                // Cells stay on one line and the scroller absorbs overflow.
+                if let Some(label) = widget.downcast_ref::<Label>() {
+                    label.set_wrap(false);
+                } else if let Some(view) = widget.downcast_ref::<gtk::TextView>() {
+                    view.set_wrap_mode(gtk::WrapMode::None);
+                }
+                widget.set_valign(gtk::Align::Center);
+                grid.attach(&widget, column as i32, row_index as i32, 1, 1);
+            }
+        }
+        grid
     }
 
     fn image(&self, image: &MessageImage) -> Widget {

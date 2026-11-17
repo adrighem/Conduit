@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::models::{SlackAttachment, SlackFile};
 
 use crate::rich_message::{
-    MessageAccessory as RichAccessory, MessageAttachment as RichAttachment,
+    inlines_to_text, MessageAccessory as RichAccessory, MessageAttachment as RichAttachment,
     MessageContextElement as RichContextElement, MessageControl as RichControl,
     MessageControlConfirmation, MessageDocument as RichDocument, MessageField as RichField,
     MessageImage as RichImage, MessageLinkedText as RichLinkedText, MessageNode as RichNode,
@@ -134,6 +134,7 @@ fn normalize_block(
                 .collect::<Vec<_>>();
             (!controls.is_empty()).then_some(RichNode::Actions(controls))
         }
+        "table" => normalize_table(block).map(RichNode::Table),
         "call" => normalize_call_block(block),
         "rich_text" => {
             let nodes = block
@@ -146,6 +147,39 @@ fn normalize_block(
             (!nodes.is_empty()).then_some(RichNode::RichText(nodes))
         }
         _ => None,
+    }
+}
+
+/// Rows of mrkdwn cell texts. Cells are `raw_text` or `rich_text`; ragged rows
+/// are padded so the grid stays rectangular.
+fn normalize_table(block: &Value) -> Option<Vec<Vec<String>>> {
+    let mut rows = block
+        .get("rows")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_array)
+        .map(|row| row.iter().map(table_cell_text).collect::<Vec<_>>())
+        .filter(|row| !row.is_empty())
+        .collect::<Vec<_>>();
+    let width = rows.iter().map(Vec::len).max()?;
+    for row in &mut rows {
+        row.resize(width, String::new());
+    }
+    Some(rows)
+}
+
+fn table_cell_text(cell: &Value) -> String {
+    match cell.get("type").and_then(Value::as_str) {
+        Some("rich_text") => cell
+            .get("elements")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(non_empty_inlines)
+            .map(|inlines| inlines_to_text(&inlines))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => block_text(cell).unwrap_or_default(),
     }
 }
 
@@ -1284,5 +1318,32 @@ mod tests {
         assert!(normalize_attachments(&[empty_share], &[])
             .nodes()
             .is_empty());
+    }
+
+    #[test]
+    fn table_block_normalizes_raw_and_rich_cells_into_rectangular_rows() {
+        let blocks = serde_json::json!([{
+            "type": "table",
+            "rows": [
+                [{"type": "raw_text", "text": "Outcome"}, {"type": "raw_text", "text": "Count"}],
+                [
+                    {"type": "rich_text", "elements": [{
+                        "type": "rich_text_section",
+                        "elements": [{"type": "text", "text": "Good"}]
+                    }]}
+                ]
+            ]
+        }]);
+        let document = normalize_blocks_with_files(&blocks, "Choose", "More", &[]);
+        let [RichNode::Table(rows)] = document.nodes() else {
+            panic!("expected one table node");
+        };
+        assert_eq!(
+            rows,
+            &vec![
+                vec!["Outcome".to_string(), "Count".to_string()],
+                vec!["Good".to_string(), String::new()],
+            ]
+        );
     }
 }

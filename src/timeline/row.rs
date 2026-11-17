@@ -57,6 +57,8 @@ pub fn register_timeline_css() {
             .reaction-emoji-unicode { line-height: 1; }
             .reaction-emoji-image { margin-top: 3px; margin-bottom: 3px; }
             .timeline-attachment { border-left: 3px solid #e0e0e0; padding-left: 8px; margin-left: 4px; }
+            .timeline-table { border-top: 1px solid alpha(currentColor, 0.2); border-left: 1px solid alpha(currentColor, 0.2); }
+            .timeline-table-cell { padding: 6px 10px; border-right: 1px solid alpha(currentColor, 0.2); border-bottom: 1px solid alpha(currentColor, 0.2); }
             .timeline-media-image { border-radius: 8px; }
             .timeline-media-placeholder {
                 border-radius: 8px;

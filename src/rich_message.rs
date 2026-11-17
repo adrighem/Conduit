@@ -247,6 +247,8 @@ pub enum MessageNode {
     },
     Context(Vec<MessageContextElement>),
     Divider,
+    /// Block Kit `table`: rows of mrkdwn cell texts, the first row is the header.
+    Table(Vec<Vec<String>>),
     Actions(Vec<MessageControl>),
     RichText(Vec<RichTextNode>),
     Attachment(Box<MessageAttachment>),
@@ -622,6 +624,11 @@ fn project_node_text(node: &MessageNode, include_controls: bool, parts: &mut Vec
             }
         }
         MessageNode::Image(image) => push_text(parts, &image.alt),
+        MessageNode::Table(rows) => {
+            for cell in rows.iter().flatten() {
+                push_text(parts, cell);
+            }
+        }
         MessageNode::Actions(controls) if include_controls => {
             for control in controls {
                 push_text(parts, control.label());
@@ -715,7 +722,7 @@ fn push_text(parts: &mut Vec<String>, value: &str) {
     }
 }
 
-fn inlines_to_text(inlines: &[RichInline]) -> String {
+pub(crate) fn inlines_to_text(inlines: &[RichInline]) -> String {
     let mut out = String::new();
     for inline in inlines {
         match inline {
