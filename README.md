@@ -215,7 +215,8 @@ defensively and falls back to normal Web API refreshes when needed.
   Channels), From, In and Last 7 days filters (Slack applies all but People and
   Channels, which match names in the local directory), source-message
   navigation, Slack permalink handling, and an internal image and video viewer.
-- Status viewing and editing, person profile actions, relevant desktop
+- Status viewing and editing (with each author's status emoji in message
+  headers), person profile actions, relevant desktop
   notifications, and optional realtime updates.
 - Transactional SQLite caching for responsive startup and offline context, with
   workspace credentials kept separately in the system keyring.

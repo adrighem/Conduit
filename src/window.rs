@@ -11946,15 +11946,12 @@ impl ConduitWindow {
                 return;
             };
             if window.imp().status_expiry_generation.get() == generation {
-                let user_ids = window
-                    .imp()
-                    .workspace
-                    .user_directory
-                    .user_statuses
-                    .borrow()
-                    .keys()
-                    .cloned()
+                let directory = &window.imp().workspace.user_directory;
+                let mut user_ids = directory
+                    .remove_expired_statuses(current_unix_seconds())
+                    .into_iter()
                     .collect::<Vec<_>>();
+                user_ids.extend(directory.user_statuses.borrow().keys().cloned());
                 window.patch_users_on_timelines(&user_ids);
                 window.queue_user_projection_invalidations(&user_ids);
                 window.schedule_status_expiry();

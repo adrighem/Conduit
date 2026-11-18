@@ -661,6 +661,46 @@ pub(crate) fn build_timeline_message_widget(
     )
 }
 
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or_default()
+}
+
+/// Status emoji of `user_id` for the message header, when their status is
+/// active at `now` and carries one. The status text is its tooltip.
+fn build_author_status_widget(
+    user_id: &str,
+    context: &MessageRenderContext,
+    now: i64,
+) -> Option<Widget> {
+    let status = context
+        .user_statuses
+        .get(user_id)
+        .filter(|status| status.active_at(now))?;
+    let emoji_name = status.emoji_name();
+    if emoji_name.is_empty() {
+        return None;
+    }
+    let catalog = crate::emoji::EmojiCatalog::new(&context.custom_emojis);
+    let emoji = super::reactions::resolve_reaction_emoji_widget(
+        emoji_name,
+        emoji_name,
+        context,
+        &catalog,
+        crate::message_markup::INLINE_EMOJI_SIZE,
+    );
+    let text = status.accessible_text();
+    let status_box = Box::new(Orientation::Horizontal, 0);
+    status_box.add_css_class("timeline-author-status");
+    status_box.set_valign(gtk::Align::Center);
+    status_box.set_tooltip_text(Some(&text));
+    status_box.update_property(&[gtk::accessible::Property::Label(&format!("Status: {text}"))]);
+    status_box.append(&emoji);
+    Some(status_box.upcast())
+}
+
 /// Longest thread root excerpt shown in a broadcast reply's banner.
 const THREAD_ROOT_PREVIEW_CHARS: usize = 80;
 
@@ -820,6 +860,12 @@ pub(crate) fn build_timeline_message_widget_with_root(
                 columns.append(&avatar_widget);
                 header_box.append(&author_label);
             }
+        }
+
+        if let Some(status_widget) = author_user_id.and_then(|user_id| {
+            build_author_status_widget(user_id, context, current_unix_seconds())
+        }) {
+            header_box.append(&status_widget);
         }
 
         let timestamp_label = Label::new(None);

@@ -319,6 +319,21 @@ impl UserDirectoryState {
         self.apply_projection_edits(edits)
     }
 
+    /// Drops statuses that expired by `now`, so rows showing them rebind;
+    /// returns the users whose status was dropped.
+    pub(crate) fn remove_expired_statuses(&self, now: i64) -> HashSet<String> {
+        let mut changed = HashSet::new();
+        let edits = self
+            .user_statuses
+            .borrow()
+            .iter()
+            .filter(|(_, status)| status.expiration > 0 && status.expiration <= now)
+            .map(|(user_id, _)| (user_id.clone(), None))
+            .collect();
+        edit_shared_map(&self.user_statuses, edits, &mut changed);
+        changed
+    }
+
     /// Records `user_names` (from a lookup) without copying the shared name
     /// map when every name is already known; returns the changed ids.
     pub(crate) fn merge_user_names(
@@ -3180,6 +3195,36 @@ mod tests {
             .unwrap();
         assert!(changed.users_reset());
         assert_eq!(changed.changed_user_ids(), &["U2"]);
+    }
+
+    #[test]
+    fn remove_expired_statuses_drops_only_expired_ones() {
+        let directory = UserDirectoryState::default();
+        let status = |expiration| crate::models::SlackUserStatus {
+            text: "Away".to_string(),
+            emoji: ":house:".to_string(),
+            expiration,
+        };
+        *directory.user_statuses.borrow_mut() = Arc::new(HashMap::from([
+            ("U_EXPIRED".to_string(), status(100)),
+            ("U_LATER".to_string(), status(200)),
+            ("U_FOREVER".to_string(), status(0)),
+        ]));
+        let held = directory.user_statuses.borrow().clone();
+
+        assert_eq!(
+            directory.remove_expired_statuses(150),
+            HashSet::from(["U_EXPIRED".to_string()])
+        );
+        let statuses = directory.user_statuses.borrow().clone();
+        let mut remaining = statuses.keys().cloned().collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(remaining, ["U_FOREVER", "U_LATER"]);
+        assert_eq!(held.len(), 3, "held snapshots stay untouched");
+
+        // Nothing expired: the shared map is not copied.
+        assert!(directory.remove_expired_statuses(150).is_empty());
+        assert!(Arc::ptr_eq(&statuses, &directory.user_statuses.borrow()));
     }
 
     #[test]

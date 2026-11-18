@@ -2668,6 +2668,79 @@ mod graphical {
     }
 
     #[test]
+    fn header_shows_active_author_status_emoji_between_name_and_time() {
+        run_gtk_test(|| {
+            let status = |expiration| crate::models::SlackUserStatus {
+                text: "Out to lunch".to_string(),
+                emoji: ":house:".to_string(),
+                expiration,
+            };
+            let msg = SlackMessage {
+                ts: "1700000000.000100".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("body".to_string()),
+                ..Default::default()
+            };
+            let status_widgets = |ctx: &MessageRenderContext, show_header: bool| {
+                let row = build_timeline_message_widget(
+                    &msg,
+                    ctx,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    show_header,
+                );
+                let shown = descendants(row.upcast_ref())
+                    .into_iter()
+                    .filter(|w| w.has_css_class("timeline-author-status"))
+                    .collect::<Vec<_>>();
+                (row, shown)
+            };
+
+            let mut ctx = test_context();
+            ctx.user_statuses = Arc::new(HashMap::from([("U123".to_string(), status(0))]));
+            let (_row, shown) = status_widgets(&ctx, true);
+            assert_eq!(shown.len(), 1);
+            let status_widget = &shown[0];
+            assert_eq!(
+                status_widget.tooltip_text().as_deref(),
+                Some("Out to lunch")
+            );
+            // Name, then status, then posting time.
+            let header = status_widget.parent().unwrap();
+            let previous = status_widget.prev_sibling().unwrap();
+            assert!(previous
+                .downcast_ref::<Label>()
+                .is_some_and(|label| label.text() == "Alice"));
+            assert!(status_widget
+                .next_sibling()
+                .is_some_and(|w| w.has_css_class("caption")));
+            assert_eq!(
+                header.last_child().as_ref(),
+                status_widget.next_sibling().as_ref()
+            );
+
+            assert!(
+                status_widgets(&ctx, false).1.is_empty(),
+                "grouped rows have no header"
+            );
+
+            ctx.user_statuses = Arc::new(HashMap::from([("U123".to_string(), status(1))]));
+            assert!(status_widgets(&ctx, true).1.is_empty(), "expired status");
+
+            let mut text_only = status(0);
+            text_only.emoji.clear();
+            ctx.user_statuses = Arc::new(HashMap::from([("U123".to_string(), text_only)]));
+            assert!(
+                status_widgets(&ctx, true).1.is_empty(),
+                "status without emoji"
+            );
+        });
+    }
+
+    #[test]
     fn test_resolve_reaction_emoji_widget_unicode() {
         run_gtk_test(|| {
             let context = test_context();
