@@ -570,16 +570,19 @@ impl<'a> DocumentRenderer<'a> {
     }
 
     fn control_button(&self, control: &MessageControl) -> Button {
+        // Display only: the click path uses the control key or URL, never the label.
+        let label = crate::emoji::EmojiCatalog::new(&self.context.custom_emojis)
+            .shortcodes_to_unicode(control.label());
         let button = if control.is_call() {
             let content = adw::ButtonContent::builder()
                 .icon_name("call-start-symbolic")
-                .label(control.label())
+                .label(&label)
                 .build();
             let button = Button::builder().child(&content).build();
             button.add_css_class("suggested-action");
             button
         } else {
-            Button::with_label(control.label())
+            Button::with_label(&label)
         };
         button.set_focus_on_click(false);
         if let Some(url) = control.url().filter(|url| is_http_url(url)) {
@@ -803,6 +806,30 @@ mod tests {
     /// `CONDUIT_GRAPHICAL_TESTS` is set (see `run_gtk_test`).
     mod graphical {
         use super::*;
+
+        #[test]
+        fn button_labels_show_unicode_emoji_but_keep_the_control_key() {
+            crate::timeline::tests::run_gtk_test(|| {
+                let context = MessageRenderContext::default();
+                let sources = MediaSources {
+                    resolve: &|_| None,
+                    is_failed: &|_| false,
+                };
+                let renderer = DocumentRenderer::new(&context, sources, "123.456", None);
+                let control = MessageControl::new(":mag_right: View alert", None);
+                let button = renderer.control_button(&control);
+                assert_eq!(
+                    button.label().as_deref(),
+                    Some("\u{1f50e} View alert"),
+                    "label shows the glyph"
+                );
+                assert_eq!(
+                    control.label(),
+                    ":mag_right: View alert",
+                    "model keeps the shortcode"
+                );
+            });
+        }
 
         #[test]
         fn call_button_has_suggested_action() {

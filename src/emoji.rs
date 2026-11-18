@@ -118,6 +118,32 @@ impl<'a> EmojiCatalog<'a> {
             .map(|emoji| EmojiValue::Unicode(emoji.as_str()))
     }
 
+    /// Replaces `:shortcode:` runs that resolve to a unicode glyph, for plain
+    /// text surfaces such as button labels. Workspace image emoji and unknown
+    /// names stay as written.
+    pub fn shortcodes_to_unicode(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find(':') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            let name_len = shortcode_len(after);
+            let closed = name_len > 0 && after[name_len..].starts_with(':');
+            match closed.then(|| self.resolve(&after[..name_len])).flatten() {
+                Some(EmojiValue::Unicode(glyph)) => {
+                    out.push_str(glyph);
+                    rest = &after[name_len + 1..];
+                }
+                _ => {
+                    out.push(':');
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
     pub fn entries(&self) -> Vec<EmojiEntry> {
         let mut entries = emojis::iter()
             .filter_map(|emoji| {
@@ -179,6 +205,21 @@ impl<'a> EmojiCatalog<'a> {
             return canonical.to_string();
         }
         name.to_string()
+    }
+}
+
+/// Byte length of the shortcode name at the start of `text`, including a
+/// `::skin-tone-N` suffix.
+fn shortcode_len(text: &str) -> usize {
+    let is_name = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-' | '\'');
+    let base = text.find(|c: char| !is_name(c)).unwrap_or(text.len());
+    let tone = text[base..]
+        .strip_prefix("::skin-tone-")
+        .and_then(|tail| tail.chars().next())
+        .filter(|digit| ('2'..='6').contains(digit));
+    match tone {
+        Some(_) => base + "::skin-tone-".len() + 1,
+        None => base,
     }
 }
 
@@ -482,6 +523,22 @@ fn category_label(group: emojis::Group) -> &'static str {
 mod tests {
     use super::*;
     use crate::search::take_candidates_scored;
+
+    #[test]
+    fn shortcodes_to_unicode_replaces_only_resolvable_unicode_names() {
+        let custom = HashMap::from([("party".to_string(), "https://e/p.png".to_string())]);
+        let catalog = EmojiCatalog::new(&custom);
+        assert_eq!(
+            catalog.shortcodes_to_unicode(":mute: Mute"),
+            "\u{1f507} Mute"
+        );
+        assert_eq!(
+            catalog.shortcodes_to_unicode("a :white_check_mark: b :nope: :party: 10:30:45"),
+            "a \u{2705} b :nope: :party: 10:30:45"
+        );
+        assert_eq!(catalog.shortcodes_to_unicode("::"), "::");
+        assert_eq!(catalog.shortcodes_to_unicode("plain"), "plain");
+    }
 
     #[test]
     fn catalog_resolves_unicode_custom_and_alias_emoji() {
