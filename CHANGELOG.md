@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.10.0](https://github.com/adrighem/Conduit/compare/v0.9.0...v0.10.0) (2026-11-19)
+
+
+### Features
+
+* new screenshot to show off the updated window ([b69e4c2](https://github.com/adrighem/Conduit/commit/b69e4c23c1b8f97491df3f4475acd8c812013bbf))
+* **packaging:** prepare metainfo and manifest for Flathub submission ([0bdc2e2](https://github.com/adrighem/Conduit/commit/0bdc2e26f8f325e24e1025313d52bf60a5f312d2))
+* **sidebar:** list direct messages before channels in unread filter ([1d9501c](https://github.com/adrighem/Conduit/commit/1d9501c262d8edf7e4a35c5c083a9c7edadb7bd4))
+* **timeline:** show author status emoji in message headers ([f6f042a](https://github.com/adrighem/Conduit/commit/f6f042a500559f58a227c0293da2a1a24e57967c))
+* **timeline:** show files of forwarded and shared messages (fixes [#47](https://github.com/adrighem/Conduit/issues/47)) ([615980a](https://github.com/adrighem/Conduit/commit/615980a90c246d2219222860ce938469b27869e8))
+* **timeline:** show reply user mini avatars in thread pill ([5ade35f](https://github.com/adrighem/Conduit/commit/5ade35f82972ecaf16b55db4b45970b8a6075eff))
+* **timeline:** show unicode emoji in button labels ([395154e](https://github.com/adrighem/Conduit/commit/395154ec64181bda896e35680cc87664ddacbea4))
+
+
+### Bug Fixes
+
+* **notifications:** keep full link URL when Slack link label is ellipsed ([ba6bbe2](https://github.com/adrighem/Conduit/commit/ba6bbe226bc7ff0729f902f6b51702a5d8739324))
+* **picker:** fix arrow navigation between search entry and results ([28b88c7](https://github.com/adrighem/Conduit/commit/28b88c7d7f5c6fc0e45275c393716fa8a01c22c2))
+* **timeline:** render Block Kit table blocks ([5a1959c](https://github.com/adrighem/Conduit/commit/5a1959c191c7b9fb723414c7a99333dbe021c8ea))
+
+
+### Performance Improvements
+
+* keep the GTK main thread responsive ([#46](https://github.com/adrighem/Conduit/issues/46)) ([c5751ac](https://github.com/adrighem/Conduit/commit/c5751acadae7e418c064342e3f08690c21e151e1))
+* **sidebar:** build sidebar row widgets once in setup and update in bind (fixes [#49](https://github.com/adrighem/Conduit/issues/49)) ([4a36f30](https://github.com/adrighem/Conduit/commit/4a36f30804f393f27a00d95eb40e01c70c3d3238))
+* **timeline:** reuse timeline row widgets across binds (fixes [#48](https://github.com/adrighem/Conduit/issues/48)) ([f733e52](https://github.com/adrighem/Conduit/commit/f733e52c3e3979706afa55938b5d8adfaf14e7e5))
+* **timeline:** share messages with timeline rows instead of cloning (fixes [#50](https://github.com/adrighem/Conduit/issues/50)) ([629292a](https://github.com/adrighem/Conduit/commit/629292adc1530488a26e8f9e59a6cb7bf657588e))
+* **workspace:** merge queued workspace patches per frame (fixes [#51](https://github.com/adrighem/Conduit/issues/51)) ([4e70538](https://github.com/adrighem/Conduit/commit/4e7053892f6f186cd3e1a4dc5f4104ad8194d233))
+
 ## [0.9.0](https://github.com/adrighem/Conduit/compare/v0.8.0...v0.9.0) (2026-11-08)
 
 
