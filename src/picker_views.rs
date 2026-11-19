@@ -357,6 +357,7 @@ impl ConversationPickerModel {
                 };
                 list_item.set_selectable(item_id.is_some());
                 list_item.set_activatable(item_id.is_some());
+                list_item.set_focusable(item_id.is_some());
                 bin.set_child(Some(&widget(&entry)));
                 if let Some(item_id) = item_id {
                     bound.borrow_mut().insert(item_id, bin);
@@ -476,6 +477,76 @@ impl ConversationPickerModel {
             .iter()
             .position(|entry| entry.key() == PickerEntryKey::Item(id))
             .and_then(|position| u32::try_from(position).ok())
+    }
+
+    /// Position of the first selectable item row, skipping headers and placeholders.
+    pub fn first_selectable_position(&self) -> Option<u32> {
+        self.entries
+            .borrow()
+            .iter()
+            .position(|entry| matches!(entry, ConversationPickerListEntry::Item(_)))
+            .and_then(|position| u32::try_from(position).ok())
+    }
+
+    /// Moves keyboard focus and selection to the first selectable item.
+    pub fn focus_first_selectable(&self) -> bool {
+        let Some(position) = self.first_selectable_position() else {
+            return false;
+        };
+        self.list.grab_focus();
+        self.list.scroll_to(
+            position,
+            gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
+            None,
+        );
+        true
+    }
+
+    /// Returns whether the selection is on the first selectable item or unset.
+    pub fn is_at_first_selectable(&self) -> bool {
+        let selected = self.selection.selected();
+        self.first_selectable_position()
+            .is_none_or(|pos| selected == pos || selected == gtk::INVALID_LIST_POSITION)
+    }
+
+    /// Clears the current selection.
+    pub fn clear_selection(&self) {
+        if self.selection.selected() != gtk::INVALID_LIST_POSITION {
+            self.selection.set_selected(gtk::INVALID_LIST_POSITION);
+        }
+    }
+
+    /// Wires `Down` in `search` to focus/select the first result and `Up` on
+    /// the first result in `list` to return focus to `search`.
+    pub fn bind_search_navigation(&self, search: &gtk::SearchEntry) {
+        let search_keys = gtk::EventControllerKey::new();
+        search_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let model = self.clone();
+        search_keys.connect_key_pressed(move |_, key, _, state| {
+            if state.is_empty() && matches!(key, gtk::gdk::Key::Down | gtk::gdk::Key::KP_Down) {
+                model.focus_first_selectable();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        search.add_controller(search_keys);
+
+        let list_keys = gtk::EventControllerKey::new();
+        list_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let model = self.clone();
+        let search_for_up = search.clone();
+        list_keys.connect_key_pressed(move |_, key, _, state| {
+            if state.is_empty()
+                && matches!(key, gtk::gdk::Key::Up | gtk::gdk::Key::KP_Up)
+                && model.is_at_first_selectable()
+            {
+                model.clear_selection();
+                search_for_up.grab_focus();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        self.list.add_controller(list_keys);
     }
 
     /// The action for the activatable picker entry at `position`, if any.
@@ -1281,6 +1352,127 @@ mod tests {
                         .is_some_and(|check| check.is_active()),
                     "a person checked before a search is checked after it"
                 );
+                window.close();
+            });
+        }
+
+        #[test]
+        fn picker_arrow_navigation_focuses_first_result_and_returns_to_entry() {
+            run_gtk_test(|| {
+                let bound_titles = Rc::new(RefCell::new(Vec::<String>::new()));
+                let model = label_model(Rc::default(), bound_titles);
+                let search = gtk::SearchEntry::new();
+                model.bind_search_navigation(&search);
+
+                let scroller = gtk::ScrolledWindow::new();
+                scroller.set_vexpand(true);
+                scroller.set_child(Some(&model.list));
+
+                let container = gtk::Box::new(gtk::Orientation::Vertical, 8);
+                container.append(&search);
+                container.append(&scroller);
+
+                let window = gtk::Window::builder()
+                    .default_width(400)
+                    .default_height(300)
+                    .child(&container)
+                    .build();
+
+                model.show("", channel_entries("team", 0..5));
+                window.present();
+                search.grab_focus();
+                pump_until(5000, || {
+                    gtk::prelude::GtkWindowExt::focus(&window)
+                        .is_some_and(|focus| focus == search || focus.is_ancestor(&search))
+                });
+                assert_eq!(model.selection().selected(), gtk::INVALID_LIST_POSITION);
+
+                // Down in SearchEntry focuses and selects the first Item (index 1, skipping Header at 0).
+                let search_controller = (0..search.observe_controllers().n_items())
+                    .filter_map(|idx| {
+                        search
+                            .observe_controllers()
+                            .item(idx)
+                            .and_downcast::<gtk::EventControllerKey>()
+                    })
+                    .next_back()
+                    .expect("search key controller");
+                let handled = search_controller.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk::glib::translate::IntoGlib::into_glib(gtk::gdk::Key::Down),
+                        &0_u32,
+                        &gtk::gdk::ModifierType::empty(),
+                    ],
+                );
+                assert!(handled, "Down in search entry should be handled");
+                pump(50);
+
+                assert_eq!(model.selection().selected(), 1);
+                assert!(
+                    gtk::prelude::GtkWindowExt::focus(&window)
+                        .is_some_and(|focus| focus == model.list || focus.is_ancestor(&model.list)),
+                    "focus should move into the list"
+                );
+
+                // Moving down again from index 1 must advance to index 2, not re-select index 1.
+                assert!(
+                    model
+                        .list
+                        .activate_action(
+                            "list.select-item",
+                            Some(&(2_u32, false, false).to_variant()),
+                        )
+                        .is_ok(),
+                    "list.select-item action should succeed"
+                );
+                pump(50);
+                assert_eq!(model.selection().selected(), 2);
+
+                // Up while not on first item proceeds to normal list handling.
+                let list_controller = (0..model.list.observe_controllers().n_items())
+                    .filter_map(|idx| {
+                        model
+                            .list
+                            .observe_controllers()
+                            .item(idx)
+                            .and_downcast::<gtk::EventControllerKey>()
+                    })
+                    .next_back()
+                    .expect("list key controller");
+                let handled_at_second = list_controller.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk::glib::translate::IntoGlib::into_glib(gtk::gdk::Key::Up),
+                        &0_u32,
+                        &gtk::gdk::ModifierType::empty(),
+                    ],
+                );
+                assert!(
+                    !handled_at_second,
+                    "Up on second item should proceed to list navigation"
+                );
+
+                // Up while on first selectable item returns focus to SearchEntry and clears selection.
+                model.focus_first_selectable();
+                pump(50);
+                assert_eq!(model.selection().selected(), 1);
+
+                let handled_at_first = list_controller.emit_by_name::<bool>(
+                    "key-pressed",
+                    &[
+                        &gtk::glib::translate::IntoGlib::into_glib(gtk::gdk::Key::Up),
+                        &0_u32,
+                        &gtk::gdk::ModifierType::empty(),
+                    ],
+                );
+                assert!(handled_at_first, "Up on first item should be handled");
+                pump_until(5000, || {
+                    gtk::prelude::GtkWindowExt::focus(&window)
+                        .is_some_and(|focus| focus == search || focus.is_ancestor(&search))
+                });
+                assert_eq!(model.selection().selected(), gtk::INVALID_LIST_POSITION);
+
                 window.close();
             });
         }

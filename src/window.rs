@@ -3450,13 +3450,15 @@ impl AvatarUserIndex {
     }
 }
 
-/// Collects every user id the rendered messages depend on (author, mentions, reactions).
+/// Collects every user id the rendered messages depend on (author, mentions, reactions, thread replies).
 fn collect_message_user_ids<T: std::borrow::Borrow<SlackMessage>>(
     messages: &[T],
     out: &mut HashSet<String>,
 ) {
     for message in messages {
-        out.extend(rendering::extract_user_ids(message.borrow()));
+        let msg = message.borrow();
+        out.extend(rendering::extract_user_ids(msg));
+        out.extend(msg.reply_users.iter().flatten().cloned());
     }
 }
 
@@ -13109,6 +13111,7 @@ impl ConduitWindow {
             )
         });
         let list = model.list.clone();
+        model.bind_search_navigation(&search);
 
         let scroller = gtk::ScrolledWindow::new();
         scroller.set_vexpand(true);
@@ -13285,6 +13288,7 @@ impl ConduitWindow {
                 let custom_emojis = std::sync::Arc::clone(&self.imp().custom_emojis.borrow());
                 let generation = std::rc::Rc::new(std::cell::Cell::new(1));
                 widgets.update(&item.row, &custom_emojis, generation, 1);
+                widgets.status_indicator.set_focusable(false);
                 widgets.content.upcast()
             }
             ConversationPickerListEntry::Placeholder(text) => self.placeholder_label(text).upcast(),
