@@ -32,6 +32,7 @@ thread_local! {
 }
 
 pub const TIMELINE_AVATAR_SIZE: i32 = 36;
+pub const THREAD_REPLY_AVATAR_SIZE: i32 = 18;
 pub const FOCUS_TARGET_CLASS: &str = "timeline-focus-target";
 pub const FOCUS_TARGET_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -487,10 +488,44 @@ pub fn build_thread_replies_widget(
     } else {
         count_str
     };
-    let reply_button = Button::with_label(&label_text);
+    let reply_button = Button::new();
     reply_button.set_focus_on_click(false);
     reply_button.add_css_class("flat");
     reply_button.add_css_class("thread-reply-pill");
+    let pill_content = Box::new(Orientation::Horizontal, 6);
+    pill_content.set_valign(gtk::Align::Center);
+    if let Some(reply_users) = message.reply_users.as_deref() {
+        let mut seen_users: Vec<&str> = Vec::new();
+        let avatars = Box::new(Orientation::Horizontal, 2);
+        avatars.set_valign(gtk::Align::Center);
+        for user_id in reply_users {
+            if seen_users.contains(&user_id.as_str()) {
+                continue;
+            }
+            seen_users.push(user_id.as_str());
+            let display_name = context.user_names.get(user_id).map(String::as_str);
+            let avatar = adw::Avatar::new(
+                THREAD_REPLY_AVATAR_SIZE,
+                display_name,
+                display_name.is_some(),
+            );
+            avatar.add_css_class("thread-reply-avatar");
+            avatar.set_valign(gtk::Align::Center);
+            if let Some(url) = context.user_avatar_urls.get(user_id) {
+                if let Some(path) = resolve_cached_asset_path(url, context) {
+                    set_avatar_image_when_mapped(&avatar, &path);
+                }
+            }
+            avatars.append(&avatar);
+        }
+        if !seen_users.is_empty() {
+            pill_content.append(&avatars);
+        }
+    }
+    let label = gtk::Label::new(Some(&label_text));
+    label.set_valign(gtk::Align::Center);
+    pill_content.append(&label);
+    reply_button.set_child(Some(&pill_content));
     let replied = message.reply_users.as_deref().is_some_and(|users| {
         context
             .current_user_id

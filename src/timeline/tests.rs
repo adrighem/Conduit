@@ -2317,6 +2317,60 @@ mod graphical {
     }
 
     #[test]
+    fn thread_reply_pill_renders_deduped_mini_avatars_for_reply_users() {
+        run_gtk_test(|| {
+            let mut ctx = test_context();
+            let names = Arc::make_mut(&mut ctx.user_names);
+            names.insert("U_A".to_string(), "Alice".to_string());
+            names.insert("U_B".to_string(), "Bob".to_string());
+            let msg = SlackMessage {
+                ts: "1700000000.000951".to_string(),
+                user: Some("U123".to_string()),
+                text: Some("root".to_string()),
+                reply_count: Some(3),
+                reply_users: Some(vec![
+                    "U_A".to_string(),
+                    "U_B".to_string(),
+                    "U_A".to_string(),
+                ]),
+                ..Default::default()
+            };
+            let open_thread: Rc<dyn Fn(String)> = Rc::new(|_| {});
+            let widget = build_timeline_message_widget(
+                &msg,
+                &ctx,
+                None,
+                Some(&open_thread),
+                None,
+                None,
+                None,
+                true,
+            );
+            let pill = find_descendant(&widget.upcast(), &|w| w.has_css_class("thread-reply-pill"))
+                .expect("thread pill");
+            let mut avatars = Vec::new();
+            let mut stack = vec![pill];
+            while let Some(node) = stack.pop() {
+                if node.has_css_class("thread-reply-avatar") {
+                    avatars.push(node.clone());
+                }
+                let mut child = node.first_child();
+                while let Some(c) = child {
+                    stack.push(c.clone());
+                    child = c.next_sibling();
+                }
+            }
+            assert_eq!(avatars.len(), 2);
+            for avatar_widget in avatars {
+                let avatar = avatar_widget
+                    .downcast::<adw::Avatar>()
+                    .expect("thread-reply-avatar is adw::Avatar");
+                assert_eq!(avatar.size(), THREAD_REPLY_AVATAR_SIZE);
+            }
+        });
+    }
+
+    #[test]
     fn message_text_links_dispatch_open_link() {
         run_gtk_test(|| {
             let ctx = test_context();
