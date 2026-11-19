@@ -1008,6 +1008,7 @@ where
     SidebarListModel::Sections(build_sidebar_sections_from_rows(
         scored.into_iter().map(|(row, _)| row),
         None,
+        options.unread_only,
     ))
 }
 
@@ -1025,6 +1026,7 @@ fn build_sidebar_sections(
                 SidebarRowModel::from_conversation(conversation, user_names, selected_channel, None)
             }),
         None,
+        false,
     )
 }
 
@@ -1447,9 +1449,13 @@ fn sort_by_band_then_title<T>(
     items.extend(keyed.into_iter().map(|(_, _, item)| item));
 }
 
+/// Sections in display order: Priority, Channels, Direct messages, Other.
+/// `direct_messages_first` (the Unread view) puts Direct messages before
+/// Channels.
 fn build_sidebar_sections_from_rows(
     rows: impl IntoIterator<Item = SidebarRowModel>,
     query: Option<&SearchQuery>,
+    direct_messages_first: bool,
 ) -> Vec<SidebarSectionModel> {
     let mut priority_direct_messages = Vec::new();
     let mut priority_channels = Vec::new();
@@ -1492,10 +1498,17 @@ fn build_sidebar_sections_from_rows(
         .chain(priority_channels)
         .collect();
 
+    let channels = section(SidebarSectionKind::Channels, channels);
+    let direct_messages = section(SidebarSectionKind::DirectMessages, direct_messages);
+    let (first, second) = if direct_messages_first {
+        (direct_messages, channels)
+    } else {
+        (channels, direct_messages)
+    };
     [
         section(SidebarSectionKind::Priority, priority),
-        section(SidebarSectionKind::Channels, channels),
-        section(SidebarSectionKind::DirectMessages, direct_messages),
+        first,
+        second,
         section(SidebarSectionKind::Other, other),
     ]
     .into_iter()
@@ -2940,6 +2953,50 @@ mod tests {
         assert_eq!(rows.len(), RECENT_HISTORY_DIRECT_MESSAGE_LIMIT * 2);
         assert!(ids.contains("D_RECENT_20"));
         assert!(!ids.contains("D_RECENT_00"));
+    }
+
+    #[test]
+    fn unread_view_lists_direct_messages_before_channels() {
+        let channel = SlackConversation {
+            id: "C_UNREAD".to_string(),
+            name: Some("unread".to_string()),
+            is_channel: Some(true),
+            ..Default::default()
+        };
+        let mut group = dm("G_UNREAD", "U_OTHER");
+        group.is_im = Some(false);
+        group.is_mpim = Some(true);
+        let conversations = [channel, dm("D_UNREAD", "U_DM"), group];
+        let ledger = read_states(&[("C_UNREAD", 0), ("D_UNREAD", 0), ("G_UNREAD", 0)]);
+        let kinds = |unread_only| {
+            list_sections(build_sidebar_list(
+                &conversations,
+                &HashMap::new(),
+                SidebarBuildOptions {
+                    unread_only,
+                    read_states: Some(&ledger),
+                    ..Default::default()
+                },
+            ))
+            .iter()
+            .map(|section| section.kind)
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            kinds(true),
+            [
+                SidebarSectionKind::DirectMessages,
+                SidebarSectionKind::Channels
+            ]
+        );
+        assert_eq!(
+            kinds(false),
+            [
+                SidebarSectionKind::Channels,
+                SidebarSectionKind::DirectMessages
+            ]
+        );
     }
 
     #[test]
